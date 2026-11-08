@@ -2,13 +2,16 @@
 //! program that leads a process group (Unix) or runs in a job object
 //! (Windows) with everything it starts, read continuously on a thread of its
 //! own, watched for hangs, and ended with everything it started.
+#![deny(clippy::missing_const_for_fn)]
+#![deny(clippy::panic_in_result_fn)]
+#![deny(clippy::map_err_ignore)]
 use super::protocol::{self, Input, Line, Output, PROTOCOL, WorkerCommand};
 use crate::types::{Categorized, ErrorKind};
-use anyhow::{Context, Result};
+use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, VecDeque},
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Read as _, Write as _},
     process::{Child, ChildStdin, Command, ExitStatus, Stdio},
     sync::{
         Arc, Condvar, Mutex, PoisonError,
@@ -104,7 +107,7 @@ pub(crate) fn executable() -> Result<std::path::PathBuf> {
     Ok(std::env::current_exe()?)
 }
 
-/// A camera worker leads a process group of its own, which its FFmpeg and helper
+/// A camera worker leads a process group of its own, which its `FFmpeg` and helper
 /// processes join. A terminal sends Ctrl-C, and the shell sends the SIGHUP of
 /// a closed terminal, to the whole foreground group: in this one, they would
 /// end a recording before this process could finish it. The worker exits when
@@ -191,19 +194,18 @@ impl Worker {
         let (hello, said) = mpsc::channel();
         std::thread::Builder::new()
             .name("capturefab-worker".into())
-            .spawn(move || shared.read(output, hello, sink))
+            .spawn(move || shared.read(output, hello, &sink))
             .context("start worker reader")?;
-        let started = match said.recv_timeout(HELLO) {
-            Ok(started) => started,
-            Err(_) => Err(Categorized::new(
+        let started = said.recv_timeout(HELLO).unwrap_or_else(|_| {
+            Err(Categorized::new(
                 ErrorKind::Timeout,
                 format!(
                     "the camera worker did not start within {}",
                     crate::types::duration_text(HELLO)
                 ),
             )
-            .into()),
-        };
+            .into())
+        });
         if started.is_err() {
             worker.kill();
         }
@@ -212,7 +214,7 @@ impl Worker {
     pub(super) fn pid(&self) -> u32 {
         self.0.pid
     }
-    pub(super) fn shared(&self) -> &Arc<Shared> {
+    pub(super) const fn shared(&self) -> &Arc<Shared> {
         &self.0
     }
     /// Whether the process is gone.
@@ -295,17 +297,20 @@ impl Worker {
                 changes: false,
             },
         );
-        self.0.send(&Input::Status { id })?;
-        let result = receiver.recv_timeout(wait);
+        let result = self.0.send(&Input::Status { id }).and_then(|()| {
+            let value = match receiver.recv_timeout(wait) {
+                Ok(reply) => reply,
+                Err(mpsc::RecvTimeoutError::Timeout) => Err(Categorized::new(
+                    ErrorKind::Timeout,
+                    "the camera worker did not answer a status request",
+                )
+                .into()),
+                Err(mpsc::RecvTimeoutError::Disconnected) => self.wait(&receiver),
+            }?;
+            Ok(serde_json::from_value(value)?)
+        });
         locked(&self.0.calls).remove(&id);
-        match result {
-            Ok(value) => Ok(serde_json::from_value(value?)?),
-            Err(_) => Err(Categorized::new(
-                ErrorKind::Timeout,
-                "the camera worker did not answer a status request",
-            )
-            .into()),
-        }
+        result
     }
     /// Cancel request `id`.
     pub(super) fn cancel(&self, id: u64) {
@@ -441,7 +446,7 @@ impl Shared {
         if matches!(child.try_wait(), Ok(Some(_))) {
             return;
         }
-        if !self.tree.terminate(self.pid) {
+        if !self.tree.terminate() {
             let _ = child.kill();
         }
     }
@@ -451,7 +456,7 @@ impl Shared {
         self: Arc<Self>,
         output: std::process::ChildStdout,
         hello: mpsc::Sender<Result<()>>,
-        sink: Sink,
+        sink: &Sink,
     ) {
         let mut reader = BufReader::new(output);
         let mut hello = Some(hello);
@@ -459,12 +464,12 @@ impl Shared {
         let mut skipped = 0;
         loop {
             let line = match read_line(&mut reader, protocol::MAX_LINE) {
-                Ok(Some(Some(line))) => line,
-                Ok(Some(None)) => {
+                Ok(ReadLine::Bytes(line)) => line,
+                Ok(ReadLine::TooLong) => {
                     crate::eprintln!("capturefab: ignoring an oversized line from a camera worker");
                     continue;
                 }
-                Ok(None) | Err(_) => break,
+                Ok(ReadLine::End) | Err(_) => break,
             };
             *locked(&self.heard) = Instant::now();
             let line = match serde_json::from_slice::<Line>(&line) {
@@ -577,7 +582,8 @@ impl Shared {
         // output: look again soon, then less and less often.
         let mut pause = Duration::from_micros(50);
         let status = loop {
-            if let Ok(Some(status)) = locked(&self.child).try_wait() {
+            let status = locked(&self.child).try_wait();
+            if let Ok(Some(status)) = status {
                 break Some(status);
             }
             if Instant::now() >= deadline {
@@ -588,7 +594,7 @@ impl Shared {
             pause = (pause * 2).min(Duration::from_millis(5));
         };
         // A worker that died leaves its FFmpeg running in its group.
-        self.tree.terminate(self.pid);
+        self.tree.terminate();
         status
     }
     /// What the exit means: a hang, a shutdown, or a crash with how it ended.
@@ -654,9 +660,9 @@ impl Shared {
         let mut reader = BufReader::new(errors);
         loop {
             let line = match read_line(&mut reader, 64 * 1024) {
-                Ok(Some(Some(line))) => line,
-                Ok(Some(None)) => continue,
-                Ok(None) | Err(_) => {
+                Ok(ReadLine::Bytes(line)) => line,
+                Ok(ReadLine::TooLong) => continue,
+                Ok(ReadLine::End) | Err(_) => {
                     self.errors_ended.store(true, Ordering::Release);
                     return;
                 }
@@ -675,90 +681,105 @@ impl Shared {
     }
 }
 
-/// One line of at most `max` bytes, without its newline: None at the end,
-/// Some(None) for a longer line, which is skipped.
-fn read_line(reader: &mut impl BufRead, max: usize) -> std::io::Result<Option<Option<Vec<u8>>>> {
+#[derive(Debug, PartialEq, Eq)]
+enum ReadLine {
+    Bytes(Vec<u8>),
+    TooLong,
+    End,
+}
+
+/// One line of at most `max` bytes, without its newline. Oversized lines
+/// are skipped whole so the next read starts at a new line.
+#[deny(clippy::panic_in_result_fn)]
+fn read_line(reader: &mut impl BufRead, max: usize) -> std::io::Result<ReadLine> {
     let mut line = Vec::new();
     reader
         .by_ref()
-        .take(max as u64 + 1)
+        .take(u64::try_from(max).unwrap_or(u64::MAX).saturating_add(1))
         .read_until(b'\n', &mut line)?;
     if line.is_empty() {
-        return Ok(None);
+        return Ok(ReadLine::End);
     }
     if line.last() == Some(&b'\n') {
         line.pop();
-        return Ok(Some(Some(line)));
+        return Ok(ReadLine::Bytes(line));
     }
     if line.len() <= max {
         // The last line, without a newline.
-        return Ok(Some(Some(line)));
+        return Ok(ReadLine::Bytes(line));
     }
     // Skip the rest of the oversized line.
     loop {
-        let buffer = reader.fill_buf()?;
+        let buffer = match reader.fill_buf() {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            filled => filled?,
+        };
         if buffer.is_empty() {
-            return Ok(Some(None));
+            return Ok(ReadLine::TooLong);
         }
-        match buffer.iter().position(|byte| *byte == b'\n') {
-            Some(end) => {
-                reader.consume(end + 1);
-                return Ok(Some(None));
-            }
-            None => {
-                let length = buffer.len();
-                reader.consume(length);
-            }
+        if let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
+            reader.consume(end + 1);
+            return Ok(ReadLine::TooLong);
         }
+        let length = buffer.len();
+        reader.consume(length);
     }
 }
 
 #[cfg(unix)]
 mod tree {
-    use std::os::{fd::AsRawFd, unix::process::CommandExt};
+
+    use std::os::{fd::AsRawFd as _, unix::process::CommandExt as _};
 
     /// Let the worker `command` starts inherit `output`, and name it.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the shared platform interface propagates fallible Windows handle setup; Unix setup fails later in pre_exec"
+    )]
     pub(super) fn pass(
         command: &mut std::process::Command,
         output: &std::io::PipeWriter,
     ) -> anyhow::Result<()> {
         let fd = output.as_raw_fd();
         command.args(["--output-fd", &fd.to_string()]);
-        // SAFETY: fcntl is async-signal-safe, as pre_exec requires; the
-        // descriptor is this process's own pipe, which outlives the spawn.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        let prepare = move || {
+            // SAFETY: fd names the output pipe kept open through spawn.
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        };
+        // SAFETY: prepare uses only async-signal-safe fcntl and errno reads.
+        unsafe { command.pre_exec(prepare) };
         Ok(())
     }
 
     /// A worker's process group, which it leads.
-    pub(super) struct Tree;
+    pub(super) struct Tree(Option<libc::pid_t>);
     impl Tree {
-        pub(super) fn adopt(_child: &std::process::Child) -> Self {
-            Self
+        pub(super) fn adopt(child: &std::process::Child) -> Self {
+            Self(
+                libc::pid_t::try_from(child.id())
+                    .ok()
+                    .filter(|&group| group > 0),
+            )
         }
-        /// End the group: the worker and everything it started.
-        pub(super) fn terminate(&self, pid: u32) -> bool {
-            let Ok(group) = libc::pid_t::try_from(pid) else {
-                return false;
-            };
-            // SAFETY: killpg only sends a signal, to the group this worker
-            // leads; a group outlives its leader while any member runs.
-            unsafe { libc::killpg(group, libc::SIGKILL) == 0 }
+        /// End the adopted group: the worker and everything it started.
+        pub(super) fn terminate(&self) -> bool {
+            self.0.is_some_and(|group| {
+                // SAFETY: a positive process-group ID of the adopted worker;
+                // its group outlives its leader while any member runs.
+                unsafe { libc::killpg(group, libc::SIGKILL) == 0 }
+            })
         }
     }
 }
 
 #[cfg(windows)]
 mod tree {
-    use anyhow::Context;
-    use std::os::windows::io::AsRawHandle;
+
+    use anyhow::Context as _;
+    use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::{
         Foundation::{CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation},
         System::JobObjects::{
@@ -775,7 +796,7 @@ mod tree {
     ) -> anyhow::Result<()> {
         let handle = output.as_raw_handle();
         // SAFETY: the handle is this process's own pipe end.
-        if unsafe { SetHandleInformation(handle as _, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }
+        if unsafe { SetHandleInformation(handle.cast(), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }
             == 0
         {
             return Err(std::io::Error::last_os_error()).context("stdout capture pipe");
@@ -789,36 +810,47 @@ mod tree {
     pub(super) struct Tree(HANDLE);
     // SAFETY: a job object handle may be used from any thread.
     unsafe impl Send for Tree {}
+    // SAFETY: job object operations may run concurrently; the handle stays
+    // open until exclusive ownership is recovered by Drop.
     unsafe impl Sync for Tree {}
     impl Tree {
         pub(super) fn adopt(child: &std::process::Child) -> Self {
-            // SAFETY: a new unnamed job with default security; its handle is
-            // checked before use and closed on drop.
-            unsafe {
-                let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-                if job.is_null() {
-                    return Self(std::ptr::null_mut());
-                }
-                let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-                limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-                let set = SetInformationJobObject(
+            let size = u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+                .expect("Windows job limits size fits DWORD");
+            // SAFETY: create an unnamed job with default security.
+            let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if job.is_null() {
+                return Self(std::ptr::null_mut());
+            }
+            let tree = Self(job);
+            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // SAFETY: tree owns job, and limits has the layout and size named
+            // by JobObjectExtendedLimitInformation for the duration of the call.
+            let set = unsafe {
+                SetInformationJobObject(
                     job,
                     JobObjectExtendedLimitInformation,
                     (&raw const limits).cast(),
-                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                    size,
+                )
+            };
+            let assigned = if set == 0 {
+                0
+            } else {
+                // SAFETY: tree owns job and child owns the live process handle.
+                unsafe { AssignProcessToJobObject(job, child.as_raw_handle().cast()) }
+            };
+            if assigned == 0 {
+                crate::eprintln!(
+                    "capturefab: camera worker outside a job object; FFmpeg may outlive it"
                 );
-                if set == 0 || AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) == 0 {
-                    crate::eprintln!(
-                        "capturefab: camera worker outside a job object; FFmpeg may outlive it"
-                    );
-                    CloseHandle(job);
-                    return Self(std::ptr::null_mut());
-                }
-                Self(job)
+                return Self(std::ptr::null_mut());
             }
+            tree
         }
         /// End the worker and everything it started.
-        pub(super) fn terminate(&self, _pid: u32) -> bool {
+        pub(super) fn terminate(&self) -> bool {
             // SAFETY: the job handle this tree owns.
             !self.0.is_null() && unsafe { TerminateJobObject(self.0, 1) } != 0
         }
@@ -840,6 +872,75 @@ mod tree {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn failed_status_requests_remove_their_waiters() {
+        use std::os::unix::process::CommandExt as _;
+
+        let hello = serde_json::to_string(&Line {
+            seq: 0,
+            output: Output::Hello {
+                protocol: PROTOCOL,
+                build: "test".into(),
+            },
+        })
+        .unwrap();
+        let child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "printf '%s\\n' \"$1\"; exec sleep 30",
+                "worker",
+                &hello,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let worker = Worker::attach(child, Arc::new(|_, _| {})).unwrap();
+        let timeout = worker.status(Duration::from_millis(1));
+        let pending_after_timeout = locked(&worker.0.calls).len();
+        // A lost reply sender reports a broken reply path and clears its waiter.
+        let disconnected = std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| worker.status(HELLO));
+            while !waiting.is_finished() {
+                let waiter = locked(&worker.0.calls).pop_first();
+                if let Some(waiter) = waiter {
+                    drop(waiter);
+                    break;
+                }
+                std::thread::yield_now();
+            }
+            waiting.join().unwrap()
+        });
+        let pending_after_disconnect = locked(&worker.0.calls).len();
+        // Keep the pipe open but unavailable to send, without racing a child exit.
+        let input = locked(&worker.0.input).take();
+        let result = worker.status(Duration::from_millis(1));
+        let pending = locked(&worker.0.calls).len();
+        *locked(&worker.0.input) = input;
+        worker.kill();
+        assert!(worker.wait_exit(Instant::now() + Duration::from_secs(2)));
+        assert_eq!(
+            crate::types::classify(&timeout.unwrap_err()).kind,
+            ErrorKind::Timeout
+        );
+        assert_eq!(pending_after_timeout, 0);
+        assert_eq!(
+            crate::types::classify(&disconnected.unwrap_err()).kind,
+            ErrorKind::OperationFailed
+        );
+        assert_eq!(pending_after_disconnect, 0);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("worker is closing")
+        );
+        assert_eq!(pending, 0);
+    }
+
     #[test]
     fn workers_start_in_the_hidden_worker_mode() {
         let options = Options {
@@ -854,17 +955,57 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_oversized_lines_keep_the_following_line() {
+        let mut reader = crate::test_io::FaultReader::new(
+            BufReader::with_capacity(2, b"1234567890123\nok\n".as_slice()),
+            std::io::ErrorKind::Interrupted,
+        );
+        assert_eq!(read_line(&mut reader, 8).unwrap(), ReadLine::TooLong);
+        assert_eq!(
+            read_line(&mut reader, 8).unwrap(),
+            ReadLine::Bytes(b"ok".to_vec())
+        );
+        assert_eq!(read_line(&mut reader, 8).unwrap(), ReadLine::End);
+    }
+    #[test]
+    fn bounded_lines_cover_exact_limits_and_unterminated_input() {
+        for input in [b"12345678".as_slice(), b"12345678\n".as_slice()] {
+            let mut reader = std::io::Cursor::new(input);
+            assert_eq!(
+                read_line(&mut reader, 8).unwrap(),
+                ReadLine::Bytes(b"12345678".to_vec())
+            );
+            assert_eq!(read_line(&mut reader, 8).unwrap(), ReadLine::End);
+        }
+        let mut reader = BufReader::with_capacity(2, b"123456789\nok\n".as_slice());
+        assert_eq!(read_line(&mut reader, 8).unwrap(), ReadLine::TooLong);
+        assert_eq!(
+            read_line(&mut reader, 8).unwrap(),
+            ReadLine::Bytes(b"ok".to_vec())
+        );
+        let mut reader = std::io::Cursor::new(b"123456789");
+        assert_eq!(read_line(&mut reader, 8).unwrap(), ReadLine::TooLong);
+        assert_eq!(read_line(&mut reader, 8).unwrap(), ReadLine::End);
+        let mut reader = std::io::Cursor::new(b"last");
+        assert_eq!(
+            read_line(&mut reader, usize::MAX).unwrap(),
+            ReadLine::Bytes(b"last".to_vec())
+        );
+        assert_eq!(read_line(&mut reader, usize::MAX).unwrap(), ReadLine::End);
+    }
+
+    #[test]
     fn oversized_lines_are_skipped_whole() {
         let mut input = std::io::Cursor::new(b"short\n0123456789abc\nnext".to_vec());
         assert_eq!(
             read_line(&mut input, 8).unwrap(),
-            Some(Some(b"short".to_vec()))
+            ReadLine::Bytes(b"short".to_vec())
         );
-        assert_eq!(read_line(&mut input, 8).unwrap(), Some(None));
+        assert_eq!(read_line(&mut input, 8).unwrap(), ReadLine::TooLong);
         assert_eq!(
             read_line(&mut input, 8).unwrap(),
-            Some(Some(b"next".to_vec()))
+            ReadLine::Bytes(b"next".to_vec())
         );
-        assert_eq!(read_line(&mut input, 8).unwrap(), None);
+        assert_eq!(read_line(&mut input, 8).unwrap(), ReadLine::End);
     }
 }

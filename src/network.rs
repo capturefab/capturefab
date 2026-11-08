@@ -1,11 +1,13 @@
-//! Read-only GigE network diagnosis. Discovery, control reachability and stream
+//! Read-only `GigE` network diagnosis. Discovery, control reachability and stream
 //! stability are separate facts: a discovery reply alone establishes none of the
 //! others, and even a good wired route cannot prove a loss-free image stream.
+#![forbid(unsafe_code)]
+#![deny(clippy::missing_const_for_fn)]
 use crate::{
     transport::gige,
     types::{CameraInfo, Categorized, ErrorKind, Transport},
 };
-use anyhow::{Context, Result};
+use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, UdpSocket};
@@ -14,7 +16,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum InterfaceKind {
+pub(crate) enum InterfaceKind {
     Wired,
     Wireless,
     Loopback,
@@ -23,7 +25,7 @@ pub enum InterfaceKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct NetworkInterface {
+pub(crate) struct NetworkInterface {
     pub name: String,
     pub address: Ipv4Addr,
     pub netmask: Ipv4Addr,
@@ -35,7 +37,7 @@ pub struct NetworkInterface {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum NetworkHealth {
+pub(crate) enum NetworkHealth {
     Unreachable,
     Limited,
     Unverified,
@@ -53,7 +55,7 @@ pub struct NetworkTuning {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct NetworkCamera {
+pub(crate) struct NetworkCamera {
     pub camera: CameraInfo,
     pub active: bool,
     pub interface: Option<String>,
@@ -66,14 +68,14 @@ pub struct NetworkCamera {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct NetworkScan {
+pub(crate) struct NetworkScan {
     pub interfaces: Vec<NetworkInterface>,
     pub cameras: Vec<NetworkCamera>,
     pub warnings: Vec<String>,
     pub scanned_at_ms: u64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 struct LinkMetadata {
     mtu: Option<u32>,
     speed_mbps: Option<u64>,
@@ -83,8 +85,8 @@ struct LinkMetadata {
 
 /// IPv4 addresses and link metadata; never changes host configuration. Unknown
 /// metadata is preserved rather than inferring Ethernet from an interface name.
-pub fn interfaces() -> Result<Vec<NetworkInterface>> {
-    interfaces_with(link_metadata())
+pub(crate) fn interfaces() -> Result<Vec<NetworkInterface>> {
+    interfaces_with(&link_metadata())
 }
 
 /// [`interfaces`], waiting at most `limit` for link metadata: on macOS and
@@ -97,10 +99,10 @@ pub(crate) fn interfaces_within(limit: Duration) -> Result<Vec<NetworkInterface>
     std::thread::spawn(move || {
         let _ = sender.send(link_metadata());
     });
-    interfaces_with(receiver.recv_timeout(limit).unwrap_or_default())
+    interfaces_with(&receiver.recv_timeout(limit).unwrap_or_default())
 }
 
-fn interfaces_with(metadata: HashMap<String, LinkMetadata>) -> Result<Vec<NetworkInterface>> {
+fn interfaces_with(metadata: &HashMap<String, LinkMetadata>) -> Result<Vec<NetworkInterface>> {
     let addresses = if_addrs::get_if_addrs().context("enumerating network interfaces")?;
     let mut interfaces = Vec::new();
     for interface in addresses {
@@ -109,8 +111,8 @@ fn interfaces_with(metadata: HashMap<String, LinkMetadata>) -> Result<Vec<Networ
         };
         let name = interface.name;
         #[cfg(target_os = "linux")]
-        let name = canonical_link_name(&name, &metadata).to_owned();
-        let link = metadata.get(&name).cloned().unwrap_or_default();
+        let name = canonical_link_name(name, metadata);
+        let link = metadata.get(&name).copied().unwrap_or_default();
         interfaces.push(NetworkInterface {
             name,
             address: address.ip,
@@ -131,19 +133,19 @@ fn interfaces_with(metadata: HashMap<String, LinkMetadata>) -> Result<Vec<Networ
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn canonical_link_name<'a>(name: &'a str, metadata: &HashMap<String, LinkMetadata>) -> &'a str {
+fn canonical_link_name(mut name: String, metadata: &HashMap<String, LinkMetadata>) -> String {
     // Linux IPv4 address labels can be eth0:1 even though sysfs and the receive
     // bottleneck are eth0. Preserve real device names and unknown labels.
-    if !metadata.contains_key(name)
+    if !metadata.contains_key(&name)
         && let Some((base, alias)) = name.rsplit_once(':')
         && !alias.is_empty()
         && alias.bytes().all(|byte| byte.is_ascii_digit())
         && metadata.contains_key(base)
     {
-        base
-    } else {
-        name
+        let end = base.len();
+        name.truncate(end);
     }
+    name
 }
 
 #[cfg(target_os = "linux")]
@@ -228,7 +230,7 @@ fn link_metadata() -> HashMap<String, LinkMetadata> {
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn bounded_output(program: &str, arguments: &[&str]) -> Option<String> {
-    use std::io::Read;
+    use std::io::Read as _;
     use std::process::{Command, Stdio};
     let mut command = Command::new(program);
     command
@@ -423,7 +425,7 @@ fn route_host(address: Ipv4Addr) -> Option<Ipv4Addr> {
     let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).ok()?;
     socket.connect(SocketAddrV4::new(address, 3956)).ok()?;
     match socket.local_addr().ok()?.ip() {
-        std::net::IpAddr::V4(address) if !address.is_unspecified() => Some(address),
+        IpAddr::V4(address) if !address.is_unspecified() => Some(address),
         _ => None,
     }
 }
@@ -447,12 +449,15 @@ macro_rules! local_network_text {
 /// What to try when macOS refuses a route to the local network. A denied
 /// Local Network privacy prompt reads as "no route to host", which has
 /// genuine causes too, hence "may".
-pub const LOCAL_NETWORK_HINT: &str = local_network_text!();
+pub(crate) const LOCAL_NETWORK_HINT: &str = local_network_text!();
 
 /// [`LOCAL_NETWORK_HINT`] when `error` may come from macOS Local Network
 /// privacy: EHOSTUNREACH on the way to a private, link-local, broadcast or
 /// multicast address, or to one not known. Never on other systems.
-pub fn local_network_hint(error: &std::io::Error, dest: Option<IpAddr>) -> Option<&'static str> {
+pub(crate) fn local_network_hint(
+    error: &std::io::Error,
+    dest: Option<IpAddr>,
+) -> Option<&'static str> {
     local_network_hint_on(cfg!(target_os = "macos"), error, dest)
 }
 fn local_network_hint_on(
@@ -477,13 +482,11 @@ pub(crate) fn with_local_network_hint(
     error: &std::io::Error,
     dest: Option<IpAddr>,
 ) -> String {
-    match local_network_hint(error, dest) {
-        Some(hint) => format!("{context}; {hint}"),
-        None => context.to_owned(),
-    }
+    local_network_hint(error, dest)
+        .map_or_else(|| context.to_owned(), |hint| format!("{context}; {hint}"))
 }
 
-/// The adapter list in a GigE connect error: name, address/prefix and kind.
+/// The adapter list in a `GigE` connect error: name, address/prefix and kind.
 fn adapter_summary(interface: &NetworkInterface) -> String {
     let prefix = u32::from(interface.netmask).count_ones();
     let kind = match interface.kind {
@@ -494,11 +497,11 @@ fn adapter_summary(interface: &NetworkInterface) -> String {
     format!("{} {}/{prefix}{kind}", interface.name, interface.address)
 }
 
-/// The advice a GigE connect error ends with when no adapter shares the
+/// The advice a `GigE` connect error ends with when no adapter shares the
 /// camera's subnet.
 pub(crate) const SCAN_ADVICE: &str = "run `capturefab network`";
 
-/// What to do when the GigE Vision camera typed as `ip` did not answer within
+/// What to do when the `GigE` Vision camera typed as `ip` did not answer within
 /// `waited`, or `refused` its control port, using this computer's adapters
 /// the way `capturefab network` does.
 pub(crate) fn explain_gige_unreachable(
@@ -581,8 +584,8 @@ fn wait_text(duration: Duration) -> String {
     }
 }
 
-/// A GigE probe of `ip` that went unanswered or was refused, explained.
-/// Either way no GigE Vision camera is there, so it is `camera_not_found`
+/// A `GigE` probe of `ip` that went unanswered or was refused, explained.
+/// Either way no `GigE` Vision camera is there, so it is `camera_not_found`
 /// (exit 3), as a camera named by its MAC address or serial that does not
 /// answer is: which of the two happens depends on whether a router answers
 /// for the address, and waiting longer would not change it. Other
@@ -661,18 +664,14 @@ fn diagnose(
             "{} · host {} · subnet mask {}",
             interface.name, interface.address, interface.netmask
         ));
-        details.push(match interface.speed_mbps {
-            Some(speed) => format!("Host adapter's negotiated link speed: {speed} Mb/s. Camera and switch ports may have lower speeds."),
-            None => {
-                "Link speed could not be verified; using a conservative bandwidth limit.".into()
-            }
-        });
-        details.push(match interface.mtu {
-            Some(mtu) => {
-                format!("Host MTU: {mtu} bytes. Jumbo packets require end-to-end verification.")
-            }
-            None => "Host MTU could not be read; standard-size packets are safest.".into(),
-        });
+        details.push(interface.speed_mbps.map_or_else(
+            || "Link speed could not be verified; using a conservative bandwidth limit.".into(),
+            |speed| format!("Host adapter's negotiated link speed: {speed} Mb/s. Camera and switch ports may have lower speeds."),
+        ));
+        details.push(interface.mtu.map_or_else(
+            || "Host MTU could not be read; standard-size packets are safest.".into(),
+            |mtu| format!("Host MTU: {mtu} bytes. Jumbo packets require end-to-end verification."),
+        ));
     } else {
         details.push("The route could not be matched to a local IPv4 interface.".into());
         if host.is_some_and(|host| {
@@ -699,16 +698,16 @@ fn diagnose(
         } else {
             details.push("Discovery can succeed even when unicast control and image traffic cannot reach the camera.".into());
             if let Some(address) = address {
-                if !interfaces
+                if interfaces
                     .iter()
                     .any(|interface| same_subnet(interface, address))
                 {
+                    details.push("Check the Ethernet cable, camera power and firewall access for GigE Vision UDP traffic; another application may own camera control.".into());
+                } else {
                     details.push(format!("No host interface shares the camera's subnet ({address}). Give the camera and a wired adapter compatible IPv4 addresses and subnet masks, then scan again."));
                     if address.is_link_local() {
                         details.push("The camera fell back to a link-local address. Adding a 169.254.0.0/16 address to the adapter it is plugged into reaches it without reconfiguring the camera.".into());
                     }
-                } else {
-                    details.push("Check the Ethernet cable, camera power and firewall access for GigE Vision UDP traffic; another application may own camera control.".into());
                 }
             } else {
                 details.push("The camera has no valid IPv4 address. Configure an address on the wired adapter's subnet.".into());
@@ -778,10 +777,10 @@ fn diagnose(
     }
 }
 
-/// Diagnose discovered and open GigE cameras with at most four simultaneous
+/// Diagnose discovered and open `GigE` cameras with at most four simultaneous
 /// read-only probes. The probe budget is shared, so a long list cannot block the
 /// scan indefinitely. No IP addresses, routes or operating-system MTUs change.
-pub fn scan(
+pub(crate) fn scan(
     devices: &[CameraInfo],
     active: &[CameraInfo],
     timeout: Duration,
@@ -865,17 +864,19 @@ where
         interfaces,
         cameras: results.into_iter().map(|(_, camera)| camera).collect(),
         warnings,
-        scanned_at_ms: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-            .min(u64::MAX as u128) as u64,
+        scanned_at_ms: u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX),
     }
 }
 
 /// What a camera streaming beside others on one host interface may send.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Share {
+pub(crate) struct Share {
     pub bytes_per_second: u64,
     pub interface: String,
     /// The cameras of the scan that share the interface, this one too.
@@ -885,7 +886,7 @@ pub struct Share {
 /// The share of their host interface each camera of `scan` may send when
 /// they all stream at once, in the scan's order: None for a camera alone
 /// on its interface, or whose path is not known.
-pub fn shares(scan: &NetworkScan) -> Vec<Option<Share>> {
+pub(crate) fn shares(scan: &NetworkScan) -> Vec<Option<Share>> {
     scan.cameras
         .iter()
         .map(|camera| {
@@ -907,7 +908,7 @@ pub fn shares(scan: &NetworkScan) -> Vec<Option<Share>> {
 /// Reserve 20% of the adapter's negotiated line rate for packet headers,
 /// control, resends and other traffic; share the remainder across active cameras
 /// on that adapter. Routed, wireless and unknown paths get conservative caps.
-pub fn budget_bytes_per_second(
+pub(crate) fn budget_bytes_per_second(
     camera: &NetworkCamera,
     interfaces: &[NetworkInterface],
     sharers: usize,
@@ -925,8 +926,7 @@ pub fn budget_bytes_per_second(
     });
     let mut budget = interface
         .and_then(|interface| interface.speed_mbps)
-        .map(|speed| speed.saturating_mul(100_000))
-        .unwrap_or(10_000_000);
+        .map_or(10_000_000, |speed| speed.saturating_mul(100_000));
     if let Some(interface) = interface {
         if interface.kind == InterfaceKind::Wireless {
             budget = budget.min(5_000_000);
@@ -948,9 +948,9 @@ pub fn budget_bytes_per_second(
     budget / sharers.max(1) as u64
 }
 
-/// SFNC DeviceLinkSpeed uses bytes/s; the deprecated GevLinkSpeed uses Mb/s.
-/// Explicit GenApi units take precedence for cameras that use vendor units.
-/// See https://www.emva.org/wp-content/uploads/GenICam_SFNC_v2_7.pdf.
+/// SFNC `DeviceLinkSpeed` uses bytes/s; the deprecated `GevLinkSpeed` uses Mb/s.
+/// Explicit `GenApi` units take precedence for cameras that use vendor units.
+/// See <https://www.emva.org/wp-content/uploads/GenICam_SFNC_v2_7.pdf>.
 pub(crate) fn camera_link_bytes_per_second(camera: &mut crate::camera::Camera) -> Option<f64> {
     for (name, default_multiplier) in [("DeviceLinkSpeed", 1.0), ("GevLinkSpeed", 125_000.0)] {
         let Some(value) = camera.get(name).ok().and_then(|value| value.as_f64()) else {
@@ -973,12 +973,12 @@ fn link_bytes_per_second(value: f64, unit: Option<&str>, default_multiplier: f64
     (bytes.is_finite() && bytes > 0.0).then_some(bytes)
 }
 
-/// Bytes per second in one unit of a GenApi bandwidth `<Unit>`, or
+/// Bytes per second in one unit of a `GenApi` bandwidth `<Unit>`, or
 /// `default_multiplier` when the node declares none.
 pub(crate) fn bytes_per_second_scale(unit: Option<&str>, default_multiplier: f64) -> Option<f64> {
     // Unit case matters: B is byte, b is bit. An unfamiliar explicit unit
     // cannot safely be interpreted as the standard's default.
-    Some(match unit.map(str::trim).unwrap_or("") {
+    Some(match unit.map_or("", str::trim) {
         "" => default_multiplier,
         "Bps" | "B/s" | "byte/s" | "bytes/s" => 1.0,
         "bps" | "b/s" | "bit/s" | "bits/s" => 1.0 / 8.0,
@@ -993,7 +993,7 @@ pub(crate) fn bytes_per_second_scale(unit: Option<&str>, default_multiplier: f64
 }
 
 /// Plain name for an adapter type.
-pub fn kind_label(kind: InterfaceKind) -> &'static str {
+pub(crate) const fn kind_label(kind: InterfaceKind) -> &'static str {
     match kind {
         InterfaceKind::Wired => "Wired Ethernet",
         InterfaceKind::Wireless => "Wi-Fi",
@@ -1003,7 +1003,7 @@ pub fn kind_label(kind: InterfaceKind) -> &'static str {
     }
 }
 
-fn health_label(health: NetworkHealth) -> &'static str {
+const fn health_label(health: NetworkHealth) -> &'static str {
     match health {
         NetworkHealth::Unreachable => "Unreachable",
         NetworkHealth::Limited => "Limited",
@@ -1015,7 +1015,10 @@ fn health_label(health: NetworkHealth) -> &'static str {
 
 /// The readable `capturefab network` summary for a terminal. Report warnings are
 /// diagnostics, so callers print `scan.warnings` to stderr themselves.
-pub fn write_human(scan: &NetworkScan, out: &mut impl std::io::Write) -> std::io::Result<()> {
+pub(crate) fn write_human(
+    scan: &NetworkScan,
+    out: &mut impl std::io::Write,
+) -> std::io::Result<()> {
     writeln!(out, "Adapters")?;
     let adapters: Vec<_> = scan
         .interfaces
@@ -1071,24 +1074,25 @@ pub fn write_human(scan: &NetworkScan, out: &mut impl std::io::Write) -> std::io
         }
     }
     for camera in &scan.cameras {
-        let name = [camera.camera.vendor.as_str(), camera.camera.model.as_str()]
-            .into_iter()
-            .filter(|part| !part.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
+        let vendor = camera.camera.vendor.as_str();
+        let model = camera.camera.model.as_str();
+        let separator = if vendor.is_empty() || model.is_empty() {
+            ""
+        } else {
+            " "
+        };
         let address = camera
             .camera
             .address
             .as_deref()
             .unwrap_or(camera.camera.id.as_str());
-        let via = camera
-            .interface
-            .as_deref()
-            .map(|interface| format!(" via {interface}"))
-            .unwrap_or_default();
+        write!(out, "  {vendor}{separator}{model} · {address}")?;
+        if let Some(interface) = &camera.interface {
+            write!(out, " via {interface}")?;
+        }
         writeln!(
             out,
-            "  {name} · {address}{via} · {} ({})",
+            " · {} ({})",
             health_label(camera.health),
             if camera.active {
                 "Connected"
@@ -1411,7 +1415,7 @@ mod tests {
             model: "Camera".into(),
             serial: id.into(),
             address: Some(address.into()),
-            profile: Default::default(),
+            profile: crate::camera_profile::CameraProfile::default(),
         }
     }
     fn checked(interface: &NetworkInterface, address: &str) -> NetworkCamera {
@@ -1450,13 +1454,16 @@ mod tests {
     fn address_aliases_use_the_same_physical_link_metadata() {
         let mut links = HashMap::new();
         links.insert("eth0".into(), LinkMetadata::default());
-        assert_eq!(canonical_link_name("eth0:1", &links), "eth0");
-        assert_eq!(canonical_link_name("eth0:2", &links), "eth0");
-        assert_eq!(canonical_link_name("eth1:1", &links), "eth1:1");
-        assert_eq!(canonical_link_name("eth0:label", &links), "eth0:label");
-        assert_eq!(canonical_link_name("eth0:", &links), "eth0:");
+        assert_eq!(canonical_link_name("eth0:1".into(), &links), "eth0");
+        assert_eq!(canonical_link_name("eth0:2".into(), &links), "eth0");
+        assert_eq!(canonical_link_name("eth1:1".into(), &links), "eth1:1");
+        assert_eq!(
+            canonical_link_name("eth0:label".into(), &links),
+            "eth0:label"
+        );
+        assert_eq!(canonical_link_name("eth0:".into(), &links), "eth0:");
         links.insert("eth0:1".into(), LinkMetadata::default());
-        assert_eq!(canonical_link_name("eth0:1", &links), "eth0:1");
+        assert_eq!(canonical_link_name("eth0:1".into(), &links), "eth0:1");
     }
 
     #[test]
@@ -1648,7 +1655,7 @@ mod tests {
         assert!(!same_subnet(&interface, Ipv4Addr::new(192, 168, 5, 2)));
         interface.netmask = Ipv4Addr::new(255, 0, 255, 0);
         assert!(!same_subnet(&interface, Ipv4Addr::new(192, 168, 5, 2)));
-        interface.netmask = Ipv4Addr::new(255, 255, 255, 255);
+        interface.netmask = Ipv4Addr::BROADCAST;
         assert!(!same_subnet(&interface, Ipv4Addr::new(192, 168, 5, 2)));
     }
 
@@ -1706,7 +1713,7 @@ mod tests {
         };
         let shared = Some(Share {
             bytes_per_second: 50_000_000,
-            interface: wired.name.clone(),
+            interface: wired.name,
             sharers: 2,
         });
         assert_eq!(shares(&scan), [shared.clone(), None, shared, None]);

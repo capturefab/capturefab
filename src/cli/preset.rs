@@ -2,18 +2,21 @@
 //! them against a camera and restore them as one change. A preset lives on
 //! this computer and works with any camera of the model; a camera's user
 //! sets live in the camera (`--persist` writes one).
+#![forbid(unsafe_code)]
 use super::{Client, Global, args::CameraArg, args::KeepArg, output::Report};
 use crate::session::SessionCommand;
 use crate::setup::{self as setups, Setup, Store};
 use crate::types::{Categorized, ErrorKind, Usage};
-use anyhow::{Context, Result};
+use anyhow::{Context as _, Result};
 use clap::Subcommand;
 use serde_json::{Value, json};
+use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Subcommand)]
-pub enum PresetCommand {
+pub(crate) enum PresetCommand {
     /// Save the camera's current settings as a named preset
     #[command(
         after_help = "Examples:\n  capturefab preset save bench -c sim:0\n  capturefab preset save line1 -c gige:00c0df123456 --note 'ring light 60%'"
@@ -60,8 +63,8 @@ pub enum PresetCommand {
         /// Apply to a camera of another model; only settings both share change
         #[arg(long)]
         allow_other_model: bool,
-        /// Then save it in the camera's user set (default UserSet1) and make that the power-on default
-        #[arg(long, value_name = "USERSET", num_args = 0..=1, default_missing_value = "UserSet1")]
+        /// Then save it in the camera's user set (default `UserSet1`) and make that the power-on default
+        #[arg(help = "Then save it in the camera's user set (default UserSet1) and make that the power-on default", long, value_name = "USERSET", num_args = 0..=1, default_missing_value = "UserSet1")]
         persist: Option<String>,
         #[command(flatten)]
         keep: KeepArg,
@@ -147,7 +150,7 @@ fn renamed(mut value: Value) -> Value {
     value
 }
 
-pub fn run(global: &Global, command: PresetCommand) -> Result<Report> {
+pub(super) fn run(global: &Global, command: PresetCommand) -> Result<Report> {
     prepare(&command)?;
     // Presets live in the state folder, looked for only by the commands
     // that use it: applying a file needs none.
@@ -192,7 +195,8 @@ pub fn run(global: &Global, command: PresetCommand) -> Result<Report> {
             let setup = store()?.get(&name)?;
             let document = serde_json::to_value(&setup)?;
             let Some(output) = output else {
-                let text = serde_json::to_string_pretty(&document)? + "\n";
+                let mut text = serde_json::to_string_pretty(&document)?;
+                text.push('\n');
                 return Ok(Report::json(document).text(text));
             };
             let path = absolute(&output)?;
@@ -239,7 +243,7 @@ pub fn run(global: &Global, command: PresetCommand) -> Result<Report> {
             keep,
         } => {
             let file = file.as_deref().map(absolute).transpose()?;
-            let setup = load(&name, &file)?;
+            let setup = load(name.as_deref(), file.as_deref())?;
             if let Some(user_set) = &persist {
                 crate::controls::Name::parse(user_set)?;
             }
@@ -312,7 +316,7 @@ pub fn run(global: &Global, command: PresetCommand) -> Result<Report> {
 }
 
 /// Check that the camera can save its settings in `user_set` and start
-/// with it: UserSetSave, a UserSetSelector entry and a power-on default.
+/// with it: `UserSetSave`, a `UserSetSelector` entry and a power-on default.
 /// What `--persist` will write.
 fn check_persist(client: &Client, user_set: &str) -> Result<Value> {
     let list = client.call(SessionCommand::FeatureList {
@@ -322,7 +326,10 @@ fn check_persist(client: &Client, user_set: &str) -> Result<Value> {
             category: None,
         },
     })?;
-    let rows = list["features"].as_array().cloned().unwrap_or_default();
+    let rows = list["features"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
     let row = |name: &str| rows.iter().find(|row| row["name"] == name);
     let choices = |row: &Value| -> Vec<String> {
         row["choices"]
@@ -361,16 +368,18 @@ fn check_persist(client: &Client, user_set: &str) -> Result<Value> {
     let default = ["UserSetDefault", "UserSetDefaultSelector"]
         .into_iter()
         .find(|name| row(name).is_some_and(|row| choices(row).iter().any(|c| c == user_set)));
-    match default {
-        Some(default) => Ok(json!({"user_set": user_set, "default": default})),
-        None => Err(unsupported(format!(
-            "this camera cannot start with {user_set} (no UserSetDefault entry for it)"
-        ))),
-    }
+    default.map_or_else(
+        || {
+            Err(unsupported(format!(
+                "this camera cannot start with {user_set} (no UserSetDefault entry for it)"
+            )))
+        },
+        |default| Ok(json!({"user_set": user_set, "default": default})),
+    )
 }
 
 /// Save the camera's settings in `user_set` and make it the power-on
-/// default: UserSetDefault, or UserSetDefaultSelector on older cameras.
+/// default: `UserSetDefault`, or `UserSetDefaultSelector` on older cameras.
 fn persist_user_set(client: &Client, user_set: &str) -> Result<Value> {
     let save = crate::controls::Name::parse(&format!("UserSetSave[UserSetSelector={user_set}]"))?;
     client.call(SessionCommand::Exec { name: save })?;
@@ -397,7 +406,10 @@ fn persist_user_set(client: &Client, user_set: &str) -> Result<Value> {
 
 fn list_text(value: &Value) -> String {
     let mut out = String::new();
-    let presets = value["presets"].as_array().cloned().unwrap_or_default();
+    let presets = value["presets"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
     if presets.is_empty() {
         out.push_str("No saved presets. Save one with: capturefab preset save NAME -c CAMERA\n");
     } else {
@@ -432,13 +444,13 @@ fn list_text(value: &Value) -> String {
                     ),
                 ]
             })
-            .collect();
+            .collect::<Vec<_>>();
         out.push_str(&super::camera::table(
             &["NAME", "SAVED", "SETTINGS", "CAMERA"],
-            rows,
+            &rows,
         ));
     }
-    out.push_str(&format!("Folder: {}\n", shown(&value["dir"])));
+    let _ = writeln!(out, "Folder: {}", shown(&value["dir"]));
     out
 }
 
@@ -450,29 +462,34 @@ fn show_text(value: &Value) -> String {
         value["saved_at"].as_str().unwrap_or_default()
     );
     if let Some(note) = value["note"].as_str() {
-        out.push_str(&format!("Note: {note}\n"));
+        let _ = writeln!(out, "Note: {note}");
     }
     if value["auto"].is_object() {
         out.push_str("Auto exposure on\n");
     }
     for row in value["values"].as_array().into_iter().flatten() {
-        out.push_str(&format!(
-            "  {}{} = {}\n",
+        let _ = writeln!(
+            out,
+            "  {}{} = {}",
             row["feature"].as_str().unwrap_or_default(),
             banks(row),
             shown(&row["value"])
-        ));
+        );
     }
-    let skipped = value["skipped"].as_array().cloned().unwrap_or_default();
+    let skipped = value["skipped"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
     if !skipped.is_empty() {
         out.push_str("Not saved:\n");
-        for row in &skipped {
-            out.push_str(&format!(
-                "  {}{}: {}\n",
+        for row in skipped {
+            let _ = writeln!(
+                out,
+                "  {}{}: {}",
                 row["feature"].as_str().unwrap_or_default(),
                 banks(row),
                 row["reason"].as_str().unwrap_or_default()
-            ));
+            );
         }
     }
     out
@@ -486,31 +503,36 @@ fn save_text(value: &Value, camera: Option<&str>) -> String {
         preset["values"],
         camera_label(&preset["camera"])
     );
-    let skipped = preset["skipped"].as_array().cloned().unwrap_or_default();
+    let skipped = preset["skipped"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
     if !skipped.is_empty() {
-        out.push_str(&format!("Not saved ({}):\n", skipped.len()));
+        let _ = writeln!(out, "Not saved ({}):", skipped.len());
         for row in skipped.iter().take(10) {
-            out.push_str(&format!(
-                "  {}{}: {}\n",
+            let _ = writeln!(
+                out,
+                "  {}{}: {}",
                 row["feature"].as_str().unwrap_or_default(),
                 banks(row),
                 row["reason"].as_str().unwrap_or_default()
-            ));
+            );
         }
         if skipped.len() > 10 {
-            out.push_str(&format!("  and {} more (see --json)\n", skipped.len() - 10));
+            let _ = writeln!(out, "  and {} more (see --json)", skipped.len() - 10);
         }
     }
-    out.push_str(&format!(
-        "Network, user-set and file settings are never saved. Restore with: capturefab preset apply {} -c {}\n",
+    let _ = writeln!(
+        out,
+        "Network, user-set and file settings are never saved. Restore with: capturefab preset apply {} -c {}",
         crate::hint::shell_quote(name),
         crate::hint::shell_quote(camera.unwrap_or("CAMERA"))
-    ));
+    );
     out
 }
 
 /// Result fields, for `schema`.
-pub const APPLY_FIELDS: &[(&str, &str)] = &[
+pub(super) const APPLY_FIELDS: &[(&str, &str)] = &[
     ("preset", "string — the preset's name"),
     ("camera", "{id,vendor,model,serial} — the camera compared"),
     ("match", "same_camera|same_model|other_model|unknown_source"),
@@ -549,10 +571,10 @@ fn document_input<T>(result: Result<T>) -> Result<T> {
         Err(error)
             if error
                 .chain()
-                .any(|cause| cause.is::<setups::NewerVersion>()) =>
+                .any(<dyn std::error::Error + 'static>::is::<setups::NewerVersion>) =>
         {
-            Err(crate::types::Categorized::error(
-                crate::types::ErrorKind::Unsupported,
+            Err(Categorized::error(
+                ErrorKind::Unsupported,
                 format!("{error:#}"),
             ))
         }
@@ -561,15 +583,13 @@ fn document_input<T>(result: Result<T>) -> Result<T> {
 }
 
 fn taken(error: anyhow::Error) -> anyhow::Error {
-    match error.downcast_ref::<setups::NameTaken>() {
-        Some(taken) => {
-            crate::types::Categorized::new(crate::types::ErrorKind::Exists, taken.to_string())
-                .hint("pass --replace to overwrite it")
-                .details(json!({"name": taken.name, "path": taken.path}))
-                .into()
-        }
-        None => error,
-    }
+    let replacement = error.downcast_ref::<setups::NameTaken>().map(|taken| {
+        Categorized::new(ErrorKind::Exists, taken.to_string())
+            .hint("pass --replace to overwrite it")
+            .details(json!({"name": taken.name, "path": taken.path}))
+            .into()
+    });
+    replacement.unwrap_or(error)
 }
 
 fn summary(setup: &Setup, path: &Path) -> Value {
@@ -585,13 +605,12 @@ fn summary(setup: &Setup, path: &Path) -> Value {
 
 /// The setup an apply names: a saved one, from this command's state
 /// folder, or a file.
-fn load(name: &Option<String>, file: &Option<PathBuf>) -> Result<Setup> {
-    match file {
-        Some(file) => document_input(setups::read_file(file)),
-        None => {
-            let name = name.as_deref().context("name a preset or pass --file")?;
-            Store::session()?.get(name)
-        }
+fn load(name: Option<&str>, file: Option<&Path>) -> Result<Setup> {
+    if let Some(file) = file {
+        document_input(setups::read_file(file))
+    } else {
+        let name = name.context("name a preset or pass --file")?;
+        Store::session()?.get(name)
     }
 }
 
@@ -614,14 +633,14 @@ fn strict_refusal(diff: &Value) -> Option<anyhow::Error> {
                 row["feature"].as_str().unwrap_or_default(),
                 row["reason"]
                     .as_str()
-                    .or(row["status"].as_str())
+                    .or_else(|| row["status"].as_str())
                     .unwrap_or_default()
             )
         })
         .collect::<Vec<_>>();
     (!failing.is_empty()).then(|| {
-        crate::types::Categorized::error(
-            crate::types::ErrorKind::Unsupported,
+        Categorized::error(
+            ErrorKind::Unsupported,
             format!(
                 "Preset {} cannot be applied strictly; nothing changed. Not applicable: {}",
                 diff["setup"].as_str().unwrap_or_default(),
@@ -645,40 +664,46 @@ fn changes(diff: &Value) -> impl Iterator<Item = &Value> {
 }
 
 /// A value as people read it; whole floats without ".0".
-fn shown(value: &Value) -> String {
+fn shown(value: &Value) -> Cow<'_, str> {
     match value {
-        Value::String(text) => text.clone(),
-        Value::Null => "?".into(),
+        Value::String(text) => Cow::Borrowed(text),
+        Value::Null => Cow::Borrowed("?"),
         Value::Number(number) => {
-            let text = number.to_string();
-            match text.strip_suffix(".0") {
-                Some("-0") => "0".into(),
-                Some(whole) => whole.into(),
-                None => text,
+            let mut text = number.to_string();
+            if text == "-0.0" {
+                return Cow::Borrowed("0");
             }
+            if text.ends_with(".0") {
+                text.truncate(text.len() - 2);
+            }
+            Cow::Owned(text)
         }
-        value => value.to_string(),
+        value => Cow::Owned(value.to_string()),
     }
 }
 
-fn banks(row: &Value) -> String {
-    let at = row["at"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|bank| {
-            format!(
-                "{} {}",
-                bank["selector"].as_str().unwrap_or_default(),
-                bank["value"].as_str().unwrap_or_default()
-            )
-        })
-        .collect::<Vec<_>>();
-    if at.is_empty() {
-        String::new()
-    } else {
-        format!(" ({})", at.join(", "))
+struct Banks<'a>(&'a [Value]);
+
+impl std::fmt::Display for Banks<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_empty() {
+            return Ok(());
+        }
+        f.write_str(" (")?;
+        for (index, bank) in self.0.iter().enumerate() {
+            if index != 0 {
+                f.write_str(", ")?;
+            }
+            f.write_str(bank["selector"].as_str().unwrap_or_default())?;
+            f.write_str(" ")?;
+            f.write_str(bank["value"].as_str().unwrap_or_default())?;
+        }
+        f.write_str(")")
     }
+}
+
+fn banks(row: &Value) -> Banks<'_> {
+    Banks(row["at"].as_array().map_or(&[][..], Vec::as_slice))
 }
 
 fn write_diff(out: &mut impl Write, diff: &Value, verb: &str) -> Result<()> {
@@ -737,10 +762,13 @@ fn write_diff(out: &mut impl Write, diff: &Value, verb: &str) -> Result<()> {
             "  ! not a known image setting: may change triggering, I/O lines or acquisition rate"
         )?;
     }
-    let not_applied = diff["not_applied"].as_array().cloned().unwrap_or_default();
+    let not_applied = diff["not_applied"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
     if !not_applied.is_empty() {
         writeln!(out, "Not applied:")?;
-        for row in &not_applied {
+        for row in not_applied {
             writeln!(
                 out,
                 "  {}{} ({})",

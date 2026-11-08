@@ -1,13 +1,15 @@
 //! USB3 Vision transport using native OS USB APIs through nusb (no libusb).
 //! UVCP/UVSP wire fields and bootstrap register addresses follow USB3 Vision.
+#![deny(clippy::missing_const_for_fn)]
+
 use crate::{
     framebuf::{PoolVec, pool},
     genicam::decode_xml,
     types::{Backend, CameraInfo, Categorized, ErrorKind, Frame, RegisterIo, Transport},
 };
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use nusb::{
-    DeviceInfo, Endpoint, Interface, MaybeFuture,
+    DeviceInfo, Endpoint, Interface, MaybeFuture as _,
     descriptors::{TransferType, language_id::US_ENGLISH},
     transfer::{
         Buffer, Bulk, Completion, ControlOut, ControlType, In, Out, Recipient, TransferError,
@@ -28,7 +30,7 @@ const PENDING_ACK: u16 = 0x0805;
 const MAX_FRAME: usize = 256 * 1024 * 1024;
 const SIRM_CONTROL: u64 = 0x04;
 
-fn is_u3v_interface(class: u8, subclass: u8, protocol: u8) -> bool {
+const fn is_u3v_interface(class: u8, subclass: u8, protocol: u8) -> bool {
     class == 0xef && subclass == 0x05 && protocol == 0
 }
 /// Names nusb could not take from the operating system's cache: Windows
@@ -42,14 +44,29 @@ struct DeviceNames {
 }
 /// The iDeviceGUID, iVendorName, iModelName and iSerialNumber string indexes
 /// of a USB3 Vision device info descriptor (type 0x24, subtype 1).
-fn name_indexes(descriptor: &[u8]) -> Option<[u8; 4]> {
+const fn name_indexes(descriptor: &[u8]) -> Option<[u8; 4]> {
     match descriptor {
-        [_, 0x24, 0x01, ..] if descriptor.len() >= 18 => Some([
-            descriptor[11],
-            descriptor[12],
-            descriptor[13],
-            descriptor[17],
-        ]),
+        [
+            _,
+            0x24,
+            0x01,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            guid,
+            vendor,
+            model,
+            _,
+            _,
+            _,
+            serial,
+            ..,
+        ] => Some([*guid, *vendor, *model, *serial]),
         _ => None,
     }
 }
@@ -73,7 +90,7 @@ fn device_names(d: &DeviceInfo) -> DeviceNames {
             .get_string_descriptor(index?, US_ENGLISH, Duration::from_millis(100))
             .wait()
             .ok()?;
-        Some(text.trim().to_string()).filter(|text| !text.is_empty())
+        Some(text.trim().to_owned()).filter(|text| !text.is_empty())
     };
     DeviceNames {
         vendor: read(NonZeroU8::new(vendor))
@@ -133,10 +150,10 @@ fn camera_info(d: &DeviceInfo) -> CameraInfo {
         model: names.model.unwrap_or_else(|| "USB3 Vision camera".into()),
         serial: names.serial.unwrap_or_default(),
         address: Some(location),
-        profile: Default::default(),
+        profile: crate::camera_profile::CameraProfile::default(),
     }
 }
-pub fn discover() -> Result<Vec<CameraInfo>> {
+pub(crate) fn discover() -> Result<Vec<CameraInfo>> {
     let mut result = Vec::new();
     for d in nusb::list_devices()
         .wait()
@@ -278,7 +295,7 @@ struct InterfaceEndpoints {
     output: Option<u8>,
 }
 
-pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
+pub(crate) fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
     ensure!(
         info.transport == Transport::Usb3,
         "camera is not a USB3 Vision device"
@@ -390,7 +407,7 @@ pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
         "camera reports an invalid maximum response time"
     );
     let control = &mut backend.control;
-    control.response = Duration::from_millis(response_ms as u64);
+    control.response = Duration::from_millis(u64::from(response_ms));
     control.timeout = control.timeout.max(control.response);
     let sbrm = backend.u64(0x01d8)?;
     let max_command = backend.u32(sbrm + 0x14)? as usize;
@@ -458,8 +475,8 @@ fn usbfs_window() -> usize {
 }
 
 /// The longest transfer that may receive a whole image. nusb turns on
-/// WinUSB's RAW_IO, under which a transfer must fit the pipe's
-/// MAXIMUM_TRANSFER_SIZE, which nusb does not report, so Windows keeps to
+/// `WinUSB`'s `RAW_IO`, under which a transfer must fit the pipe's
+/// `MAXIMUM_TRANSFER_SIZE`, which nusb does not report, so Windows keeps to
 /// the length every other transfer uses: only images up to 1 MiB arrive
 /// whole there. macOS and Linux take a transfer of any length, Linux
 /// within its usbfs window.
@@ -537,12 +554,12 @@ fn layout(
 
 /// Whether Linux refused to submit a transfer for lack of usbfs memory. The
 /// transfer never reached the camera, so no data is missing.
-fn usbfs_refused(status: &Result<(), TransferError>) -> bool {
+fn usbfs_refused(status: Result<(), TransferError>) -> bool {
     (cfg!(any(target_os = "linux", target_os = "android")) || cfg!(test))
-        && *status == Err(TransferError::Unknown(ENOMEM))
+        && status == Err(TransferError::Unknown(ENOMEM))
 }
 
-/// SET_FEATURE(ENDPOINT_HALT) for an endpoint.
+/// `SET_FEATURE(ENDPOINT_HALT)` for an endpoint.
 fn halt(endpoint: u8) -> ControlOut<'static> {
     ControlOut {
         control_type: ControlType::Standard,
@@ -605,20 +622,20 @@ trait Transfers {
 }
 impl Transfers for Endpoint<Bulk, In> {
     fn allocate(&mut self, len: usize) -> Buffer {
-        Endpoint::allocate(self, len)
+        Self::allocate(self, len)
     }
     fn submit(&mut self, buffer: Buffer) {
-        Endpoint::submit(self, buffer)
+        Self::submit(self, buffer);
     }
     fn wait(&mut self, timeout: Duration) -> Option<Completion> {
         self.wait_next_complete(timeout)
     }
     fn cancel_all(&mut self) {
-        Endpoint::cancel_all(self)
+        Self::cancel_all(self);
     }
 }
 impl Stream {
-    fn new(expected: usize, leader: usize, trailer: usize, whole: Option<usize>) -> Self {
+    const fn new(expected: usize, leader: usize, trailer: usize, whole: Option<usize>) -> Self {
         Self {
             expected,
             leader,
@@ -636,10 +653,9 @@ impl Stream {
     /// transfers take their buffers from the pool.
     fn queue(&mut self, transfers: &mut impl Transfers, count: usize, len: usize) {
         for _ in 0..count {
-            let buffer = match self.whole {
-                Some(len) => whole_buffer(len),
-                None => transfers.allocate(len),
-            };
+            let buffer = self
+                .whole
+                .map_or_else(|| transfers.allocate(len), whole_buffer);
             self.idle.push(buffer);
         }
         self.fill(transfers);
@@ -704,7 +720,7 @@ impl Stream {
         let Completion {
             mut buffer, status, ..
         } = completion;
-        let received = if usbfs_refused(&status) {
+        let received = if usbfs_refused(status) {
             self.starved = true;
             Ok(None)
         } else if let Err(error) = status {
@@ -722,12 +738,12 @@ impl Stream {
     /// Returns the frame a trailer completes. A whole image in a transfer
     /// of the pool becomes the frame's buffer, `transfer` replaced.
     fn take(&mut self, transfer: &mut Buffer, full: bool) -> Result<Option<Frame>> {
-        let bytes = &transfer[..];
+        let bytes: &[u8] = transfer;
         // Some cameras end the last payload transfer with a zero-length packet.
         if bytes.is_empty() {
             return Ok(None);
         }
-        let held = |data: &Option<PoolVec>| data.as_ref().map_or(0, |data| data.len());
+        let held = |data: &Option<PoolVec>| data.as_ref().map_or(0, PoolVec::len);
         // A transfer holding exactly the rest of an open image is image data,
         // even when its pixels start like a leader or trailer.
         let rest = self
@@ -841,18 +857,16 @@ fn le64(data: &[u8], offset: usize) -> Result<u64> {
     ))
 }
 /// A command packet. Every command asks for an acknowledgement; a resend
-/// keeps the original request ID and sets the CommandResend flag.
+/// keeps the original request ID and sets the `CommandResend` flag.
 fn command(cmd: u16, id: u16, resend: bool, payload: &[u8]) -> Result<Vec<u8>> {
-    ensure!(
-        payload.len() <= u16::MAX as usize,
-        "UVCP command payload exceeds 65535 bytes"
-    );
+    let length =
+        u16::try_from(payload.len()).context("UVCP command payload exceeds 65535 bytes")?;
     let flags = if resend { 0xc000u16 } else { 0x4000 };
     let mut packet = Vec::with_capacity(12 + payload.len());
     packet.extend_from_slice(&MAGIC.to_le_bytes());
     packet.extend_from_slice(&flags.to_le_bytes());
     packet.extend_from_slice(&cmd.to_le_bytes());
-    packet.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    packet.extend_from_slice(&length.to_le_bytes());
     packet.extend_from_slice(&id.to_le_bytes());
     packet.extend_from_slice(payload);
     Ok(packet)
@@ -889,7 +903,7 @@ fn ack(packet: &[u8], id: u16) -> Result<(u16, &[u8])> {
     );
     Ok((le16(packet, 6)?, &packet[12..12 + length]))
 }
-/// Check a WriteMem acknowledgement. GenCP lets it carry the written length
+/// Check a `WriteMem` acknowledgement. `GenCP` lets it carry the written length
 /// only when the camera's Device Capability bit 11 is set; otherwise it is
 /// empty.
 fn write_acknowledged(response: &[u8], len: usize) -> Result<()> {
@@ -929,7 +943,7 @@ impl Channel for ControlEndpoints {
         let _ = self.input.clear_halt().wait();
     }
 }
-/// Sends per command: GenCP asks a sender to retry a failed command three
+/// Sends per command: `GenCP` asks a sender to retry a failed command three
 /// times.
 const ATTEMPTS: u32 = 4;
 const STATUS_BUSY: u16 = 0x8007;
@@ -947,7 +961,7 @@ struct Control<C> {
     max_ack: usize,
 }
 impl<C: Channel> Control<C> {
-    fn new(channel: C, timeout: Duration) -> Self {
+    const fn new(channel: C, timeout: Duration) -> Self {
         Self {
             channel,
             id: 0,
@@ -958,9 +972,9 @@ impl<C: Channel> Control<C> {
         }
     }
     /// Send a command and wait for its acknowledgement within the command
-    /// timeout. As GenCP describes, a lost or corrupt acknowledgement or a
+    /// timeout. As `GenCP` describes, a lost or corrupt acknowledgement or a
     /// failed transfer resends the command after the response time with the
-    /// same request ID and the CommandResend flag, so a late acknowledgement
+    /// same request ID and the `CommandResend` flag, so a late acknowledgement
     /// still answers it. A busy camera, which did not run the command, gets
     /// it again as a new command, as does one that cannot take a resend,
     /// which may then run a write whose acknowledgement was lost twice.
@@ -1033,8 +1047,8 @@ impl<C: Channel> Control<C> {
         for _ in 0..64 {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(crate::types::Categorized::error(
-                    crate::types::ErrorKind::Timeout,
+                return Err(Categorized::error(
+                    ErrorKind::Timeout,
                     "USB camera control acknowledgement timed out",
                 ));
             }
@@ -1049,7 +1063,7 @@ impl<C: Channel> Control<C> {
             let (response_cmd, data) = ack(&response, self.id)?;
             if response_cmd == PENDING_ACK {
                 ensure!(data.len() >= 4, "truncated UVCP pending acknowledgement");
-                let extension = Duration::from_millis(le16(data, 2)? as u64);
+                let extension = Duration::from_millis(u64::from(le16(data, 2)?));
                 ensure!(
                     !extension.is_zero(),
                     "camera sent zero pending acknowledgement timeout"
@@ -1067,7 +1081,7 @@ impl<C: Channel> Control<C> {
     }
     /// Clear a halt the camera signalled before the command is sent again.
     fn unhalt<T>(&mut self, result: Result<T, TransferError>) -> Result<T, TransferError> {
-        if let Err(TransferError::Stall) = result {
+        if matches!(result, Err(TransferError::Stall)) {
             self.channel.clear_halt();
         }
         result
@@ -1084,10 +1098,13 @@ impl<C: Channel> RegisterIo for Control<C> {
         let mut result = Vec::with_capacity(length);
         while result.len() < length {
             let len = (length - result.len()).min(chunk_size);
-            let mut request = Vec::with_capacity(12);
-            request.extend_from_slice(&(address + result.len() as u64).to_le_bytes());
-            request.extend_from_slice(&0u16.to_le_bytes());
-            request.extend_from_slice(&(len as u16).to_le_bytes());
+            let mut request = [0u8; 12];
+            request[..8].copy_from_slice(&(address + result.len() as u64).to_le_bytes());
+            request[10..].copy_from_slice(
+                &u16::try_from(len)
+                    .context("USB read chunk exceeds u16")?
+                    .to_le_bytes(),
+            );
             let bytes = self.transact(READ_CMD, &request)?;
             ensure!(bytes.len() == len, "camera returned short UVCP memory data");
             result.extend_from_slice(&bytes);
@@ -1107,8 +1124,10 @@ impl<C: Channel> RegisterIo for Control<C> {
             .saturating_sub(20)
             .min(u16::MAX as usize - 8);
         ensure!(size > 0, "invalid USB write transfer limit");
+        let mut request = Vec::new();
         for (i, chunk) in data.chunks(size).enumerate() {
-            let mut request = Vec::with_capacity(8 + chunk.len());
+            request.clear();
+            request.reserve(8 + chunk.len());
             request.extend_from_slice(&(address + (i * size) as u64).to_le_bytes());
             request.extend_from_slice(chunk);
             let response = self.transact(WRITE_CMD, &request)?;
@@ -1125,11 +1144,8 @@ impl UsbBackend {
         le64(&self.read_memory(address, 8)?, 0)
     }
     fn put32(&mut self, offset: u64, value: usize) -> Result<()> {
-        ensure!(
-            value <= u32::MAX as usize,
-            "stream register value exceeds u32"
-        );
-        self.write_memory(self.sirm + offset, &(value as u32).to_le_bytes())
+        let value = u32::try_from(value).context("stream register value exceeds u32")?;
+        self.write_memory(self.sirm + offset, &value.to_le_bytes())
     }
     fn start_stream(&mut self) -> Result<()> {
         // The stream registers must not change while the stream interface
@@ -1150,7 +1166,8 @@ impl UsbBackend {
             expected > 0 && expected <= MAX_FRAME as u64,
             "USB stream required payload is outside 1..256 MiB"
         );
-        let expected = expected as usize;
+        let expected =
+            usize::try_from(expected).context("USB payload exceeds host address size")?;
         let leader = aligned((self.u32(self.sirm + 0x10)? as usize).max(52), alignment)?;
         let trailer = aligned((self.u32(self.sirm + 0x14)? as usize).max(28), alignment)?;
         ensure!(
@@ -1217,8 +1234,17 @@ impl RegisterIo for UsbBackend {
         self.control.write_memory(address, data)
     }
 }
+/// Validate the wire count before converting it to a host-sized allocation.
+fn manifest_size(count: u64) -> Result<usize> {
+    ensure!(
+        (1..=64).contains(&count),
+        "invalid USB3 Vision manifest entry count"
+    );
+    Ok(usize::try_from(count).context("USB manifest count exceeds host address size")? * 64)
+}
+
 /// Each manifest entry for a raw or zipped device XML, with its address
-/// and size, newest version first. GenCP puts the file type in bits 0-2 of
+/// and size, newest version first. `GenCP` puts the file type in bits 0-2 of
 /// the entry's second word, where 1 is a Buffer XML holding only chunk
 /// nodes, and the 6-bit file format in bits 10-15.
 fn device_xml_entries(entries: &[u8]) -> Result<Vec<([u8; 64], u64, u64)>> {
@@ -1294,16 +1320,12 @@ fn validate_trailer(bytes: &[u8], frame: &Frame, expected: usize) -> Result<()> 
 impl Backend for UsbBackend {
     fn xml(&mut self) -> Result<String> {
         let address = self.u64(0x01d0)?;
-        let count = self.u64(address)? as usize;
-        ensure!(
-            (1..=64).contains(&count),
-            "invalid USB3 Vision manifest entry count"
-        );
+        let size = manifest_size(self.u64(address)?)?;
         let entries = self.read_memory(
             address
                 .checked_add(8)
                 .context("manifest address overflow")?,
-            count * 64,
+            size,
         )?;
         let mut last_error = anyhow!("USB manifest contains no raw or ZIP device XML entry");
         // The manifest entry (version, address, size and a SHA-1 where the
@@ -1325,7 +1347,10 @@ impl Backend for UsbBackend {
                 crate::xml_cache::forget(&key);
             }
             match self
-                .read_memory(address, size as usize)
+                .read_memory(
+                    address,
+                    usize::try_from(size).context("USB XML size exceeds host address size")?,
+                )
                 .and_then(|data| decode_xml(&data))
                 .and_then(|xml| {
                     crate::genicam::NodeMap::parse(&xml)?;
@@ -1616,13 +1641,22 @@ mod tests {
         let mut response = command(READ_CMD + 1, 7, false, &[1, 2, 3, 4]).unwrap();
         response[4..6].fill(0);
         assert_eq!(ack(&response, 7).unwrap(), (0x0801, &[1, 2, 3, 4][..]));
-        assert!(ack(&response, 8).is_err());
+        ack(&response, 8).unwrap_err();
         // Warning severity: the command ran.
         response[4..6].copy_from_slice(&0x4001u16.to_le_bytes());
         assert_eq!(ack(&response, 7).unwrap(), (0x0801, &[1, 2, 3, 4][..]));
         response[4..6].copy_from_slice(&0x8003u16.to_le_bytes());
         let error = ack(&response, 7).unwrap_err();
         assert_eq!(error.downcast_ref::<UvcpStatus>().unwrap().0, 0x8003);
+    }
+    #[test]
+    fn uvcp_payload_length_cannot_wrap() {
+        let mut payload = vec![0; usize::from(u16::MAX)];
+        let packet = command(READ_CMD, 7, false, &payload).unwrap();
+        assert_eq!(&packet[8..10], &u16::MAX.to_le_bytes());
+        assert_eq!(packet.len(), 12 + payload.len());
+        payload.push(0);
+        command(READ_CMD, 7, false, &payload).unwrap_err();
     }
     #[test]
     fn write_acknowledgement_may_omit_the_written_length() {
@@ -1639,6 +1673,15 @@ mod tests {
         assert!(write_acknowledged(&[0, 0], 4).is_err());
     }
     #[test]
+    fn manifest_counts_are_checked_before_narrowing() {
+        assert_eq!(manifest_size(1).unwrap(), 64);
+        assert_eq!(manifest_size(64).unwrap(), 4096);
+        for count in [0, 65, (1u64 << 32) + 1, u64::MAX] {
+            assert!(manifest_size(count).is_err(), "accepted count {count}");
+        }
+    }
+
+    #[test]
     fn manifest_selects_the_device_xml_over_a_newer_buffer_xml() {
         let entry = |version: u32, schema: u32, address: u64, size: u64| {
             let mut entry = [0u8; 64];
@@ -1649,7 +1692,7 @@ mod tests {
             entry
         };
         // Schema 1.1 in the top half; file type in bits 0-2, format at 10.
-        let schema = |file_type: u32, format: u32| 0x0101_0000 | format << 10 | file_type;
+        let schema = |file_type: u32, format: u32| 0x0101_0000 | (format << 10) | file_type;
         let manifest = [
             entry(0x0200_0000, schema(1, 0), 0x1000, 100),
             entry(0x0100_0002, schema(0, 1), 0x2000, 200),
@@ -1679,8 +1722,9 @@ mod tests {
     }
     impl Channel for Script {
         fn send(&mut self, packet: Vec<u8>, _timeout: Duration) -> Result<usize, TransferError> {
+            let length = packet.len();
             self.sent.push(packet);
-            Ok(self.sent.last().unwrap().len())
+            Ok(length)
         }
         fn receive(&mut self, _len: usize, timeout: Duration) -> Result<Vec<u8>, TransferError> {
             // A read with nothing to receive times out.
@@ -1695,14 +1739,14 @@ mod tests {
             self.halts_cleared += 1;
         }
     }
-    fn reply(status: u16, command: u16, id: u16, scd: &[u8]) -> Result<Vec<u8>, TransferError> {
+    fn reply(status: u16, command: u16, id: u16, scd: &[u8]) -> Vec<u8> {
         let mut packet = MAGIC.to_le_bytes().to_vec();
         packet.extend(status.to_le_bytes());
         packet.extend(command.to_le_bytes());
-        packet.extend((scd.len() as u16).to_le_bytes());
+        packet.extend(u16::try_from(scd.len()).unwrap().to_le_bytes());
         packet.extend(id.to_le_bytes());
         packet.extend(scd);
-        Ok(packet)
+        packet
     }
     fn control(
         replies: impl IntoIterator<Item = Result<Vec<u8>, TransferError>>,
@@ -1723,16 +1767,19 @@ mod tests {
     fn lost_or_corrupt_acknowledgements_resend_the_command() {
         let value = 2000u32.to_le_bytes();
         // No acknowledgement: resend with the same ID and CommandResend.
-        let mut lost = control([Err(TransferError::Cancelled), reply(0, 0x0801, 1, &value)]);
+        let mut lost = control([
+            Err(TransferError::Cancelled),
+            Ok(reply(0, 0x0801, 1, &value)),
+        ]);
         assert_eq!(lost.read_memory(0x1cc, 4).unwrap(), value);
         assert_eq!(sent(&lost), [(0x4000, 1), (0xc000, 1)]);
         // A corrupt acknowledgement, then a stall the endpoint must clear.
-        let mut corrupt = reply(0, 0x0801, 1, &value).unwrap();
+        let mut corrupt = reply(0, 0x0801, 1, &value);
         corrupt[0] = 0;
         let mut flaky = control([
             Ok(corrupt),
             Err(TransferError::Stall),
-            reply(0, 0x0801, 1, &value),
+            Ok(reply(0, 0x0801, 1, &value)),
         ]);
         assert_eq!(flaky.read_memory(0x1cc, 4).unwrap(), value);
         assert_eq!(flaky.channel.sent.len(), 3);
@@ -1740,30 +1787,48 @@ mod tests {
         // A busy camera gets the command again under a new ID, as does one
         // that cannot take a resend.
         let mut busy = control([
-            reply(STATUS_BUSY, 0x0801, 1, &[]),
-            reply(0, 0x0801, 2, &value),
+            Ok(reply(STATUS_BUSY, 0x0801, 1, &[])),
+            Ok(reply(0, 0x0801, 2, &value)),
         ]);
         assert_eq!(busy.read_memory(0x1cc, 4).unwrap(), value);
         assert_eq!(sent(&busy), [(0x4000, 1), (0x4000, 2)]);
         let mut plain = control([
             Err(TransferError::Cancelled),
-            reply(STATUS_RESEND_NOT_SUPPORTED, 0x0801, 1, &[]),
-            reply(0, 0x0801, 2, &value),
+            Ok(reply(STATUS_RESEND_NOT_SUPPORTED, 0x0801, 1, &[])),
+            Ok(reply(0, 0x0801, 2, &value)),
         ]);
         assert_eq!(plain.read_memory(0x1cc, 4).unwrap(), value);
         assert_eq!(sent(&plain), [(0x4000, 1), (0xc000, 1), (0x4000, 2)]);
         // A camera that writes without reporting the written length.
-        let mut write = control([reply(0, 0x0803, 1, &[])]);
+        let mut write = control([Ok(reply(0, 0x0803, 1, &[]))]);
         write.write_memory(0x10_0004, &[1, 0, 0, 0]).unwrap();
     }
     #[test]
+    fn memory_write_chunks_keep_addresses_and_short_final_payloads() {
+        let mut control = control((1..=3).map(|id| Ok(reply(0, WRITE_CMD + 1, id, &[]))));
+        control.max_command = 24;
+        let data = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+        control.write_memory(0x1000, &data).unwrap();
+        assert_eq!(control.channel.sent.len(), 3);
+        for (index, (packet, chunk)) in control.channel.sent.iter().zip(data.chunks(4)).enumerate()
+        {
+            assert_eq!(packet.len(), 20 + chunk.len());
+            assert_eq!(
+                le64(packet, 12).unwrap(),
+                0x1000 + u64::try_from(index * 4).unwrap()
+            );
+            assert_eq!(&packet[20..], chunk);
+        }
+    }
+
+    #[test]
     fn definite_failures_are_not_resent() {
-        let mut rejected = control([reply(0x8003, 0x0801, 1, &[])]);
+        let mut rejected = control([Ok(reply(0x8003, 0x0801, 1, &[]))]);
         let error = rejected.read_memory(0x1cc, 4).unwrap_err();
         assert_eq!(error.downcast_ref::<UvcpStatus>().unwrap().0, 0x8003);
         assert_eq!(rejected.channel.sent.len(), 1);
         let mut gone = control([Err(TransferError::Disconnected)]);
-        assert!(gone.read_memory(0x1cc, 4).is_err());
+        gone.read_memory(0x1cc, 4).unwrap_err();
         assert_eq!(gone.channel.sent.len(), 1);
         let mut silent = control([]);
         let error = silent.read_memory(0x1cc, 4).unwrap_err();
@@ -1780,7 +1845,7 @@ mod tests {
         // one resend in the time that remains.
         let mut slow = Control::new(script, Duration::from_millis(300));
         slow.response = Duration::from_millis(200);
-        assert!(slow.read_memory(0x1cc, 4).is_err());
+        slow.read_memory(0x1cc, 4).unwrap_err();
         assert!(slow.channel.sent.len() <= 2);
         assert_eq!(sent(&slow)[0], (0x4000, 1));
     }
@@ -1806,7 +1871,7 @@ mod tests {
         trailer[16] = 1;
         assert!(validate_trailer(&trailer, &frame, 8).is_err());
         leader[18] = 2;
-        assert!(parse_leader(&leader).is_err());
+        parse_leader(&leader).unwrap_err();
     }
     const MPS: usize = 1024;
     /// Stands in for the stream endpoint and the camera behind it. The
@@ -1835,7 +1900,7 @@ mod tests {
         }
         /// Queue a whole frame as a camera sends it after SIRM setup.
         fn frame(&mut self, id: u64, image: &[u8], block: usize) {
-            self.send(&leader(id, image.len() as u32, 1));
+            self.send(&leader(id, u32::try_from(image.len()).unwrap(), 1));
             for chunk in image.chunks(block) {
                 self.send(chunk);
             }
@@ -1862,32 +1927,32 @@ mod tests {
             self.submitted.push_back((buffer, status));
         }
         fn wait(&mut self, _timeout: Duration) -> Option<Completion> {
-            let (buffer, status) = self.submitted.front()?;
-            let status = match status {
-                Some(error) => Err(*error),
-                None => {
-                    let mut room = buffer.requested_len();
-                    let mut taken = 0;
-                    loop {
-                        let packet = self.packets.get(taken)?;
-                        assert!(packet.len() <= room, "babble");
-                        room -= packet.len();
-                        taken += 1;
-                        if packet.len() < MPS || room == 0 {
-                            break;
-                        }
-                    }
-                    let packets: Vec<_> = self.packets.drain(..taken).collect();
-                    if std::mem::take(&mut self.fault) {
-                        Err(TransferError::Fault)
-                    } else {
-                        let buffer = &mut self.submitted.front_mut().unwrap().0;
-                        packets.iter().for_each(|p| buffer.extend_from_slice(p));
-                        Ok(())
+            let (buffer, status) = self.submitted.front_mut()?;
+            let status = if let Some(error) = status {
+                Err(*error)
+            } else {
+                let mut room = buffer.requested_len();
+                let mut taken = 0;
+                loop {
+                    let packet = self.packets.get(taken)?;
+                    assert!(packet.len() <= room, "babble");
+                    room -= packet.len();
+                    taken += 1;
+                    if packet.len() < MPS || room == 0 {
+                        break;
                     }
                 }
+                let packets: Vec<_> = self.packets.drain(..taken).collect();
+                if std::mem::take(&mut self.fault) {
+                    Err(TransferError::Fault)
+                } else {
+                    for packet in &packets {
+                        buffer.extend_from_slice(packet);
+                    }
+                    Ok(())
+                }
             };
-            let (buffer, _) = self.submitted.pop_front().unwrap();
+            let (buffer, _) = self.submitted.pop_front()?;
             Some(Completion {
                 actual_len: buffer.len(),
                 buffer,
@@ -1911,7 +1976,7 @@ mod tests {
         leader[36..40].copy_from_slice(&height.to_le_bytes());
         leader
     }
-    /// An image trailer with SizeY, as U3V 1.0 cameras send it.
+    /// An image trailer with `SizeY`, as U3V 1.0 cameras send it.
     fn trailer(id: u64, size: usize) -> Vec<u8> {
         let mut trailer = vec![0; 32];
         trailer[..4].copy_from_slice(&TRAILER_MAGIC.to_le_bytes());
@@ -1935,7 +2000,9 @@ mod tests {
         frame
     }
     fn image(id: u64, len: usize) -> Vec<u8> {
-        (0..len).map(|i| (i as u64 * 7 + id) as u8).collect()
+        (0..len)
+            .map(|i| (i as u64 * 7 + id).to_le_bytes()[0])
+            .collect()
     }
     #[test]
     fn stream_assembles_frames_larger_than_its_transfer_window() {
@@ -1954,7 +2021,7 @@ mod tests {
         // packet before the trailer.
         let (mut stream, mut bus) = streaming(12 * MPS, block);
         for id in 1..=3 {
-            bus.send(&leader(id, 12 * MPS as u32, 1));
+            bus.send(&leader(id, 12 * u32::try_from(MPS).unwrap(), 1));
             for chunk in image(id, 12 * MPS).chunks(block) {
                 bus.send(chunk);
             }
@@ -1971,7 +2038,7 @@ mod tests {
         bus.frame(1, &image(1, expected), block);
         bus.frame(2, &image(2, expected), block);
         // The third has its leader and part of its image so far.
-        bus.send(&leader(3, expected as u32, 1));
+        bus.send(&leader(3, u32::try_from(expected).unwrap(), 1));
         bus.send(&image(3, expected)[..block]);
         assert_eq!(stream.take_in(&mut bus), 3);
         assert!(bus.packets.is_empty());
@@ -2015,27 +2082,27 @@ mod tests {
         // Each bad frame is one error, and the next frame arrives whole.
         let lost = |stream: &mut Stream, bus: &mut Bus, id: u64| {
             bus.frame(id, &image(id, expected), block);
-            assert!(next(stream, bus).is_err());
+            next(stream, bus).unwrap_err();
             let frame = next(stream, bus).unwrap();
             assert_eq!((frame.id, frame.data.to_vec()), (id, image(id, expected)));
         };
         // A truncated frame whose trailer arrives early.
-        bus.send(&leader(2, expected as u32, 1));
+        bus.send(&leader(2, u32::try_from(expected).unwrap(), 1));
         bus.send(&image(2, block));
         bus.send(&trailer(2, block));
         lost(&mut stream, &mut bus, 3);
         // A truncated frame that keeps its transfer count.
-        bus.send(&leader(4, expected as u32, 1));
+        bus.send(&leader(4, u32::try_from(expected).unwrap(), 1));
         bus.send(&image(4, 1000));
         bus.send(&[]);
         bus.send(&trailer(4, 1000));
         lost(&mut stream, &mut bus, 5);
         // A frame without its trailer.
-        bus.send(&leader(6, expected as u32, 1));
+        bus.send(&leader(6, u32::try_from(expected).unwrap(), 1));
         bus.send(&image(6, expected));
         lost(&mut stream, &mut bus, 7);
         // A transfer error in the middle of a frame.
-        bus.send(&leader(8, expected as u32, 1));
+        bus.send(&leader(8, u32::try_from(expected).unwrap(), 1));
         bus.send(&image(8, block));
         let waiting = next(&mut stream, &mut bus).unwrap_err();
         assert!(format!("{waiting:#}").contains("timed out"));
@@ -2076,7 +2143,7 @@ mod tests {
         let (mut stream, mut bus) = streaming(expected, block);
         bus.frame(1, &image(1, expected), block);
         assert_eq!(next(&mut stream, &mut bus).unwrap().id, 1);
-        bus.send(&leader(2, expected as u32, 1));
+        bus.send(&leader(2, u32::try_from(expected).unwrap(), 1));
         bus.stall();
         let error = next(&mut stream, &mut bus).unwrap_err();
         assert!(
@@ -2163,18 +2230,18 @@ mod tests {
     type Received = (std::result::Result<(u64, Vec<u8>), String>, bool);
     /// What the stream made of a camera's transfers.
     fn received(stream: &mut Stream, bus: &mut Bus, calls: usize) -> Vec<Received> {
-        (0..calls)
-            .map(|_| {
-                let frame = stream.next(bus, Instant::now() + Duration::from_millis(20));
-                let own = frame
-                    .as_ref()
-                    .is_ok_and(|frame| bus.buffers.contains(&(frame.data.as_ptr() as usize)));
-                let frame = frame
-                    .map(|frame| (frame.id, frame.data.to_vec()))
-                    .map_err(|error| format!("{error:#}"));
-                (frame, own)
-            })
-            .collect()
+        std::iter::repeat_with(|| {
+            let frame = stream.next(bus, Instant::now() + Duration::from_millis(20));
+            let own = frame
+                .as_ref()
+                .is_ok_and(|frame| bus.buffers.contains(&(frame.data.as_ptr() as usize)));
+            let frame = frame
+                .map(|frame| (frame.id, frame.data.to_vec()))
+                .map_err(|error| format!("{error:#}"));
+            (frame, own)
+        })
+        .take(calls)
+        .collect()
     }
     /// Images that fill a transfer whole become their frames' buffers; the
     /// frames and errors are those of copying them, whatever the camera
@@ -2196,7 +2263,7 @@ mod tests {
                 "zero-length packet",
                 |bus, expected, _| {
                     for id in 1..=2 {
-                        bus.send(&leader(id, expected as u32, 1));
+                        bus.send(&leader(id, u32::try_from(expected).unwrap(), 1));
                         bus.send(&image(id, expected));
                         bus.send(&[]);
                         bus.send(&trailer(id, expected));
@@ -2220,7 +2287,7 @@ mod tests {
             (
                 "short image",
                 |bus, expected, request| {
-                    bus.send(&leader(1, expected as u32, 1));
+                    bus.send(&leader(1, u32::try_from(expected).unwrap(), 1));
                     bus.send(&image(1, expected / 2 + 3));
                     bus.send(&trailer(1, expected / 2 + 3));
                     bus.frame(2, &image(2, expected), request);
@@ -2230,7 +2297,7 @@ mod tests {
             (
                 "no trailer",
                 |bus, expected, request| {
-                    bus.send(&leader(1, expected as u32, 1));
+                    bus.send(&leader(1, u32::try_from(expected).unwrap(), 1));
                     bus.send(&image(1, expected));
                     bus.frame(2, &image(2, expected), request);
                 },
@@ -2239,7 +2306,7 @@ mod tests {
             (
                 "wrong size in the trailer",
                 |bus, expected, request| {
-                    bus.send(&leader(1, expected as u32, 1));
+                    bus.send(&leader(1, u32::try_from(expected).unwrap(), 1));
                     bus.send(&image(1, expected));
                     bus.send(&trailer(1, expected + 1));
                     bus.frame(2, &image(2, expected), request);
@@ -2258,7 +2325,7 @@ mod tests {
             (
                 "transfer error",
                 |bus, expected, request| {
-                    bus.send(&leader(1, expected as u32, 1));
+                    bus.send(&leader(1, u32::try_from(expected).unwrap(), 1));
                     bus.fault = true;
                     bus.send(&image(1, expected));
                     bus.send(&trailer(1, expected));
@@ -2269,7 +2336,7 @@ mod tests {
             (
                 "two images in a row",
                 |bus, expected, request| {
-                    bus.send(&leader(1, expected as u32, 1));
+                    bus.send(&leader(1, u32::try_from(expected).unwrap(), 1));
                     bus.send(&image(1, expected));
                     bus.send(&image(1, expected));
                     bus.send(&trailer(1, expected));
@@ -2364,7 +2431,7 @@ mod tests {
         // Aravis: LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_STANDARD |
         // LIBUSB_RECIPIENT_ENDPOINT, SET_FEATURE, ENDPOINT_HALT, endpoint.
         let request = halt(0x81);
-        let request_type = (request.control_type as u8) << 5 | request.recipient as u8;
+        let request_type = ((request.control_type as u8) << 5) | request.recipient as u8;
         assert_eq!(request_type, 0x02);
         assert_eq!(
             (request.request, request.value, request.index, request.data),
@@ -2374,12 +2441,12 @@ mod tests {
     #[test]
     fn malformed_packets_fail_without_panics() {
         for n in 0..12 {
-            assert!(ack(&vec![0; n], 1).is_err());
+            ack(&vec![0; n], 1).unwrap_err();
         }
         for n in 0..52 {
-            assert!(parse_leader(&vec![0; n]).is_err());
+            parse_leader(&vec![0; n]).unwrap_err();
         }
         assert_eq!(aligned(53, 1024).unwrap(), 1024);
-        assert!(aligned(53, 3).is_err());
+        aligned(53, 3).unwrap_err();
     }
 }

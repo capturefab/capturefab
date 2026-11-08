@@ -3,8 +3,7 @@
 //! and memory this process may use, kernel limits that cap camera throughput
 //! and the free space captures have, each turned into a check with a
 //! copyable fix.
-#![allow(unsafe_code)]
-
+#![deny(clippy::missing_const_for_fn)]
 #[cfg(any(target_os = "linux", test))]
 use crate::dirs::LoginDir;
 use crate::media::FfmpegHealth;
@@ -12,6 +11,7 @@ use crate::network::{InterfaceKind, NetworkInterface};
 use crate::types::human_bytes;
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 use std::{
     io::{self, Write},
     path::{Path, PathBuf},
@@ -24,7 +24,7 @@ const LINE_COMPUTER: &str = "https://capturefab.com/guides/line-computer.md";
 /// The udev rule Linux archives ship in share/udev/rules.d, and the fix for
 /// `usb_access` writes: the logged-in seat user and the plugdev group may
 /// open any device with a USB3 Vision interface (class ef/05/00).
-/// The first rule imports usb_id, which sets ID_USB_INTERFACES, as not every
+/// The first rule imports `usb_id`, which sets `ID_USB_INTERFACES`, as not every
 /// distribution has by the time rules sorted at 70 run.
 #[cfg(any(feature = "usb", test))]
 const UDEV_RULES: [&str; 2] = [
@@ -33,19 +33,19 @@ const UDEV_RULES: [&str; 2] = [
 ];
 #[cfg(any(feature = "usb", test))]
 const UDEV_RULE_FILE: &str = "70-capturefab-usb3vision.rules";
-/// Room for two frames of a 16 MiB GigE camera; the value the GigE transport
+/// Room for two frames of a 16 MiB `GigE` camera; the value the `GigE` transport
 /// already suggests when its receive buffer comes up short.
 const GIGE_RECEIVE_BUFFER: u64 = 32 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Level {
+pub(crate) enum Level {
     Ok,
     Warn,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Check {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct Check {
     #[serde(rename = "name")]
     pub id: &'static str,
     #[serde(rename = "status")]
@@ -55,7 +55,7 @@ pub struct Check {
     pub fix: Option<String>,
 }
 impl Check {
-    fn ok(id: &'static str, message: String) -> Self {
+    const fn ok(id: &'static str, message: String) -> Self {
         Self {
             id,
             level: Level::Ok,
@@ -63,7 +63,7 @@ impl Check {
             fix: None,
         }
     }
-    fn warn(id: &'static str, message: String, fix: String) -> Self {
+    const fn warn(id: &'static str, message: String, fix: String) -> Self {
         Self {
             id,
             level: Level::Warn,
@@ -74,8 +74,8 @@ impl Check {
 }
 
 /// A file system holding something Capturefab writes.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct Place {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct Place {
     pub path: PathBuf,
     /// When false, the facts describe the nearest existing parent folder.
     pub exists: bool,
@@ -90,7 +90,7 @@ impl Place {
         let existing = path
             .ancestors()
             .find(|p| !p.as_os_str().is_empty() && p.exists())
-            .unwrap_or(Path::new("."));
+            .unwrap_or_else(|| Path::new("."));
         let fs_type = file_system(existing);
         Self {
             exists: existing == path,
@@ -102,19 +102,19 @@ impl Place {
         }
     }
     fn described(&self) -> String {
-        match &self.fs_type {
-            Some(fs) => format!("{} ({fs})", self.path.display()),
-            None => self.path.display().to_string(),
-        }
+        self.fs_type.as_ref().map_or_else(
+            || self.path.display().to_string(),
+            |fs| format!("{} ({fs})", self.path.display()),
+        )
     }
 }
 fn ram_backed(fs_type: &str) -> bool {
     matches!(fs_type, "tmpfs" | "ramfs")
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Serialize)]
-pub struct Limits {
-    /// Linux caps every socket receive buffer here, whatever GigE asks for.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct Limits {
+    /// Linux caps every socket receive buffer here, whatever `GigE` asks for.
     pub rmem_max: Option<u64>,
     /// Linux's budget for zero-copy USB transfers, shared by all devices.
     pub usbfs_memory_mb: Option<u64>,
@@ -172,7 +172,7 @@ struct Facts {
     runtime: Folder,
     /// Presets, saved sign-ins and sessions' jobs.
     state: Folder,
-    /// The extracted FFmpeg and GenICam XML.
+    /// The extracted `FFmpeg` and `GenICam` XML.
     cache: Folder,
     /// A camera command can start the `auto` session, for the full report.
     warm_sessions: Option<bool>,
@@ -185,7 +185,7 @@ struct Facts {
     /// without it, and why.
     #[cfg(any(target_os = "linux", test))]
     missed_runtime_dir: Option<(PathBuf, LoginDir)>,
-    /// From a login that has XDG_RUNTIME_DIR: where a service without it
+    /// From a login that has `XDG_RUNTIME_DIR`: where a service without it
     /// keeps sessions instead.
     #[cfg(any(target_os = "linux", test))]
     service_runtime_dir: Option<ServiceDir>,
@@ -200,10 +200,10 @@ struct Facts {
     /// IPv4 adapters, for the full report only: `serve`'s warnings never
     /// need them, and on Windows listing them runs PowerShell.
     interfaces: Option<Vec<NetworkInterface>>,
-    /// Whether FFmpeg runs, or why not, for the full report only: `serve`
-    /// would otherwise start FFmpeg (extracting it first) on every launch.
+    /// Whether `FFmpeg` runs, or why not, for the full report only: `serve`
+    /// would otherwise start `FFmpeg` (extracting it first) on every launch.
     ffmpeg: Option<Result<FfmpegHealth, String>>,
-    /// CAPTUREFAB_FFMPEG chose FFmpeg.
+    /// `CAPTUREFAB_FFMPEG` chose `FFmpeg`.
     ffmpeg_overridden: bool,
     /// Files in the state directory that version 0.5 wrote and nothing
     /// reads any more, its storage ledger among them.
@@ -217,10 +217,10 @@ struct Facts {
 struct PrivateDir {
     path: PathBuf,
     why: String,
-    /// A cache folder, which CAPTUREFAB_CACHE_DIR moves, not sessions'.
+    /// A cache folder, which `CAPTUREFAB_CACHE_DIR` moves, not sessions'.
     cache: bool,
 }
-/// Where a service started without XDG_RUNTIME_DIR keeps sessions, out of
+/// Where a service started without `XDG_RUNTIME_DIR` keeps sessions, out of
 /// this login's sight, the login runtime directory it passes over and why,
 /// and the sessions running there.
 #[cfg(any(target_os = "linux", test))]
@@ -231,7 +231,7 @@ struct ServiceDir {
     running: Vec<String>,
 }
 impl Facts {
-    /// `report` also lists network adapters and runs FFmpeg, which only
+    /// `report` also lists network adapters and runs `FFmpeg`, which only
     /// `doctor` shows; `warm_sessions` is whether a session can start.
     fn gather(report: bool, warm_sessions: Option<bool>) -> Self {
         let runtime = Folder::of(crate::dirs::Kind::Runtime);
@@ -320,9 +320,9 @@ impl Facts {
 }
 
 /// The `doctor` document: checks with fixes, this build, its folders and
-/// the fallbacks they use, the CPUs and memory it may use, and the FFmpeg
+/// the fallbacks they use, the CPUs and memory it may use, and the `FFmpeg`
 /// it runs. `warm_sessions`: whether a camera command can start a session.
-pub fn report(warm_sessions: bool) -> Value {
+pub(crate) fn report(warm_sessions: bool) -> Value {
     let facts = Facts::gather(true, Some(warm_sessions));
     let mut report = json!({
         "checks": checks(&facts),
@@ -362,7 +362,7 @@ pub fn report(warm_sessions: bool) -> Value {
 }
 
 /// For `serve`: one line naming what `doctor` warns about.
-pub fn print_warnings() {
+pub(crate) fn print_warnings() {
     let warnings: Vec<String> = checks(&Facts::gather(false, None))
         .into_iter()
         .filter(|check| check.level == Level::Warn)
@@ -378,7 +378,7 @@ pub fn print_warnings() {
 
 /// Human `doctor`: the build on one line, then one line per check with
 /// its fix.
-pub fn print_checklist(out: &mut impl Write, report: &Value) -> io::Result<()> {
+pub(crate) fn print_checklist(out: &mut impl Write, report: &Value) -> io::Result<()> {
     let text = |value: &Value| value.as_str().unwrap_or_default().to_owned();
     writeln!(
         out,
@@ -454,7 +454,7 @@ fn checks(facts: &Facts) -> Vec<Check> {
     checks
 }
 
-/// Without XDG_RUNTIME_DIR, Capturefab uses the login's runtime directory
+/// Without `XDG_RUNTIME_DIR`, Capturefab uses the login's runtime directory
 /// for a lingering user, so a service and an SSH shell find the same
 /// sessions. Otherwise logind removes it at logout, taking a service's
 /// session with it, so Capturefab falls back to disk, or to a temporary
@@ -480,7 +480,7 @@ fn runtime_dir_check(login: &Path, why: LoginDir, runtime: &Place, state: Option
 }
 
 /// The same problem seen from a login, such as SSH, that has
-/// XDG_RUNTIME_DIR: a service started without it keeps its sessions in
+/// `XDG_RUNTIME_DIR`: a service started without it keeps its sessions in
 /// `service` instead, out of this login's sight. A warning once such a
 /// session runs, otherwise a note, as most logins never start a service.
 #[cfg(any(target_os = "linux", test))]
@@ -566,10 +566,10 @@ fn sessions_check(runtime: &Folder, warm: Option<bool>) -> Check {
             .as_deref()
             .unwrap_or("no runtime folder")
             .trim_end_matches('.');
-        let previews = match crate::dirs::temp() {
-            Some(temp) => format!("previews go to {}", temp.join("inspect").display()),
-            None => "previews need --preview FILE or --preview none".into(),
-        };
+        let previews = crate::dirs::temp().map_or_else(
+            || "previews need --preview FILE or --preview none".into(),
+            |temp| format!("previews go to {}", temp.join("inspect").display()),
+        );
         return Check::warn(
             "sessions",
             format!(
@@ -743,17 +743,17 @@ fn private_dirs_check(
     let mut consequences = Vec::new();
     let mut variables = Vec::new();
     if problems.iter().any(|problem| !problem.cache) {
-        consequences.push(match runtime {
-            Some(runtime) => format!("sessions use {}", runtime.path.display()),
-            None => "no session can start".into(),
-        });
+        consequences.push(runtime.map_or_else(
+            || "no session can start".into(),
+            |runtime| format!("sessions use {}", runtime.path.display()),
+        ));
         variables.push(crate::dirs::SESSION_DIR_ENV);
     }
     if problems.iter().any(|problem| problem.cache) {
-        consequences.push(match cache {
-            Some(cache) => format!("the cache is in {}", cache.path.display()),
-            None => "nothing is cached".into(),
-        });
+        consequences.push(cache.map_or_else(
+            || "nothing is cached".into(),
+            |cache| format!("the cache is in {}", cache.path.display()),
+        ));
         variables.push(crate::dirs::CACHE_DIR_ENV);
     }
     let foreign = problems.iter().any(|problem| {
@@ -814,22 +814,24 @@ fn read_only_root_check(read_only: bool) -> Option<Check> {
 fn resources_check(cpus: usize, quota: Option<f64>, memory: &crate::host::Memory) -> Check {
     let mut message = format!("{cpus} CPU{}", if cpus == 1 { "" } else { "s" });
     if let Some(quota) = quota {
-        message.push_str(&format!(" (cgroup quota {quota:.2})"));
+        let _ = write!(message, " (cgroup quota {quota:.2})");
     }
     if let Some(budget) = memory.budget() {
-        message.push_str(&format!(", {} of memory available", human_bytes(budget)));
+        let _ = write!(message, ", {} of memory available", human_bytes(budget));
     }
     if let (Some(limit), Some(used)) = (memory.limit, memory.used) {
-        message.push_str(&format!(
+        let _ = write!(
+            message,
             " (cgroup limit {}, {} in use)",
             human_bytes(limit),
             human_bytes(used)
-        ));
+        );
     }
     let queue = memory
         .budget()
         .map_or(1 << 30, |budget| (budget / 4).min(1 << 30));
-    message.push_str(&format!(
+    let _ = write!(
+        message,
         "; captures encode on {} thread{} and a burst holds at most {} of frames.",
         crate::host::threads(cpus),
         if crate::host::threads(cpus) == 1 {
@@ -838,11 +840,11 @@ fn resources_check(cpus: usize, quota: Option<f64>, memory: &crate::host::Memory
             "s"
         },
         human_bytes(queue)
-    ));
+    );
     Check::ok("resources", message)
 }
 
-/// Wired adapters a GigE Vision camera could use. Never a warning: most
+/// Wired adapters a `GigE` Vision camera could use. Never a warning: most
 /// computers have none and need none, and `serve` prints every warning.
 fn camera_network_check(interfaces: &[NetworkInterface]) -> Check {
     let wired: Vec<String> = interfaces
@@ -856,8 +858,12 @@ fn camera_network_check(interfaces: &[NetworkInterface]) -> Check {
             let prefix = u32::from(interface.netmask).count_ones();
             let mut text = format!("{} {}/{prefix}", interface.name, interface.address);
             match interface.mtu {
-                Some(mtu) if mtu > 1500 => text.push_str(&format!(", MTU {mtu}")),
-                Some(mtu) => text.push_str(&format!(", MTU {mtu} (no jumbo frames)")),
+                Some(mtu) if mtu > 1500 => {
+                    let _ = write!(text, ", MTU {mtu}");
+                }
+                Some(mtu) => {
+                    let _ = write!(text, ", MTU {mtu} (no jumbo frames)");
+                }
                 None => {}
             }
             if interface.address.is_link_local() {
@@ -876,20 +882,17 @@ fn camera_network_check(interfaces: &[NetworkInterface]) -> Check {
     )
 }
 
-/// Whether FFmpeg, which every webcam, stream, file and recording goes
+/// Whether `FFmpeg`, which every webcam, stream, file and recording goes
 /// through, starts, and where it was found. `bundled` is a build with
-/// FFmpeg built in.
+/// `FFmpeg` built in.
 fn ffmpeg_check(health: &Result<FfmpegHealth, String>, overridden: bool, bundled: bool) -> Check {
     match health {
         Ok(health) => {
-            let named = match health
+            let named = health
                 .version
                 .strip_prefix("ffmpeg version ")
                 .and_then(|rest| rest.split_whitespace().next())
-            {
-                Some(version) => format!("FFmpeg {version}"),
-                None => "FFmpeg".into(),
-            };
+                .map_or_else(|| "FFmpeg".into(), |version| format!("FFmpeg {version}"));
             let from = match health.source {
                 "bundled" => format!("bundled, extracted to {}", health.path),
                 "next_to_executable" => format!("next to capturefab: {}", health.path),
@@ -931,8 +934,11 @@ fn ffmpeg_check(health: &Result<FfmpegHealth, String>, overridden: bool, bundled
             } else if bundled {
                 "Reinstall Capturefab from https://capturefab.com/downloads.html, or set CAPTUREFAB_FFMPEG to an FFmpeg executable.".into()
             } else {
-                let hint = crate::media::ffmpeg_hint();
-                let mut fix = hint[..1].to_uppercase() + &hint[1..];
+                let mut fix = crate::media::ffmpeg_hint();
+                // The install hint begins with the ASCII word "install".
+                fix.get_mut(..1)
+                    .expect("the install hint starts with an ASCII letter")
+                    .make_ascii_uppercase();
                 fix.push('.');
                 fix
             },
@@ -995,7 +1001,7 @@ fn usb_check(cameras: &[UsbCamera]) -> Option<Check> {
 /// Vision cameras through the shipped udev rule. It uses sudo, so it is only
 /// ever shown or copied, never run.
 #[cfg(any(feature = "usb", test))]
-pub fn usb_access_fix() -> String {
+pub(crate) fn usb_access_fix() -> String {
     // One rule for the USB3 Vision class covers every camera plugged in
     // later. The note is a shell comment, so the whole line still pastes
     // and runs.
@@ -1008,8 +1014,8 @@ pub fn usb_access_fix() -> String {
 /// Whether this user lacks read/write access to the usbfs `node`
 /// (`/dev/bus/usb/BBB/DDD`). A permission check only: it opens nothing.
 #[cfg(all(target_os = "linux", feature = "usb"))]
-pub fn usb_access_denied(node: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
+pub(crate) fn usb_access_denied(node: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
     std::ffi::CString::new(node.as_os_str().as_bytes()).is_ok_and(|path| {
         // SAFETY: a NUL-terminated path; access only checks permissions.
         let status = unsafe { libc::access(path.as_ptr(), libc::R_OK | libc::W_OK) };
@@ -1062,12 +1068,15 @@ fn free_space_check(place: &Place, floor: &Result<u64, String>) -> Option<Check>
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn statfs(path: &Path) -> Option<libc::statfs> {
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::ffi::OsStrExt as _;
     let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    // SAFETY: a NUL-terminated path and a buffer the call fills on success,
-    // only read after it succeeded.
-    unsafe { (libc::statfs(path.as_ptr(), stat.as_mut_ptr()) == 0).then(|| stat.assume_init()) }
+    // SAFETY: a NUL-terminated path and a correctly sized writable buffer.
+    if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: statfs succeeded and initialized its output buffer.
+    Some(unsafe { stat.assume_init() })
 }
 
 /// Names for the magic numbers Linux reports; others show in hex.
@@ -1102,19 +1111,23 @@ fn file_system_name(magic: u32) -> String {
 #[cfg(target_os = "linux")]
 fn file_system(path: &Path) -> Option<String> {
     // f_type is a signed word on glibc; the magic numbers are its low 32 bits.
-    Some(file_system_name(statfs(path)?.f_type as u32))
+    let bytes = statfs(path)?.f_type.to_le_bytes();
+    Some(file_system_name(u32::from_le_bytes(
+        *bytes.first_chunk::<4>()?,
+    )))
 }
 
 #[cfg(target_os = "macos")]
+#[forbid(unsafe_code)]
 fn file_system(path: &Path) -> Option<String> {
     let stat = statfs(path)?;
-    // SAFETY: the kernel NUL-terminates the type name within the array.
-    let name = unsafe { std::ffi::CStr::from_ptr(stat.f_fstypename.as_ptr()) };
+    let bytes = stat.f_fstypename.map(i8::cast_unsigned);
+    let name = std::ffi::CStr::from_bytes_until_nul(&bytes).ok()?;
     Some(name.to_string_lossy().into_owned())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn file_system(_path: &Path) -> Option<String> {
+const fn file_system(_path: &Path) -> Option<String> {
     None
 }
 
@@ -1175,7 +1188,7 @@ fn usb_cameras() -> Vec<UsbCamera> {
         .collect()
 }
 #[cfg(all(test, not(all(target_os = "linux", feature = "usb"))))]
-fn usb_cameras() -> Vec<UsbCamera> {
+const fn usb_cameras() -> Vec<UsbCamera> {
     Vec::new()
 }
 
@@ -1670,11 +1683,11 @@ mod tests {
         );
         // On a read-only system with a noexec /tmp the bundled copy has
         // nowhere to run from, and the system's is used instead.
-        let instead = Ok(FfmpegHealth {
+        let instead = found.map(|health| FfmpegHealth {
             bundled_error: Some(
                 "cannot extract the bundled FFmpeg to a folder that runs programs (/tmp/capturefab-0/cache: mounted noexec)".into(),
             ),
-            ..found.clone().unwrap()
+            ..health
         });
         let check = ffmpeg_check(&instead, false, true);
         assert_eq!(check.level, Level::Ok);
@@ -1718,7 +1731,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn a_shared_session_directory_warns_with_chmod() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt as _;
         let dir =
             std::env::temp_dir().join(format!("capturefab-doctor-private-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1743,7 +1756,7 @@ mod tests {
             "{fix}"
         );
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(crate::dirs::check_private_dir(&dir).is_ok());
+        crate::dirs::check_private_dir(&dir).unwrap();
         assert_eq!(private_dirs_check(&[], None, None), None);
         let runtime = place("/tmp/capturefab-1000", "tmpfs", 400 << 20);
         let foreign = private_dirs_check(

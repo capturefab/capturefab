@@ -1,4 +1,4 @@
-//! Apple's JPEG engine through VideoToolbox (`videotoolbox` feature,
+//! Apple's JPEG engine through `VideoToolbox` (`videotoolbox` feature,
 //! macOS), a system framework that runs in the camera worker.
 //!
 //! Apple silicon has a dedicated JPEG encoder. A compression session that
@@ -7,16 +7,17 @@
 //!
 //! A frame is converted once, from its rows straight into the session's
 //! IOSurface-backed buffer that the engine reads, as full-range BT.601
-//! Y'CbCr 4:2:0 (NV12, `'420f'`): the JFIF color space decoders assume,
+//! `Y'CbCr` 4:2:0 (NV12, `'420f'`): the JFIF color space decoders assume,
 //! which the engine's own RGB conversion does not produce (it shifts colors
 //! by several levels). RGB8 rows are read in place; Bayer, packed and other
 //! layouts are decoded a row at a time on the way. The JPEG stays in the
 //! sample buffer the engine wrote it to. Sessions are kept per frame size.
-#![allow(unsafe_code)]
+
+#![deny(let_underscore_drop, unused_results)]
 
 use super::backend::Backend;
 use crate::frame::{Body, Chroma, FrameRef, Yuv420};
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context as _, Result, bail, ensure};
 use std::{
     ffi::c_void,
     ptr::{null, null_mut},
@@ -158,7 +159,7 @@ const SESSIONS: usize = 2;
 /// A JPEG in the sample buffer the engine wrote it to.
 pub struct Output {
     /// Retained here, and released on drop.
-    sample: CMSampleBufferRef,
+    _sample: Cf,
     data: *const u8,
     len: usize,
 }
@@ -175,12 +176,6 @@ impl std::ops::Deref for Output {
         unsafe { std::slice::from_raw_parts(self.data, self.len) }
     }
 }
-impl Drop for Output {
-    fn drop(&mut self) {
-        // SAFETY: retained in `on_output`, released once here.
-        unsafe { CFRelease(self.sample) }
-    }
-}
 
 /// What the output callback leaves for one frame: the retained sample
 /// buffer, or the engine's error status.
@@ -195,45 +190,51 @@ extern "C" fn on_output(
 ) {
     // SAFETY: `frame` is the `Slot` passed to EncodeFrame, which outlives
     // the synchronous CompleteFrames call that delivers it.
-    let slot = unsafe { &mut *(frame as *mut Slot) };
+    let slot = unsafe { &mut *frame.cast::<Slot>() };
     *slot = Some(if status != 0 || sample.is_null() {
         Err(if status != 0 { status } else { -1 })
     } else {
         // SAFETY: a live sample buffer, kept until its `Output` drops.
-        Ok(unsafe { CFRetain(sample) as CMSampleBufferRef })
+        Ok(unsafe { CFRetain(sample).cast_mut() })
     });
 }
 
 /// The JPEG of a sample buffer the callback retained: its own bytes where
 /// they are contiguous, as they normally are, else a counted copy.
 fn output(sample: CMSampleBufferRef) -> Result<Body<'static>> {
+    let sample = Cf(sample);
     // SAFETY: a retained sample buffer; its block buffer lives as long.
-    unsafe {
-        let block = CMSampleBufferGetDataBuffer(sample);
-        if block.is_null() {
-            CFRelease(sample);
-            bail!("the JPEG engine returned no data");
-        }
-        let len = CMBlockBufferGetDataLength(block);
-        if CMBlockBufferIsRangeContiguous(block, 0, 0) != 0 {
-            let (mut at_offset, mut total, mut data) = (0, 0, null_mut());
-            let status =
-                CMBlockBufferGetDataPointer(block, 0, &mut at_offset, &mut total, &mut data);
-            if status == 0 && !data.is_null() && at_offset == len {
-                crate::copies::record(crate::copies::Site::JpegEncode, len);
-                return Ok(Body::Native(Output { sample, data, len }));
-            }
-        }
-        let mut bytes = vec![0u8; len];
-        let status = CMBlockBufferCopyDataBytes(block, 0, len, bytes.as_mut_ptr().cast());
-        CFRelease(sample);
-        ensure!(
-            status == 0,
-            "cannot read the JPEG engine's output (status {status})"
-        );
-        crate::copies::record(crate::copies::Site::OutputCopy, len);
-        Ok(Body::Vec(bytes))
+    let block = unsafe { CMSampleBufferGetDataBuffer(sample.0.cast_mut()) };
+    if block.is_null() {
+        bail!("the JPEG engine returned no data");
     }
+    // SAFETY: the block is retained by `sample` throughout this function.
+    let len = unsafe { CMBlockBufferGetDataLength(block) };
+    // SAFETY: checks the complete range of that live block.
+    if unsafe { CMBlockBufferIsRangeContiguous(block, 0, 0) } != 0 {
+        let (mut at_offset, mut total, mut data) = (0, 0, null_mut());
+        // SAFETY: the live block writes to the initialized output slots.
+        let status = unsafe {
+            CMBlockBufferGetDataPointer(block, 0, &raw mut at_offset, &raw mut total, &raw mut data)
+        };
+        if status == 0 && !data.is_null() && at_offset == len {
+            crate::copies::record(crate::copies::Site::JpegEncode, len);
+            return Ok(Body::Native(Output {
+                _sample: sample,
+                data,
+                len,
+            }));
+        }
+    }
+    let mut bytes = vec![0u8; len];
+    // SAFETY: the retained block copies `len` bytes into a buffer of that size.
+    let status = unsafe { CMBlockBufferCopyDataBytes(block, 0, len, bytes.as_mut_ptr().cast()) };
+    ensure!(
+        status == 0,
+        "cannot read the JPEG engine's output (status {status})"
+    );
+    crate::copies::record(crate::copies::Site::OutputCopy, len);
+    Ok(Body::Vec(bytes))
 }
 
 /// An owned CoreFoundation object.
@@ -241,7 +242,7 @@ struct Cf(CFTypeRef);
 impl Drop for Cf {
     fn drop(&mut self) {
         if !self.0.is_null() {
-            // SAFETY: created by a CF "Create" function and owned here.
+            // SAFETY: created or retained by a CF function and owned here.
             unsafe { CFRelease(self.0) }
         }
     }
@@ -252,14 +253,14 @@ fn dictionary() -> Cf {
         CFDictionaryCreateMutable(
             null(),
             0,
-            &kCFTypeDictionaryKeyCallBacks,
-            &kCFTypeDictionaryValueCallBacks,
+            &raw const kCFTypeDictionaryKeyCallBacks,
+            &raw const kCFTypeDictionaryValueCallBacks,
         )
     })
 }
 fn set(dict: &Cf, key: CFStringRef, value: CFTypeRef) {
     // SAFETY: `dict` is a live mutable dictionary; values are retained.
-    unsafe { CFDictionarySetValue(dict.0 as CFMutableDictionaryRef, key, value) }
+    unsafe { CFDictionarySetValue(dict.0.cast_mut(), key, value) }
 }
 fn int(value: i32) -> Cf {
     // SAFETY: reads one i32.
@@ -277,10 +278,9 @@ unsafe impl Send for Session {}
 impl Drop for Session {
     fn drop(&mut self) {
         // SAFETY: the session was created here and is no longer in use.
-        unsafe {
-            VTCompressionSessionInvalidate(self.raw);
-            CFRelease(self.raw);
-        }
+        unsafe { VTCompressionSessionInvalidate(self.raw) };
+        // SAFETY: invalidation finished; release this session's retained reference.
+        unsafe { CFRelease(self.raw) };
     }
 }
 impl Session {
@@ -291,37 +291,42 @@ impl Session {
         );
         let spec = dictionary();
         // SAFETY: framework constants are valid for the process lifetime.
-        unsafe {
-            set(
-                &spec,
-                kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder,
-                kCFBooleanTrue,
-            );
-        }
+        let hardware =
+            unsafe { kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder };
+        // SAFETY: the framework boolean is valid for the process lifetime.
+        let enabled = unsafe { kCFBooleanTrue };
+        set(&spec, hardware, enabled);
         let attributes = dictionary();
         let surface = dictionary();
-        let (format, w, h) = (int(PIXEL_420F), int(width as i32), int(height as i32));
+        let signed_width = i32::try_from(width).context("JPEG width exceeds encoder range")?;
+        let signed_height = i32::try_from(height).context("JPEG height exceeds encoder range")?;
+        let (format, w, h) = (int(PIXEL_420F), int(signed_width), int(signed_height));
         // SAFETY: as above.
-        unsafe {
-            set(&attributes, kCVPixelBufferPixelFormatTypeKey, format.0);
-            set(&attributes, kCVPixelBufferWidthKey, w.0);
-            set(&attributes, kCVPixelBufferHeightKey, h.0);
-            set(&attributes, kCVPixelBufferIOSurfacePropertiesKey, surface.0);
-        }
+        let pixel_format = unsafe { kCVPixelBufferPixelFormatTypeKey };
+        // SAFETY: a framework key, valid for the process lifetime.
+        let width_key = unsafe { kCVPixelBufferWidthKey };
+        // SAFETY: a framework key, valid for the process lifetime.
+        let height_key = unsafe { kCVPixelBufferHeightKey };
+        // SAFETY: a framework key, valid for the process lifetime.
+        let surface_key = unsafe { kCVPixelBufferIOSurfacePropertiesKey };
+        set(&attributes, pixel_format, format.0);
+        set(&attributes, width_key, w.0);
+        set(&attributes, height_key, h.0);
+        set(&attributes, surface_key, surface.0);
         let mut raw = null_mut();
         // SAFETY: all arguments are valid; the session is returned retained.
         let status = unsafe {
             VTCompressionSessionCreate(
                 null(),
-                width as i32,
-                height as i32,
+                signed_width,
+                signed_height,
                 CODEC_JPEG,
                 spec.0,
                 attributes.0,
                 null(),
                 Some(on_output),
                 null_mut(),
-                &mut raw,
+                &raw mut raw,
             )
         };
         if status != 0 || raw.is_null() {
@@ -329,15 +334,13 @@ impl Session {
         }
         let session = Self { raw, width, height };
         let quality = ENGINE_QUALITY;
-        // SAFETY: reads one f32; the key is a framework constant.
-        let status = unsafe {
-            let quality = Cf(CFNumberCreate(
-                null(),
-                NUMBER_FLOAT32,
-                (&raw const quality).cast(),
-            ));
-            VTSessionSetProperty(raw, kVTCompressionPropertyKey_Quality, quality.0)
-        };
+        // SAFETY: reads one initialized f32, copied into the returned CF number.
+        let quality =
+            Cf(unsafe { CFNumberCreate(null(), NUMBER_FLOAT32, (&raw const quality).cast()) });
+        // SAFETY: a framework key, valid for the process lifetime.
+        let quality_key = unsafe { kVTCompressionPropertyKey_Quality };
+        // SAFETY: the live session receives the live quality number under its quality key.
+        let status = unsafe { VTSessionSetProperty(raw, quality_key, quality.0) };
         ensure!(
             status == 0,
             "cannot set the JPEG engine's quality (status {status})"
@@ -347,75 +350,84 @@ impl Session {
 
     fn encode(&mut self, view: FrameRef<'_>) -> Result<Body<'static>> {
         let (width, height) = (self.width as usize, self.height as usize);
-        // SAFETY: the pool belongs to the live session; the buffer is
-        // released below and its planes are written only while locked,
-        // within the extents CoreVideo reports for them.
-        unsafe {
-            let pool = VTCompressionSessionGetPixelBufferPool(self.raw);
-            ensure!(!pool.is_null(), "the JPEG engine has no buffer pool");
-            let mut buffer = null_mut();
-            let status = CVPixelBufferPoolCreatePixelBuffer(null(), pool, &mut buffer);
-            ensure!(
-                status == 0 && !buffer.is_null(),
-                "cannot allocate a JPEG engine buffer (status {status})"
+        // SAFETY: the pool belongs to this live session.
+        let pool = unsafe { VTCompressionSessionGetPixelBufferPool(self.raw) };
+        ensure!(!pool.is_null(), "the JPEG engine has no buffer pool");
+        let mut buffer = null_mut();
+        // SAFETY: the live pool writes a retained buffer to the initialized output slot.
+        let status = unsafe { CVPixelBufferPoolCreatePixelBuffer(null(), pool, &raw mut buffer) };
+        ensure!(
+            status == 0 && !buffer.is_null(),
+            "cannot allocate a JPEG engine buffer (status {status})"
+        );
+        let buffer = Cf(buffer);
+        let pixels = buffer.0.cast_mut();
+        // SAFETY: `buffer` owns this live pixel buffer.
+        let status = unsafe { CVPixelBufferLockBaseAddress(pixels, 0) };
+        ensure!(status == 0, "cannot lock the JPEG engine's buffer");
+        let plane = |i| {
+            // SAFETY: only planes 0 and 1 of this locked two-plane buffer are queried.
+            let base = unsafe { CVPixelBufferGetBaseAddressOfPlane(pixels, i) };
+            // SAFETY: the same live plane provides its row extent.
+            let stride = unsafe { CVPixelBufferGetBytesPerRowOfPlane(pixels, i) };
+            // SAFETY: the same live plane provides its height.
+            let rows = unsafe { CVPixelBufferGetHeightOfPlane(pixels, i) };
+            let len = stride
+                .checked_mul(rows)
+                .filter(|&len| isize::try_from(len).is_ok())?;
+            (!base.is_null()).then(|| {
+                // SAFETY: CoreVideo supplies a writable plane of this checked extent;
+                // the buffer remains locked and its two planes are disjoint.
+                let bytes = unsafe { std::slice::from_raw_parts_mut(base, len) };
+                (bytes, stride, rows)
+            })
+        };
+        // SAFETY: the pixel buffer is live and locked.
+        let planes = (unsafe { CVPixelBufferGetPlaneCount(pixels) } == 2)
+            .then(|| plane(0).zip(plane(1)))
+            .flatten()
+            .filter(
+                |((_, luma_stride, luma_rows), (_, chroma_stride, chroma_rows))| {
+                    *luma_stride >= width
+                        && *luma_rows >= height
+                        && *chroma_stride >= width.div_ceil(2) * 2
+                        && *chroma_rows >= height.div_ceil(2)
+                },
             );
-            let buffer = Cf(buffer);
-            let pixels = buffer.0 as CVPixelBufferRef;
-            ensure!(
-                CVPixelBufferLockBaseAddress(pixels, 0) == 0,
-                "cannot lock the JPEG engine's buffer"
+        let fits = planes.is_some();
+        if let Some(((luma, luma_stride, _), (cbcr, stride, _))) = planes {
+            crate::frame::ycbcr420(
+                view,
+                Yuv420 {
+                    luma,
+                    luma_stride,
+                    chroma: Chroma::Interleaved { cbcr, stride },
+                },
             );
-            let plane = |i| {
-                let (base, stride, rows) = (
-                    CVPixelBufferGetBaseAddressOfPlane(pixels, i),
-                    CVPixelBufferGetBytesPerRowOfPlane(pixels, i),
-                    CVPixelBufferGetHeightOfPlane(pixels, i),
-                );
-                (!base.is_null()).then(|| {
-                    (
-                        std::slice::from_raw_parts_mut(base, stride * rows),
-                        stride,
-                        rows,
-                    )
-                })
-            };
-            let planes = (CVPixelBufferGetPlaneCount(pixels) == 2)
-                .then(|| plane(0).zip(plane(1)))
-                .flatten()
-                .filter(
-                    |((_, luma_stride, luma_rows), (_, chroma_stride, chroma_rows))| {
-                        *luma_stride >= width
-                            && *luma_rows >= height
-                            && *chroma_stride >= width.div_ceil(2) * 2
-                            && *chroma_rows >= height.div_ceil(2)
-                    },
-                );
-            let fits = planes.is_some();
-            if let Some(((luma, luma_stride, _), (cbcr, stride, _))) = planes {
-                crate::frame::ycbcr420(
-                    view,
-                    Yuv420 {
-                        luma,
-                        luma_stride,
-                        chroma: Chroma::Interleaved { cbcr, stride },
-                    },
-                );
-                crate::copies::record(
-                    crate::copies::Site::StillTransform,
-                    width * height + width.div_ceil(2) * 2 * height.div_ceil(2),
-                );
-            }
-            CVPixelBufferUnlockBaseAddress(pixels, 0);
-            ensure!(fits, "the JPEG engine's buffer has an unexpected layout");
-            let mut slot: Slot = None;
-            let pts = CMTime {
-                value: 0,
-                timescale: 1,
-                flags: VALID,
-                epoch: 0,
-            };
-            let invalid = CMTime { flags: 0, ..pts };
-            let status = VTCompressionSessionEncodeFrame(
+            crate::copies::record(
+                crate::copies::Site::StillTransform,
+                width * height + width.div_ceil(2) * 2 * height.div_ceil(2),
+            );
+        }
+        // SAFETY: all plane slices are out of scope and this buffer was locked above.
+        let status = unsafe { CVPixelBufferUnlockBaseAddress(pixels, 0) };
+        ensure!(
+            status == 0,
+            "cannot unlock the JPEG engine's buffer (status {status})"
+        );
+        ensure!(fits, "the JPEG engine's buffer has an unexpected layout");
+        let mut slot: Slot = None;
+        let pts = CMTime {
+            value: 0,
+            timescale: 1,
+            flags: VALID,
+            epoch: 0,
+        };
+        let invalid = CMTime { flags: 0, ..pts };
+        // SAFETY: the live session receives a live, unlocked pixel buffer;
+        // `slot` stays alive through the synchronous CompleteFrames call below.
+        let status = unsafe {
+            VTCompressionSessionEncodeFrame(
                 self.raw,
                 pixels,
                 pts,
@@ -423,37 +435,39 @@ impl Session {
                 null(),
                 (&raw mut slot).cast(),
                 null_mut(),
-            );
-            ensure!(
-                status == 0,
-                "the JPEG engine rejected the frame (status {status})"
-            );
-            let status = VTCompressionSessionCompleteFrames(self.raw, invalid);
-            if status != 0 {
-                if let Some(Ok(sample)) = slot {
-                    CFRelease(sample);
-                }
-                bail!("the JPEG engine failed (status {status})");
+            )
+        };
+        ensure!(
+            status == 0,
+            "the JPEG engine rejected the frame (status {status})"
+        );
+        // SAFETY: the session is live and the callback's output slot is still in scope.
+        let status = unsafe { VTCompressionSessionCompleteFrames(self.raw, invalid) };
+        if status != 0 {
+            if let Some(Ok(sample)) = slot {
+                // SAFETY: the callback retained this sample; no output will take ownership.
+                unsafe { CFRelease(sample) };
             }
-            match slot {
-                Some(Ok(sample)) => output(sample),
-                Some(Err(status)) => bail!("the JPEG engine failed (status {status})"),
-                None => bail!("the JPEG engine produced no output"),
-            }
+            bail!("the JPEG engine failed (status {status})");
+        }
+        match slot {
+            Some(Ok(sample)) => output(sample),
+            Some(Err(status)) => bail!("the JPEG engine failed (status {status})"),
+            None => bail!("the JPEG engine produced no output"),
         }
     }
 }
 
 /// The engine, with a session for each of the last frame sizes it encoded.
-pub struct Encoder {
+pub(crate) struct Encoder {
     sessions: Vec<Session>,
 }
 
 impl Encoder {
     /// The engine, if this Mac has one: a session that requires hardware
     /// opens only on it.
-    pub fn open() -> Result<Self> {
-        Session::open(64, 64)?;
+    pub(crate) fn open() -> Result<Self> {
+        drop(Session::open(64, 64)?);
         Ok(Self {
             sessions: Vec::new(),
         })
@@ -470,26 +484,28 @@ impl Backend for Encoder {
             "the JPEG engine takes only color frames at the default quality"
         );
         crate::frame::validate_source(view.frame)?;
-        let size = (view.width as u32, view.height as u32);
-        let index = match self
+        let size = (
+            u32::try_from(view.width).context("JPEG view width exceeds u32")?,
+            u32::try_from(view.height).context("JPEG view height exceeds u32")?,
+        );
+        let index = if let Some(index) = self
             .sessions
             .iter()
             .position(|session| (session.width, session.height) == size)
         {
-            Some(index) => index,
-            None => {
-                if self.sessions.len() == SESSIONS {
-                    // Close the oldest first, so fewer hold the engine.
-                    self.sessions.remove(0);
-                }
-                self.sessions.push(Session::open(size.0, size.1)?);
-                self.sessions.len() - 1
+            index
+        } else {
+            if self.sessions.len() == SESSIONS {
+                // Close the oldest first, so fewer hold the engine.
+                drop(self.sessions.remove(0));
             }
+            self.sessions.push(Session::open(size.0, size.1)?);
+            self.sessions.len() - 1
         };
         let result = self.sessions[index].encode(view);
         if result.is_err() {
             // A session that failed is not reused.
-            self.sessions.remove(index);
+            drop(self.sessions.remove(index));
         }
         result
     }
@@ -517,9 +533,9 @@ mod tests {
             .map(|i| {
                 let (x, y) = (i % w, i / w);
                 [
-                    (x * 255 / w) as u8,
-                    (y * 255 / h) as u8,
-                    ((x + y) * 255 / (w + h)) as u8,
+                    u8::try_from(x * 255 / w).unwrap(),
+                    u8::try_from(y * 255 / h).unwrap(),
+                    u8::try_from((x + y) * 255 / (w + h)).unwrap(),
                 ]
             })
             .collect();
@@ -528,20 +544,25 @@ mod tests {
             RGB8 => rgb.as_flattened().to_vec(),
             // Each sample takes its filter's channel, packed for 12p.
             0x0108_0009 => (0..w * h)
-                .map(|i| rgb[i][pattern[((i / w) & 1) * 2 + ((i % w) & 1)]])
+                .map(|i| rgb[i][usize::from(pattern[((i / w) & 1) * 2 + ((i % w) & 1)])])
                 .collect(),
             0x010c_0059 => {
                 let samples: Vec<u16> = (0..w * h)
-                    .map(|i| u16::from(rgb[i][pattern[((i / w) & 1) * 2 + ((i % w) & 1)]]) << 4)
+                    .map(|i| {
+                        u16::from(rgb[i][usize::from(pattern[((i / w) & 1) * 2 + ((i % w) & 1)])])
+                            << 4
+                    })
                     .collect();
                 samples
                     .chunks(2)
                     .flat_map(|pair| {
                         let (a, b) = (pair[0], *pair.get(1).unwrap_or(&0));
+                        let [a_low, a_high] = a.to_le_bytes();
+                        let [b_low, b_high] = b.to_le_bytes();
                         [
-                            a as u8,
-                            ((a >> 8) as u8 & 0x0f) | ((b as u8 & 0x0f) << 4),
-                            (b >> 4) as u8,
+                            a_low,
+                            (a_high & 0x0f) | ((b_low & 0x0f) << 4),
+                            (b_low >> 4) | (b_high << 4),
                         ]
                     })
                     .collect()
@@ -559,13 +580,13 @@ mod tests {
 
     fn engine() -> Option<Engine> {
         let engine = Engine::new(Kind::VideoToolbox, Encoder::open);
-        match engine.unavailable() {
-            Some(reason) => {
+        engine.unavailable().map_or_else(
+            || Some(engine),
+            |reason| {
                 eprintln!("no VideoToolbox JPEG engine ({reason}); skipped");
                 None
-            }
-            None => Some(engine),
-        }
+            },
+        )
     }
 
     /// On this Mac's engine, color frames of every kind and size pass the
@@ -618,22 +639,22 @@ mod tests {
         let frame = scene(0x0108_0009, 1920, 1080);
         // Checked once, so later frames go straight to the engine when it
         // is faster here, else to the CPU.
-        engine.encode(&frame, QUALITY, true).unwrap();
-        let threads: Vec<_> = (0..2)
-            .map(|_| {
-                let (engine, frame) = (engine.clone(), frame.clone());
-                std::thread::spawn(move || {
-                    (0..20)
-                        .map(|_| engine.encode(&frame, QUALITY, false).unwrap())
-                        .collect::<Vec<_>>()
-                })
+        drop(engine.encode(&frame, QUALITY, true).unwrap());
+        let threads: Vec<_> = std::iter::repeat_with(|| {
+            let (engine, frame) = (engine.clone(), frame.clone());
+            std::thread::spawn(move || {
+                std::iter::repeat_with(|| engine.encode(&frame, QUALITY, false).unwrap())
+                    .take(20)
+                    .collect::<Vec<_>>()
             })
-            .collect();
+        })
+        .take(2)
+        .collect();
         let mut kinds = std::collections::HashSet::new();
         for thread in threads {
             for jpeg in thread.join().unwrap() {
                 assert!(super::super::well_formed(&jpeg, 1920, 1080));
-                kinds.insert(matches!(jpeg, Body::Native(_)));
+                let _ = kinds.insert(matches!(jpeg, Body::Native(_)));
             }
         }
         assert!(!kinds.is_empty());

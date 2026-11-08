@@ -1,7 +1,13 @@
 //! Rollback checkpoints for camera changes that write several values: what
 //! a change would replace is read from the camera first, never inferred
 //! from a cached snapshot, and a failure writes it all back.
-use super::*;
+#![forbid(unsafe_code)]
+use super::{
+    AutoController, Camera, CommandState, Context, Duration, Forwarder, Instant, JobStatus, Result,
+    Scheduled, SessionCommand, Value, WorkerCommand, WorkerHandle, camera_mut, end_auto_job,
+    ensure, enter_auto, json, process_plain, publish_auto, refresh, release_auto,
+};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 mod setup;
@@ -18,17 +24,18 @@ struct Configuration {
     auto: Option<AutoController>,
 }
 
-fn text(value: &Value) -> String {
+fn text(value: &Value) -> Cow<'_, str> {
     match value {
-        Value::String(value) => value.clone(),
-        Value::Number(number) if number.is_f64() => number.as_f64().unwrap().to_string(),
-        value => value.to_string(),
+        Value::String(value) => Cow::Borrowed(value),
+        Value::Number(number) if number.is_f64() => {
+            Cow::Owned(number.as_f64().unwrap().to_string())
+        }
+        value => Cow::Owned(value.to_string()),
     }
 }
 
-fn evolving(auto: &Option<AutoController>, feature: &str) -> bool {
-    auto.as_ref()
-        .is_some_and(|controller| controller.manages(feature))
+fn evolving(auto: Option<&AutoController>, feature: &str) -> bool {
+    auto.is_some_and(|controller| controller.manages(feature))
         && matches!(
             feature,
             "ExposureTime" | "ExposureTimeAbs" | "Gain" | "GainAbs" | "BalanceRatio"
@@ -48,15 +55,21 @@ fn addressed<T>(
 
 /// How results name a value: `Feature`, or `Feature[Selector=Value,...]`.
 fn address_name(address: &Address) -> String {
+    let mut name = address.feature.clone();
     if address.selectors.is_empty() {
-        return address.feature.clone();
+        return name;
     }
-    let bank = address
-        .selectors
-        .iter()
-        .map(|(selector, value)| format!("{selector}={value}"))
-        .collect::<Vec<_>>();
-    format!("{}[{}]", address.feature, bank.join(","))
+    name.push('[');
+    for (index, (selector, value)) in address.selectors.iter().enumerate() {
+        if index != 0 {
+            name.push(',');
+        }
+        name.push_str(selector);
+        name.push('=');
+        name.push_str(value);
+    }
+    name.push(']');
+    name
 }
 
 /// Read the value at `address` for a checkpoint. A bank hidden by
@@ -104,7 +117,7 @@ fn addresses(
         let current = camera
             .get(&selector)
             .with_context(|| format!("read {selector} for rollback"))?;
-        let mut choices = vec![text(&current)];
+        let mut choices = vec![text(&current).into_owned()];
         if banks(&selector) {
             for choice in camera.choices(&selector).unwrap_or_default() {
                 if !choices.contains(&choice) {
@@ -115,17 +128,17 @@ fn addresses(
         if addresses.len().saturating_mul(choices.len()) > 256 {
             return Err(TooManyBanks(feature.into()).into());
         }
+        let selector = selector.as_str();
         addresses = addresses
             .into_iter()
             .flat_map(|address| {
-                choices
-                    .iter()
-                    .map(|choice| {
-                        let mut address = address.clone();
-                        address.selectors.push((selector.clone(), choice.clone()));
-                        address
-                    })
-                    .collect::<Vec<_>>()
+                choices.iter().map(move |choice| {
+                    let mut address = address.clone();
+                    address
+                        .selectors
+                        .push((selector.to_owned(), choice.clone()));
+                    address
+                })
             })
             .collect();
     }
@@ -149,12 +162,12 @@ const COUPLED: [&[&str]; 2] = [
 /// auto mode manages, and the exposure, gain and white-balance features an
 /// auto mode it ends may have locked. Every gain and white-balance bank is
 /// included, since auto can change them; any other feature stays at its
-/// current bank. Never a walk of every feature, which on GigE is hundreds
+/// current bank. Never a walk of every feature, which on `GigE` is hundreds
 /// of round trips. `written` requires each named feature, including
 /// controls absent from the feature tree.
 fn capture(
     camera: &mut Camera,
-    auto: &Option<AutoController>,
+    auto: Option<&AutoController>,
     written: &[&str],
 ) -> Result<Configuration> {
     let mut required = written
@@ -220,7 +233,7 @@ fn capture(
     }
     Ok(Configuration {
         values,
-        auto: auto.clone(),
+        auto: auto.cloned(),
     })
 }
 
@@ -252,7 +265,6 @@ fn restore(
     camera: &mut Camera,
     auto: &mut Option<AutoController>,
     target: &Configuration,
-    fields: &[Address],
     switch_auto: bool,
 ) -> Result<()> {
     if switch_auto {
@@ -266,37 +278,34 @@ fn restore(
             .get(*address)
             .is_some_and(|value| !value.is_null())
     };
-    let mut pending = fields
-        .iter()
-        .filter(restorable)
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut pending = target.values.keys().filter(restorable).collect::<Vec<_>>();
     // The same order as a setup restore: a switch that arms (TriggerMode On,
     // LineMode Output) after its source, one that disarms before it, auto
     // flags last and selectors after the values in their banks. Retry
     // dependency-locked fields after limits and enabling controls settle.
-    pending.sort_by_cached_key(|address| {
+    pending.sort_by_cached_key(|&address| {
         (
             crate::setup::order_key(&address.feature, Some(&text(&target.values[address]))),
-            address.selectors.clone(),
+            address.selectors.as_slice(),
         )
     });
     let mut errors = Vec::new();
-    for _ in 0..fields.len().saturating_add(1).clamp(3, 32) {
+    for _ in 0..target.values.len().saturating_add(1).clamp(3, 32) {
         errors.clear();
         let mut failures = BTreeMap::new();
-        for address in &pending {
+        for &address in &pending {
             if let Err(error) = set_exact(camera, address, &target.values[address]) {
-                failures.insert(address.clone(), format!("{error:#}"));
+                failures.insert(address, format!("{error:#}"));
             }
         }
         // A later write may clamp an earlier field. Verify the final state,
         // rather than treating each successful write as permanently settled.
-        pending = fields
-            .iter()
+        pending = target
+            .values
+            .keys()
             .filter(restorable)
             .filter(|address| {
-                if evolving(&target.auto, &address.feature) {
+                if evolving(target.auto.as_ref(), &address.feature) {
                     return false;
                 }
                 match addressed(camera, address, |camera| camera.get(&address.feature)) {
@@ -307,8 +316,7 @@ fn restore(
                             address.feature,
                             failures
                                 .get(*address)
-                                .map(String::as_str)
-                                .unwrap_or("did not retain its recorded value")
+                                .map_or("did not retain its recorded value", String::as_str)
                         ));
                         true
                     }
@@ -318,7 +326,6 @@ fn restore(
                     }
                 }
             })
-            .cloned()
             .collect();
         if pending.is_empty() {
             break;
@@ -329,7 +336,7 @@ fn restore(
         "could not restore camera values: {}",
         errors.join("; ")
     );
-    *auto = target.auto.clone();
+    auto.clone_from(&target.auto);
     if let Some(controller) = auto.as_mut() {
         controller.invalidate();
     }
@@ -338,39 +345,46 @@ fn restore(
 
 /// Publish the camera after a rollback: its state and auto mode. A
 /// rollback to manual mode ends continuous auto exposure.
-fn publish(h: &WorkerHandle, camera: &Option<Camera>, auto: &Option<AutoController>) {
+fn publish(h: &WorkerHandle, camera: Option<&Camera>, auto: Option<&AutoController>) {
     refresh(h, camera);
     if let Some(controller) = auto {
         publish_auto(h, controller);
     } else {
-        h.state.write().unwrap_or_else(|e| e.into_inner()).auto = None;
+        h.state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .auto = None;
         end_auto_job(h, JobStatus::Done);
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn process(
     h: &WorkerHandle,
-    camera: &mut Option<Camera>,
-    forwarder: &mut Option<(Forwarder, f64)>,
-    auto: &mut Option<AutoController>,
-    jobs: &mut Vec<Scheduled>,
-    next_job: &mut u64,
-    scheduled_stream: &mut JobStream,
+    state: CommandState<'_>,
     command: WorkerCommand,
 ) -> Result<Value> {
+    let CommandState {
+        camera,
+        forwarder,
+        auto,
+        jobs,
+        next_job,
+        scheduled_stream,
+    } = state;
     command.validate()?;
     match command.session() {
         // Reading and comparing switch selectors only to read, and restore them.
-        Some(SessionCommand::ReadSetup) => return setup::read(h, camera_mut(camera)?, auto),
+        Some(SessionCommand::ReadSetup) => {
+            return setup::read(h, camera_mut(camera)?, auto.as_ref());
+        }
         Some(SessionCommand::SetupDiff {
             setup: Some(document),
             allow_other_model,
             ..
         }) => {
-            let holders = setup::stream_holders(forwarder, jobs);
+            let holders = setup::stream_holders(forwarder.as_ref(), jobs);
             let c = camera_mut(camera)?;
-            let plan = setup::plan(c, auto, &holders, document, *allow_other_model)?;
+            let plan = setup::plan(c, auto.as_ref(), &holders, document, *allow_other_model)?;
             return Ok(setup::report(&plan, &c.info));
         }
         Some(SessionCommand::SetupDiff { .. } | SessionCommand::ApplySetup { setup: None, .. }) => {
@@ -391,12 +405,14 @@ pub(super) fn process(
     if !atomic {
         return process_plain(
             h,
-            camera,
-            forwarder,
-            auto,
-            jobs,
-            next_job,
-            scheduled_stream,
+            CommandState {
+                camera,
+                forwarder,
+                auto,
+                jobs,
+                next_job,
+                scheduled_stream,
+            },
             command,
         );
     }
@@ -410,8 +426,8 @@ pub(super) fn process(
             strict,
             ..
         }) => {
-            let holders = setup::stream_holders(forwarder, jobs);
-            let plan = setup::plan(c, auto, &holders, document, *allow_other_model)?;
+            let holders = setup::stream_holders(forwarder.as_ref(), jobs);
+            let plan = setup::plan(c, auto.as_ref(), &holders, document, *allow_other_model)?;
             plan.check(*strict)?;
             Some(plan)
         }
@@ -433,7 +449,7 @@ pub(super) fn process(
         _ => Vec::new(),
     };
     let apply_setup = matches!(command.session(), Some(SessionCommand::ApplySetup { .. }));
-    let mut before = match capture(c, auto, &written) {
+    let mut before = match capture(c, auto.as_ref(), &written) {
         Ok(before) => before,
         // Its values must be restorable together, so it writes none.
         Err(error) if apply_setup => {
@@ -446,12 +462,14 @@ pub(super) fn process(
         Err(_) => {
             return process_plain(
                 h,
-                camera,
-                forwarder,
-                auto,
-                jobs,
-                next_job,
-                scheduled_stream,
+                CommandState {
+                    camera,
+                    forwarder,
+                    auto,
+                    jobs,
+                    next_job,
+                    scheduled_stream,
+                },
                 command,
             );
         }
@@ -477,19 +495,21 @@ pub(super) fn process(
                     setup::apply(
                         h,
                         camera,
-                        forwarder,
+                        forwarder.as_ref(),
                         auto,
                         jobs,
-                        document,
-                        plan,
-                        *strict,
+                        setup::Application {
+                            setup: document,
+                            plan,
+                            strict: *strict,
+                        },
                         |camera, address| setup::extend_at(camera, &mut before, address),
                     )
                 })
                 .and_then(|mut result| {
                     if restart {
                         camera_mut(camera)?.start()?;
-                        refresh(h, camera);
+                        refresh(h, camera.as_ref());
                         result["restarted_stream"] = json!(true);
                     }
                     Ok(result)
@@ -497,12 +517,14 @@ pub(super) fn process(
         }
         _ => process_plain(
             h,
-            camera,
-            forwarder,
-            auto,
-            jobs,
-            next_job,
-            scheduled_stream,
+            CommandState {
+                camera,
+                forwarder,
+                auto,
+                jobs,
+                next_job,
+                scheduled_stream,
+            },
             command.clone(),
         ),
     };
@@ -510,13 +532,11 @@ pub(super) fn process(
         Ok(result) => return Ok(result),
         Err(error) => error,
     };
-    let fields = before.values.keys().cloned().collect::<Vec<_>>();
     // What a failed preset wrote, for the rollback its error reports.
     let mut written = Vec::new();
     if apply_setup {
         let camera = camera_mut(camera)?;
-        for address in &fields {
-            let saved = &before.values[address];
+        for (address, saved) in &before.values {
             if !saved.is_null()
                 && read_at(camera, address).is_ok_and(|now| !setup::close(&now, saved, None))
             {
@@ -525,9 +545,9 @@ pub(super) fn process(
         }
     }
     let switch_auto = before.auto.is_some() != auto.is_some();
-    let rollback = restore(camera_mut(camera)?, auto, &before, &fields, switch_auto);
+    let rollback = restore(camera_mut(camera)?, auto, &before, switch_auto);
     let restarted = restart.then(|| camera_mut(camera).and_then(Camera::start));
-    publish(h, camera, auto);
+    publish(h, camera.as_ref(), auto.as_ref());
     let restart_note = match &restarted {
         Some(Err(start_error)) => {
             format!("; the stream could not be restarted: {start_error:#}")
@@ -571,6 +591,12 @@ pub(super) fn process(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::JobStream;
+    use crate::types::Frame;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    };
 
     fn connected() -> WorkerHandle {
         let h = WorkerHandle::new();
@@ -593,7 +619,7 @@ mod tests {
         })
         .unwrap();
         let exposure = get(&h, "ExposureTime");
-        assert!(h.set_value("ExposureTime", "0").is_err());
+        h.set_value("ExposureTime", "0").unwrap_err();
         assert!(h.snapshot().auto.is_some());
         assert_eq!(get(&h, "ExposureTime"), exposure);
         h.shutdown();
@@ -607,7 +633,10 @@ mod tests {
     struct Coupled(Arc<Mutex<CoupledState>>);
     impl crate::types::RegisterIo for Coupled {
         fn read_memory(&mut self, address: u64, _: usize) -> Result<Vec<u8>> {
-            let state = self.0.lock().unwrap();
+            let state = self
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test fixture lock is poisoned"))?;
             Ok(if address == 0 {
                 state.width
             } else {
@@ -617,8 +646,14 @@ mod tests {
             .to_vec())
         }
         fn write_memory(&mut self, address: u64, bytes: &[u8]) -> Result<()> {
-            let mut state = self.0.lock().unwrap();
-            let value = u32::from_le_bytes(bytes.try_into().unwrap());
+            let mut state = self
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test fixture lock is poisoned"))?;
+            let value =
+                u32::from_le_bytes(bytes.try_into().map_err(|_| {
+                    anyhow::anyhow!("fixture register write must contain four bytes")
+                })?);
             if address == 0 {
                 state.width = value;
                 state.offset = state.offset.min(1024 - value);
@@ -667,12 +702,14 @@ mod tests {
         let mut run = |command: SessionCommand| {
             process(
                 &h,
-                &mut camera,
-                &mut None,
-                &mut None,
-                &mut Vec::new(),
-                &mut 1,
-                &mut JobStream::default(),
+                CommandState {
+                    camera: &mut camera,
+                    forwarder: &mut None,
+                    auto: &mut None,
+                    jobs: &mut Vec::new(),
+                    next_job: &mut 1,
+                    scheduled_stream: &mut JobStream::default(),
+                },
                 command.into(),
             )
         };
@@ -778,38 +815,38 @@ mod tests {
         }
     }
 
-    fn walked(walks: &Arc<AtomicU64>, hidden: &Arc<AtomicBool>) -> Option<Camera> {
-        Some(
-            Camera::from_backend(
-                crate::transport::simulator::info(),
-                Box::new(Walked {
-                    simulator: Default::default(),
-                    walks: walks.clone(),
-                    streaming: false,
-                    hidden: hidden.clone(),
-                }),
-            )
-            .unwrap(),
+    fn walked(walks: &Arc<AtomicU64>, hidden: &Arc<AtomicBool>) -> Camera {
+        Camera::from_backend(
+            crate::transport::simulator::info(),
+            Box::new(Walked {
+                simulator: crate::transport::simulator::Simulator::default(),
+                walks: walks.clone(),
+                streaming: false,
+                hidden: hidden.clone(),
+            }),
         )
+        .unwrap()
     }
 
     #[test]
     fn edits_starting_and_stopping_walk_no_features() {
         let walks = Arc::new(AtomicU64::new(0));
         let h = WorkerHandle::new();
-        let mut camera = walked(&walks, &Arc::default());
+        let mut camera = Some(walked(&walks, &Arc::default()));
         let (mut forwarder, mut auto, mut jobs) = (None, None, Vec::new());
         let (mut next, mut scheduled) = (1, JobStream::default());
         let mut walked = |camera: &mut Option<Camera>, command| {
             let before = walks.load(Ordering::Relaxed);
             let result = process(
                 &h,
-                camera,
-                &mut forwarder,
-                &mut auto,
-                &mut jobs,
-                &mut next,
-                &mut scheduled,
+                CommandState {
+                    camera,
+                    forwarder: &mut forwarder,
+                    auto: &mut auto,
+                    jobs: &mut jobs,
+                    next_job: &mut next,
+                    scheduled_stream: &mut scheduled,
+                },
                 command,
             )
             .unwrap();
@@ -868,16 +905,18 @@ mod tests {
     fn a_coupled_feature_that_is_unavailable_is_left_out_of_the_checkpoint() {
         let hidden = Arc::new(AtomicBool::new(false));
         let h = WorkerHandle::new();
-        let mut camera = walked(&Arc::default(), &hidden);
+        let mut camera = Some(walked(&Arc::default(), &hidden));
         let mut run = |command: SessionCommand| {
             process(
                 &h,
-                &mut camera,
-                &mut None,
-                &mut None,
-                &mut Vec::new(),
-                &mut 1,
-                &mut JobStream::default(),
+                CommandState {
+                    camera: &mut camera,
+                    forwarder: &mut None,
+                    auto: &mut None,
+                    jobs: &mut Vec::new(),
+                    next_job: &mut 1,
+                    scheduled_stream: &mut JobStream::default(),
+                },
                 command.into(),
             )
         };

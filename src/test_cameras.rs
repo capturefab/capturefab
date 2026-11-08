@@ -1,11 +1,12 @@
-//! Small, unauthenticated network cameras for unit tests of the GigE Vision
-//! transport and the ONVIF client: GigE uses GVCP/GVSP and serves frames from
+//! Small, unauthenticated network cameras for unit tests of the `GigE` Vision
+//! transport and the ONVIF client: `GigE` uses GVCP/GVSP and serves frames from
 //! a source camera; ONVIF answers device, media and WS-Discovery requests.
+#![forbid(unsafe_code)]
 mod gige;
 mod onvif;
 
 use crate::{camera::Camera, types::Frame};
-use anyhow::{Context, Result};
+use anyhow::{Context as _, Result};
 use std::{
     net::Ipv4Addr,
     sync::{
@@ -34,19 +35,30 @@ pub(crate) struct LatestFrame {
 }
 impl LatestFrame {
     fn publish(&self, frame: Frame) {
-        let mut value = self.value.lock().unwrap_or_else(|e| e.into_inner());
-        value.0 = value.0.wrapping_add(1).max(1);
-        value.1 = Some(Arc::new(frame));
+        let frame = Arc::new(frame);
+        let previous = {
+            let mut value = self
+                .value
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            value.0 = value.0.wrapping_add(1).max(1);
+            value.1.replace(frame)
+        };
         self.wake.notify_all();
+        // Returning a frame to its pool may acquire another lock or free memory.
+        drop(previous);
     }
     pub(crate) fn wait_after(&self, sequence: u64, timeout: Duration) -> Option<(u64, Arc<Frame>)> {
-        let value = self.value.lock().unwrap_or_else(|e| e.into_inner());
+        let value = self
+            .value
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (value, _) = self
             .wake
             .wait_timeout_while(value, timeout, |value| {
                 value.0 == sequence || value.1.is_none()
             })
-            .unwrap_or_else(|e| e.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if value.0 == sequence {
             return None;
         }
@@ -54,7 +66,7 @@ impl LatestFrame {
     }
 }
 
-/// A GigE Vision camera serving frames from a source camera.
+/// A `GigE` Vision camera serving frames from a source camera.
 pub(crate) struct VirtualCameraServer {
     shutdown: Arc<AtomicBool>,
     producer: Option<JoinHandle<()>>,
@@ -62,7 +74,7 @@ pub(crate) struct VirtualCameraServer {
     gige: Option<gige::GigEServer>,
 }
 impl VirtualCameraServer {
-    pub(crate) fn start(camera: Camera, options: ServerOptions) -> Result<Self> {
+    pub(crate) fn start(camera: Camera, options: &ServerOptions) -> Result<Self> {
         let port = options.gige_port.context("enable GigE serving")?;
         let camera = Arc::new(Mutex::new(camera));
         let frames = Arc::new(LatestFrame::default());
@@ -88,7 +100,9 @@ impl VirtualCameraServer {
                             continue;
                         }
                         let result = {
-                            let mut source = camera.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut source = camera
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             if !source_acquisition.load(Ordering::Relaxed) || !source.is_streaming()
                             {
                                 continue;
@@ -110,7 +124,7 @@ impl VirtualCameraServer {
                 .context("starting virtual camera source")?,
         );
         let gige = gige::GigEServer::start(
-            &options,
+            options,
             port,
             server.camera.clone(),
             frames,
@@ -132,7 +146,11 @@ impl Drop for VirtualCameraServer {
         if let Some(producer) = self.producer.take() {
             let _ = producer.join();
         }
-        let _ = self.camera.lock().unwrap_or_else(|e| e.into_inner()).stop();
+        let _ = self
+            .camera
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stop();
     }
 }
 
@@ -159,6 +177,32 @@ fn polling_timeout(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mailbox_skips_old_frames_without_invalidating_a_consumers_frame() {
+        let mailbox = LatestFrame::default();
+        assert!(mailbox.wait_after(0, Duration::ZERO).is_none());
+        mailbox.publish(Frame {
+            id: 1,
+            data: vec![1].into(),
+            ..Frame::default()
+        });
+        let (sequence, held) = mailbox.wait_after(0, Duration::ZERO).unwrap();
+        let retired = Arc::downgrade(&held);
+        for id in 2..=3 {
+            mailbox.publish(Frame {
+                id,
+                ..Frame::default()
+            });
+        }
+        let (latest, frame) = mailbox.wait_after(sequence, Duration::ZERO).unwrap();
+        assert_eq!(frame.id, 3);
+        assert_eq!(held.id, 1);
+        assert_eq!(&*held.data, &[1]);
+        assert!(mailbox.wait_after(latest, Duration::ZERO).is_none());
+        drop(held);
+        assert!(retired.upgrade().is_none());
+    }
 
     #[test]
     fn corrupt_source_names_and_decoder_failures_are_not_polling_timeouts() {

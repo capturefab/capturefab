@@ -1,6 +1,7 @@
 //! `shell` and `watch`: several commands in one process with the camera
 //! kept connected, one result a line; and live measurements, one JSON line
 //! each.
+#![deny(clippy::doc_markdown)]
 mod support;
 
 use serde_json::Value;
@@ -86,7 +87,7 @@ fn the_first_failure_ends_the_run_unless_it_keeps_going() {
     // An empty run succeeds.
     let empty = home.run_stdin("\n# nothing\n", &["shell", "--json"]);
     assert_eq!(empty.code, Some(0));
-    assert!(empty.stdout.is_empty());
+    assert_eq!(empty.stdout, "");
 }
 
 #[test]
@@ -251,7 +252,7 @@ fn the_shell_keeps_its_cameras_in_the_warm_session() {
 #[test]
 fn a_signal_stops_the_command_and_the_run() {
     use std::{
-        io::{BufRead, BufReader, Write},
+        io::{BufRead as _, BufReader, Write as _},
         process::Stdio,
     };
     let home = Home::new("shell-signal");
@@ -300,43 +301,48 @@ struct Pty {
 #[cfg(unix)]
 impl Pty {
     fn spawn(mut command: std::process::Command) -> Self {
-        use std::os::{fd::FromRawFd, unix::process::CommandExt};
+        use std::os::{fd::FromRawFd as _, unix::process::CommandExt as _};
         let (master, slave) = {
             let (mut master, mut slave) = (0, 0);
             // SAFETY: openpty writes two descriptors this test owns.
             let opened = unsafe {
                 libc::openpty(
-                    &mut master,
-                    &mut slave,
+                    &raw mut master,
+                    &raw mut slave,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
                 )
             };
             assert_eq!(opened, 0);
-            // SAFETY: openpty made both descriptors; each File owns one.
-            unsafe {
-                (
-                    std::fs::File::from_raw_fd(master),
-                    std::fs::File::from_raw_fd(slave),
-                )
-            }
+            // SAFETY: openpty created the master descriptor, now owned by this File.
+            let master = unsafe { std::fs::File::from_raw_fd(master) };
+            // SAFETY: openpty created the distinct slave descriptor, owned by this File.
+            let slave = unsafe { std::fs::File::from_raw_fd(slave) };
+            (master, slave)
         };
         command
             .env("TERM", "xterm-256color")
             .stdin(slave.try_clone().unwrap())
             .stdout(slave.try_clone().unwrap())
             .stderr(slave);
-        // SAFETY: setsid and ioctl are async-signal-safe; the terminal
-        // becomes the child's, so Ctrl-C reaches it as SIGINT.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        let own_terminal = || {
+            // Apple's constant is narrower than ioctl's request argument.
+            #[cfg(target_vendor = "apple")]
+            let request = libc::c_ulong::from(libc::TIOCSCTTY);
+            #[cfg(not(target_vendor = "apple"))]
+            let request = libc::TIOCSCTTY;
+            // SAFETY: setsid takes no pointers and establishes this child's session.
+            if unsafe { libc::setsid() } < 0
+                // SAFETY: stdin is the slave terminal, with no pointer argument required.
+                || unsafe { libc::ioctl(0, request, 0) } < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        };
+        // SAFETY: setsid and ioctl are async-signal-safe; the closure only uses locals.
+        unsafe { command.pre_exec(own_terminal) };
         let child = command.spawn().unwrap();
         drop(command);
         let screen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
@@ -445,7 +451,13 @@ fn quiet_lines_show_no_progress() {
     let shown = |shell: &mut Pty, line: &str| {
         let mark = shell.mark();
         shell.run(line, "Saved 4 frames", Duration::from_secs(20));
-        shell.screen.lock().unwrap()[mark..].to_owned()
+        shell
+            .screen
+            .lock()
+            .unwrap()
+            .get(mark..)
+            .expect("screen mark lies on a character boundary")
+            .to_owned()
     };
     let loud = shown(&mut shell, "capture -n 4 --every 250ms -o loud/");
     assert!(loud.contains("saved ·"), "{loud}");
@@ -506,7 +518,7 @@ fn ctrl_c_in_a_shell_frees_session_cameras_at_once() {
 #[test]
 fn ctrl_c_ends_watch_and_its_stream() {
     use std::{
-        io::{BufRead, BufReader},
+        io::{BufRead as _, BufReader},
         process::Stdio,
     };
     let home = Home::new("watch-signal");

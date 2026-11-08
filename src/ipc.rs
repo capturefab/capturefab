@@ -1,13 +1,15 @@
 //! Versioned newline-delimited JSON over loopback, with a private per-session bearer token.
+#![deny(clippy::panic_in_result_fn)]
+#![deny(clippy::cast_precision_loss)]
 use crate::session::{SessionCommand, SessionHandle};
 use crate::types::hex;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context as _, Result, ensure};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead as _, BufReader, Write as _},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
@@ -20,7 +22,7 @@ use std::{
 /// The session protocol: descriptors, greetings, requests and replies. A
 /// session of another version, such as one started by Capturefab 0.5, is
 /// never listed, chosen or sent a request.
-pub const VERSION: u32 = 3;
+pub(crate) const VERSION: u32 = 3;
 const MAX_REQUEST: usize = 1024 * 1024;
 const MAX_RESPONSE: usize = 16 * 1024 * 1024;
 const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
@@ -28,7 +30,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
 const MAX_DESCRIPTOR: u64 = 256 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Descriptor {
+pub(crate) struct Descriptor {
     pub version: u32,
     pub name: String,
     pub pid: u32,
@@ -59,6 +61,10 @@ pub struct HeldCamera {
     pub aliases: Vec<String>,
 }
 impl HeldCamera {
+    #[allow(
+        single_use_lifetimes,
+        reason = "Rust 1.89 requires a named lifetime for references in impl Trait"
+    )]
     pub fn new<'a>(
         info: &crate::types::CameraInfo,
         aliases: impl Iterator<Item = &'a str>,
@@ -91,13 +97,23 @@ impl HeldCamera {
     }
 }
 /// A MAC address as twelve lowercase hex digits, from any usual spelling.
+#[deny(clippy::arithmetic_side_effects)]
 fn mac(text: &str) -> Option<String> {
-    let digits = text
-        .chars()
-        .filter(|c| !matches!(c, ':' | '-' | '.'))
-        .collect::<String>()
-        .to_ascii_lowercase();
-    (digits.len() == 12 && digits.bytes().all(|b| b.is_ascii_hexdigit())).then_some(digits)
+    let mut input = text
+        .bytes()
+        .filter(|byte| !matches!(byte, b':' | b'-' | b'.'));
+    let mut digits = [0; 12];
+    for digit in &mut digits {
+        let byte = input.next()?;
+        if !byte.is_ascii_hexdigit() {
+            return None;
+        }
+        *digit = byte.to_ascii_lowercase();
+    }
+    if input.next().is_some() {
+        return None;
+    }
+    String::from_utf8(digits.to_vec()).ok()
 }
 /// The line a client opens a connection with: a challenge the session
 /// answers with [`Proof`], before the client sends its token or request,
@@ -146,7 +162,7 @@ struct Request {
 }
 /// Why a session ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Quit {
+pub(crate) enum Quit {
     /// SIGINT, SIGTERM or SIGHUP.
     Signal,
     /// `session stop`.
@@ -210,22 +226,25 @@ impl Shared {
         Some(idle.saturating_sub(Self::locked(&self.used).elapsed()))
     }
     /// Rewrite the descriptor when the cameras it lists changed.
+    #[deny(clippy::significant_drop_tightening)]
     fn publish(&self, cameras: Vec<HeldCamera>) {
         let mut descriptor = Self::locked(&self.descriptor);
         if descriptor.cameras == cameras {
             return;
         }
         descriptor.cameras = cameras;
-        if let Err(error) = write_descriptor(&self.dir, &descriptor) {
+        let written = write_descriptor(&self.dir, &descriptor);
+        drop(descriptor);
+        if let Err(error) = written {
             crate::eprintln!("capturefab: cannot update the session descriptor: {error:#}");
         }
     }
 }
 /// Ends a session from a signal handler.
 #[derive(Clone)]
-pub struct Quitter(Arc<Shared>);
+pub(crate) struct Quitter(Arc<Shared>);
 impl Quitter {
-    pub fn quit(&self, why: Quit) {
+    pub(crate) fn quit(&self, why: Quit) {
         self.0.quit(why);
     }
 }
@@ -299,7 +318,7 @@ impl Drop for Greeting<'_> {
         Shared::locked(&self.greetings.open).retain(|(key, _)| *key != self.key);
     }
 }
-pub struct Server {
+pub(crate) struct Server {
     path: PathBuf,
     token: String,
     address: SocketAddr,
@@ -332,13 +351,12 @@ fn lock_file(path: &Path) -> std::io::Result<fs::File> {
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
     options.open(path)
 }
-pub fn validate_name(name: &str) -> Result<()> {
-    let lower = name.to_ascii_lowercase();
+pub(crate) fn validate_name(name: &str) -> Result<()> {
     ensure!(
         !name.is_empty()
             && name.len() <= 64
@@ -350,10 +368,13 @@ pub fn validate_name(name: &str) -> Result<()> {
     // Windows treats these as device names even when an extension is present.
     // Reject them on every OS so scripts and session names remain portable.
     ensure!(
-        !matches!(lower.as_str(), "con" | "prn" | "aux" | "nul")
-            && !(lower.len() == 4
-                && (lower.starts_with("com") || lower.starts_with("lpt"))
-                && matches!(lower.as_bytes()[3], b'1'..=b'9')),
+        !["con", "prn", "aux", "nul"]
+            .iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
+            && !name.as_bytes().split_last().is_some_and(|(digit, prefix)| {
+                matches!(digit, b'1'..=b'9')
+                    && (prefix.eq_ignore_ascii_case(b"com") || prefix.eq_ignore_ascii_case(b"lpt"))
+            }),
         "session name is reserved by Windows; choose a portable name"
     );
     Ok(())
@@ -412,7 +433,7 @@ fn missing_session_error(name: &str, active: &[Descriptor]) -> anyhow::Error {
 /// its name lock. What a session that was killed left is removed, and
 /// never sent a request, so a program that took its port later learns
 /// nothing.
-pub fn read_descriptor(name: &str) -> Result<Descriptor> {
+pub(crate) fn read_descriptor(name: &str) -> Result<Descriptor> {
     let descriptor = published(name)?;
     let dir = crate::dirs::runtime()?;
     if running_in(&dir, &descriptor) {
@@ -468,6 +489,28 @@ fn published(name: &str) -> Result<Descriptor> {
         missing_session_error(name, &active_sessions().unwrap_or_default())
     })
 }
+
+fn read_descriptor_file(path: &Path) -> Result<Vec<u8>> {
+    let file = fs::File::open(path)?;
+    let capacity = usize::try_from(file.metadata()?.len().min(MAX_DESCRIPTOR))?;
+    read_descriptor_bytes(file, capacity)
+}
+
+/// Bound the read itself as well as its allocation hint: a file may grow
+/// after its metadata was inspected.
+#[deny(clippy::arithmetic_side_effects)]
+fn read_descriptor_bytes(reader: impl std::io::Read, capacity: usize) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    let maximum = usize::try_from(MAX_DESCRIPTOR)
+        .context("session descriptor size limit exceeds the host address space")?;
+    let mut bytes = Vec::with_capacity(capacity.min(maximum));
+    reader
+        .take(MAX_DESCRIPTOR.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= maximum, "invalid session descriptor");
+    Ok(bytes)
+}
+
 fn read_descriptor_in(dir: &Path, name: &str) -> Result<Descriptor> {
     let path = descriptor_path_in(dir, name)?;
     let meta = match fs::symlink_metadata(&path) {
@@ -487,13 +530,13 @@ fn read_descriptor_in(dir: &Path, name: &str) -> Result<Descriptor> {
     );
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt as _;
         ensure!(
             meta.permissions().mode() & 0o077 == 0,
             "session descriptor is not private"
         );
     }
-    let d: Descriptor = serde_json::from_slice(&fs::read(path)?)?;
+    let d: Descriptor = serde_json::from_slice(&read_descriptor_file(&path)?)?;
     ensure!(
         d.version == VERSION
             && d.name == name
@@ -526,7 +569,7 @@ pub(crate) fn is_descriptor(path: &Path) -> bool {
     };
     fs::symlink_metadata(path).is_ok_and(|meta| {
         meta.is_file() && !meta.file_type().is_symlink() && meta.len() <= MAX_DESCRIPTOR
-    }) && fs::read(path)
+    }) && read_descriptor_file(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Published>(&bytes).ok())
         .is_some_and(|published| published.name == name)
@@ -541,14 +584,14 @@ fn other_protocol(path: &Path, name: &str) -> bool {
     }
     fs::symlink_metadata(path).is_ok_and(|meta| {
         meta.is_file() && !meta.file_type().is_symlink() && meta.len() <= MAX_DESCRIPTOR
-    }) && fs::read(path)
+    }) && read_descriptor_file(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Published>(&bytes).ok())
         .is_some_and(|published| published.version != VERSION && published.name == name)
 }
 #[cfg(test)]
-fn read_line(reader: &mut impl BufRead, limit: usize) -> Result<Vec<u8>> {
-    use std::io::Read;
+fn read_line(reader: &mut impl std::io::BufRead, limit: usize) -> Result<Vec<u8>> {
+    use std::io::Read as _;
     let mut data = Vec::new();
     reader.take(limit as u64 + 1).read_until(b'\n', &mut data)?;
     ensure!(
@@ -632,10 +675,9 @@ impl std::fmt::Display for Closed {
     }
 }
 impl std::error::Error for Closed {
+    #[deny(trivial_casts)]
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.0
-            .as_ref()
-            .map(|error| error as &(dyn std::error::Error + 'static))
+        Some(self.0.as_ref()?)
     }
 }
 /// What a session that may have ended suggests.
@@ -646,7 +688,7 @@ fn closed_early(error: Option<std::io::Error>) -> anyhow::Error {
 }
 /// HMAC-SHA256 of `message` under `key` (RFC 2104).
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
+    use sha2::{Digest as _, Sha256};
     const BLOCK: usize = 64;
     let mut block = [0u8; BLOCK];
     if key.len() > BLOCK {
@@ -746,13 +788,13 @@ fn authenticate(stream: &mut TcpStream, token: &str, deadline: Instant) -> Resul
 }
 fn serve_client(
     mut stream: TcpStream,
-    h: SessionHandle,
-    token: String,
-    shared: Arc<Shared>,
+    h: &SessionHandle,
+    token: &str,
+    shared: &Shared,
 ) -> Result<()> {
     stream.set_nonblocking(false)?;
     let greeting = Greeting::enter(&shared.greetings, &stream);
-    let request = authenticate(&mut stream, &token, rpc_deadline(GREETING)?);
+    let request = authenticate(&mut stream, token, rpc_deadline(GREETING)?);
     drop(greeting);
     let slot = ClientSlot::acquire(&shared.clients);
     let result = match (request, slot) {
@@ -762,7 +804,7 @@ fn serve_client(
         ))),
         (Ok(request), Some(_slot)) => {
             stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-            answer(request, &stream, &h, &shared)
+            answer(request, &stream, h, shared)
         }
     };
     let response = match result {
@@ -798,16 +840,17 @@ fn answer(
         let session = shared.idle_left().filter(|_| !h.has_jobs());
         // A camera is let go when its own keep runs out, or else with
         // the session.
-        let left = match request.camera.as_deref() {
-            None => session,
-            Some(camera) => match h.unused_left(camera) {
-                Some(crate::session::Unused::After(left)) => {
-                    Some(session.map_or(left, |session| session.min(left)))
-                }
-                Some(crate::session::Unused::WithSession) => session,
-                Some(crate::session::Unused::InUse) | None => None,
-            },
-        };
+        let left =
+            request
+                .camera
+                .as_deref()
+                .map_or(session, |camera| match h.unused_left(camera) {
+                    Some(crate::session::Unused::After(left)) => {
+                        Some(session.map_or(left, |session| session.min(left)))
+                    }
+                    Some(crate::session::Unused::WithSession) => session,
+                    Some(crate::session::Unused::InUse) | None => None,
+                });
         if let Some(left) = left {
             probe["idle_ms"] = json!(millis(left));
         }
@@ -977,7 +1020,7 @@ fn write_descriptor(dir: &Path, descriptor: &Descriptor) -> Result<()> {
 impl Server {
     /// Serve `h` as session `name`, which exits after `idle` without use
     /// when one is given.
-    pub fn start(h: SessionHandle, name: &str, idle: Option<Duration>) -> Result<Self> {
+    pub(crate) fn start(h: SessionHandle, name: &str, idle: Option<Duration>) -> Result<Self> {
         Self::start_in(h, name, &crate::dirs::runtime()?, idle)
     }
     fn start_in(h: SessionHandle, name: &str, dir: &Path, idle: Option<Duration>) -> Result<Self> {
@@ -1030,7 +1073,7 @@ impl Server {
         write_descriptor(dir, &descriptor)?;
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
-        let server_token = token.clone();
+        let server_token = Arc::<str>::from(token.as_str());
         let shared = Arc::new(Shared {
             dir: dir.to_owned(),
             descriptor: std::sync::Mutex::new(descriptor),
@@ -1074,7 +1117,7 @@ impl Server {
                     let spawned = std::thread::Builder::new()
                         .name("capturefab-rpc-client".into())
                         .spawn(move || {
-                            let _ = serve_client(stream, h, token, shared);
+                            let _ = serve_client(stream, &h, &token, &shared);
                         });
                     if let Err(e) = spawned {
                         eprintln!("capturefab: rejected RPC client: {e}");
@@ -1100,17 +1143,17 @@ impl Server {
         })
     }
     /// What a signal handler ends the session with.
-    pub fn quitter(&self) -> Quitter {
+    pub(crate) fn quitter(&self) -> Quitter {
         Quitter(self.shared.clone())
     }
     /// The descriptor as published now.
-    pub fn descriptor(&self) -> Descriptor {
+    pub(crate) fn descriptor(&self) -> Descriptor {
         Shared::locked(&self.shared.descriptor).clone()
     }
     /// Block until the session should end: a signal, `session stop`, or its
     /// idle time passed with no request and no job running. `jobs_running`
     /// is asked only once the idle time has passed.
-    pub fn wait(&self, mut jobs_running: impl FnMut() -> bool) -> Quit {
+    pub(crate) fn wait(&self, mut jobs_running: impl FnMut() -> bool) -> Quit {
         let (quit, changed) = &self.shared.quit;
         let mut why = Shared::locked(quit);
         loop {
@@ -1163,7 +1206,7 @@ impl Drop for Server {
                 let _ = thread.join();
             }
         }
-        if fs::read(&self.path)
+        if read_descriptor_file(&self.path)
             .ok()
             .and_then(|v| serde_json::from_slice::<Descriptor>(&v).ok())
             .is_some_and(|d| d.token == self.token)
@@ -1173,10 +1216,10 @@ impl Drop for Server {
     }
 }
 
-pub fn call(name: &str, command: SessionCommand, timeout: Duration) -> Result<Value> {
+pub(crate) fn call(name: &str, command: SessionCommand, timeout: Duration) -> Result<Value> {
     call_to(name, None, command, timeout)
 }
-pub fn call_to(
+pub(crate) fn call_to(
     name: &str,
     camera: Option<&str>,
     command: SessionCommand,
@@ -1185,7 +1228,7 @@ pub fn call_to(
     call_keeping(name, camera, command, timeout, None)
 }
 /// `call_to`, and keep the session at least `keep` after this request.
-pub fn call_keeping(
+pub(crate) fn call_keeping(
     name: &str,
     camera: Option<&str>,
     command: SessionCommand,
@@ -1217,7 +1260,7 @@ pub fn call_keeping(
 /// its `camera`: keep the session, and the camera, at least `keep` after
 /// now. `camera_not_found` when the session let go of the camera since the
 /// descriptor listed it.
-pub fn touch(descriptor: &Descriptor, camera: &str, keep: Option<Duration>) -> Result<()> {
+pub(crate) fn touch(descriptor: &Descriptor, camera: &str, keep: Option<Duration>) -> Result<()> {
     send(
         descriptor,
         Request {
@@ -1231,7 +1274,7 @@ pub fn touch(descriptor: &Descriptor, camera: &str, keep: Option<Duration>) -> R
 }
 /// Keep session `name`, and its `camera` when given, at least `keep` after
 /// now.
-pub fn keep(name: &str, camera: Option<&str>, keep: Duration) -> Result<()> {
+pub(crate) fn keep(name: &str, camera: Option<&str>, keep: Duration) -> Result<()> {
     let descriptor = read_descriptor(name)?;
     send(
         &descriptor,
@@ -1245,7 +1288,7 @@ pub fn keep(name: &str, camera: Option<&str>, keep: Duration) -> Result<()> {
     .map(drop)
 }
 /// Ask session `name` to finish its recordings and exit.
-pub fn stop(descriptor: &Descriptor) -> Result<()> {
+pub(crate) fn stop(descriptor: &Descriptor) -> Result<()> {
     send(
         descriptor,
         Request {
@@ -1315,25 +1358,25 @@ fn send_request(
 /// for: the session then cancels what only they waited for, as it does
 /// when a command's process exits.
 static OWNED: std::sync::Mutex<Vec<(u64, u64, TcpStream)>> = std::sync::Mutex::new(Vec::new());
-static NEXT_OWNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-static NEXT_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static NEXT_OWNED: AtomicU64 = AtomicU64::new(1);
+static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 thread_local! {
     static OWNER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 /// An owner for requests that close together.
-pub fn new_owner() -> u64 {
+pub(crate) fn new_owner() -> u64 {
     NEXT_OWNER.fetch_add(1, Ordering::Relaxed)
 }
 /// Requests this thread sends from now on belong to `owner`.
-pub fn own_requests(owner: u64) {
+pub(crate) fn own_requests(owner: u64) {
     OWNER.with(|cell| cell.set(owner));
 }
 /// The owner of the requests this thread sends, 0 for none.
-pub fn requests_owner() -> u64 {
+pub(crate) fn requests_owner() -> u64 {
     OWNER.with(std::cell::Cell::get)
 }
 /// Close the connections of `owner`'s requests in flight.
-pub fn close_requests(owner: u64) {
+pub(crate) fn close_requests(owner: u64) {
     let owned = OWNED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1370,8 +1413,9 @@ impl Drop for Owned {
 
 fn send(descriptor: &Descriptor, request: Request, timeout: Duration) -> Result<Value> {
     let deadline = rpc_deadline(timeout)?;
-    let request = serde_json::to_vec(&request)?;
-    ensure!(request.len() < MAX_REQUEST, "RPC request exceeds 1 MiB");
+    let mut message = serde_json::to_vec(&request)?;
+    drop(request);
+    ensure!(message.len() < MAX_REQUEST, "RPC request exceeds 1 MiB");
     let name = &descriptor.name;
     let mut stream = TcpStream::connect_timeout(&descriptor.address, remaining(deadline)?)
         .map_err(|error| rpc_network_error(name, "connecting", error))?;
@@ -1400,7 +1444,6 @@ fn send(descriptor: &Descriptor, request: Request, timeout: Duration) -> Result<
     }
     // A single budget covers connect, sending, and the response. A timeout is
     // never retried because the coordinator may already have applied a write.
-    let mut message = request;
     message.push(b'\n');
     let mut offset = 0;
     while offset < message.len() {
@@ -1476,7 +1519,7 @@ fn descriptors_in(dir: &Path) -> Result<Vec<Descriptor>> {
 }
 /// Discover authenticated, responsive sessions without touching camera state
 /// or their logs.
-pub fn active_sessions() -> Result<Vec<Descriptor>> {
+pub(crate) fn active_sessions() -> Result<Vec<Descriptor>> {
     // Without a runtime folder no session can run.
     let Ok(dir) = crate::dirs::runtime() else {
         return Ok(Vec::new());
@@ -1488,7 +1531,7 @@ pub fn active_sessions() -> Result<Vec<Descriptor>> {
 }
 /// The running sessions' descriptors, read locally without asking any of
 /// them: a client matches its camera against these and sends one request.
-pub fn sessions() -> Vec<Descriptor> {
+pub(crate) fn sessions() -> Vec<Descriptor> {
     let Ok(dir) = crate::dirs::runtime() else {
         return Vec::new();
     };
@@ -1511,7 +1554,7 @@ fn running_in(dir: &Path, descriptor: &Descriptor) -> bool {
 /// and nothing uses the camera now: what a command the camera it holds
 /// refuses is told. The camera goes when its own keep runs out, or else
 /// when the session ends unused.
-pub fn idle_left(name: &str, camera: &str) -> Option<Duration> {
+pub(crate) fn idle_left(name: &str, camera: &str) -> Option<Duration> {
     let descriptor = running_session(name)?;
     let probe = send_request(&descriptor, Some(camera), None, true, PROBE_TIMEOUT).ok()?;
     probe["idle_ms"].as_u64().map(Duration::from_millis)
@@ -1519,7 +1562,7 @@ pub fn idle_left(name: &str, camera: &str) -> Option<Duration> {
 /// Wait up to `wait` for session `name`, which is ending, to be gone, so
 /// another may start under its name: whether it is. The wait is for its
 /// name lock, which it holds until it exits, so it ends as the session does.
-pub fn wait_ended(name: &str, wait: Duration) -> bool {
+pub(crate) fn wait_ended(name: &str, wait: Duration) -> bool {
     let Ok(lock) = crate::dirs::runtime()
         .and_then(|dir| Ok(fs::File::open(dir.join(format!("{name}.session.lock")))?))
     else {
@@ -1544,7 +1587,7 @@ pub fn wait_ended(name: &str, wait: Duration) -> bool {
     running_session(name).is_none()
 }
 /// Session `name`'s descriptor, when that session runs.
-pub fn running_session(name: &str) -> Option<Descriptor> {
+pub(crate) fn running_session(name: &str) -> Option<Descriptor> {
     let dir = crate::dirs::runtime().ok()?;
     read_descriptor_in(&dir, name)
         .ok()
@@ -1552,7 +1595,7 @@ pub fn running_session(name: &str) -> Option<Descriptor> {
 }
 /// Remove the descriptor a session that no longer runs left under `name`.
 /// False when there was none, or a session holds the name.
-pub fn remove_stale(name: &str) -> Result<bool> {
+pub(crate) fn remove_stale(name: &str) -> Result<bool> {
     validate_name(name)?;
     let dir = crate::dirs::runtime()?;
     let lock = lock_file(&dir.join(format!("{name}.session.lock")))?;
@@ -1568,7 +1611,7 @@ pub fn remove_stale(name: &str) -> Result<bool> {
 /// Wait for the turn to start session `name`: commands that would start it
 /// at once take turns, so the first starts it and the others find it
 /// running. The turn lasts while the returned file is open.
-pub fn start_turn(name: &str) -> Result<fs::File> {
+pub(crate) fn start_turn(name: &str) -> Result<fs::File> {
     validate_name(name)?;
     let dir = crate::dirs::runtime()?;
     crate::dirs::ensure_private_dir(&dir)?;
@@ -1594,21 +1637,21 @@ pub(crate) fn process_alive(pid: u32) -> bool {
             Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError, WAIT_TIMEOUT},
             System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
         };
-        // SAFETY: the handle opened is only waited on, without waiting,
-        // and closed.
-        unsafe {
-            let process = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
-            if process.is_null() {
-                // One this user may not open runs all the same; a pid
-                // that names no process is an invalid parameter.
-                return GetLastError() == ERROR_ACCESS_DENIED;
-            }
-            // A process that exited is still there while a handle to it
-            // is open, signalled.
-            let running = WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
-            CloseHandle(process);
-            running
+        // SAFETY: only synchronization access is requested for the given process ID.
+        let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+        if process.is_null() {
+            // One this user may not open runs all the same; a pid
+            // that names no process is an invalid parameter.
+            // SAFETY: GetLastError takes no pointers and reads this thread's last error.
+            return unsafe { GetLastError() } == ERROR_ACCESS_DENIED;
         }
+        // A process that exited is still there while a handle to it
+        // is open, signalled.
+        // SAFETY: the owned handle has synchronization access; timeout zero never waits.
+        let running = unsafe { WaitForSingleObject(process, 0) } == WAIT_TIMEOUT;
+        // SAFETY: this handle was opened above and is closed exactly once.
+        unsafe { CloseHandle(process) };
+        running
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -1619,6 +1662,48 @@ pub(crate) fn process_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn descriptor_reads_reject_growth_beyond_the_metadata_hint() {
+        let limit = usize::try_from(MAX_DESCRIPTOR).unwrap();
+        let mut reader = std::io::Cursor::new(vec![b' '; limit + 8192]);
+        let error = read_descriptor_bytes(&mut reader, 1).unwrap_err();
+        assert!(error.to_string().contains("invalid session descriptor"));
+        assert_eq!(reader.position(), MAX_DESCRIPTOR + 1);
+        assert_eq!(
+            read_descriptor_bytes(&b"{}"[..], usize::MAX).unwrap(),
+            b"{}"
+        );
+        let bytes = vec![b' '; limit];
+        assert_eq!(read_descriptor_bytes(&*bytes, limit).unwrap(), bytes);
+    }
+
+    #[test]
+    fn mac_normalization_preserves_separator_spellings_and_rejects_invalid_bytes() {
+        for source in [
+            "AABBCCDDEEFF",
+            "aa:bb:cc:dd:ee:ff",
+            "AA-BB-CC-DD-EE-FF",
+            "aabb.ccdd.eeff",
+            ":.-Aa:bB-Cc.Dd:eE-Ff-.:",
+        ] {
+            assert_eq!(mac(source).as_deref(), Some("aabbccddeeff"), "{source}");
+        }
+        for source in [
+            "",
+            "::::::::::::",
+            "aabbccddee",
+            "aabbccddeeff0",
+            "aabbccddeefg",
+            "aabbccddeefé",
+            "aabbccddeeff\0",
+            "aabb ccdd eeff",
+            "aa：bb：cc：dd：ee：ff",
+        ] {
+            assert_eq!(mac(source), None, "{source:?}");
+        }
+    }
+
     struct TestDir(PathBuf);
     impl TestDir {
         fn new() -> Self {
@@ -1640,7 +1725,7 @@ mod tests {
             options.write(true).create_new(true);
             #[cfg(unix)]
             {
-                use std::os::unix::fs::OpenOptionsExt;
+                use std::os::unix::fs::OpenOptionsExt as _;
                 options.mode(0o600);
             }
             let mut file = options
@@ -1783,7 +1868,7 @@ mod tests {
         .unwrap_err();
         assert!(format!("{error:#}").contains("probes cannot include a command"));
         let snapshot = handle.snapshot();
-        assert!(snapshot.logs.is_empty());
+        assert_eq!(snapshot.logs, [] as [crate::session::LogEntry; 0]);
         assert!(snapshot.cameras.is_empty());
         drop(server);
         assert!(!descriptor_path_in(&dir.0, "bench").unwrap().exists());
@@ -1937,7 +2022,7 @@ mod tests {
     fn socket2_linger_zero(stream: &TcpStream) {
         #[cfg(unix)]
         {
-            use std::os::fd::AsRawFd;
+            use std::os::fd::AsRawFd as _;
             let linger = libc::linger {
                 l_onoff: 1,
                 l_linger: 0,
@@ -1950,7 +2035,8 @@ mod tests {
                     libc::SOL_SOCKET,
                     libc::SO_LINGER,
                     (&raw const linger).cast(),
-                    std::mem::size_of::<libc::linger>() as libc::socklen_t,
+                    libc::socklen_t::try_from(size_of::<libc::linger>())
+                        .expect("linger size fits socklen_t"),
                 );
             }
         }
@@ -1980,17 +2066,16 @@ mod tests {
         dir.write_descriptor(&descriptor);
         let handle = SessionHandle::new();
         let gate = Arc::new(std::sync::Barrier::new(4));
-        let claimants: Vec<_> = (0..4)
-            .map(|_| {
-                let handle = handle.clone();
-                let dir = dir.0.clone();
-                let gate = gate.clone();
-                std::thread::spawn(move || {
-                    gate.wait();
-                    Server::start_in(handle, "stale", &dir, None)
-                })
-            })
-            .collect();
+        let mut claimants = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let handle = handle.clone();
+            let dir = dir.0.clone();
+            let gate = gate.clone();
+            claimants.push(std::thread::spawn(move || {
+                gate.wait();
+                Server::start_in(handle, "stale", &dir, None)
+            }));
+        }
         let claims: Vec<_> = claimants
             .into_iter()
             .map(|claim| claim.join().unwrap())
@@ -2009,26 +2094,24 @@ mod tests {
         handle.shutdown();
     }
     /// A signal's handler interrupts a read with a timeout (on Linux even
-    /// under SA_RESTART, which this handler does not ask for); the read
+    /// under `SA_RESTART`, which this handler does not ask for); the read
     /// goes on within its deadline.
     #[cfg(unix)]
     #[test]
     fn a_signal_does_not_cut_an_rpc_read_short() {
         extern "C" fn nothing(_: libc::c_int) {}
-        /// The reading thread, for pthread_kill.
+        /// The reading thread, for `pthread_kill`.
         struct Reader(libc::pthread_t);
         // SAFETY: only an ID, signalled while its thread runs.
         unsafe impl Send for Reader {}
-        // SAFETY: a handler that does nothing, for a signal nothing else
-        // in these tests sends.
-        unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = nothing as *const () as usize;
-            assert_eq!(
-                libc::sigaction(libc::SIGURG, &action, std::ptr::null_mut()),
-                0
-            );
-        }
+        // SAFETY: an all-zero sigaction is valid before setting its handler.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = nothing as *const () as usize;
+        assert_eq!(
+            // SAFETY: a handler that does nothing, for a signal nothing else in these tests sends.
+            unsafe { libc::sigaction(libc::SIGURG, &raw const action, std::ptr::null_mut()) },
+            0
+        );
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (stream, _) = listener.accept().unwrap();
@@ -2172,7 +2255,7 @@ mod tests {
             let handle = SessionHandle::new();
             let server = std::thread::spawn({
                 let handle = handle.clone();
-                move || serve_client(stream, handle, "t".into(), test_shared())
+                move || serve_client(stream, &handle, "t", &test_shared())
             });
             greet(&mut client, "t");
             client.write_all(request.as_bytes()).unwrap();
@@ -2188,15 +2271,15 @@ mod tests {
             );
             server.join().unwrap().unwrap();
             let snapshot = handle.snapshot();
-            assert!(snapshot.logs.is_empty());
+            assert_eq!(snapshot.logs, [] as [crate::session::LogEntry; 0]);
             assert!(snapshot.cameras.is_empty());
             handle.shutdown();
         }
     }
     #[test]
     fn bounded_rpc_lines_and_auth() {
-        assert!(read_line(&mut BufReader::new(b"abc\n".as_slice()), 3).is_err());
-        assert!(read_line(&mut BufReader::new(b"abc".as_slice()), 10).is_err());
+        read_line(&mut BufReader::new(b"abc\n".as_slice()), 3).unwrap_err();
+        read_line(&mut BufReader::new(b"abc".as_slice()), 10).unwrap_err();
         assert_eq!(
             read_line(&mut BufReader::new(b"abc\n".as_slice()), 4).unwrap(),
             b"abc\n"
@@ -2219,7 +2302,7 @@ mod tests {
         let h = SessionHandle::new();
         let server = std::thread::spawn({
             let h = h.clone();
-            move || serve_client(stream, h, "t".into(), test_shared())
+            move || serve_client(stream, &h, "t", &test_shared())
         });
         std::thread::sleep(Duration::from_millis(200));
         greet(&mut client, "t");
@@ -2252,7 +2335,7 @@ mod tests {
         let (stream, _) = listener.accept().unwrap();
         let server = std::thread::spawn({
             let h = h.clone();
-            move || serve_client(stream, h, "t".into(), shared)
+            move || serve_client(stream, &h, "t", &shared)
         });
         greet(&mut client, "t");
         serde_json::to_writer(
@@ -2278,8 +2361,8 @@ mod tests {
         };
         // Past MAX_WAITERS a wait is answered within a moment, not refused.
         let shared = test_shared();
-        let waiters = (0..MAX_WAITERS)
-            .map(|_| Waiter::enter(&shared.waiting).unwrap())
+        let waiters = std::iter::repeat_with(|| Waiter::enter(&shared.waiting).unwrap())
+            .take(MAX_WAITERS)
             .collect::<Vec<_>>();
         let asked = Instant::now();
         let (client, server) = served(&h, shared.clone(), wait());
@@ -2316,8 +2399,8 @@ mod tests {
             )
         };
         // Clients being served take every slot: the next is told so.
-        let taken = (0..MAX_CLIENTS)
-            .map(|_| ClientSlot::acquire(&server.shared.clients).unwrap())
+        let taken = std::iter::repeat_with(|| ClientSlot::acquire(&server.shared.clients).unwrap())
+            .take(MAX_CLIENTS)
             .collect::<Vec<_>>();
         let error = status().unwrap_err();
         assert_eq!(
@@ -2333,8 +2416,8 @@ mod tests {
         status().unwrap();
         // Waits take at most MAX_WAITERS slots.
         let shared = test_shared();
-        let waiters = (0..MAX_WAITERS)
-            .map(|_| Waiter::enter(&shared.waiting).unwrap())
+        let waiters = std::iter::repeat_with(|| Waiter::enter(&shared.waiting).unwrap())
+            .take(MAX_WAITERS)
             .collect::<Vec<_>>();
         assert!(Waiter::enter(&shared.waiting).is_none());
         drop(waiters);
@@ -2350,8 +2433,8 @@ mod tests {
         // Many more connections than client slots, which say nothing or
         // only greet: none of them holds a slot, and the oldest are closed
         // as more come.
-        let mut silent = (0..MAX_CLIENTS * 3)
-            .map(|_| TcpStream::connect(descriptor.address).unwrap())
+        let mut silent = std::iter::repeat_with(|| TcpStream::connect(descriptor.address).unwrap())
+            .take(MAX_CLIENTS * 3)
             .collect::<Vec<_>>();
         for stream in silent.iter_mut().take(MAX_CLIENTS) {
             let hello = Hello {
@@ -2377,8 +2460,8 @@ mod tests {
             .unwrap();
         }
         assert_eq!(server.shared.clients.load(Ordering::Acquire), 0);
-        let flood = (0..MAX_GREETINGS + 8)
-            .map(|_| TcpStream::connect(descriptor.address).unwrap())
+        let flood = std::iter::repeat_with(|| TcpStream::connect(descriptor.address).unwrap())
+            .take(MAX_GREETINGS + 8)
             .collect::<Vec<_>>();
         std::thread::sleep(Duration::from_millis(200));
         assert!(Shared::locked(&server.shared.greetings.open).len() <= MAX_GREETINGS);
@@ -2404,7 +2487,7 @@ mod tests {
         )
         .unwrap();
         // A wrong token is refused once it greeted.
-        let mut wrong = descriptor.clone();
+        let mut wrong = descriptor;
         wrong.token = "f".repeat(64);
         let error = send_request(
             &wrong,
@@ -2425,9 +2508,17 @@ mod tests {
         ] {
             assert!(validate_name(name).is_err());
         }
-        assert!(validate_name("bench-01").is_ok());
-        assert!(validate_name("storage").is_ok());
-        assert!(validate_name("com10").is_ok());
-        assert!(validate_name("lpt0").is_ok());
+        validate_name("bench-01").unwrap();
+        validate_name("storage").unwrap();
+        validate_name("com10").unwrap();
+        validate_name("lpt0").unwrap();
+        for prefix in ["com", "COM", "CoM", "lpt", "LPT", "LpT"] {
+            for digit in 1..=9 {
+                assert!(validate_name(&format!("{prefix}{digit}")).is_err());
+            }
+            for suffix in ["", "0", "10", "1x", "-1", "_1"] {
+                validate_name(&format!("{prefix}{suffix}")).unwrap();
+            }
+        }
     }
 }

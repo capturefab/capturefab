@@ -2,42 +2,44 @@
 //! keeps the colour filter phase, exposure, auto-meter and focus
 //! measurements, and a bounded JPEG or PNG preview. The session's `frame`
 //! command answers with these for agents, scripts and remote clients.
+#![deny(clippy::missing_const_for_fn)]
+#![deny(clippy::cast_precision_loss)]
 use crate::{
     camera_profile::CameraKind,
     frame::{self, Clipping, FrameRef, RowReader},
     jpeg::Raster,
     types::Frame,
 };
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context as _, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::ops::RangeInclusive;
 
 /// Frames to wait for after the request by default: one, so the frame was
 /// exposed after any change ordered before the request.
-pub fn default_fresh() -> u32 {
+pub(crate) const fn default_fresh() -> u32 {
     1
 }
 /// How long an inspection waits for its frame by default, in milliseconds.
-pub fn default_wait_ms() -> u64 {
+pub(crate) const fn default_wait_ms() -> u64 {
     3_000
 }
 /// The preview's longest edge by default, in pixels.
-pub fn default_edge() -> u32 {
+pub(crate) const fn default_edge() -> u32 {
     1_024
 }
 
-pub const MAX_FRESH: u32 = 10;
+pub(crate) const MAX_FRESH: u32 = 10;
 /// The longest an inspection may wait for its frame: ten minutes, for a
 /// part on a conveyor that triggers the camera.
-pub const MAX_WAIT_MS: u64 = 600_000;
+pub(crate) const MAX_WAIT_MS: u64 = 600_000;
 /// The wait `--timeout none` asks for: for a trigger until stopped, as a
 /// capture's.
-pub const WAIT_FOREVER_MS: u64 = crate::scheduling::MAX_DURATION_MS;
+pub(crate) const WAIT_FOREVER_MS: u64 = crate::scheduling::MAX_DURATION_MS;
 /// Preview edges a request may ask for; 0 asks for measurements only.
-pub const EDGES: RangeInclusive<u32> = 64..=2048;
+pub(crate) const EDGES: RangeInclusive<u32> = 64..=2048;
 /// The largest encoded preview. About 2 MiB as base64, well inside the
 /// session's 16 MiB reply limit and what vision models accept per image.
-pub const MAX_IMAGE_BYTES: usize = 3 * 512 * 1024;
+pub(crate) const MAX_IMAGE_BYTES: usize = 3 * 512 * 1024;
 
 /// JPEG qualities tried in turn while a preview exceeds `MAX_IMAGE_BYTES`.
 const QUALITIES: [i32; 3] = [85, 75, 65];
@@ -68,7 +70,7 @@ pub enum PreviewFormat {
 }
 
 /// Check an inspection request.
-pub fn validate(
+pub(crate) fn validate(
     fresh: u32,
     timeout_ms: u64,
     max_dimension: u32,
@@ -98,22 +100,34 @@ pub fn validate(
     Ok(())
 }
 
+/// Round a pixel count within finite integer bounds, including empty sides.
+fn rounded_pixels(value: f64, minimum: u32, maximum: u32) -> u32 {
+    let value = value
+        .round()
+        .max(f64::from(minimum))
+        .min(f64::from(maximum));
+    u32::try_from(
+        crate::types::integral_float(value).expect("bounded pixel count is a finite integer"),
+    )
+    .expect("bounded pixel count fits u32")
+}
+
 /// A normalized `[x, y, width, height]` region in pixels of a `width` ×
 /// `height` frame, clamped to the frame and at least one pixel on each side.
-pub fn region_pixels(region: [f64; 4], width: u32, height: u32) -> [u32; 4] {
+pub(crate) fn region_pixels(region: [f64; 4], width: u32, height: u32) -> [u32; 4] {
     let (w, h) = (f64::from(width), f64::from(height));
-    let x = ((region[0] * w).round().max(0.0) as u32).min(width.saturating_sub(1));
-    let y = ((region[1] * h).round().max(0.0) as u32).min(height.saturating_sub(1));
+    let x = rounded_pixels(region[0] * w, 0, width.saturating_sub(1));
+    let y = rounded_pixels(region[1] * h, 0, height.saturating_sub(1));
     [
         x,
         y,
-        ((region[2] * w).round().max(1.0) as u32).min(width - x),
-        ((region[3] * h).round().max(1.0) as u32).min(height - y),
+        rounded_pixels(region[2] * w, 1, width - x),
+        rounded_pixels(region[3] * h, 1, height - y),
     ]
 }
 
 /// A PFNC name such as `BayerRG8`, or the code in hex when it has none here.
-pub fn pixel_format_label(pixel_format: u32) -> String {
+pub(crate) fn pixel_format_label(pixel_format: u32) -> String {
     match frame::pixel_format_name(pixel_format) {
         "Unknown" => format!("0x{pixel_format:08x}"),
         name => name.into(),
@@ -123,7 +137,7 @@ pub fn pixel_format_label(pixel_format: u32) -> String {
 /// The pixels `crop` takes for `px`: clamped to the frame and, for Bayer
 /// frames, widened to whole 2×2 quads on even coordinates, so every pixel
 /// keeps its colour filter.
-pub fn crop_rect(frame: &Frame, px: [u32; 4]) -> [u32; 4] {
+pub(crate) fn crop_rect(frame: &Frame, px: [u32; 4]) -> [u32; 4] {
     let (fw, fh) = (frame.width, frame.height);
     if fw == 0 || fh == 0 {
         return [0, 0, fw, fh];
@@ -148,7 +162,7 @@ pub fn crop_rect(frame: &Frame, px: [u32; 4]) -> [u32; 4] {
 /// as interleaved RGB; other formats use `frame::unpacked`'s representation.
 /// What a region measured in place must match.
 #[cfg(test)]
-pub fn crop(frame: &Frame, px: [u32; 4]) -> Result<Frame> {
+pub(crate) fn crop(frame: &Frame, px: [u32; 4]) -> Result<Frame> {
     frame::validate_source(frame)?;
     if let Some((_, bits)) = frame::native_color(frame, 0, 0) {
         let [x, y, width, height] = crop_rect(frame, px);
@@ -168,11 +182,15 @@ pub fn crop(frame: &Frame, px: [u32; 4]) -> Result<Frame> {
         let mut data = Vec::with_capacity(width as usize * height as usize * bytes);
         for yy in y..y + height {
             for xx in x..x + width {
-                let (rgb, _) = frame::native_color(frame, xx as usize, yy as usize)
-                    .expect("a validated native color layout stays constant across the frame");
+                let (rgb, _) =
+                    frame::native_color(frame, xx as usize, yy as usize).ok_or_else(|| {
+                        anyhow::anyhow!("validated native color layout changed across the frame")
+                    })?;
                 for sample in rgb {
                     if bits == 8 {
-                        data.push(sample as u8);
+                        data.push(u8::try_from(sample).map_err(|_| {
+                            anyhow::anyhow!("cropped eight-bit component exceeds u8")
+                        })?);
                     } else {
                         data.extend_from_slice(&sample.to_le_bytes());
                     }
@@ -229,7 +247,7 @@ fn round4(value: f64) -> f64 {
 /// How a region is exposed, from the evenly sampled pixels of
 /// `frame::exposure`. Values are 0–1, rounded to 4 decimals; they are f64
 /// so JSON carries them exactly as rounded.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct ExposureSummary {
     /// Mean luminance.
     pub mean: f64,
@@ -282,21 +300,20 @@ impl From<&frame::Exposure> for ExposureSummary {
         let round = |value: f32| round4(f64::from(value));
         // Bin i holds 8-bit levels 4i..4i+3; its centre is 4i + 1.5.
         let mean_of = |bins: &[u32; 64]| {
-            let total: f64 = bins
-                .iter()
-                .enumerate()
-                .map(|(i, &n)| (4.0 * i as f64 + 1.5) * f64::from(n))
+            let total: f64 = (0u8..64)
+                .zip(bins)
+                .map(|(i, &n)| (4.0 * f64::from(i) + 1.5) * f64::from(n))
                 .sum();
             round4(total / f64::from(samples.max(1)) / 255.0)
         };
         let percentile = |q: f64| {
             let target = q * f64::from(samples);
             let mut seen = 0.0;
-            for (i, &n) in exposure.luma.iter().enumerate() {
+            for (i, &n) in (0u8..64).zip(&exposure.luma) {
                 let next = seen + f64::from(n);
                 if n > 0 && next >= target {
                     let within = ((target - seen) / f64::from(n)).clamp(0.0, 1.0);
-                    return round4((i as f64 + within) / 64.0);
+                    return round4((f64::from(i) + within) / 64.0);
                 }
                 seen = next;
             }
@@ -341,6 +358,7 @@ pub struct Measurements {
 /// `kind`. Depth, thermal and line-scan images and undecodable formats have
 /// no exposure or focus; a note says why.
 #[cfg(any(test, feature = "testing"))]
+#[must_use]
 pub fn measure(frame: &Frame, kind: CameraKind, region_px: [u32; 4]) -> Measurements {
     let rect = crop_rect(frame, region_px);
     match view(frame, rect) {
@@ -389,7 +407,7 @@ fn measure_view(
             measured.clipping = Some(Clipping {
                 max: round4(clipping.max),
                 ..clipping
-            })
+            });
         }
         Err(error) => measured
             .notes
@@ -440,14 +458,14 @@ pub struct EncodedImage {
     pub mime: &'static str,
     pub width: u32,
     pub height: u32,
-    pub bytes: crate::frame::Body<'static>,
+    pub bytes: frame::Body<'static>,
 }
 
 /// JSON carries the image as base64 beside its byte count.
 impl Serialize for EncodedImage {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use base64::Engine;
-        use serde::ser::SerializeStruct;
+        use base64::Engine as _;
+        use serde::ser::SerializeStruct as _;
         let mut image = serializer.serialize_struct("EncodedImage", 5)?;
         image.serialize_field("mime", self.mime)?;
         image.serialize_field("width", &self.width)?;
@@ -516,22 +534,23 @@ fn render_within(
     } else {
         frame::Channels::Rgb
     };
-    let (source_width, source_height) = (view.width as u32, view.height as u32);
+    let source_width =
+        u32::try_from(view.width).context("preview width exceeds native dimensions")?;
+    let source_height =
+        u32::try_from(view.height).context("preview height exceeds native dimensions")?;
     let (width, height) = fit(source_width, source_height, max_dimension);
     let first = first_quality(cropped, source_width, source_height);
     let lowest = QUALITIES[QUALITIES.len() - 1];
     for step in 0..=SCALE_STEPS {
-        let shrink = |side: u32| ((f64::from(side) * SCALE.powi(step)).round() as u32).max(1);
+        let shrink = |side: u32| rounded_pixels(f64::from(side) * SCALE.powi(step), 1, side.max(1));
         let (out_width, out_height) = (shrink(width), shrink(height));
         let pixels = shrunk(view, channels, out_width, out_height)?;
         let raster = Raster::of(out_width, out_height, channels.bytes(), &pixels);
-        let qualities: Vec<i32> = if step == 0 {
-            std::iter::once(first)
-                .chain(QUALITIES.into_iter().filter(|&quality| quality < first))
-                .collect()
-        } else {
-            vec![lowest]
-        };
+        let qualities = std::iter::once(if step == 0 { first } else { lowest }).chain(
+            QUALITIES
+                .into_iter()
+                .filter(|&quality| step == 0 && quality < first),
+        );
         for quality in qualities {
             let bytes = if jpeg {
                 crate::jpeg::software_quality(&raster, quality)?
@@ -561,8 +580,11 @@ fn fit(width: u32, height: u32, max_edge: u32) -> (u32, u32) {
         return (width, height);
     }
     let scale = |side: u32| {
-        ((u64::from(side) * u64::from(max_edge) + u64::from(longest) / 2) / u64::from(longest))
-            .max(1) as u32
+        u32::try_from(
+            ((u64::from(side) * u64::from(max_edge) + u64::from(longest) / 2) / u64::from(longest))
+                .max(1),
+        )
+        .expect("a fitted edge cannot exceed its u32 source dimension")
     };
     (scale(width), scale(height))
 }
@@ -588,14 +610,21 @@ fn shrunk(
     if (ow, oh) == (w, h) {
         return frame::samples(view, channels);
     }
+    let width = u32::try_from(w).context("preview width exceeds native dimensions")?;
+    let height = u32::try_from(h).context("preview height exceeds native dimensions")?;
     // Every byte is an output pixel the box filter writes.
     let mut out = crate::framebuf::transforms().take_stale(ow * oh * bytes);
     let threads = frame::worker_threads(view.pixels()).min(oh);
     let band = oh.div_ceil(threads);
+    let columns = AreaColumns::new(width, out_width);
     // The first source row of output row `row`.
-    let first = |row: usize| (row * h).div_ceil(oh);
+    let first = |row: usize| {
+        let row = u64::try_from(row).expect("output row indices fit u64");
+        usize::try_from((row * u64::from(height)).div_ceil(u64::from(out_height)))
+            .expect("a source row index fits the source height")
+    };
     let shrink_band = |rows: std::ops::Range<usize>, out: &mut [u8]| {
-        let mut shrink = AreaAverage::new(w, channels, ow, oh, h);
+        let mut shrink = AreaAverage::new(&columns, channels, out_height, height);
         let mut reader = RowReader::new(view);
         for y in first(rows.start)..first(rows.end) {
             shrink.push(y, reader.row(y, channels), out);
@@ -617,14 +646,11 @@ fn shrunk(
 
 /// A box filter fed one source row at a time: each source pixel belongs to
 /// exactly one output pixel, which is the rounded mean of its source pixels.
-struct AreaAverage {
+struct AreaAverage<'a> {
     channels: usize,
-    out_height: usize,
-    height: usize,
-    /// The output column of each source column.
-    columns: Vec<usize>,
-    /// Source columns in each output column.
-    widths: Vec<u64>,
+    out_height: u32,
+    height: u32,
+    columns: &'a AreaColumns,
     sums: Vec<u64>,
     /// Source rows summed into the current output row.
     rows: u64,
@@ -632,26 +658,54 @@ struct AreaAverage {
     written: usize,
 }
 
-impl AreaAverage {
-    fn new(
-        width: usize,
-        channels: frame::Channels,
-        out_width: usize,
-        out_height: usize,
-        height: usize,
-    ) -> Self {
-        let columns: Vec<usize> = (0..width).map(|x| x * out_width / width).collect();
-        let mut widths = vec![0u64; out_width];
-        for &column in &columns {
-            widths[column] += 1;
+/// Immutable column geometry, shared by every output band of a preview.
+struct AreaColumns {
+    /// The output column of each source column.
+    destinations: Vec<u32>,
+    /// Source columns in each output column.
+    widths: Vec<u32>,
+}
+impl AreaColumns {
+    fn new(width: u32, out_width: u32) -> Self {
+        debug_assert!(width > 0 && (1..=width).contains(&out_width));
+        let mut columns =
+            Vec::with_capacity(usize::try_from(width).expect("source width fits usize"));
+        let mut widths = vec![0u32; usize::try_from(out_width).expect("output width fits usize")];
+        let (mut column, mut remainder) = (0, 0);
+        for _ in 0..width {
+            columns.push(column);
+            widths[usize::try_from(column).expect("output column fits usize")] += 1;
+            // Advance floor(x * out_width / width) without forming that
+            // product. Subtract first so even remainder + out_width cannot
+            // overflow on a 32-bit host with a very wide source row.
+            let room = width - remainder;
+            if out_width >= room {
+                remainder = out_width - room;
+                column += 1;
+            } else {
+                remainder += out_width;
+            }
         }
+        Self {
+            destinations: columns,
+            widths,
+        }
+    }
+}
+
+impl<'a> AreaAverage<'a> {
+    fn new(
+        columns: &'a AreaColumns,
+        channels: frame::Channels,
+        out_height: u32,
+        height: u32,
+    ) -> Self {
         Self {
             channels: channels.bytes(),
             out_height,
             height,
             columns,
-            widths,
-            sums: vec![0; out_width * channels.bytes()],
+            sums: vec![0; columns.widths.len() * channels.bytes()],
             rows: 0,
             written: 0,
         }
@@ -660,7 +714,8 @@ impl AreaAverage {
     /// the next row of `out`.
     fn push(&mut self, y: usize, line: &[u8], out: &mut [u8]) {
         let channels = self.channels;
-        for (pixel, &column) in line.chunks_exact(channels).zip(&self.columns) {
+        for (pixel, &column) in line.chunks_exact(channels).zip(&self.columns.destinations) {
+            let column = usize::try_from(column).expect("output column fits usize");
             for (sum, &value) in self.sums[column * channels..][..channels]
                 .iter_mut()
                 .zip(pixel)
@@ -669,13 +724,15 @@ impl AreaAverage {
             }
         }
         self.rows += 1;
-        let (h, oh) = (self.height, self.out_height);
+        let (h, oh) = (u64::from(self.height), u64::from(self.out_height));
+        let y = u64::try_from(y).expect("source row indices fit u64");
         // The next source row starts another output row, or there is none.
         if y + 1 == h || (y + 1) * oh / h != y * oh / h {
             let row = &mut out[self.written * self.sums.len()..][..self.sums.len()];
             for (i, (sum, out)) in self.sums.iter_mut().zip(row).enumerate() {
-                let count = self.rows * self.widths[i / channels];
-                *out = ((*sum + count / 2) / count) as u8;
+                let count = self.rows * u64::from(self.columns.widths[i / channels]);
+                *out = u8::try_from((*sum + count / 2) / count)
+                    .expect("mean of eight-bit samples fits eight bits");
                 *sum = 0;
             }
             self.rows = 0;
@@ -705,7 +762,8 @@ fn area_average(
     } else {
         frame::Channels::Rgb
     };
-    let mut shrink = AreaAverage::new(w, gray, ow, oh, h);
+    let columns = AreaColumns::new(width, out_width);
+    let mut shrink = AreaAverage::new(&columns, gray, out_height, height);
     let mut out = vec![0; ow * oh * channels];
     for (y, line) in source.chunks_exact(w * channels).take(h).enumerate() {
         shrink.push(y, line, &mut out);
@@ -713,7 +771,7 @@ fn area_average(
     std::borrow::Cow::Owned(out)
 }
 
-fn png(raster: &Raster) -> Result<Vec<u8>> {
+fn png(raster: &Raster<'_>) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut encoder = png::Encoder::new(&mut bytes, raster.width, raster.height);
     encoder.set_color(if raster.channels == 1 {
@@ -728,7 +786,7 @@ fn png(raster: &Raster) -> Result<Vec<u8>> {
 }
 
 /// The pixels an inspection covered.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct Region {
     pub x: u32,
     pub y: u32,
@@ -749,6 +807,11 @@ pub struct Inspection {
 
 /// Measure and preview the normalized `region` of `frame` (all of it when
 /// None) from a camera of `kind`; see `measure` and `render`.
+///
+/// # Errors
+/// Returns an error if the source cannot provide the requested view, the
+/// preview dimensions or pixel format cannot be rendered, or image encoding
+/// fails. The requested region is clamped to the source frame.
 pub fn inspect(
     frame: &Frame,
     kind: CameraKind,
@@ -793,6 +856,48 @@ pub fn inspect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn very_tall_previews_keep_exact_row_boundaries() {
+        let source: Vec<u8> = (0..100_000u32).map(|row| row.to_le_bytes()[0]).collect();
+        let input = frame(MONO8, 1, 100_000, source.clone());
+        let actual = shrunk(FrameRef::whole(&input), frame::Channels::Gray, 1, 80_000).unwrap();
+        let expected: Vec<u8> = (0..80_000u64)
+            .map(|row| {
+                let start = usize::try_from((row * 100_000).div_ceil(80_000)).unwrap();
+                let end = usize::try_from(((row + 1) * 100_000).div_ceil(80_000)).unwrap();
+                let count = u64::try_from(end - start).unwrap();
+                let sum: u64 = source[start..end].iter().copied().map(u64::from).sum();
+                u8::try_from((sum + count / 2) / count).unwrap()
+            })
+            .collect();
+        assert_eq!(&*actual, expected.as_slice());
+    }
+
+    #[test]
+    fn preview_columns_match_exact_ratios_without_native_width_products() {
+        fn check(width: u32, out_width: u32) {
+            let columns = AreaColumns::new(width, out_width);
+            let mut widths = vec![0u32; usize::try_from(out_width).unwrap()];
+            for (x, &column) in columns.destinations.iter().enumerate() {
+                let expected = u64::try_from(x).unwrap() * u64::from(out_width) / u64::from(width);
+                assert_eq!(
+                    column,
+                    u32::try_from(expected).unwrap(),
+                    "{width} → {out_width}, x={x}"
+                );
+                widths[usize::try_from(column).expect("output column fits usize")] += 1;
+            }
+            assert_eq!(columns.widths, widths);
+        }
+        for width in 1..=64 {
+            for out_width in 1..=width {
+                check(width, out_width);
+            }
+        }
+        // The direct product exceeds u32 even though the row is only 100 KB.
+        check(100_000, 80_000);
+    }
     use crate::types::{MONO8, RGB8};
     use std::borrow::Cow;
 
@@ -834,7 +939,7 @@ mod tests {
         (0..height)
             .flat_map(|_| {
                 (0..width).map(move |x| {
-                    let level = (x * 255 / (width - 1)) as u8;
+                    let level = u8::try_from(x * 255 / (width - 1)).unwrap();
                     if x % 8 < 2 { level / 2 } else { level }
                 })
             })
@@ -842,14 +947,14 @@ mod tests {
     }
     fn noise(len: usize) -> Vec<u8> {
         let mut state = 0x2545_f491_u32;
-        (0..len)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                state as u8
-            })
-            .collect()
+        std::iter::repeat_with(|| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state.to_le_bytes()[0]
+        })
+        .take(len)
+        .collect()
     }
 
     #[test]
@@ -916,6 +1021,16 @@ mod tests {
         let mono = frame(MONO8, 10, 8, vec![0; 80]);
         assert_eq!(crop_rect(&mono, [3, 5, 99, 99]), [3, 5, 7, 3]);
         assert_eq!(crop_rect(&mono, [99, 99, 0, 0]), [9, 7, 1, 1]);
+        assert_eq!(
+            region_pixels([0.5, 0.5, 0.5, 0.5], u32::MAX, u32::MAX),
+            [2_147_483_648, 2_147_483_648, 2_147_483_647, 2_147_483_647]
+        );
+        assert_eq!(region_pixels([0.0, 0.0, 1.0, 1.0], 0, 0), [0; 4]);
+        assert_eq!(
+            fit(u32::MAX, u32::MAX - 1, u32::MAX - 1),
+            (u32::MAX - 1, u32::MAX - 2)
+        );
+        assert_eq!(fit(1, u32::MAX, 17), (1, 17));
     }
 
     #[test]
@@ -925,7 +1040,7 @@ mod tests {
             BAYER_RG8,
             width,
             height,
-            (0..width * height).map(|i| i as u8).collect(),
+            (0..width * height).map(|i| i.to_le_bytes()[0]).collect(),
         );
         // Odd corners widen to whole quads on even coordinates.
         assert_eq!(crop_rect(&source, [3, 1, 2, 2]), [2, 0, 4, 4]);
@@ -972,11 +1087,15 @@ mod tests {
     fn packed_frames_crop_unpacked_and_measure_at_native_depth() {
         // BayerRG12p: each pair of 12-bit samples lsb packed into three bytes.
         let (width, height) = (8u32, 6u32);
-        let sample = |i: u32| (i * 50) as u16;
+        let sample = |i: u32| u16::try_from(i * 50).unwrap();
         let packed = (0..width * height / 2)
             .flat_map(|pair| {
                 let (a, b) = (sample(2 * pair), sample(2 * pair + 1));
-                [a as u8, (a >> 8) as u8 | (b << 4) as u8, (b >> 4) as u8]
+                [
+                    a.to_le_bytes()[0],
+                    a.to_le_bytes()[1] | (b << 4).to_le_bytes()[0],
+                    u8::try_from(b >> 4).unwrap(),
+                ]
             })
             .collect();
         let source = frame(0x010c_0059, width, height, packed);
@@ -1023,7 +1142,7 @@ mod tests {
                         max / 2 + 2 * i + 2,
                         3 * max / 4 + i + 3,
                     ]
-                    .map(|v| v as u16)
+                    .map(|v| u16::try_from(v).unwrap())
                 })
                 .collect();
             let components: Vec<u16> = if planar {
@@ -1040,7 +1159,7 @@ mod tests {
                             rgb.to_vec()
                         };
                         if alpha {
-                            channels.push(max as u16);
+                            channels.push(u16::try_from(max).unwrap());
                         }
                         channels
                     })
@@ -1054,14 +1173,17 @@ mod tests {
                         for (i, &value) in row.iter().enumerate() {
                             for bit in 0..bits {
                                 packed[(i * bits + bit) / 8] |=
-                                    ((value >> bit) as u8 & 1) << ((i * bits + bit) % 8);
+                                    u8::from((value >> bit) & 1 != 0) << ((i * bits + bit) % 8);
                             }
                         }
                         packed
                     })
                     .collect()
             } else if bits == 8 {
-                components.iter().map(|&v| v as u8).collect()
+                components
+                    .iter()
+                    .map(|&v| u8::try_from(v).unwrap())
+                    .collect()
             } else {
                 components.iter().flat_map(|v| v.to_le_bytes()).collect()
             };
@@ -1073,7 +1195,11 @@ mod tests {
                 2,
                 2,
                 if bits == 8 {
-                    selected.into_iter().flatten().map(|v| v as u8).collect()
+                    selected
+                        .into_iter()
+                        .flatten()
+                        .map(|v| u8::try_from(v).unwrap())
+                        .collect()
                 } else {
                     selected
                         .into_iter()
@@ -1107,7 +1233,7 @@ mod tests {
         let measured = measure(&source, CameraKind::AreaScan, [0, 0, 128, 64]);
         let exposure = measured.exposure.as_ref().unwrap();
         let expected = source.data.iter().map(|&v| f64::from(v)).sum::<f64>()
-            / source.data.len() as f64
+            / f64::from(u32::try_from(source.data.len()).unwrap())
             / 255.0;
         assert!((exposure.mean - expected).abs() < 0.01, "{exposure:?}");
         assert!(exposure.p01 < exposure.p50 && exposure.p50 < exposure.p99);
@@ -1250,14 +1376,14 @@ mod tests {
     fn previews_fit_the_requested_edge_in_gray_or_colour() {
         let mono = frame(MONO8, 300, 200, ramp(300, 200));
         let pixels = (0..300 * 200)
-            .flat_map(|i| [(i % 256) as u8, 64, 200])
+            .flat_map(|i| [u8::try_from(i % 256).unwrap(), 64, 200])
             .collect();
         let color = frame(RGB8, 300, 200, pixels);
         let bayer = frame(BAYER_RG8, 300, 200, ramp(300, 200));
         for (source, channels) in [(&mono, 1), (&color, 3), (&bayer, 3)] {
             let image = render(source, 64, PreviewFormat::Png).unwrap().unwrap();
             assert_eq!((image.width, image.height), (64, 43));
-            let decoder = png::Decoder::new(&image.bytes[..]);
+            let decoder = png::Decoder::new(&*image.bytes);
             let reader = decoder.read_info().unwrap();
             assert_eq!(reader.info().color_type.samples(), channels);
             assert_eq!((reader.info().width, reader.info().height), (64, 43));
@@ -1269,7 +1395,7 @@ mod tests {
         let json = serde_json::to_value(&image).unwrap();
         assert_eq!(json["bytes"], image.bytes.len());
         assert_eq!(json["mime"], "image/png");
-        use base64::Engine;
+        use base64::Engine as _;
         assert_eq!(
             base64::engine::general_purpose::STANDARD
                 .decode(json["base64"].as_str().unwrap())
@@ -1436,17 +1562,15 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!((smaller.width, smaller.height), (160, 160));
-        assert!(
-            render_within(
-                FrameRef::whole(&noisy),
-                200,
-                PreviewFormat::Png,
-                true,
-                64,
-                false
-            )
-            .is_err()
-        );
+        render_within(
+            FrameRef::whole(&noisy),
+            200,
+            PreviewFormat::Png,
+            true,
+            64,
+            false,
+        )
+        .unwrap_err();
     }
 
     #[test]
@@ -1504,10 +1628,14 @@ mod tests {
             match value {
                 serde_json::Value::Number(number) => found.push(number.to_string()),
                 serde_json::Value::Array(items) => {
-                    items.iter().for_each(|item| numbers(item, found));
+                    for item in items {
+                        numbers(item, found);
+                    }
                 }
                 serde_json::Value::Object(fields) => {
-                    fields.values().for_each(|field| numbers(field, found));
+                    for field in fields.values() {
+                        numbers(field, found);
+                    }
                 }
                 _ => {}
             }
@@ -1599,7 +1727,7 @@ mod tests {
             ] {
                 let rect = crop_rect(&source, region);
                 let view = FrameRef::region(&source, rect);
-                let crop = super::crop(&source, rect).unwrap();
+                let crop = crop(&source, rect).unwrap();
                 let whole = FrameRef::whole(&crop);
                 let label = format!("{format:08x} {rect:?}");
                 assert_eq!(

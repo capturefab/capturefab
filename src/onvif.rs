@@ -1,17 +1,21 @@
 //! ONVIF WS-Discovery and Media1/Media2 profile/RTSP URI resolution.
-//! SOAP uses bounded HTTP requests, WS UsernameToken PasswordDigest, and HTTP
+//! SOAP uses bounded HTTP requests, WS `UsernameToken` `PasswordDigest`, and HTTP
 //! Basic/Digest authentication. HTTPS SOAP is rejected explicitly.
+#![forbid(unsafe_code)]
+#![deny(clippy::panic_in_result_fn)]
+#![deny(clippy::missing_const_for_fn, clippy::cast_precision_loss)]
 use crate::types::{Categorized, ErrorKind};
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use md5::{Digest, Md5};
+use md5::{Digest as _, Md5};
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Sha256, Sha512_256};
+use std::fmt::Write as _;
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{BufRead, BufReader, Read, Write},
-    net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs as _, UdpSocket},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -20,7 +24,7 @@ const DEVICE_NS: &str = "http://www.onvif.org/ver10/device/wsdl";
 const MEDIA_NS: &str = "http://www.onvif.org/ver10/media/wsdl";
 const MEDIA2_NS: &str = "http://www.onvif.org/ver20/media/wsdl";
 #[derive(Clone, Serialize, Deserialize)]
-pub struct Credentials {
+pub(crate) struct Credentials {
     pub username: String,
     pub password: String,
 }
@@ -33,7 +37,7 @@ impl std::fmt::Debug for Credentials {
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OnvifDevice {
+pub(crate) struct OnvifDevice {
     pub endpoint: String,
     pub addresses: Vec<String>,
     pub scopes: Vec<String>,
@@ -41,7 +45,7 @@ pub struct OnvifDevice {
     pub source: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OnvifStream {
+pub(crate) struct OnvifStream {
     pub token: String,
     pub name: String,
     pub encoding: Option<String>,
@@ -49,26 +53,46 @@ pub struct OnvifStream {
     pub height: Option<u32>,
     pub uri: String,
 }
+fn random_bytes() -> Result<[u8; 16]> {
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random)
+        .map_err(|error| anyhow!("random bytes: {error}"))
+        .context("cannot generate ONVIF nonce")?;
+    Ok(random)
+}
 fn random_hex() -> Result<String> {
-    crate::types::random_hex(16).context("cannot generate ONVIF nonce")
+    Ok(crate::types::hex(random_bytes()?))
 }
 fn uuid() -> Result<String> {
-    let h = random_hex()?;
-    Ok(format!(
-        "{}-{}-{}-{}-{}",
-        &h[..8],
-        &h[8..12],
-        &h[12..16],
-        &h[16..20],
-        &h[20..]
-    ))
+    Ok(crate::types::format_uuid(&random_bytes()?))
 }
-fn escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+
+struct XmlText<'a>(&'a str);
+
+impl std::fmt::Display for XmlText<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for chunk in self.0.split_inclusive(['&', '<', '>', '"', '\'']) {
+            let mut characters = chunk.chars();
+            let escaped = match characters.next_back() {
+                Some('&') => "&amp;",
+                Some('<') => "&lt;",
+                Some('>') => "&gt;",
+                Some('"') => "&quot;",
+                Some('\'') => "&apos;",
+                _ => {
+                    f.write_str(chunk)?;
+                    continue;
+                }
+            };
+            f.write_str(characters.as_str())?;
+            f.write_str(escaped)?;
+        }
+        Ok(())
+    }
+}
+
+const fn escape(s: &str) -> XmlText<'_> {
+    XmlText(s)
 }
 fn child_text<'a>(n: roxmltree::Node<'a, 'a>, name: &str) -> Option<&'a str> {
     n.descendants()
@@ -119,7 +143,7 @@ fn parse_discovery(xml: &str, source: SocketAddr) -> Result<Vec<OnvifDevice>> {
             .split_whitespace()
             .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
             .filter(|url| uri_characters(url))
-            .map(str::to_string)
+            .map(str::to_owned)
             .collect::<Vec<_>>();
         let Some(endpoint) = device_endpoint(&addresses, source.ip()) else {
             continue;
@@ -130,7 +154,7 @@ fn parse_discovery(xml: &str, source: SocketAddr) -> Result<Vec<OnvifDevice>> {
             scopes: child_text(matched, "Scopes")
                 .unwrap_or("")
                 .split_whitespace()
-                .map(str::to_string)
+                .map(str::to_owned)
                 .collect(),
             uuid: child_text(matched, "Address").unwrap_or("").into(),
             source: source.to_string(),
@@ -138,7 +162,7 @@ fn parse_discovery(xml: &str, source: SocketAddr) -> Result<Vec<OnvifDevice>> {
     }
     Ok(result)
 }
-/// The device service address to connect to among those a ProbeMatch lists
+/// The device service address to connect to among those a `ProbeMatch` lists
 /// (one per scheme and address, in no set order, Core 7.3.2.3): HTTP before
 /// the unsupported HTTPS, then the address the reply came from, IPv4, host
 /// names and IPv6, with an IPv6 link-local address, unusable without its
@@ -164,14 +188,14 @@ fn device_endpoint(addresses: &[String], source: IpAddr) -> Option<String> {
         return Some(url.clone());
     }
     let (scheme, rest) = url.split_once("://")?;
-    let path = &rest[rest.find(['/', '?', '#']).unwrap_or(rest.len())..];
+    let (_, path) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
     Some(match source {
         IpAddr::V4(ip) => format!("{scheme}://{ip}:{port}{path}"),
         IpAddr::V6(ip) => format!("{scheme}://[{ip}]:{port}{path}"),
     })
 }
 /// Add a discovered device unless it is already listed: the same endpoint,
-/// or the same EndpointReference (stable across interfaces, Core 7.3.1)
+/// or the same `EndpointReference` (stable across interfaces, Core 7.3.1)
 /// with an address in common, since cloned firmware can repeat one UUID.
 fn merge_device(devices: &mut Vec<OnvifDevice>, device: OnvifDevice) {
     let known = devices.iter_mut().find(|known| {
@@ -207,7 +231,7 @@ fn probe_message(message_id: &str, types: &str) -> String {
 fn repeat_offsets(first_delay_ms: u64) -> [Duration; 3] {
     let mut delay = first_delay_ms.clamp(50, 250);
     let mut at = 0;
-    [(); 3].map(|_| {
+    [(); 3].map(|()| {
         at += delay;
         delay = (delay * 2).min(500);
         Duration::from_millis(at)
@@ -235,7 +259,7 @@ fn discover_until(
         .filter(|interface| !interface.is_loopback())
         .filter_map(|interface| match interface.addr {
             if_addrs::IfAddr::V4(v4) => Some(v4.ip),
-            _ => None,
+            if_addrs::IfAddr::V6(_) => None,
         })
         .collect::<Vec<_>>();
     let send = || {
@@ -268,7 +292,7 @@ fn discover_until(
         // Devices wait up to 500 ms before answering, so a later copy is late.
         .filter(|at| *at + Duration::from_millis(500) <= deadline)
         .peekable();
-    let mut buffer = [0u8; 65536];
+    let mut buffer = vec![0u8; 64 * 1024].into_boxed_slice();
     let mut devices = Vec::new();
     loop {
         let now = Instant::now();
@@ -330,8 +354,8 @@ fn parse_endpoint(url: &str, allow_https: bool) -> Result<HttpUrl> {
         .split_once("://")
         .context("ONVIF endpoint must use http://")?;
     if !allow_https && protocol.eq_ignore_ascii_case("https") {
-        return Err(crate::types::Categorized::error(
-            crate::types::ErrorKind::Unsupported,
+        return Err(Categorized::error(
+            ErrorKind::Unsupported,
             "HTTPS ONVIF SOAP is not supported in this build; use a camera's HTTP ONVIF service endpoint (HTTPS media playback remains available through FFmpeg)",
         ));
     }
@@ -345,13 +369,13 @@ fn parse_endpoint(url: &str, allow_https: bool) -> Result<HttpUrl> {
         80
     };
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..end];
-    let path: String = if rest[end..].starts_with('?') {
-        format!("/{}", &rest[end..])
-    } else if end == rest.len() {
+    let (authority, tail) = rest.split_at(end);
+    let path: String = if tail.starts_with('?') {
+        format!("/{tail}")
+    } else if tail.is_empty() {
         "/".into()
     } else {
-        rest[end..].into()
+        tail.into()
     };
     ensure!(
         !url.contains('#'),
@@ -362,22 +386,21 @@ fn parse_endpoint(url: &str, allow_https: bool) -> Result<HttpUrl> {
         !authority.contains('@'),
         "ONVIF credentials must be supplied separately from the endpoint URL"
     );
-    let (host, port) = if authority.starts_with('[') {
-        let end = authority.find(']').context("invalid IPv6 ONVIF endpoint")?;
-        let port = if let Some(suffix) = authority[end + 1..].strip_prefix(':') {
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let (host, after) = rest
+            .split_once(']')
+            .context("invalid IPv6 ONVIF endpoint")?;
+        let port = if let Some(suffix) = after.strip_prefix(':') {
             suffix.parse::<u16>()?
         } else {
-            ensure!(
-                authority[end + 1..].is_empty(),
-                "invalid IPv6 endpoint port"
-            );
+            ensure!(after.is_empty(), "invalid IPv6 endpoint port");
             default_port
         };
-        (authority[1..end].to_string(), port)
+        (host.to_owned(), port)
     } else if let Some((host, port)) = authority.rsplit_once(':') {
-        (host.to_string(), port.parse::<u16>()?)
+        (host.to_owned(), port.parse::<u16>()?)
     } else {
-        (authority.to_string(), default_port)
+        (authority.to_owned(), default_port)
     };
     ensure!(
         !host.is_empty() && port > 0,
@@ -390,11 +413,21 @@ fn parse_endpoint(url: &str, allow_https: bool) -> Result<HttpUrl> {
         path,
     })
 }
-fn read_line(reader: &mut impl BufRead, limit: usize) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    reader.take(limit as u64 + 1).read_until(b'\n', &mut out)?;
+#[deny(clippy::arithmetic_side_effects)]
+fn read_line_into(reader: &mut impl BufRead, limit: usize, out: &mut Vec<u8>) -> Result<()> {
+    out.clear();
+    reader
+        .take(u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1))
+        .read_until(b'\n', out)?;
     ensure!(out.len() <= limit, "ONVIF HTTP header line is too long");
     ensure!(!out.is_empty(), "ONVIF HTTP response ended before headers");
+    Ok(())
+}
+
+#[cfg(test)]
+fn read_line(reader: &mut impl BufRead, limit: usize) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    read_line_into(reader, limit, &mut out)?;
     Ok(out)
 }
 struct HttpResponse {
@@ -405,23 +438,24 @@ struct HttpResponse {
 }
 /// The status, headers (repeats joined) and `WWW-Authenticate` lines of an
 /// HTTP or RTSP response.
+#[deny(clippy::arithmetic_side_effects)]
 fn parse_head(reader: &mut impl BufRead) -> Result<(u16, BTreeMap<String, String>, Vec<String>)> {
-    let status = read_line(reader, 4096)?;
-    let status = std::str::from_utf8(&status)?
+    let mut line = Vec::new();
+    read_line_into(reader, 4096, &mut line)?;
+    let status = std::str::from_utf8(&line)?
         .split_whitespace()
         .nth(1)
         .context("malformed ONVIF HTTP status")?
         .parse::<u16>()?;
     let mut headers: BTreeMap<String, String> = BTreeMap::new();
     let mut challenges = Vec::new();
-    let mut header_bytes = 0;
+    let mut header_bytes = 0usize;
     loop {
-        let line = read_line(reader, 8192)?;
-        header_bytes += line.len();
-        ensure!(
-            header_bytes <= 65536,
-            "ONVIF HTTP headers exceed size limit"
-        );
+        read_line_into(reader, 8192, &mut line)?;
+        header_bytes = header_bytes
+            .checked_add(line.len())
+            .filter(|&size| size <= 65536)
+            .context("ONVIF HTTP headers exceed size limit")?;
         if line == b"\r\n" || line == b"\n" {
             break;
         }
@@ -437,21 +471,24 @@ fn parse_head(reader: &mut impl BufRead) -> Result<(u16, BTreeMap<String, String
             .entry(name)
             .and_modify(|v| {
                 v.push_str(", ");
-                v.push_str(value.trim())
+                v.push_str(value.trim());
             })
             .or_insert_with(|| value.trim().into());
     }
     Ok((status, headers, challenges))
 }
+#[deny(clippy::arithmetic_side_effects)]
 fn parse_http(mut reader: impl BufRead) -> Result<HttpResponse> {
     let (status, headers, challenges) = parse_head(&mut reader)?;
     let mut body = Vec::new();
-    if headers
-        .get("transfer-encoding")
-        .is_some_and(|s| s.to_ascii_lowercase().contains("chunked"))
-    {
+    if headers.get("transfer-encoding").is_some_and(|s| {
+        s.as_bytes()
+            .windows(b"chunked".len())
+            .any(|window| window.eq_ignore_ascii_case(b"chunked"))
+    }) {
+        let mut line = Vec::new();
         loop {
-            let line = read_line(&mut reader, 256)?;
+            read_line_into(&mut reader, 256, &mut line)?;
             let size = usize::from_str_radix(
                 std::str::from_utf8(&line)?
                     .trim()
@@ -464,12 +501,13 @@ fn parse_http(mut reader: impl BufRead) -> Result<HttpResponse> {
             if size == 0 {
                 break;
             }
-            ensure!(
-                body.len().checked_add(size).is_some_and(|n| n <= MAX_SOAP),
-                "ONVIF HTTP body exceeds size limit"
-            );
+            let end = body
+                .len()
+                .checked_add(size)
+                .filter(|&n| n <= MAX_SOAP)
+                .context("ONVIF HTTP body exceeds size limit")?;
             let old = body.len();
-            body.resize(old + size, 0);
+            body.resize(end, 0);
             reader.read_exact(&mut body[old..])?;
             let mut crlf = [0; 2];
             reader.read_exact(&mut crlf)?;
@@ -481,7 +519,13 @@ fn parse_http(mut reader: impl BufRead) -> Result<HttpResponse> {
         body.resize(length, 0);
         reader.read_exact(&mut body)?;
     } else {
-        reader.take(MAX_SOAP as u64 + 1).read_to_end(&mut body)?;
+        reader
+            .take(
+                u64::try_from(MAX_SOAP)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(1),
+            )
+            .read_to_end(&mut body)?;
         ensure!(body.len() <= MAX_SOAP, "ONVIF HTTP body exceeds size limit");
     }
     Ok(HttpResponse {
@@ -610,19 +654,19 @@ fn request(
     exchange(open_tcp(url, timeout)?, url, action, body, authorization)
 }
 fn utc_timestamp(seconds: u64) -> String {
-    let days = (seconds / 86400) as i64;
+    let days = seconds / 86400;
     let day_seconds = seconds % 86400;
     // Gregorian civil date from days since Unix epoch, independent of local TZ.
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
     let mut year = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
     let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = mp + if mp < 10 { 3 } else { -9 };
-    year += if month <= 2 { 1 } else { 0 };
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    year += u64::from(month <= 2);
     format!(
         "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
         day_seconds / 3600,
@@ -631,20 +675,21 @@ fn utc_timestamp(seconds: u64) -> String {
     )
 }
 /// Seconds since the Unix epoch of a UTC civil date and time.
-fn unix_seconds(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) -> i64 {
+const fn unix_seconds(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = if year >= 0 { year } else { year - 399 } / 400;
     let yoe = year - era * 400;
     let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    (era * 146097 + doe - 719468) * 86400 + hour * 3600 + minute * 60 + second
+    (era * 146_097 + doe - 719_468) * 86400 + hour * 3600 + minute * 60 + second
 }
 fn now_seconds() -> Result<i64> {
-    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64)
+    i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
+        .context("system clock exceeds signed seconds range")
 }
 /// The device clock minus the host clock, in seconds, from the device's
-/// UTCDateTime in an unauthenticated GetSystemDateAndTime (Core 8.3.6,
-/// PRE_AUTH). A device that answers without it gives `None`; one that cannot
+/// `UTCDateTime` in an unauthenticated `GetSystemDateAndTime` (Core 8.3.6,
+/// `PRE_AUTH`). A device that answers without it gives `None`; one that cannot
 /// be reached is an error.
 fn clock_offset(device: &str, timeout: Duration) -> Result<Option<i64>> {
     let url = parse_url(device)?;
@@ -690,14 +735,15 @@ fn clock_offset(device: &str, timeout: Duration) -> Result<Option<i64>> {
         unix_seconds(year, month, day, hour, minute, second) - now,
     ))
 }
-/// A WS-Security UsernameToken with a new nonce, created at the device's
+/// A WS-Security `UsernameToken` with a new nonce, created at the device's
 /// time: devices reject a token whose Created is outside their own clock's
 /// freshness window.
 fn security(credentials: &Credentials, clock_offset: i64) -> Result<String> {
     validate_credentials(credentials)?;
     let mut nonce = [0u8; 20];
     getrandom::fill(&mut nonce).map_err(|e| anyhow!("cannot generate ONVIF nonce: {e}"))?;
-    let created = utc_timestamp(now_seconds()?.saturating_add(clock_offset).max(0) as u64);
+    let created =
+        utc_timestamp(u64::try_from(now_seconds()?.saturating_add(clock_offset)).unwrap_or(0));
     let mut hash = Sha1::new();
     hash.update(nonce);
     hash.update(created.as_bytes());
@@ -730,8 +776,8 @@ pub(crate) fn challenges(values: &[String]) -> Result<Vec<Challenge>> {
             let end = rest
                 .find(|c: char| c == '=' || c == ',' || c.is_ascii_whitespace())
                 .unwrap_or(rest.len());
-            let token = &rest[..end];
-            let after = rest[end..].trim_start_matches([' ', '\t']);
+            let (token, tail) = rest.split_at(end);
+            let after = tail.trim_start_matches([' ', '\t']);
             match after
                 .strip_prefix('=')
                 .map(|v| v.trim_start_matches([' ', '\t']))
@@ -744,21 +790,22 @@ pub(crate) fn challenges(values: &[String]) -> Result<Vec<Challenge>> {
                         for (i, c) in quoted.char_indices() {
                             if escaped {
                                 text.push(c);
-                                escaped = false
+                                escaped = false;
                             } else if c == '\\' {
-                                escaped = true
+                                escaped = true;
                             } else if c == '"' {
                                 end = Some(i);
                                 break;
                             } else {
-                                text.push(c)
+                                text.push(c);
                             }
                         }
                         let end = end.context("unterminated HTTP authentication challenge")?;
-                        (text, &quoted[end + 1..])
+                        (text, quoted.split_at(end + 1).1)
                     } else {
                         let end = value.find(',').unwrap_or(value.len());
-                        (value[..end].trim().to_owned(), &value[end..])
+                        let (value, next) = value.split_at(end);
+                        (value.trim().to_owned(), next)
                     };
                     if let Some(challenge) = &mut current {
                         challenge.params.insert(token.to_ascii_lowercase(), value);
@@ -773,7 +820,7 @@ pub(crate) fn challenges(values: &[String]) -> Result<Vec<Challenge>> {
                         scheme: token.to_owned(),
                         params: BTreeMap::new(),
                     });
-                    rest = &rest[end..];
+                    rest = tail;
                 }
             }
         }
@@ -791,18 +838,17 @@ impl DigestHash {
     /// The hash and whether it is a `-sess` variant, for an RFC 7616
     /// algorithm token; an absent algorithm means MD5.
     fn parse(algorithm: Option<&str>) -> Option<(Self, bool)> {
-        let name = algorithm.unwrap_or("MD5").to_ascii_lowercase();
-        let (base, sess) = match name.strip_suffix("-sess") {
-            Some(base) => (base, true),
-            None => (name.as_str(), false),
-        };
-        let hash = match base {
-            "md5" => Self::Md5,
-            "sha-256" => Self::Sha256,
-            "sha-512-256" => Self::Sha512_256,
-            _ => return None,
-        };
-        Some((hash, sess))
+        let name = algorithm.unwrap_or("MD5");
+        [
+            ("MD5", Self::Md5, false),
+            ("MD5-sess", Self::Md5, true),
+            ("SHA-256", Self::Sha256, false),
+            ("SHA-256-sess", Self::Sha256, true),
+            ("SHA-512-256", Self::Sha512_256, false),
+            ("SHA-512-256-sess", Self::Sha512_256, true),
+        ]
+        .into_iter()
+        .find_map(|(token, hash, sess)| name.eq_ignore_ascii_case(token).then_some((hash, sess)))
     }
     fn hex(self, text: &str) -> String {
         match self {
@@ -947,13 +993,14 @@ fn digest_authorization(
         param("algorithm").unwrap_or("MD5")
     );
     if qop {
-        auth.push_str(&format!(
+        let _ = write!(
+            auth,
             ", qop=auth, nc=00000001, cnonce=\"{}\"",
             quoted(cnonce)
-        ));
+        );
     }
     if let Some(opaque) = param("opaque") {
-        auth.push_str(&format!(", opaque=\"{}\"", quoted(opaque)));
+        let _ = write!(auth, ", opaque=\"{}\"", quoted(opaque));
     }
     auth
 }
@@ -978,16 +1025,16 @@ struct Soap<'a> {
     clock_offset: Option<i64>,
     /// Service endpoints that refused WS-Security and accepted HTTP
     /// authentication; a device's services may each take a different one.
-    http_auth: std::collections::BTreeSet<String>,
+    http_auth: BTreeSet<String>,
 }
 impl<'a> Soap<'a> {
-    fn new(device: &'a str, credentials: Option<&'a Credentials>, timeout: Duration) -> Self {
+    const fn new(device: &'a str, credentials: Option<&'a Credentials>, timeout: Duration) -> Self {
         Self {
             device,
             credentials,
             timeout,
             clock_offset: None,
-            http_auth: Default::default(),
+            http_auth: BTreeSet::new(),
         }
     }
     fn token(&mut self, credentials: &Credentials) -> Result<String> {
@@ -999,7 +1046,7 @@ impl<'a> Soap<'a> {
         };
         security(credentials, offset)
     }
-    /// Send a WS-Security UsernameToken first, which most cameras take.
+    /// Send a WS-Security `UsernameToken` first, which most cameras take.
     /// When the device refuses it, answer its HTTP Digest (or Basic)
     /// challenge without a token (Core 5.9.1: not both at once), and keep
     /// using HTTP authentication for later calls to that endpoint once it works.
@@ -1084,7 +1131,7 @@ fn finish(response: HttpResponse, refused: impl Fn() -> anyhow::Error) -> Result
     xml_document(&response.body)?;
     Ok(response.body)
 }
-pub fn resolve(
+pub(crate) fn resolve(
     endpoint: &str,
     credentials: Option<&Credentials>,
     profile: Option<&str>,
@@ -1109,7 +1156,11 @@ pub fn resolve(
             .to_socket_addrs()
             .map(|addresses| addresses.map(|a| a.ip()).collect())
             .unwrap_or_default(),
-        device: services.device.as_deref().and_then(host_and_port),
+        device: services
+            .device
+            .as_deref()
+            .and_then(host_and_port)
+            .map(|(host, port)| (host.to_owned(), port)),
         url,
     };
     let mut first_error = None;
@@ -1154,21 +1205,21 @@ fn local_only(ip: IpAddr) -> bool {
                 // Shared address space (RFC 6598) behind carrier-grade NAT.
                 || (ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64)
         }
-        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
-            Some(ip) => local_only(IpAddr::V4(ip)),
-            None => {
+        IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or_else(
+            || {
                 ip.is_loopback()
                     || ip.is_unspecified()
                     || ip.is_unique_local()
                     || ip.is_unicast_link_local()
-            }
-        },
+            },
+            |ip| local_only(IpAddr::V4(ip)),
+        ),
     }
 }
 /// The host and port, with the scheme's default port, of an advertised URL.
-fn host_and_port(url: &str) -> Option<(String, u16)> {
+fn host_and_port(url: &str) -> Option<(&str, u16)> {
     let (scheme, rest) = url.split_once("://")?;
-    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     if authority.contains('@') {
         return None;
     }
@@ -1183,15 +1234,11 @@ fn host_and_port(url: &str) -> Option<(String, u16)> {
     };
     let port = match port {
         Some(port) => port.parse().ok()?,
-        None => match scheme.to_ascii_lowercase().as_str() {
-            "http" => 80,
-            "https" => 443,
-            "rtsp" => 554,
-            "rtsps" => 322,
-            _ => return None,
-        },
+        None => [("http", 80), ("https", 443), ("rtsp", 554), ("rtsps", 322)]
+            .into_iter()
+            .find_map(|(name, port)| scheme.eq_ignore_ascii_case(name).then_some(port))?,
     };
-    (!host.is_empty()).then(|| (host.to_owned(), port))
+    (!host.is_empty()).then_some((host, port))
 }
 impl Reached {
     /// `url` at the host the device answered on, when the advertised host
@@ -1230,20 +1277,20 @@ impl Reached {
             self.url.host.clone()
         };
         let port = if self.device.as_ref().is_some_and(|(device, device_port)| {
-            device.eq_ignore_ascii_case(&host) && *device_port == port
+            device.eq_ignore_ascii_case(host) && *device_port == port
         }) {
             self.url.port
         } else {
             port
         };
         let (scheme, rest) = url.split_once("://").unwrap_or_default();
-        let path = &rest[rest.find(['/', '?', '#']).unwrap_or(rest.len())..];
+        let (_, path) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
         format!("{scheme}://{endpoint}:{port}{path}")
     }
 }
-/// The Media1 and Media2 service addresses from GetServices (Core 8.1.2.2),
-/// or from GetCapabilities on older devices, which list Media1 only.
-fn media_services(soap: &mut Soap, endpoint: &str) -> Result<Services> {
+/// The Media1 and Media2 service addresses from `GetServices` (Core 8.1.2.2),
+/// or from `GetCapabilities` on older devices, which list Media1 only.
+fn media_services(soap: &mut Soap<'_>, endpoint: &str) -> Result<Services> {
     let mut services = Services::default();
     match soap.call(
         endpoint,
@@ -1302,19 +1349,19 @@ enum Media {
     V2,
 }
 impl Media {
-    fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Self::V1 => "Media1",
             Self::V2 => "Media2",
         }
     }
-    fn namespace(self) -> &'static str {
+    const fn namespace(self) -> &'static str {
         match self {
             Self::V1 => MEDIA_NS,
             Self::V2 => MEDIA2_NS,
         }
     }
-    fn get_profiles(self) -> &'static str {
+    const fn get_profiles(self) -> &'static str {
         match self {
             Self::V1 => "<trt:GetProfiles/>",
             // Without a type, Media2 lists no configurations.
@@ -1336,7 +1383,7 @@ impl Media {
     }
 }
 fn media_streams(
-    soap: &mut Soap,
+    soap: &mut Soap<'_>,
     media: Media,
     address: &str,
     profile: Option<&str>,
@@ -1362,7 +1409,7 @@ fn media_streams(
         if profile.is_some_and(|requested| requested != token) {
             continue;
         }
-        if !names.insert(token.to_string()) {
+        if !names.insert(token.to_owned()) {
             continue;
         }
         let name =
@@ -1394,7 +1441,7 @@ fn media_streams(
                 .and_then(|n| n.text())
                 .context("ONVIF GetStreamUri returned no URI")?
                 .trim()
-                .to_string();
+                .to_owned();
             ensure!(
                 matches!(
                     uri.split(':').next(),
@@ -1440,7 +1487,7 @@ fn media_streams(
 }
 
 /// Recognize ONVIF locators before the general media URL handler.
-pub fn is_source(source: &str) -> bool {
+pub(crate) fn is_source(source: &str) -> bool {
     source
         .get(..6)
         .is_some_and(|protocol| protocol.eq_ignore_ascii_case("onvif:"))
@@ -1460,7 +1507,9 @@ fn source_endpoint_impl(source: &str, allow_https: bool) -> Result<(String, Opti
         is_source(source),
         "ONVIF source must use onvif:http://HOST/service or onvif://USER:PASS@HOST/service"
     );
-    let endpoint = &source[6..];
+    let (_, endpoint) = source
+        .split_once(':')
+        .context("ONVIF locator needs a colon")?;
     if endpoint.split_once("://").is_some_and(|(protocol, _)| {
         protocol.eq_ignore_ascii_case("http") || protocol.eq_ignore_ascii_case("https")
     }) {
@@ -1471,11 +1520,11 @@ fn source_endpoint_impl(source: &str, allow_https: bool) -> Result<(String, Opti
         "ONVIF source must use onvif:http://HOST/service or onvif://USER:PASS@HOST/service",
     )?;
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..end];
-    let path = if rest[end..].starts_with('?') || end == rest.len() {
-        format!("/onvif/device_service{}", &rest[end..])
+    let (authority, tail) = rest.split_at(end);
+    let path = if tail.starts_with('?') || tail.is_empty() {
+        format!("/onvif/device_service{tail}")
     } else {
-        rest[end..].to_owned()
+        tail.to_owned()
     };
     let (host, credentials) = if let Some((userinfo, host)) = authority.rsplit_once('@') {
         let (username, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
@@ -1503,7 +1552,7 @@ fn source_endpoint_impl(source: &str, allow_https: bool) -> Result<(String, Opti
 /// `onvif:http://HOST:PORT/PATH`, with the host lowercased, the port made
 /// explicit and any query dropped, so `onvif://cam` and
 /// `onvif:http://cam:80/onvif/device_service` are the same camera.
-pub fn endpoint_key(source: &str) -> Result<String> {
+pub(crate) fn endpoint_key(source: &str) -> Result<String> {
     let (endpoint, credentials) = source_endpoint(source)?;
     if credentials.is_some() {
         return Err(crate::types::Usage(
@@ -1525,11 +1574,11 @@ pub fn endpoint_key(source: &str) -> Result<String> {
     Ok(format!("onvif:http://{host}:{}{path}", url.port))
 }
 /// Validate a camera locator before discovery, authentication or camera changes.
-pub fn validate_source(source: &str) -> Result<()> {
+pub(crate) fn validate_source(source: &str) -> Result<()> {
     source_endpoint(source).map(|_| ())
 }
 /// Check locator syntax without testing whether this build can contact the service.
-pub fn validate_source_shape(source: &str) -> Result<()> {
+pub(crate) fn validate_source_shape(source: &str) -> Result<()> {
     source_endpoint_impl(source, true).map(|_| ())
 }
 fn authenticated_uri(uri: &str, credentials: Option<&Credentials>) -> Result<String> {
@@ -1545,7 +1594,7 @@ fn authenticated_uri(uri: &str, credentials: Option<&Credentials>) -> Result<Str
 fn rtsp_challenges(uri: &str, timeout: Duration) -> Result<Vec<String>> {
     let (host, port) = host_and_port(uri).context("invalid RTSP address")?;
     let url = HttpUrl {
-        host,
+        host: host.to_owned(),
         port,
         authority: String::new(),
         path: String::new(),
@@ -1561,7 +1610,7 @@ fn rtsp_challenges(uri: &str, timeout: Duration) -> Result<Vec<String>> {
         Vec::new()
     })
 }
-/// Why the bundled FFmpeg (9.0) cannot answer an RTSP server's challenges,
+/// Why the bundled `FFmpeg` (9.0) cannot answer an RTSP server's challenges,
 /// if it cannot. It takes the last header that starts a Digest challenge
 /// (Digest outranks Basic) and computes only MD5 and MD5-sess, spelled in
 /// that case, with qop auth or none (libavformat/httpauth.c).
@@ -1608,7 +1657,7 @@ fn ffmpeg_cannot_answer(values: &[String], address: &str) -> Option<String> {
     })
 }
 /// A camera that refused the sign-in for an rtsp:// stream although its ONVIF
-/// service took it may be asking for a Digest algorithm FFmpeg cannot answer;
+/// service took it may be asking for a Digest algorithm `FFmpeg` cannot answer;
 /// say so instead of reporting a wrong password.
 fn explain_rtsp_refusal(error: anyhow::Error, uri: &str, timeout: Duration) -> anyhow::Error {
     let uri = crate::logins::strip_userinfo(uri);
@@ -1621,12 +1670,9 @@ fn explain_rtsp_refusal(error: anyhow::Error, uri: &str, timeout: Duration) -> a
     }
     let address = crate::media::redact_url(&uri);
     match rtsp_challenges(&uri, timeout) {
-        Ok(values) => match ffmpeg_cannot_answer(&values, &address) {
-            Some(message) => {
-                crate::types::Categorized::error(crate::types::ErrorKind::Unsupported, message)
-            }
-            None => error,
-        },
+        Ok(values) => ffmpeg_cannot_answer(&values, &address).map_or(error, |message| {
+            Categorized::error(ErrorKind::Unsupported, message)
+        }),
         Err(_) => error,
     }
 }
@@ -1643,7 +1689,7 @@ fn open_stream<T>(
             Ok(backend) => return Ok((stream, backend)),
             // A sign-in problem says more than a later profile's failure.
             Err(error) if auth_error.is_none() && crate::logins::is_auth_error(&error) => {
-                auth_error = Some(error)
+                auth_error = Some(error);
             }
             Err(error) => last_error = Some(error),
         }
@@ -1657,7 +1703,7 @@ fn open_stream<T>(
 /// Open an ONVIF camera, with a sign-in given beside its address. Sign-in
 /// errors always name the ONVIF address, never a stream URI it reported,
 /// since the ONVIF address is what a sign-in is saved under.
-pub fn connect_with(
+pub(crate) fn connect_with(
     source: &str,
     login: Option<&crate::logins::CameraLogin>,
     timeout: Duration,
@@ -1702,9 +1748,11 @@ pub fn connect_with(
         zeroize::Zeroize::zeroize(&mut credentials.password);
     }
     let safe_endpoint = crate::media::redact_url(&endpoint);
-    let hash = safe_endpoint.bytes().fold(0xcbf29ce484222325u64, |h, b| {
-        (h ^ b as u64).wrapping_mul(0x100000001b3)
-    });
+    let hash = safe_endpoint
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        });
     let info = crate::types::CameraInfo {
         id: format!("onvif:{safe_endpoint}"),
         transport: crate::types::Transport::Media,
@@ -1712,21 +1760,21 @@ pub fn connect_with(
         model: profile.name.clone(),
         serial: format!("{hash:016x}"),
         address: Some(safe_endpoint),
-        profile: Default::default(),
+        profile: crate::camera_profile::CameraProfile::default(),
     };
     Ok((info, backend))
 }
 /// The ONVIF cameras that answer within `timeout`, as `list` shows them,
 /// telling `found` of each camera as it answers; it returns at once when
 /// `found` says that was the one.
-pub fn camera_infos_until(
+pub(crate) fn camera_infos_until(
     timeout: Duration,
     found: &mut dyn FnMut(&crate::types::CameraInfo) -> bool,
 ) -> Result<Vec<crate::types::CameraInfo>> {
     Ok(
-        discover_until(timeout, &mut |device| found(&camera_info(device.clone())))?
+        discover_until(timeout, &mut |device| found(&camera_info(device)))?
             .into_iter()
-            .map(camera_info)
+            .map(|device| camera_info(&device))
             .collect(),
     )
 }
@@ -1734,7 +1782,7 @@ pub fn camera_infos_until(
 /// answer discovery, so nothing it names keeps control characters that
 /// could steer the terminal that shows it: a name, percent-encoded in a
 /// scope, that decodes to one is no name.
-fn camera_info(device: OnvifDevice) -> crate::types::CameraInfo {
+fn camera_info(device: &OnvifDevice) -> crate::types::CameraInfo {
     let endpoint = crate::media::redact_url(&device.endpoint);
     let name = device
         .scopes
@@ -1749,13 +1797,51 @@ fn camera_info(device: OnvifDevice) -> crate::types::CameraInfo {
         model: name,
         serial: crate::types::printable_line(&device.uuid).into_owned(),
         address: Some(endpoint),
-        profile: Default::default(),
+        profile: crate::camera_profile::CameraProfile::default(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_ids_keep_their_hex_groups() {
+        let id = uuid().unwrap();
+        let groups: Vec<_> = id.split('-').collect();
+        assert_eq!(
+            groups.iter().map(|group| group.len()).collect::<Vec<_>>(),
+            [8, 4, 4, 4, 12]
+        );
+        assert!(groups.iter().all(|group| {
+            group
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }));
+    }
+
+    #[test]
+    fn xml_text_escapes_each_special_character_and_preserves_unicode() {
+        assert_eq!(
+            escape("雪&<>\"'🙂").to_string(),
+            "雪&amp;&lt;&gt;&quot;&apos;🙂"
+        );
+        for text in [
+            "",
+            "plain 日本語🙂",
+            "&<>\"'",
+            "&amp;",
+            "é'雪&🙂",
+            "&&雪<<🙂>>é\"\"''",
+            "'雪",
+            "🙂&",
+        ] {
+            let xml = format!("<value>{}</value>", escape(text));
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            assert_eq!(doc.root_element().text().unwrap_or_default(), text);
+        }
+    }
+
     #[test]
     fn hosts_that_do_not_answer_are_unavailable() {
         let code = |url: &str, timeout| {
@@ -1788,7 +1874,7 @@ mod tests {
         let devices = parse_discovery(xml, "192.168.1.3:3702".parse().unwrap()).unwrap();
         assert_eq!(devices[0].uuid, "urn:uuid:test");
         assert_eq!(devices[0].addresses.len(), 2);
-        assert_eq!(camera_info(devices[0].clone()).model, "Camera");
+        assert_eq!(camera_info(&devices[0]).model, "Camera");
     }
     #[test]
     fn discovered_names_cannot_steer_the_terminal() {
@@ -1802,12 +1888,12 @@ mod tests {
         )
         .replace("name/IPC", "name/Door%1B%5B2J");
         let devices = parse_discovery(&xml, "192.168.1.3:3702".parse().unwrap()).unwrap();
-        let info = camera_info(devices[0].clone());
+        let info = camera_info(&devices[0]);
         assert_eq!(info.model, "Network camera");
         assert_eq!(info.serial, "urn:uuid:a\u{fffd}2J");
         let raw = xml.replace("name/Door%1B%5B2J", "name/Door\u{9b}2J");
         let devices = parse_discovery(&raw, "192.168.1.3:3702".parse().unwrap()).unwrap();
-        assert_eq!(camera_info(devices[0].clone()).model, "Network camera");
+        assert_eq!(camera_info(&devices[0]).model, "Network camera");
     }
     #[test]
     fn discovery_drops_addresses_no_uri_could_hold() {
@@ -1975,7 +2061,7 @@ mod tests {
                 .to_string()
                 .contains("positive")
         );
-        assert!(discover_until(Duration::MAX, &mut |_| false).is_err());
+        discover_until(Duration::MAX, &mut |_| false).unwrap_err();
     }
     #[test]
     fn endpoint_schemes_ignore_case_and_fragments_have_specific_errors() {
@@ -2001,27 +2087,55 @@ mod tests {
             assert!(!error.contains("secret"));
             assert!(!error.contains("credentials"));
         }
-        assert!(parse_url("http://camera/service%23profile").is_ok());
+        parse_url("http://camera/service%23profile").unwrap();
         assert!(
             validate_source("ONVIF:HTTPS://camera/service")
                 .unwrap_err()
                 .to_string()
                 .contains("not supported")
         );
-        assert!(validate_source_shape("ONVIF:HTTPS://camera/service").is_ok());
+        validate_source_shape("ONVIF:HTTPS://camera/service").unwrap();
         assert!(validate_source_shape("onvif:https://camera:0/service").is_err());
         assert!(validate_source_shape("onvif:https://camera/service#profile").is_err());
     }
     #[test]
+    fn http_header_line_limits_include_the_terminator() {
+        let mut reader = BufReader::with_capacity(1, b"abc\nnext\n".as_slice());
+        let mut line = vec![b'x'; 32];
+        read_line_into(&mut reader, 4, &mut line).unwrap();
+        assert_eq!(line, b"abc\n");
+        read_line_into(&mut reader, usize::MAX, &mut line).unwrap();
+        assert_eq!(line, b"next\n");
+        read_line(&mut reader, 4).unwrap_err();
+        read_line(&mut b"abc\n".as_slice(), 3).unwrap_err();
+        read_line(&mut b"x".as_slice(), 0).unwrap_err();
+        assert_eq!(
+            read_line(&mut b"last".as_slice(), usize::MAX).unwrap(),
+            b"last"
+        );
+    }
+
+    #[test]
     fn http_fixed_and_chunked_body_limits() {
         let fixed = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ntest";
         assert_eq!(parse_http(BufReader::new(&fixed[..])).unwrap().body, "test");
-        let chunked =
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nte\r\n2\r\nst\r\n0\r\n\r\n";
-        assert_eq!(
-            parse_http(BufReader::new(&chunked[..])).unwrap().body,
-            "test"
+        for encoding in ["chunked", "ChUnKeD"] {
+            let chunked = format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: {encoding}\r\n\r\n2\r\nte\r\n2\r\nst\r\n0\r\n\r\n"
+            );
+            assert_eq!(
+                parse_http(BufReader::new(chunked.as_bytes())).unwrap().body,
+                "test"
+            );
+        }
+        let overflow = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n{:x}\r\n",
+            usize::MAX
         );
+        let Err(error) = parse_http(BufReader::new(overflow.as_bytes())) else {
+            panic!("overflowing chunk length must fail before allocation");
+        };
+        assert_eq!(error.to_string(), "ONVIF HTTP body exceeds size limit");
         assert!(
             parse_http(BufReader::new(
                 &b"HTTP/1.1 200 OK\r\nContent-Length: 99999999\r\n\r\n"[..]
@@ -2030,11 +2144,27 @@ mod tests {
         );
     }
     #[test]
+    fn security_clamps_a_device_clock_before_the_epoch() {
+        let token = security(
+            &Credentials {
+                username: "camera".into(),
+                password: "secret".into(),
+            },
+            i64::MIN,
+        )
+        .unwrap();
+        assert!(token.contains("<wsu:Created>1970-01-01T00:00:00Z</wsu:Created>"));
+    }
+
+    #[test]
     fn ws_security_and_timestamps() {
         assert_eq!(utc_timestamp(0), "1970-01-01T00:00:00Z");
-        assert_eq!(utc_timestamp(951782400), "2000-02-29T00:00:00Z");
-        for seconds in [0, 951782400, 981173106, 4102444799] {
-            assert_eq!(created_seconds(&utc_timestamp(seconds)), seconds as i64);
+        assert_eq!(utc_timestamp(951_782_400), "2000-02-29T00:00:00Z");
+        for seconds in [0, 951_782_400, 981_173_106, 4_102_444_799] {
+            assert_eq!(
+                created_seconds(&utc_timestamp(seconds)),
+                i64::try_from(seconds).unwrap()
+            );
         }
         let token = security(
             &Credentials {
@@ -2046,13 +2176,41 @@ mod tests {
         .unwrap();
         assert!(token.contains("a&lt;b"));
         assert!(!token.contains("never-print-me"));
-        assert!(
-            roxmltree::Document::parse(&format!(
-                "<Root xmlns:s='http://www.w3.org/2003/05/soap-envelope'>{token}</Root>"
-            ))
-            .is_ok()
-        );
+        roxmltree::Document::parse(&format!(
+            "<Root xmlns:s='http://www.w3.org/2003/05/soap-envelope'>{token}</Root>"
+        ))
+        .unwrap();
     }
+    #[test]
+    fn digest_algorithms_accept_exact_tokens_in_any_ascii_case() {
+        assert_eq!(DigestHash::parse(None), Some((DigestHash::Md5, false)));
+        for (token, hash, sess) in [
+            ("mD5", DigestHash::Md5, false),
+            ("Md5-SeSs", DigestHash::Md5, true),
+            ("sHa-256", DigestHash::Sha256, false),
+            ("ShA-256-sEsS", DigestHash::Sha256, true),
+            ("sha-512-256", DigestHash::Sha512_256, false),
+            ("SHA-512-256-SESS", DigestHash::Sha512_256, true),
+        ] {
+            assert_eq!(
+                DigestHash::parse(Some(token)),
+                Some((hash, sess)),
+                "{token}"
+            );
+        }
+        for token in [
+            "",
+            " MD5",
+            "MD5 ",
+            "SHA256",
+            "MD5-sess-sess",
+            "SHA-512",
+            "ＭＤ５",
+        ] {
+            assert_eq!(DigestHash::parse(Some(token)), None, "{token}");
+        }
+    }
+
     #[test]
     fn digest_auth_handles_quoted_commas() {
         let challenge =
@@ -2073,8 +2231,25 @@ mod tests {
         .unwrap();
         assert!(auth.contains("qop=auth"));
         assert!(!auth.contains("pass"));
-        assert!(parse_url("https://camera/service").is_err());
-        assert!(parse_url("http://user:pass@camera/service").is_err());
+        parse_url("https://camera/service").unwrap_err();
+        parse_url("http://user:pass@camera/service").unwrap_err();
+    }
+    #[test]
+    fn challenges_preserve_unicode_and_escaped_delimiters() {
+        let parsed = challenges(&[
+            r#"Digest realm="雪, café\"館", nonce="é\\🙂", qop=auth, Basic realm="日本語""#.into(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].scheme, "Digest");
+        assert_eq!(parsed[0].params["realm"], "雪, café\"館");
+        assert_eq!(parsed[0].params["nonce"], "é\\🙂");
+        assert_eq!(parsed[0].params["qop"], "auth");
+        assert_eq!(parsed[1].scheme, "Basic");
+        assert_eq!(parsed[1].params["realm"], "日本語");
+        for malformed in ["Digest realm=\"雪", "Digest realm=\"雪\\"] {
+            assert!(challenges(&[malformed.into()]).is_err(), "{malformed}");
+        }
     }
     fn digest_response(authorization: &str) -> BTreeMap<String, String> {
         let mut parsed = challenges(&[authorization.to_owned()]).unwrap();
@@ -2191,7 +2366,7 @@ mod tests {
             .split_whitespace()
             .nth(1)
             .unwrap()
-            .to_string();
+            .to_owned();
         let mut headers = BTreeMap::new();
         loop {
             let line = read_line(&mut reader, 8192).unwrap();
@@ -2200,7 +2375,7 @@ mod tests {
             }
             let text = std::str::from_utf8(&line).unwrap();
             let (name, value) = text.split_once(':').unwrap();
-            headers.insert(name.to_ascii_lowercase(), value.trim().to_string());
+            headers.insert(name.to_ascii_lowercase(), value.trim().to_owned());
         }
         let len = headers["content-length"].parse::<usize>().unwrap();
         let mut body = vec![0; len];
@@ -2232,12 +2407,18 @@ mod tests {
         assert!(!body.contains(password));
     }
     fn token_field<'a>(body: &'a str, name: &str) -> Option<&'a str> {
-        let start = body.find(&format!(":{name}"))?;
-        let start = start + body[start..].find('>')? + 1;
-        Some(&body[start..start + body[start..].find('<')?])
+        let (_, tag) = body.split_once(format!(":{name}").as_str())?;
+        let (_, contents) = tag.split_once('>')?;
+        Some(contents.split_once('<')?.0)
     }
     fn created_seconds(created: &str) -> i64 {
-        let field = |range: std::ops::Range<usize>| created[range].parse::<i64>().unwrap();
+        let field = |range: std::ops::Range<usize>| {
+            created
+                .get(range)
+                .expect("ASCII creation timestamp")
+                .parse::<i64>()
+                .unwrap()
+        };
         unix_seconds(
             field(0..4),
             field(5..7),
@@ -2254,8 +2435,13 @@ mod tests {
         )
     }
     fn date_and_time(seconds: i64) -> String {
-        let text = utc_timestamp(seconds as u64);
-        let field = |range: std::ops::Range<usize>| text[range].parse::<u32>().unwrap();
+        let text = utc_timestamp(u64::try_from(seconds).unwrap());
+        let field = |range: std::ops::Range<usize>| {
+            text.get(range)
+                .expect("ASCII UTC timestamp")
+                .parse::<u32>()
+                .unwrap()
+        };
         format!(
             "<Envelope><Body><GetSystemDateAndTimeResponse><SystemDateAndTime><DateTimeType>Manual</DateTimeType><DaylightSavings>false</DaylightSavings><UTCDateTime><Time><Hour>{}</Hour><Minute>{}</Minute><Second>{}</Second></Time><Date><Year>{}</Year><Month>{}</Month><Day>{}</Day></Date></UTCDateTime></SystemDateAndTime></GetSystemDateAndTimeResponse></Body></Envelope>",
             field(11..13),
@@ -2511,7 +2697,7 @@ mod tests {
         let error = open_stream::<()>(&streams[..2], |_| bail!("decoder failed")).unwrap_err();
         assert_eq!(error.to_string(), "could not open any ONVIF stream profile");
         assert_eq!(error.root_cause().to_string(), "decoder failed");
-        assert!(open_stream::<()>(&[], |_| unreachable!()).is_err());
+        open_stream::<()>(&[], |_| unreachable!()).unwrap_err();
     }
 
     #[test]
@@ -2629,7 +2815,11 @@ mod tests {
                                 local("onvif/media2_service")
                             );
                             if media1 {
-                                services.push_str(&format!("<tds:Service><tds:Namespace>{MEDIA_NS}</tds:Namespace><tds:XAddr>{}</tds:XAddr></tds:Service>", local("onvif/media_service")));
+                                let _ = write!(
+                                    services,
+                                    "<tds:Service><tds:Namespace>{MEDIA_NS}</tds:Namespace><tds:XAddr>{}</tds:XAddr></tds:Service>",
+                                    local("onvif/media_service")
+                                );
                             }
                             format!("<s:Envelope xmlns:s='http://www.w3.org/2003/05/soap-envelope' xmlns:tds='{DEVICE_NS}' xmlns:tt='http://www.onvif.org/ver10/schema'><s:Body><tds:GetServicesResponse>{services}</tds:GetServicesResponse></s:Body></s:Envelope>").replace("127.0.0.1", &headers["host"])
                         }
@@ -2671,11 +2861,36 @@ mod tests {
         }
     }
     #[test]
+    fn advertised_hosts_keep_their_case_and_scheme_defaults() {
+        for (url, host, port) in [
+            ("HtTp://Camera/path", "Camera", 80),
+            ("HTTPS://Camera?query=1", "Camera", 443),
+            ("RtSp://Camera#fragment", "Camera", 554),
+            ("RTSPS://[::1]/live", "::1", 322),
+            ("rtsp://Camera:8554/live", "Camera", 8554),
+            ("http://[fd00::1]:8080/path", "fd00::1", 8080),
+            ("custom://Camera:1234/path", "Camera", 1234),
+        ] {
+            assert_eq!(host_and_port(url), Some((host, port)), "{url}");
+        }
+        for url in [
+            "http:///path",
+            "http://user:password@Camera/path",
+            "custom://Camera/path",
+            "http://Camera:70000/path",
+            "http://Camera:not-a-port/path",
+            "http://[::1/path",
+        ] {
+            assert_eq!(host_and_port(url), None, "{url}");
+        }
+    }
+
+    #[test]
     fn unreachable_advertised_hosts_become_the_reached_host() {
         let reached = |endpoint: &str, ips: &[&str], device: &str| Reached {
             url: parse_url(endpoint).unwrap(),
             ips: ips.iter().map(|ip| ip.parse().unwrap()).collect(),
-            device: host_and_port(device),
+            device: host_and_port(device).map(|(host, port)| (host.to_owned(), port)),
         };
         // Through a port forward: 203.0.113.5:8080 reaches 192.168.1.64:80.
         let forward = reached(
@@ -2800,11 +3015,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(200));
         });
         let start = Instant::now();
-        assert!(
-            Soap::new(&endpoint, None, Duration::from_millis(50))
-                .call(&endpoint, DEVICE_NS, "Test", "<Test/>")
-                .is_err()
-        );
+        Soap::new(&endpoint, None, Duration::from_millis(50))
+            .call(&endpoint, DEVICE_NS, "Test", "<Test/>")
+            .unwrap_err();
         assert!(start.elapsed() < Duration::from_secs(1));
         server.join().unwrap();
     }
@@ -2928,7 +3141,7 @@ mod tests {
         let sha = r#"Digest realm="IP Camera(C1234)", nonce="d4e5f6", stale="FALSE", algorithm="SHA-256""#;
         let basic = r#"Basic realm="IP Camera(C1234)""#;
         let check = |values: &[&str]| {
-            let values = values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+            let values = values.iter().map(ToString::to_string).collect::<Vec<_>>();
             ffmpeg_cannot_answer(&values, "rtsp://cam/live")
         };
         // FFmpeg keeps the last Digest challenge and computes MD5 only.
@@ -3016,8 +3229,8 @@ mod tests {
                 .unwrap()
                 .contains("p%40ss")
         );
-        assert!(source_endpoint("onvif://user:p%0Aass@camera/service").is_err());
-        assert!(source_endpoint("onvif:https://camera/service").is_err());
+        source_endpoint("onvif://user:p%0Aass@camera/service").unwrap_err();
+        source_endpoint("onvif:https://camera/service").unwrap_err();
         assert!(
             source_endpoint("onvif://user:pass@camera")
                 .unwrap()

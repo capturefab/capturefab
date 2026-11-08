@@ -2,6 +2,8 @@
 //! capture, from one camera or several at once. Every capture to files runs
 //! as a job in the camera's worker, direct or in a session, so the command
 //! blocks until it ends, or with `--background` leaves it running.
+#![forbid(unsafe_code)]
+#![deny(clippy::missing_const_for_fn)]
 use super::{
     Client, Global, Route,
     args::{CamerasArg, KeepArg, Wait},
@@ -15,7 +17,7 @@ use crate::{
     session::SessionCommand,
     types::{Categorized, ErrorKind, Usage},
 };
-use anyhow::{Context, Result};
+use anyhow::{Context as _, Result};
 use clap::{Args, ValueEnum};
 use serde_json::{Value, json};
 use std::{
@@ -25,14 +27,14 @@ use std::{
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum Format {
+pub(crate) enum Format {
     Png,
     #[value(alias = "jpeg")]
     Jpg,
     Raw,
 }
 impl Format {
-    fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Self::Png => "png",
             Self::Jpg => "jpeg",
@@ -42,7 +44,7 @@ impl Format {
 }
 
 #[derive(Debug, Args)]
-pub struct CaptureArgs {
+pub(crate) struct CaptureArgs {
     #[command(flatten)]
     pub cameras: CamerasArg,
     /// File, folder (existing, or ending in /) or template with {camera} {serial} {seq} {seq:N} {time} {date} {tag:KEY} {ext}; - writes one image to stdout (default: this folder, as {camera}-{time}-{seq}.png)
@@ -57,8 +59,8 @@ pub struct CaptureArgs {
     /// How long a time lapse runs, with --every
     #[arg(long = "for", value_name = "DUR", value_parser = super::args::duration)]
     pub duration: Option<Duration>,
-    /// Begin at a time: HH:MM[:SS] here, or RFC 3339
-    #[arg(long, value_name = "TIME", conflicts_with = "after", value_parser = super::args::time)]
+    /// Absolute start time in local or RFC 3339 notation.
+    #[arg(long, value_name = "TIME", conflicts_with = "after", value_parser = super::args::time, help = "Begin at a time: HH:MM[:SS] here, or RFC 3339")]
     pub at: Option<chrono::DateTime<chrono::Utc>>,
     /// Begin after a delay
     #[arg(long = "in", value_name = "DUR", value_parser = super::args::duration)]
@@ -103,7 +105,7 @@ pub struct CaptureArgs {
     #[arg(long)]
     pub background: bool,
     #[command(flatten)]
-    pub progress: super::jobs::ProgressArg,
+    pub progress: jobs::ProgressArg,
     #[command(flatten)]
     pub keep: KeepArg,
     /// Show the camera, files, settings and timing; capture nothing
@@ -237,7 +239,7 @@ impl Plan {
             output,
             format,
             count,
-            interval_ms: args.every.map(millis).unwrap_or(0),
+            interval_ms: args.every.map_or(0, millis),
             first_at_ms,
             timeout_ms,
             warmup_ms: millis(args.warmup),
@@ -334,17 +336,17 @@ fn exists_hint(error: anyhow::Error) -> anyhow::Error {
     taken.into()
 }
 
-pub fn run(global: &Global, args: CaptureArgs) -> Result<Option<Report>> {
+pub(super) fn run(global: &Global, args: &CaptureArgs) -> Result<Option<Report>> {
     if args.output.as_deref() == Some("-") {
         // Stdout is for the image alone.
         super::output::document_to_stderr();
     }
-    let plan = Plan::new(&args)?;
+    let plan = Plan::new(args)?;
     if args.quality.is_some() && plan.format != "jpeg" {
         return Err(Usage("--quality is for JPEG; use a .jpg name or -f jpg".into()).into());
     }
     if plan.output == "-" {
-        return to_stdout(global, &args, &plan).map(|()| None);
+        return to_stdout(global, args, &plan).map(|()| None);
     }
     let cameras = match args.cameras.cameras.as_slice() {
         [] => vec![None],
@@ -376,9 +378,9 @@ pub fn run(global: &Global, args: CaptureArgs) -> Result<Option<Report>> {
     let each = |camera: Option<&str>| -> Result<Value> {
         let client = Client::open_with(global, camera, route)?;
         if args.dry_run {
-            dry_run(&client, &args, &plan)
+            dry_run(&client, args, &plan)
         } else {
-            shoot(&client, &args, &plan)
+            shoot(&client, args, &plan)
         }
     };
     // Each camera's thread is part of this command, as a shell sees it.
@@ -392,7 +394,7 @@ pub fn run(global: &Global, args: CaptureArgs) -> Result<Option<Report>> {
                 .iter()
                 .enumerate()
                 .map(|(index, camera)| {
-                    let (args, plan, together) = (&args, &plan, &together);
+                    let (args, plan, together) = (args, &plan, &together);
                     scope.spawn(move || {
                         lineage.enter();
                         shoot_together(index, *camera, global, route, args, plan, together)
@@ -410,15 +412,14 @@ pub fn run(global: &Global, args: CaptureArgs) -> Result<Option<Report>> {
         })
     } else {
         std::thread::scope(|scope| {
-            let threads = cameras
-                .iter()
-                .map(|camera| {
-                    scope.spawn(move || {
-                        lineage.enter();
-                        each(*camera)
-                    })
-                })
-                .collect::<Vec<_>>();
+            // Start every camera before waiting for any of them.
+            let mut threads = Vec::with_capacity(cameras.len());
+            for camera in &cameras {
+                threads.push(scope.spawn(move || {
+                    lineage.enter();
+                    each(*camera)
+                }));
+            }
             threads
                 .into_iter()
                 .map(|thread| {
@@ -438,17 +439,19 @@ pub fn run(global: &Global, args: CaptureArgs) -> Result<Option<Report>> {
 /// `{jobs}` in the background). A failure carries every camera's result or
 /// error in details, each with what it saved, and every file saved in
 /// `files`.
+#[deny(clippy::arithmetic_side_effects, clippy::panic_in_result_fn)]
 fn combine(results: Vec<Result<Value>>, cameras: &[Option<&str>]) -> Result<Value> {
-    if results.len() == 1 {
-        return results.into_iter().next().unwrap_or_else(|| unreachable!());
-    }
+    let results = match <[_; 1]>::try_from(results) {
+        Ok([result]) => return result,
+        Err(results) => results,
+    };
     let mut first = None;
     let mut shown = Vec::new();
     let mut files = Vec::new();
     let mut truncated = 0;
     let saved = |value: &Value, files: &mut Vec<Value>, truncated: &mut u64| {
-        files.extend(value["files"].as_array().cloned().unwrap_or_default());
-        *truncated += value["truncated"].as_u64().unwrap_or(0);
+        files.extend(value["files"].as_array().into_iter().flatten().cloned());
+        *truncated = truncated.saturating_add(value["truncated"].as_u64().unwrap_or(0));
     };
     for (result, camera) in results.into_iter().zip(cameras) {
         match result {
@@ -488,7 +491,7 @@ fn combine(results: Vec<Result<Value>>, cameras: &[Option<&str>]) -> Result<Valu
             Err(combined.into())
         }
         None if shown.iter().all(|value| value.get("job").is_some()) => Ok(json!({
-            "jobs": shown.into_iter().map(|value| value["job"].clone()).collect::<Vec<_>>()
+            "jobs": shown.into_iter().map(|mut value| value["job"].take()).collect::<Vec<_>>()
         })),
         None => {
             let mut value = json!({ "cameras": shown });
@@ -502,18 +505,19 @@ fn combine(results: Vec<Result<Value>>, cameras: &[Option<&str>]) -> Result<Valu
 
 /// How far apart the cameras' first frames arrived, in milliseconds, by
 /// the host's clock.
+#[deny(clippy::arithmetic_side_effects)]
 fn skew_ms(cameras: &Value) -> Option<u64> {
-    let times = cameras
-        .as_array()?
-        .iter()
-        .map(|camera| {
-            chrono::DateTime::parse_from_rfc3339(camera["time"].as_str()?)
-                .ok()
-                .map(|time| time.timestamp_millis())
-        })
-        .collect::<Option<Vec<_>>>()?;
-    let (first, last) = (times.iter().min()?, times.iter().max()?);
-    u64::try_from(last - first).ok()
+    let mut times = cameras.as_array()?.iter().map(|camera| {
+        chrono::DateTime::parse_from_rfc3339(camera["time"].as_str()?)
+            .ok()
+            .map(|time| time.timestamp_millis())
+    });
+    let first = times.next()??;
+    let (first, last) = times.try_fold((first, first), |(first, last), time| {
+        let time = time?;
+        Some((first.min(time), last.max(time)))
+    })?;
+    Some(last.abs_diff(first))
 }
 
 /// Change settings and settle exposure, as asked, before frames are taken.
@@ -525,7 +529,11 @@ fn prepare(client: &Client, args: &CaptureArgs, plan: &Plan) -> Result<()> {
         })?;
     }
     if args.auto {
-        super::auto::settle(client, Duration::from_secs(5), &Default::default())?;
+        super::auto::settle(
+            client,
+            Duration::from_secs(5),
+            &crate::cli::auto::Limits::default(),
+        )?;
     }
     if signals::interrupted() {
         return Err(Categorized::error(
@@ -551,7 +559,7 @@ fn shoot(client: &Client, args: &CaptureArgs, plan: &Plan) -> Result<Value> {
 /// are due: time to send each its job.
 const SYNC_LEAD_MS: u64 = 300;
 /// How long before a later first frame the cameras are armed: time to start
-/// streaming, FFmpeg's included, beside their warm-up.
+/// streaming, `FFmpeg`'s included, beside their warm-up.
 const ARM_AHEAD_MS: u64 = 3000;
 
 /// What the threads of a capture from several cameras share as they line
@@ -561,7 +569,7 @@ struct Together {
     prepared: std::sync::Barrier,
     /// Every camera is armed.
     ready: std::sync::Barrier,
-    /// The GigE cameras, by thread.
+    /// The `GigE` cameras, by thread.
     gige: std::sync::Mutex<Vec<Option<crate::types::CameraInfo>>>,
     /// Each one's share of a host interface it shares with others.
     shares: std::sync::OnceLock<Vec<Option<crate::network::Share>>>,
@@ -579,12 +587,16 @@ impl Together {
         }
     }
     /// Camera `index`'s share of its host interface, once every thread
-    /// said which camera it holds: GigE cameras that stream on one
+    /// said which camera it holds: `GigE` cameras that stream on one
     /// interface at once split its bandwidth, or lose packets.
     fn share(&self, index: usize) -> Option<crate::network::Share> {
         self.shares
             .get_or_init(|| {
-                let gige = self.gige.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let gige = self
+                    .gige
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
                 let cameras = gige.iter().flatten().cloned().collect::<Vec<_>>();
                 if cameras.len() < 2 {
                     return vec![None; gige.len()];
@@ -609,10 +621,10 @@ impl Together {
     }
 }
 
-/// How long finding the host interfaces of GigE cameras may take.
+/// How long finding the host interfaces of `GigE` cameras may take.
 const NETWORK_PROBE: Duration = Duration::from_secs(1);
 
-/// The camera `client` holds, when it is a GigE camera.
+/// The camera `client` holds, when it is a `GigE` camera.
 fn gige_camera(client: &Client) -> Option<crate::types::CameraInfo> {
     let status = client.status().ok()?;
     serde_json::from_value::<crate::types::CameraInfo>(status["info"].clone())
@@ -639,7 +651,10 @@ fn shoot_together(
         Ok(client)
     });
     if let Ok(client) = &prepared {
-        together.gige.lock().unwrap_or_else(|e| e.into_inner())[index] = gige_camera(client);
+        together
+            .gige
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)[index] = gige_camera(client);
     }
     together.prepared.wait();
     let share = together.share(index);
@@ -678,7 +693,7 @@ fn shoot_together(
     result
 }
 
-/// What a result says of the pace a GigE camera was held to, sharing a
+/// What a result says of the pace a `GigE` camera was held to, sharing a
 /// host interface with others of the capture, or why it could not be.
 fn paced(value: &mut Value, arm: &Value, share: Option<&crate::network::Share>) {
     let Some(share) = share else {
@@ -693,9 +708,11 @@ fn paced(value: &mut Value, arm: &Value, share: Option<&crate::network::Share>) 
             share.interface,
             share.sharers - 1
         );
-        let mut warnings = value["warnings"].as_array().cloned().unwrap_or_default();
-        warnings.push(json!(crate::scrub::redact_urls(&warning)));
-        value["warnings"] = json!(warnings);
+        let warning = json!(crate::scrub::redact_urls(&warning));
+        match value.get_mut("warnings").and_then(Value::as_array_mut) {
+            Some(warnings) => warnings.push(warning),
+            None => value["warnings"] = Value::Array(vec![warning]),
+        }
     }
 }
 
@@ -740,10 +757,10 @@ fn run_job(
     let mut seq = 0;
     let mut stopping: Option<Instant> = None;
     loop {
-        let wait = match stopping {
-            Some(since) => STOP_GRACE.saturating_sub(since.elapsed()),
-            None => shown.step(Duration::from_secs(25)),
-        };
+        let wait = stopping.map_or_else(
+            || shown.step(Duration::from_secs(25)),
+            |since| STOP_GRACE.saturating_sub(since.elapsed()),
+        );
         let reply = client.wait_job(&id, seq, wait.max(Duration::from_millis(1)))?;
         seq = reply["seq"].as_u64().unwrap_or(seq);
         let (job, detail) = (&reply["job"], &reply["detail"]);
@@ -804,7 +821,8 @@ fn started(client: &Client, id: &str, plan: &Plan) -> Result<Value> {
 /// listed, how many; and the frames that came, were dropped or arrived
 /// incomplete, which may say why it failed.
 fn saved(job: &Value, detail: &Value) -> Value {
-    let mut value = json!({ "files": detail["files"].as_array().cloned().unwrap_or_default() });
+    let mut value =
+        json!({ "files": detail["files"].as_array().map(Vec::as_slice).unwrap_or_default() });
     if let Some(truncated) = detail["truncated"].as_u64() {
         value["truncated"] = json!(truncated);
     }
@@ -867,11 +885,16 @@ pub(super) fn job_error(job: &Value, detail: &Value) -> anyhow::Error {
 
 /// A finished job's result, from its document and its worker's account.
 fn result(job: &Value, detail: &Value, format: &str) -> Value {
-    let files = detail["files"].as_array().cloned().unwrap_or_default();
+    let files = detail["files"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
     let count = job["saved"].as_u64().unwrap_or(0);
     let frame = &detail["frame"];
     let first = detail["first_ms"].as_u64();
-    let pixel_format = frame["pixel_format"].as_u64().map(|format| format as u32);
+    let pixel_format = frame["pixel_format"]
+        .as_u64()
+        .and_then(|format| u32::try_from(format).ok());
     let mut value = json!({
         "camera": job["camera"],
         "files": files,
@@ -943,8 +966,9 @@ fn integrity(value: &mut Value, detail: &Value, count: u64) {
         value["first_id"] = json!(first);
         value["last_id"] = json!(last);
         // Block IDs that wrapped around say nothing of gaps.
-        if last >= first {
-            let gaps = (last - first + 1).saturating_sub(count);
+        if let Some(distance) = last.checked_sub(first) {
+            #[deny(clippy::arithmetic_side_effects)]
+            let gaps = distance.saturating_sub(count.saturating_sub(1));
             value["gaps"] = json!(gaps);
             value["consecutive"] = json!(gaps == 0);
         }
@@ -1011,7 +1035,7 @@ fn dry_run(client: &Client, args: &CaptureArgs, plan: &Plan) -> Result<Value> {
 /// private file this streams and deletes. A closed stdout (`| head`) ends
 /// the command quietly.
 fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
-    use std::io::IsTerminal;
+    use std::io::IsTerminal as _;
     if args.inspect {
         return Err(Usage(
             "--inspect measures a saved frame; give a file or folder with -o".into(),
@@ -1126,7 +1150,6 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
     };
     let (reply, copied) = copied;
     match copied {
-        Some(Ok(_)) => {}
         Some(Err(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => {
             // The reader went away, as `| head` does: nothing to report.
             if let Some(local) = client.local() {
@@ -1135,10 +1158,13 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
             return Ok(());
         }
         Some(Err(error)) => return Err(error).context("write the image to stdout"),
-        None => {}
+        Some(Ok(_)) | None => {}
     }
     let _ = std::io::stdout().flush();
     let meta = &reply["frame"];
+    let pixel_format = meta["pixel_format"]
+        .as_u64()
+        .and_then(|format| u32::try_from(format).ok());
     let camera = client.status()?;
     let mut value = crate::types::without_nulls(json!({
         "camera": crate::media::redact_url(camera["info"]["id"].as_str().unwrap_or_default()),
@@ -1147,9 +1173,9 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
         "count": 1,
         "width": meta["width"],
         "height": meta["height"],
-        "pixel_format": meta["pixel_format"].as_u64().map(|format| crate::inspect::pixel_format_label(format as u32)),
-        "bit_depth": meta["pixel_format"].as_u64().map(|format| crate::frame::bit_depth(format as u32, plan.format).0),
-        "source_bits": meta["pixel_format"].as_u64().and_then(|format| crate::frame::bit_depth(format as u32, plan.format).1),
+        "pixel_format": pixel_format.map(crate::inspect::pixel_format_label),
+        "bit_depth": pixel_format.map(|format| crate::frame::bit_depth(format, plan.format).0),
+        "source_bits": pixel_format.and_then(|format| crate::frame::bit_depth(format, plan.format).1),
         "settings": crate::engine::saved::settings(&meta["settings"]),
         "time": meta["wall_ms"].as_u64().map(rfc3339),
         "device_ts_ns": meta["device_ts_ns"],
@@ -1208,8 +1234,11 @@ fn text(value: &Value) -> String {
             );
             return;
         }
-        let files = value["files"].as_array().cloned().unwrap_or_default();
-        match files.as_slice() {
+        let files = value["files"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        match files {
             [file] => {
                 let _ = writeln!(text, "Saved {}", file.as_str().unwrap_or_default());
             }
@@ -1243,7 +1272,7 @@ fn text(value: &Value) -> String {
 }
 
 /// Result fields, for `schema`.
-pub const FIELDS: &[(&str, &str)] = &[
+pub(super) const FIELDS: &[(&str, &str)] = &[
     ("camera", "string — camera ID"),
     (
         "files",
@@ -1365,6 +1394,143 @@ mod tests {
     use super::*;
 
     #[test]
+    fn integrity_counts_gaps_without_overflowing_the_block_id_span() {
+        for (first, last, count, gaps) in [
+            (0, u64::MAX, 2, u64::MAX - 1),
+            (0, u64::MAX, u64::MAX, 1),
+            (u64::MAX - 1, u64::MAX, 2, 0),
+            (10, 15, 3, 3),
+            (10, 11, 5, 0),
+        ] {
+            let mut value = json!({});
+            integrity(
+                &mut value,
+                &json!({"interval_ms": 0, "first_id": first, "last_id": last}),
+                count,
+            );
+            assert_eq!(value["gaps"], gaps);
+            assert_eq!(value["consecutive"], gaps == 0);
+        }
+        let mut wrapped = json!({});
+        integrity(
+            &mut wrapped,
+            &json!({"interval_ms": 0, "first_id": u64::MAX, "last_id": 0}),
+            2,
+        );
+        assert!(wrapped.get("gaps").is_none());
+        assert!(wrapped.get("consecutive").is_none());
+    }
+
+    #[test]
+    fn one_capture_result_passes_through_unchanged() {
+        let value = json!({"camera": "sim:0", "files": ["/a.png"]});
+        assert_eq!(
+            combine(vec![Ok(value.clone())], &[Some("sim:0")]).unwrap(),
+            value
+        );
+        let error = Categorized::new(ErrorKind::Timeout, "camera timed out")
+            .details(json!({"files": ["/partial.png"]}));
+        let result = combine(vec![Err(error.into())], &[Some("sim:0")]).unwrap_err();
+        let classified = crate::types::classify(&result);
+        assert_eq!(classified.kind, ErrorKind::Timeout);
+        assert_eq!(
+            classified.details.unwrap()["files"],
+            json!(["/partial.png"])
+        );
+        assert_eq!(result.to_string(), "camera timed out");
+    }
+
+    #[test]
+    fn combined_background_jobs_preserve_documents_and_order() {
+        let first = json!({"id": "auto-1", "state": "running", "details": {"nested": [1, 2, 3]}});
+        let second = json!({"id": "auto-2", "state": "armed", "optional": null});
+        let expected = json!({"jobs": [first, second]});
+        let combined = combine(
+            vec![Ok(json!({"job": first})), Ok(json!({"job": second}))],
+            &[Some("sim:0"), Some("sim:1")],
+        )
+        .unwrap();
+        assert_eq!(combined, expected);
+    }
+
+    #[test]
+    fn skew_uses_extremes_and_requires_every_timestamp() {
+        let times = json!([
+            {"time": "1970-01-01T00:00:01.250Z"},
+            {"time": "1969-12-31T23:59:59.750Z"},
+            {"time": "1970-01-01T01:00:00+01:00"},
+            {"time": "1970-01-01T00:00:01.250Z"}
+        ]);
+        assert_eq!(skew_ms(&times), Some(1500));
+        assert_eq!(skew_ms(&json!([times[0]])), Some(0));
+        for invalid in [
+            json!([]),
+            json!([times[0], {}]),
+            json!([{"time": "bad"}]),
+            json!(null),
+        ] {
+            assert_eq!(skew_ms(&invalid), None);
+        }
+    }
+
+    #[test]
+    fn combined_error_counts_saturate_without_losing_saved_files() {
+        let error = Categorized::new(ErrorKind::OperationFailed, "first camera failed")
+            .details(json!({"files": ["/first.png"], "truncated": u64::MAX}));
+        let result = combine(
+            vec![
+                Err(error.into()),
+                Ok(json!({"files": ["/second.png"], "truncated": 1})),
+            ],
+            &[Some("sim:0"), Some("sim:1")],
+        )
+        .unwrap_err();
+        let classified = crate::types::classify(&result);
+        assert_eq!(classified.kind, ErrorKind::OperationFailed);
+        assert_eq!(result.to_string(), "first camera failed");
+        let details = classified.details.unwrap();
+        assert_eq!(details["truncated"], u64::MAX);
+        assert_eq!(details["files"], json!(["/first.png", "/second.png"]));
+    }
+
+    #[test]
+    fn pacing_warnings_append_and_replace_only_non_array_fields() {
+        let share = crate::network::Share {
+            bytes_per_second: 1_000_000,
+            interface: "eth0".into(),
+            sharers: 2,
+        };
+        let arm = json!({"network_error": "driver refused"});
+        let warning = "it shares eth0 with 1 other camera(s) but could not be paced to its share: driver refused";
+        for mut value in [
+            json!({}),
+            json!({"warnings": null}),
+            json!({"warnings": false}),
+            json!({"warnings": ["earlier", {"detail": "kept"}]}),
+        ] {
+            let mut expected = value["warnings"].as_array().cloned().unwrap_or_default();
+            expected.push(json!(warning));
+            paced(&mut value, &arm, Some(&share));
+            assert_eq!(value["warnings"], json!(expected));
+        }
+    }
+
+    #[test]
+    fn oversized_pixel_formats_do_not_alias_valid_formats() {
+        let job = json!({"camera": "sim:0", "saved": 1});
+        let frame = json!({"pixel_format": crate::types::MONO8});
+        let valid = result(&job, &json!({"frame": frame}), "raw");
+        assert!(valid.get("pixel_format").is_some());
+        assert!(valid.get("bit_depth").is_some());
+
+        let format = u64::from(crate::types::MONO8) + (1u64 << 32);
+        let invalid = result(&job, &json!({"frame": {"pixel_format": format}}), "raw");
+        assert!(invalid.get("pixel_format").is_none());
+        assert!(invalid.get("bit_depth").is_none());
+        assert!(invalid.get("source_bits").is_none());
+    }
+
+    #[test]
     fn formats_come_from_the_name_and_flags_only_fill_in() {
         assert_eq!(format("/a/shot.JPG", None).unwrap(), "jpeg");
         assert_eq!(format("/a/shot.raw", None).unwrap(), "raw");
@@ -1372,10 +1538,10 @@ mod tests {
         assert_eq!(format("/a/{seq}", None).unwrap(), "png");
         assert_eq!(format("-", Some(Format::Raw)).unwrap(), "raw");
         assert_eq!(format("/a/shot.png", Some(Format::Png)).unwrap(), "png");
-        assert!(format("/a/shot.png", Some(Format::Jpg)).is_err());
-        assert!(format("/a/shot.gif", None).is_err());
+        format("/a/shot.png", Some(Format::Jpg)).unwrap_err();
+        format("/a/shot.gif", None).unwrap_err();
         // PGM and PPM are not still formats, whatever the name says.
-        assert!(format("/a/shot.pgm", None).is_err());
-        assert!(format("/a/shot.ppm", None).is_err());
+        format("/a/shot.pgm", None).unwrap_err();
+        format("/a/shot.ppm", None).unwrap_err();
     }
 }

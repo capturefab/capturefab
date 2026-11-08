@@ -6,7 +6,7 @@
 //! read-only system with nothing writable, nothing is kept.
 use anyhow::{Context as _, Result};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
+use sha2::{Digest as _, Sha256};
 use std::path::PathBuf;
 
 /// The file of `camera`'s settings, named by a hash: a camera's ID may be a

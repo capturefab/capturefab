@@ -2,7 +2,7 @@
 use super::{Global, output::Report};
 use serde_json::json;
 
-pub const DOCTOR_FIELDS: &[(&str, &str)] = &[
+pub(super) const DOCTOR_FIELDS: &[(&str, &str)] = &[
     (
         "checks",
         "[{name,status:ok|warn|fail,message,fix?}] — fix is a command or step that resolves a warning",
@@ -47,7 +47,7 @@ pub const DOCTOR_FIELDS: &[(&str, &str)] = &[
         "{selected:auto|none|METHOD,methods:{METHOD:{built,works,reason?}}} — hardware decoding CAPTUREFAB_HWDEC selects, and each method of this platform: in this FFmpeg (built) and proved to decode here (works); only with FFmpeg",
     ),
 ];
-pub const LICENSES_FIELDS: &[(&str, &str)] = &[
+pub(super) const LICENSES_FIELDS: &[(&str, &str)] = &[
     ("capturefab", "string — Capturefab's MIT license"),
     (
         "ffmpeg",
@@ -55,7 +55,7 @@ pub const LICENSES_FIELDS: &[(&str, &str)] = &[
     ),
 ];
 
-pub fn doctor(_global: &Global) -> Report {
+pub(super) fn doctor(_global: &Global) -> Report {
     let report = crate::doctor::report(super::session::can_start());
     let mut text = Vec::new();
     let _ = crate::doctor::print_checklist(&mut text, &report);
@@ -64,7 +64,7 @@ pub fn doctor(_global: &Global) -> Report {
 
 const LICENSE: &str = include_str!("../../LICENSE");
 
-pub fn licenses() -> Report {
+pub(super) fn licenses() -> Report {
     let ffmpeg = crate::media::license_notice();
     let text = format!("Capturefab\n\n{LICENSE}\n\nFFmpeg\n\n{ffmpeg}\n");
     Report::json(json!({"capturefab": LICENSE, "ffmpeg": ffmpeg})).text(text)

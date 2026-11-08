@@ -51,7 +51,27 @@ impl Rng {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
-        self.0 as usize
+        usize::from_le_bytes(
+            self.0
+                .to_le_bytes()
+                .first_chunk::<{ size_of::<usize>() }>()
+                .copied()
+                .expect("native word fits the 64-bit random state"),
+        )
+    }
+}
+
+#[test]
+fn random_corpus_keeps_its_native_word_sequence() {
+    let mut rng = Rng(1);
+    let mask = u64::try_from(usize::MAX).unwrap();
+    for expected in [
+        0x0000_0000_4082_2041u64,
+        0x1000_4106_0c01_1441,
+        0x9b1e_842f_6e86_2629,
+        0xf554_f503_555d_8025,
+    ] {
+        assert_eq!(u64::try_from(rng.next()).unwrap(), expected & mask);
     }
 }
 
@@ -76,20 +96,20 @@ fn corpus_with(default_cases: usize, mut test: impl FnMut(&str)) {
     }
     for _ in 0..iterations {
         let mut bytes = SEEDS[rng.next() % SEEDS.len()].as_bytes().to_vec();
-        for _ in 0..1 + rng.next() % 8 {
+        for _ in 0..=(rng.next() % 8) {
             let at = rng.next() % (bytes.len() + 1);
             match rng.next() % 4 {
                 0 if at < bytes.len() => {
                     bytes.remove(at);
                 }
                 1 if at < bytes.len() => {
-                    bytes[at] = rng.next() as u8;
+                    bytes[at] = rng.next().to_le_bytes()[0];
                 }
                 2 => {
                     let seed = SEEDS[rng.next() % SEEDS.len()];
                     bytes.splice(at..at, seed.bytes());
                 }
-                _ => bytes.insert(at, rng.next() as u8),
+                _ => bytes.insert(at, rng.next().to_le_bytes()[0]),
             }
         }
         let text = String::from_utf8_lossy(&bytes);
@@ -124,14 +144,13 @@ fn fuzz_text_inputs() {
         if let Ok(password) = crate::secret_input::read_stdin_password(text.as_bytes(), "fuzz") {
             let expected = text
                 .strip_suffix('\n')
-                .map(|s| s.strip_suffix('\r').unwrap_or(s))
-                .unwrap_or(text);
+                .map_or(text, |s| s.strip_suffix('\r').unwrap_or(s));
             assert_eq!(password.as_str(), expected);
         }
         let _ = crate::setup::validate_name(text);
         let _ = crate::setup::validate_note(text);
         let _ = crate::setup::parse(text.as_bytes());
-        let _ = crate::ipc::validate_name(text);
+        let _ = ipc::validate_name(text);
         let _ = crate::session::validate_selector(text);
         let _ = crate::camera::validate_selector_shape(text);
         let _ = crate::logins::key(text);
@@ -178,13 +197,13 @@ fn fuzz_text_inputs() {
 fn fuzz_cli_arguments() {
     let tree = Cli::command();
     // Visit every command and option, including nested command families.
-    fn visit(tree: &clap::Command, prefix: Vec<String>) {
+    fn visit(tree: &clap::Command, prefix: &[String]) {
         for arg in tree
             .get_arguments()
             .filter(|a| a.get_action().takes_values())
         {
             corpus_with(32, |text| {
-                let mut argv = prefix.clone();
+                let mut argv = prefix.to_vec();
                 if let Some(long) = arg.get_long() {
                     argv.push(format!("--{long}={text}"));
                 } else if let Some(short) = arg.get_short() {
@@ -200,7 +219,7 @@ fn fuzz_cli_arguments() {
             });
             #[cfg(unix)]
             {
-                use std::os::unix::ffi::OsStringExt;
+                use std::os::unix::ffi::OsStringExt as _;
                 let mut argv: Vec<std::ffi::OsString> = prefix.iter().map(Into::into).collect();
                 if let Some(long) = arg.get_long() {
                     argv.push(format!("--{long}").into());
@@ -212,12 +231,12 @@ fn fuzz_cli_arguments() {
             }
         }
         for child in tree.get_subcommands() {
-            let mut path = prefix.clone();
+            let mut path = prefix.to_vec();
             path.push(child.get_name().to_owned());
-            visit(child, path);
+            visit(child, &path);
         }
     }
-    visit(&tree, vec!["capturefab".into()]);
+    visit(&tree, &["capturefab".into()]);
 }
 
 #[test]
@@ -236,9 +255,9 @@ fn fuzz_binary_stdin_and_documents() {
     let mut rng = Rng(0xfedc_ba98_7654_3210);
     for _ in 0..4096 {
         let mut bytes = SEEDS[rng.next() % SEEDS.len()].as_bytes().to_vec();
-        for _ in 0..1 + rng.next() % 16 {
+        for _ in 0..=(rng.next() % 16) {
             let index = rng.next() % (bytes.len() + 1);
-            bytes.insert(index, rng.next() as u8);
+            bytes.insert(index, rng.next().to_le_bytes()[0]);
         }
         let _ = crate::setup::parse(&bytes);
         let _ = SessionCommand::from_json_slice(&bytes);
@@ -246,8 +265,7 @@ fn fuzz_binary_stdin_and_documents() {
             let original = std::str::from_utf8(&bytes).unwrap();
             let expected = original
                 .strip_suffix('\n')
-                .map(|s| s.strip_suffix('\r').unwrap_or(s))
-                .unwrap_or(original);
+                .map_or(original, |s| s.strip_suffix('\r').unwrap_or(s));
             assert_eq!(secret.as_str(), expected);
         }
     }
@@ -265,7 +283,7 @@ fn fuzz_structured_commands() {
         {"op":"set_values","values":[{"name":"Gain","bank":[],"value":"1"}],"dry_run":true},
         {"op":"exec","name":{"name":"TriggerSoftware","bank":[]}},
         {"op":"info"}, {"op":"feature_list","filter":{"pattern":"*Gain*","all":true,"category":"AnalogControl"}}, {"op":"start"}, {"op":"stop"},
-        {"op":"arm","warmup_ms":0,"bytes_per_second":100000}, {"op":"read_setup"},
+        {"op":"arm","warmup_ms":0,"bytes_per_second":100_000}, {"op":"read_setup"},
         {"op":"setup_diff","name":"sample","allow_other_model":false},
         {"op":"apply_setup","name":"sample","strict":true,"allow_other_model":false},
         {"op":"auto","continuous":false,"region":[0.0,0.0,1.0,1.0],"max_exposure_us":1000.0,"job":1},
@@ -279,7 +297,7 @@ fn fuzz_structured_commands() {
         {"op":"xml"}, {"op":"read_memory","address":0,"length":4},
         {"op":"write_memory","address":0,"data":[0,1,2,3]},
         {"op":"forward","output":"/tmp/sample.mp4","codec":"h264","encoder":"auto","fps":30.0,"bitrate":"4M",
-         "max_file_bytes":1000000,"min_free":0,"on_exists":"fail","context":{},"duration_ms":1000,"utc_offset_s":0,"warmup_ms":0,"job":1,"lease":false,"copy":"never"}
+         "max_file_bytes":1_000_000,"min_free":0,"on_exists":"fail","context":{},"duration_ms":1000,"utc_offset_s":0,"warmup_ms":0,"job":1,"lease":false,"copy":"never"}
     ]);
     for op in ["setup_diff", "apply_setup"] {
         seeds

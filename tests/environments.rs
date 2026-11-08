@@ -4,12 +4,13 @@
 //! temporary folder, or commands open their cameras alone; presets and
 //! sign-ins say which variable gives them a folder; captures to a writable
 //! folder always work.
+#![deny(clippy::doc_markdown)]
 #![cfg(unix)]
 mod support;
 
 use serde_json::Value;
 use std::{
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -298,7 +299,7 @@ fn a_preset_applies_through_a_session_that_keeps_state_elsewhere() {
     let service_state = home.root.join("service-state");
     let mut service = home.command();
     service.env("CAPTUREFAB_STATE_DIR", &service_state);
-    let _session = home.serve_in(&mut service, "line", &["sim:0"], &[]);
+    let _session = Home::serve_in(&mut service, "line", &["sim:0"], &[]);
     let at = |width: &str| {
         home.ok(&[
             "set",

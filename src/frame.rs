@@ -1,4 +1,5 @@
 //! Bounded PFNC image conversion and portable output without image codecs from the OS.
+#![deny(clippy::missing_const_for_fn)]
 use crate::types::{Frame, MONO8, RGB8};
 use anyhow::{Context as _, Result, bail, ensure};
 
@@ -7,7 +8,7 @@ mod formats;
 mod rows;
 mod view;
 pub(crate) use encoded::write_all_vectored;
-pub use encoded::{Body, Encoded};
+pub(crate) use encoded::{Body, Encoded};
 #[cfg(all(jpeg_helper, feature = "nvjpeg"))]
 pub(crate) use rows::decode as decode_rows;
 #[cfg(test)]
@@ -15,8 +16,9 @@ pub(crate) use rows::tests::noise_frame;
 pub(crate) use rows::{Channels, RowReader};
 #[cfg(any(feature = "jpeg", jpeg_helper))]
 pub(crate) use rows::{Chroma, Yuv420, ycbcr420};
-pub use view::FrameRef;
+pub(crate) use view::FrameRef;
 
+#[must_use]
 pub fn pixel_format_name(format: u32) -> &'static str {
     match format {
         MONO8 => "Mono8",
@@ -87,13 +89,26 @@ pub fn pixel_format_name(format: u32) -> &'static str {
 }
 /// Bytes in one row of a `width`-pixel image: rows of packed formats are
 /// padded to a whole byte.
+///
+/// Returns `usize::MAX` if the host cannot address
+/// a row this large; frame-size validation rejects that overflow separately.
+#[must_use]
+#[deny(clippy::cast_precision_loss)]
 pub fn row_bytes(width: u32, pixel_format: u32) -> usize {
-    (u64::from(width) * u64::from((pixel_format >> 16) & 0xff)).div_ceil(8) as usize
+    checked_row_bytes(width, pixel_format).unwrap_or(usize::MAX)
+}
+
+/// The exact row size when it fits in the host's index range.
+#[deny(clippy::arithmetic_side_effects, clippy::cast_precision_loss)]
+fn checked_row_bytes(width: u32, pixel_format: u32) -> Option<usize> {
+    let bits = u64::from((pixel_format >> 16) & 0xff);
+    let bytes = u64::from(width).checked_mul(bits)?.div_ceil(8);
+    usize::try_from(bytes).ok()
 }
 /// The planes of a planar or semiplanar layout, such as decoded video's
 /// `YCbCr709_420_8_Planar` or `RGB8_Planar`: each one's offset, row bytes
 /// and rows. None for a layout of one plane, whose rows are `row_bytes`.
-pub fn planes(pixel_format: u32, width: u32, height: u32) -> Option<Vec<Plane>> {
+pub(crate) fn planes(pixel_format: u32, width: u32, height: u32) -> Option<Vec<Plane>> {
     let mut offset = 0usize;
     formats::planes(pixel_format, width, height)?
         .into_iter()
@@ -110,17 +125,19 @@ pub fn planes(pixel_format: u32, width: u32, height: u32) -> Option<Vec<Plane>> 
 }
 /// One plane of a planar layout, as a raw capture's sidecar describes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
-pub struct Plane {
+pub(crate) struct Plane {
     /// Where it starts, in bytes from the frame's first.
     pub offset: usize,
     pub row_bytes: usize,
     pub rows: usize,
 }
 /// Bytes in a `width` × `height` image: `row_bytes` for each row, or the
-/// planes of a planar Y'CbCr layout. None when it overflows.
+/// planes of a planar `Y'CbCr` layout. None when it overflows.
+#[deny(clippy::cast_precision_loss)]
 pub(crate) fn frame_len(pixel_format: u32, width: u32, height: u32) -> Option<usize> {
-    formats::planes_len(pixel_format, width, height)
-        .or_else(|| row_bytes(width, pixel_format).checked_mul(height as usize))
+    formats::planes_len(pixel_format, width, height).or_else(|| {
+        checked_row_bytes(width, pixel_format)?.checked_mul(usize::try_from(height).ok()?)
+    })
 }
 pub(crate) use formats::{Matrix, NV12_601, NV12_709, ycbcr_planes};
 /// How a packed format stores its samples.
@@ -129,14 +146,14 @@ pub(crate) enum Packing {
     /// PFNC lsb packing (the `p` formats): samples follow each other from
     /// the least significant bit of the first byte.
     Lsb,
-    /// GigE Vision `Packed`: two samples in three bytes, the high bits of
+    /// `GigE` Vision `Packed`: two samples in three bytes, the high bits of
     /// each in the outer bytes and both low parts in the middle one, the
     /// first sample's in its low nibble.
     GigE,
 }
 /// The unpacked 16-bit format of a packed format's family, its sample bits
 /// and its packing.
-pub(crate) fn packing(pixel_format: u32) -> Option<(u32, u32, Packing)> {
+pub(crate) const fn packing(pixel_format: u32) -> Option<(u32, u32, Packing)> {
     use Packing::{GigE, Lsb};
     Some(match pixel_format {
         0x010a_0046 => (0x0110_0003, 10, Lsb),
@@ -159,7 +176,7 @@ pub(crate) fn packing(pixel_format: u32) -> Option<(u32, u32, Packing)> {
     })
 }
 /// Layouts with continuous LSB packing that may need transport row alignment.
-pub(crate) fn lsb_packed(pixel_format: u32) -> bool {
+pub(crate) const fn lsb_packed(pixel_format: u32) -> bool {
     matches!(packing(pixel_format), Some((_, _, Packing::Lsb)))
         || matches!(
             pixel_format,
@@ -174,7 +191,7 @@ pub(crate) fn lsb_packed(pixel_format: u32) -> bool {
 }
 /// YUV 4:2:2 formats: the byte offsets of the first pixel's luma, the shared
 /// Cb (U), the second pixel's luma and the shared Cr (V) in each two pixels.
-fn yuv422(pixel_format: u32) -> Option<[usize; 4]> {
+const fn yuv422(pixel_format: u32) -> Option<[usize; 4]> {
     match pixel_format {
         0x0210_001f | 0x0210_0043 => Some([1, 0, 3, 2]),
         0x0210_0032 | 0x0210_003b => Some([0, 1, 2, 3]),
@@ -182,7 +199,7 @@ fn yuv422(pixel_format: u32) -> Option<[usize; 4]> {
     }
 }
 /// The format `unpacked` turns `pixel_format` into.
-pub fn unpacked_format(pixel_format: u32) -> u32 {
+pub(crate) fn unpacked_format(pixel_format: u32) -> u32 {
     match pixel_format {
         0x0220_0016 | 0x0220_0017 => RGB8,
         v if yuv422(v).is_some() => RGB8,
@@ -190,9 +207,16 @@ pub fn unpacked_format(pixel_format: u32) -> u32 {
             .unwrap_or_else(|| packing(v).map_or(v, |(unpacked, ..)| unpacked)),
     }
 }
-/// `frame` in a whole-sample layout: packed 10-, 12- and 14-bit mono/Bayer
+/// `frame` in a whole-sample layout.
+///
+/// Packed 10-, 12- and 14-bit mono/Bayer
 /// samples retain native precision in 16-bit words. Other transformed color
 /// layouts become RGB8; low-bit and signed monochrome become Mono8.
+///
+/// # Errors
+/// If a transformation is needed, returns an error for invalid or oversized
+/// image dimensions, an unsupported conversion, or truncated source bytes.
+/// A layout that is already unpacked is returned borrowed without validation.
 #[cfg(any(test, feature = "testing"))]
 pub fn unpacked(frame: &Frame) -> Result<std::borrow::Cow<'_, Frame>> {
     use std::borrow::Cow;
@@ -270,34 +294,35 @@ pub(crate) fn unpack_row(row: &[u8], bits: u32, packing: Packing, out: &mut [[u8
     match (packing, bits) {
         (Packing::Lsb, 14) => groups(row, out, |[b0, b1, b2, b3, b4, b5, b6]| {
             [
-                b0 | (b1 & 0x3f) << 8,
-                b1 >> 6 | b2 << 2 | (b3 & 0x0f) << 10,
-                b3 >> 4 | b4 << 4 | (b5 & 0x03) << 12,
-                b5 >> 2 | b6 << 6,
+                b0 | ((b1 & 0x3f) << 8),
+                (b1 >> 6) | (b2 << 2) | ((b3 & 0x0f) << 10),
+                (b3 >> 4) | (b4 << 4) | ((b5 & 0x03) << 12),
+                (b5 >> 2) | (b6 << 6),
             ]
         }),
         (Packing::Lsb, 10) => groups(row, out, |[b0, b1, b2, b3, b4]| {
             [
-                b0 | (b1 & 0x03) << 8,
-                b1 >> 2 | (b2 & 0x0f) << 6,
-                b2 >> 4 | (b3 & 0x3f) << 4,
-                b3 >> 6 | b4 << 2,
+                b0 | ((b1 & 0x03) << 8),
+                (b1 >> 2) | ((b2 & 0x0f) << 6),
+                (b2 >> 4) | ((b3 & 0x3f) << 4),
+                (b3 >> 6) | (b4 << 2),
             ]
         }),
         (Packing::Lsb, _) => groups(row, out, |[b0, b1, b2]| {
-            [b0 | (b1 & 0x0f) << 8, b1 >> 4 | b2 << 4]
+            [b0 | ((b1 & 0x0f) << 8), (b1 >> 4) | (b2 << 4)]
         }),
         (Packing::GigE, 10) => groups(row, out, |[b0, b1, b2]| {
-            [b0 << 2 | b1 & 0x03, b2 << 2 | b1 >> 4 & 0x03]
+            [(b0 << 2) | b1 & 0x03, (b2 << 2) | (b1 >> 4) & 0x03]
         }),
         (Packing::GigE, _) => groups(row, out, |[b0, b1, b2]| {
-            [b0 << 4 | b1 & 0x0f, b2 << 4 | b1 >> 4]
+            [(b0 << 4) | b1 & 0x0f, (b2 << 4) | (b1 >> 4)]
         }),
     }
 }
 
 /// One native sample without expanding the image. Packed rows start on a
 /// fresh byte; partial final groups never read into the next row.
+#[deny(clippy::cast_precision_loss)]
 fn packed_sample(row: &[u8], x: usize, bits: u32, packing: Packing) -> u16 {
     match packing {
         Packing::Lsb => {
@@ -306,7 +331,8 @@ fn packed_sample(row: &[u8], x: usize, bits: u32, packing: Packing) -> u16 {
             let word = u32::from(row[at])
                 | (u32::from(*row.get(at + 1).unwrap_or(&0)) << 8)
                 | (u32::from(*row.get(at + 2).unwrap_or(&0)) << 16);
-            ((word >> (bit % 8)) & ((1 << bits) - 1)) as u16
+            u16::try_from((word >> (bit % 8)) & ((1 << bits) - 1))
+                .expect("packed sample has at most sixteen bits")
         }
         Packing::GigE => {
             let at = x / 2 * 3;
@@ -340,7 +366,15 @@ pub(crate) fn validate_source(frame: &Frame) -> Result<()> {
     Ok(())
 }
 
+/// Clamp a native component to the eight-bit display range.
+#[inline]
+#[deny(clippy::cast_precision_loss)]
+pub(crate) fn clamp8(sample: u16) -> u8 {
+    u8::try_from(sample).unwrap_or(u8::MAX)
+}
+
 /// Display sample of a monochrome or Bayer source at its native packing.
+#[deny(clippy::cast_precision_loss)]
 fn sample8(frame: &Frame, x: usize, y: usize) -> u8 {
     let format = frame.pixel_format;
     if matches!(
@@ -356,7 +390,7 @@ fn sample8(frame: &Frame, x: usize, y: usize) -> u8 {
     let Some(shift) = shift else {
         return frame.data[y * frame.width as usize + x];
     };
-    (native_sample(frame, x, y) >> shift).min(255) as u8
+    clamp8(native_sample(frame, x, y) >> shift)
 }
 
 /// A whole monochrome/Bayer sample at native precision, from a validated frame.
@@ -382,15 +416,16 @@ pub(crate) fn native_color(frame: &Frame, x: usize, y: usize) -> Option<([u16; 3
 pub(crate) fn deep_color_bits(pixel_format: u32) -> Option<u32> {
     formats::color_bits(pixel_format).filter(|bits| *bits > 8)
 }
-/// A frame in a layout [`deep_color_bits`] names, as FFmpeg's planar
+/// A frame in a layout [`deep_color_bits`] names, as `FFmpeg`'s planar
 /// `gbrpNNle`: a G, a B and an R plane of 16-bit little-endian samples
 /// holding each component's own bits, so nothing of them is lost.
+#[deny(clippy::cast_precision_loss)]
 pub(crate) fn gbr_planes(frame: &Frame, out: &mut Vec<u8>) -> Result<()> {
     let bits =
         deep_color_bits(frame.pixel_format).context("not an RGB layout deeper than 8 bits")?;
     let pixels = checked_pixels(frame)?;
     validate_source(frame)?;
-    let mask = (u32::from(u16::MAX) >> (16 - bits)) as u16;
+    let mask = u16::MAX >> (16 - bits);
     out.clear();
     out.resize(pixels * 6, 0);
     let (g, rest) = out.split_at_mut(pixels * 2);
@@ -409,7 +444,7 @@ pub(crate) fn gbr_planes(frame: &Frame, out: &mut Vec<u8>) -> Result<()> {
     }
     Ok(())
 }
-/// Full-range BT.601 Y'CbCr as R'G'B', as PFNC defines its YCbCr formats
+/// Full-range BT.601 `Y'CbCr` as R'G'B', as PFNC defines its YCbCr formats
 /// and, with U as Cb and V as Cr, its YUV ones; 16-bit fixed point as JFIF
 /// decoders compute it.
 pub(crate) fn ycbcr(y: u8, cb: u8, cr: u8) -> [u8; 3] {
@@ -417,7 +452,7 @@ pub(crate) fn ycbcr(y: u8, cb: u8, cr: u8) -> [u8; 3] {
 }
 /// The Bayer8 format with the color filter of an unpacked 10-, 12- or 16-bit
 /// mosaic, and the shift that brings its samples to 8 bits.
-fn wide_bayer(pixel_format: u32) -> Option<(u32, u32)> {
+const fn wide_bayer(pixel_format: u32) -> Option<(u32, u32)> {
     let (first, shift) = match pixel_format {
         0x0110_000c..=0x0110_000f => (0x0110_000c, 2),
         0x0110_0010..=0x0110_0013 => (0x0110_0010, 4),
@@ -466,6 +501,10 @@ pub(crate) fn monochrome(pixel_format: u32) -> bool {
         || unpacked_shift(pixel_format).is_some()
 }
 /// The frame as 8-bit RGB, three bytes a pixel.
+///
+/// # Errors
+/// Returns an error for invalid or oversized dimensions, an unsupported
+/// pixel format, or truncated source bytes.
 #[cfg(any(test, feature = "testing"))]
 pub fn rgb(frame: &Frame) -> Result<Vec<u8>> {
     validate_source(frame)?;
@@ -500,8 +539,8 @@ impl std::ops::Deref for Samples<'_> {
         }
     }
 }
-impl<'a> Samples<'a> {
-    pub(crate) fn converted(&self) -> bool {
+impl Samples<'_> {
+    pub(crate) const fn converted(&self) -> bool {
         matches!(self, Samples::Converted(_))
     }
 }
@@ -539,7 +578,7 @@ pub(crate) fn gray8_samples(frame: &Frame) -> Result<Option<Samples<'_>>> {
 /// How far an unpacked 16-bit monochrome sample shifts right to its top 8
 /// bits: Mono10 keeps bits 9-2, Mono12 bits 11-4, Mono14 bits 13-6, and the
 /// full-range 16-bit formats their high byte. None for every other format.
-fn unpacked_shift(format: u32) -> Option<u32> {
+const fn unpacked_shift(format: u32) -> Option<u32> {
     match format {
         0x0110_0003 => Some(2),
         0x0110_0005 => Some(4),
@@ -550,7 +589,11 @@ fn unpacked_shift(format: u32) -> Option<u32> {
 }
 /// One 8-bit sample per pixel for the monochrome family, packed formats
 /// unpacked first, with the same bit choice as [`rgb`]; None for color,
-/// Bayer, YUV and RGBa formats, which stay RGB.
+/// Bayer, YUV and `RGBa` formats, which stay RGB.
+///
+/// # Errors
+/// Returns an error for invalid or oversized dimensions, or for truncated
+/// monochrome source bytes. Non-monochrome formats return `Ok(None)`.
 #[cfg(any(test, feature = "testing"))]
 pub fn gray8(frame: &Frame) -> Result<Option<Vec<u8>>> {
     checked_pixels(frame)?;
@@ -564,15 +607,17 @@ pub fn gray8(frame: &Frame) -> Result<Option<Vec<u8>>> {
     Ok(Some(out))
 }
 /// The significant bits of each sample of `pixel_format`, from its PFNC
-/// name: 12 for Mono12, Mono12p and BayerRG12, 8 for RGB8, 10 for RGB10p32.
+/// name: 12 for Mono12, Mono12p and `BayerRG12`, 8 for RGB8, 10 for `RGB10p32`.
 /// None for a format this does not know.
+#[must_use]
 pub fn sample_bits(pixel_format: u32) -> Option<u32> {
     formats::sample_bits(pixel_format).or_else(|| name_bits(pixel_format_name(pixel_format)))
 }
 /// The bits per sample of a PFNC pixel format name: the digits it ends
-/// with before any packing suffix (12 for Mono12p, 16 for Coord3D_C16) or
-/// component order (8 for YUV422_8_UYVY), or the layout's own for names
-/// whose digits say something else (10 for RGB10p32, 8 for RGB8a32).
+/// with before any packing suffix (12 for Mono12p, 16 for `Coord3D_C16`) or
+/// component order (8 for `YUV422_8_UYVY`), or the layout's own for names
+/// whose digits say something else (10 for `RGB10p32`, 8 for `RGB8a32`).
+#[deny(clippy::arithmetic_side_effects)]
 pub(crate) fn name_bits(name: &str) -> Option<u32> {
     if let Some(bits) = formats::name_bits(name) {
         return Some(bits);
@@ -584,17 +629,14 @@ pub(crate) fn name_bits(name: &str) -> Option<u32> {
     {
         name = size;
     }
-    let digits = name
-        .trim_end_matches(|c: char| c.is_ascii_alphabetic())
-        .chars()
-        .rev()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>();
-    digits.chars().rev().collect::<String>().parse().ok()
+    let name = name.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let prefix = name.trim_end_matches(|c: char| c.is_ascii_digit());
+    name.get(prefix.len()..)?.parse().ok()
 }
 /// The bit depth of `format` (png, jpeg, raw) for a frame of
 /// `pixel_format`, and the frame's own when the file keeps fewer: PNG keeps
 /// up to 16 bits of a monochrome format, raw every bit, the rest 8.
+#[must_use]
 pub fn bit_depth(pixel_format: u32, format: &str) -> (u32, Option<u32>) {
     let source = sample_bits(pixel_format).unwrap_or(8);
     let depth = match format {
@@ -606,7 +648,7 @@ pub fn bit_depth(pixel_format: u32, format: &str) -> (u32, Option<u32>) {
 }
 /// The significant bits of an unpacked monochrome format wider than 8
 /// bits, which a PNG keeps as 16-bit gray.
-fn wide_gray_bits(pixel_format: u32) -> Option<u32> {
+const fn wide_gray_bits(pixel_format: u32) -> Option<u8> {
     match pixel_format {
         0x0110_0003 => Some(10),
         0x0110_0005 => Some(12),
@@ -619,12 +661,16 @@ fn wide_gray_bits(pixel_format: u32) -> Option<u32> {
 /// 16-bit PNG samples with the significant bits at the top, written once
 /// into a pooled buffer a row at a time, and how many bits are
 /// significant; None for any other format.
-fn gray16(frame: &Frame) -> Result<Option<(crate::framebuf::PoolVec, u32)>> {
+#[deny(clippy::cast_possible_wrap)]
+fn gray16(frame: &Frame) -> Result<Option<(crate::framebuf::PoolVec, u8)>> {
     let Some(bits) = wide_gray_bits(unpacked_format(frame.pixel_format)) else {
         return Ok(None);
     };
     validate_source(frame)?;
-    let (width, height) = (frame.width as usize, frame.height as usize);
+    let (width, height) = (
+        usize::try_from(frame.width)?,
+        usize::try_from(frame.height)?,
+    );
     let stride = row_bytes(frame.width, frame.pixel_format);
     let packed = packing(frame.pixel_format);
     let mut unpack = vec![[0; 2]; if packed.is_some() { width } else { 0 }];
@@ -635,7 +681,7 @@ fn gray16(frame: &Frame) -> Result<Option<(crate::framebuf::PoolVec, u32)>> {
         let samples = match packed {
             Some((_, bits, packing)) => {
                 unpack_row(line, bits, packing, &mut unpack);
-                &unpack[..]
+                unpack.as_slice()
             }
             None => line.as_chunks::<2>().0,
         };
@@ -646,6 +692,10 @@ fn gray16(frame: &Frame) -> Result<Option<(crate::framebuf::PoolVec, u32)>> {
     Ok(Some((out, bits)))
 }
 /// Opaque RGBA bytes, converted in one pass without an intermediate RGB image.
+///
+/// # Errors
+/// Returns the same source-validation errors as [`rgb`]: invalid or oversized
+/// dimensions, an unsupported pixel format, or truncated source bytes.
 #[cfg(any(test, feature = "testing"))]
 pub fn rgba(frame: &Frame) -> Result<Vec<u8>> {
     Ok(convert(frame, |[r, g, b]| [r, g, b, 255])?.into_flattened())
@@ -662,8 +712,12 @@ pub(crate) fn checked_pixels(frame: &Frame) -> Result<usize> {
 }
 /// Convert a PFNC frame into any pixel representation (RGB, RGBA, gray) with
 /// a single allocation; `pixel` maps each interpolated RGB triple.
+///
+/// # Errors
+/// Returns an error for invalid or oversized dimensions, an unsupported
+/// pixel format, or truncated source bytes.
 #[cfg(any(test, feature = "testing"))]
-pub fn convert<P: Copy + Default + Send>(
+pub(crate) fn convert<P: Copy + Default + Send>(
     frame: &Frame,
     pixel: impl Fn([u8; 3]) -> P + Sync,
 ) -> Result<Vec<P>> {
@@ -674,6 +728,10 @@ pub fn convert<P: Copy + Default + Send>(
 /// `convert` into a reused buffer, which is replaced by the converted image;
 /// repeated conversions of one frame size then allocate nothing, and
 /// write every element without clearing it first.
+///
+/// # Errors
+/// Returns an error for invalid or oversized dimensions, an unsupported
+/// pixel format, or truncated source bytes. On these errors, `out` is cleared.
 pub fn convert_into<P: Copy + Default + Send>(
     frame: &Frame,
     out: &mut Vec<P>,
@@ -721,6 +779,7 @@ struct Quads<'a> {
     /// An 8-bit mosaic, whose samples are read as they lie.
     eight: bool,
 }
+#[deny(clippy::cast_precision_loss)]
 impl<'a> Quads<'a> {
     /// None for other formats, or a mosaic without a whole quad. The frame
     /// must have passed `validate_source`.
@@ -755,12 +814,12 @@ impl<'a> Quads<'a> {
         };
         let [red, green, other, blue] = self.order;
         let greens = u16::from(quad[green]) + u16::from(quad[other]);
-        [quad[red], ((greens + 1) >> 1) as u8, quad[blue]]
+        [quad[red], clamp8((greens + 1) >> 1), quad[blue]]
     }
 }
 /// Where red, the two greens and blue sit among a quad's samples, the top
 /// row's two first.
-fn quad_order(pattern: [usize; 4]) -> [usize; 4] {
+fn quad_order(pattern: [u8; 4]) -> [usize; 4] {
     let at = |channel, nth| {
         let mut found = (0..4).filter(|&i| pattern[i] == channel);
         found.nth(nth).unwrap_or(0)
@@ -769,7 +828,7 @@ fn quad_order(pattern: [usize; 4]) -> [usize; 4] {
 }
 /// Color filter layout as the channel (0 R, 1 G, 2 B) at (x & 1, y & 1),
 /// indexed `[(y & 1) * 2 + (x & 1)]`.
-pub fn bayer_pattern(pixel_format: u32) -> [usize; 4] {
+pub(crate) fn bayer_pattern(pixel_format: u32) -> [u8; 4] {
     match bayer8(pixel_format).unwrap_or(pixel_format) {
         0x0108_0008 => [1, 0, 2, 1],
         0x0108_0009 => [0, 1, 1, 2],
@@ -779,24 +838,26 @@ pub fn bayer_pattern(pixel_format: u32) -> [usize; 4] {
 }
 /// Bilinear demosaic of one pixel of a view using only its in-bounds
 /// neighbors of each missing color, as `rows::demosaic_row` computes it.
-fn bayer_bounded(view: FrameRef<'_>, pattern: [usize; 4], x: usize, y: usize) -> [u8; 3] {
+#[deny(clippy::cast_precision_loss)]
+fn bayer_bounded(view: FrameRef<'_>, pattern: [u8; 4], x: usize, y: usize) -> [u8; 3] {
     let (w, h) = (view.width, view.height);
     let sample = |x: usize, y: usize| sample8(view.frame, view.x0 + x, view.y0 + y);
-    let color = |x: usize, y: usize| pattern[(y & 1) * 2 + (x & 1)];
+    let color = |x: usize, y: usize| usize::from(pattern[(y & 1) * 2 + (x & 1)]);
     std::array::from_fn(|c| {
         if color(x, y) == c {
             return sample(x, y);
         }
-        let (mut sum, mut n) = (0u32, 0u32);
+        // At most nine eight-bit samples contribute to this mean.
+        let (mut sum, mut n) = (0u16, 0u16);
         for yy in y.saturating_sub(1)..(y + 2).min(h) {
             for xx in x.saturating_sub(1)..(x + 2).min(w) {
                 if color(xx, yy) == c {
-                    sum += u32::from(sample(xx, yy));
+                    sum += u16::from(sample(xx, yy));
                     n += 1;
                 }
             }
         }
-        sum.checked_div(n).map_or_else(|| sample(x, y), |v| v as u8)
+        sum.checked_div(n).map_or_else(|| sample(x, y), clamp8)
     })
 }
 /// Bytes per pixel of a convertible format, after validating dimensions and
@@ -820,6 +881,7 @@ pub(crate) fn validated_bytes_per_pixel(frame: &Frame) -> Result<usize> {
     Ok(bytes)
 }
 /// Whether `rgb`/`convert` can decode this pixel format.
+#[must_use]
 pub fn convertible(pixel_format: u32) -> bool {
     matches!(
         eight_bit_format(pixel_format),
@@ -873,14 +935,14 @@ enum Read<'a> {
         stride: usize,
     },
     /// A Bayer mosaic with its color filter, demosaicked a pixel at a time.
-    Bayer([usize; 4]),
+    Bayer([u8; 4]),
 }
+#[deny(clippy::cast_precision_loss)]
 impl<'a> Pixels<'a> {
     pub(crate) fn new(view: FrameRef<'a>) -> Self {
         let frame = view.frame;
-        let read = match formats::Decoder::new(frame) {
-            Some(decoder) => Read::Layout(decoder),
-            None => match frame.pixel_format {
+        let read = formats::Decoder::new(frame).map_or_else(
+            || match frame.pixel_format {
                 MONO8 | 0x0108_00b1 | 0x0108_00c6 => Read::Gray8,
                 RGB8 => Read::Rgb {
                     bytes: 3,
@@ -904,22 +966,20 @@ impl<'a> Pixels<'a> {
                 },
                 v if packing(v).is_some() && !is_bayer(v) => {
                     let (unpacked, bits, packing) = packing(v).unwrap();
-                    match unpacked_shift(unpacked) {
-                        Some(shift) => Read::Packed {
-                            bits,
-                            packing,
-                            shift,
-                            stride: row_bytes(frame.width, v),
-                        },
-                        // As `sample8` reads a format it has no shift for.
-                        None => Read::Gray8,
-                    }
+                    // As `sample8` reads a format it has no shift for.
+                    unpacked_shift(unpacked).map_or(Read::Gray8, |shift| Read::Packed {
+                        bits,
+                        packing,
+                        shift,
+                        stride: row_bytes(frame.width, v),
+                    })
                 }
                 0x0110_0003 | 0x0110_0005 | 0x0110_0025 | 0x0110_0007 | 0x0110_00b8
                 | 0x0110_00c7 => Read::Wide(unpacked_shift(frame.pixel_format).unwrap_or(8)),
                 v => Read::Bayer(bayer_pattern(v)),
             },
-        };
+            Read::Layout,
+        );
         Self {
             view,
             data: &frame.data,
@@ -942,7 +1002,7 @@ impl<'a> Pixels<'a> {
                 ycbcr(luma, cb, cr)
             }
             Read::Wide(shift) => {
-                [(u16::from_le_bytes([data[2 * i], data[2 * i + 1]]) >> shift).min(255) as u8; 3]
+                [clamp8(u16::from_le_bytes([data[2 * i], data[2 * i + 1]]) >> shift); 3]
             }
             Read::Packed {
                 bits,
@@ -951,18 +1011,18 @@ impl<'a> Pixels<'a> {
                 stride,
             } => {
                 let line = &data[fy * stride..(fy + 1) * stride];
-                [(packed_sample(line, fx, bits, packing) >> shift).min(255) as u8; 3]
+                [clamp8(packed_sample(line, fx, bits, packing) >> shift); 3]
             }
             Read::Bayer(pattern) => bayer_bounded(self.view, pattern, x, y),
         }
     }
     /// 8-bit luminance of pixel (x, y), with the weights the histograms use.
     #[inline]
-    pub(crate) fn luma(&self, x: usize, y: usize) -> usize {
+    pub(crate) fn luma(&self, x: usize, y: usize) -> u8 {
         luma(self.at(x, y))
     }
     /// The brightest of pixel (x, y)'s components as `at` gives them,
-    /// without working out the other two of Y'CbCr.
+    /// without working out the other two of `Y'CbCr`.
     #[inline]
     pub(crate) fn brightest(&self, x: usize, y: usize) -> u8 {
         let (fx, fy) = (self.view.x0 + x, self.view.y0 + y);
@@ -1007,8 +1067,10 @@ impl<'a> Pixels<'a> {
     }
 }
 /// 8-bit luminance of an RGB pixel, with the weights the histograms use.
-fn luma([r, g, b]: [u8; 3]) -> usize {
-    (r as usize * 54 + g as usize * 183 + b as usize * 19) >> 8
+const fn luma([r, g, b]: [u8; 3]) -> u8 {
+    // The weights sum to 256, so their 16-bit sum's high byte is luma.
+    let weighted = r as u16 * 54 + g as u16 * 183 + b as u16 * 19;
+    weighted.to_le_bytes()[1]
 }
 
 /// A sample at or below this in every channel is crushed to black.
@@ -1019,17 +1081,35 @@ const BLOWN: u8 = 254;
 /// One sample in each evenly spaced stratum, with deterministic jitter to
 /// avoid locking onto one phase of periodic sensor detail. Every index is
 /// in bounds and unique, and small inputs are read in full.
+#[deny(clippy::cast_precision_loss)]
 pub(crate) fn sample_indices(count: usize, limit: usize) -> impl Iterator<Item = usize> {
     let samples = count.min(limit);
+    // An empty iterator never uses these boundaries.
+    let divisor = samples.max(1);
+    let (stride, extra) = (count / divisor, count % divisor);
+    let (mut start, mut remainder) = (0, 0);
     (0..samples).map(move |i| {
-        let start = i as u64 * count as u64 / samples as u64;
-        let end = (i as u64 + 1) * count as u64 / samples as u64;
+        // Advance floor(i * count / samples) without forming the product.
+        // Compare before adding so the remainder cannot overflow either.
+        let carry = remainder >= samples - extra;
+        remainder = if carry {
+            remainder - (samples - extra)
+        } else {
+            remainder + extra
+        };
+        let end = start + stride + usize::from(carry);
         // SplitMix64 mixes the stratum index independently of its location.
-        let mut phase = (i as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut phase = u64::try_from(i)
+            .expect("stratum index fits u64")
+            .wrapping_add(0x9e37_79b9_7f4a_7c15);
         phase = (phase ^ (phase >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         phase = (phase ^ (phase >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         phase ^= phase >> 31;
-        (start + phase % (end - start)) as usize
+        let width = u64::try_from(end - start).expect("stratum width fits u64");
+        let offset = usize::try_from(phase % width).expect("offset is smaller than stratum width");
+        let index = start + offset;
+        start = end;
+        index
     })
 }
 
@@ -1049,40 +1129,45 @@ pub struct Exposure {
     pub highlights: f32,
 }
 
+/// Measure whole-frame luminance and the shares of dark and bright samples.
+///
+/// # Errors
+/// Returns an error for invalid or oversized dimensions, an unsupported
+/// pixel format, or truncated source bytes.
 pub fn exposure(frame: &Frame) -> Result<Exposure> {
     exposure_in(FrameRef::whole(frame))
 }
 
 /// `exposure` of a view, read where it lies.
 pub(crate) fn exposure_in(view: FrameRef<'_>) -> Result<Exposure> {
+    const SAMPLES: usize = 65_536;
+    // Counts and the largest luma sum stay exact in the f32 result fields.
+    const _: () = assert!(SAMPLES <= (1 << f32::MANTISSA_DIGITS) / 255);
     validate_source(view.frame)?;
     let (w, pixels) = (view.width, view.pixels());
     let mono = monochrome(view.pixel_format());
     let (mut luma_bins, mut channels) = ([0; 64], [[0; 64]; 3]);
-    let (mut sum, mut samples, mut shadows, mut highlights) = (0u64, 0u32, 0u32, 0u32);
+    let (mut sum, mut samples, mut shadows, mut highlights) = (0u32, 0u32, 0u32, 0u32);
     let mut add = |rgb: [u8; 3]| {
         let y = luma(rgb);
-        luma_bins[y >> 2] += 1;
+        luma_bins[usize::from(y >> 2)] += 1;
         for (bins, value) in channels.iter_mut().zip(rgb) {
             bins[value as usize >> 2] += 1;
         }
-        sum += y as u64;
+        sum += u32::from(y);
         samples += 1;
         shadows += u32::from(rgb.iter().all(|&v| v <= CRUSHED));
         highlights += u32::from(rgb.iter().any(|&v| v >= BLOWN));
     };
-    match Quads::of(view) {
-        Some(quads) => {
-            let count = quads.columns * quads.rows;
-            for i in sample_indices(count, 65_536) {
-                add(quads.color(i % quads.columns, i / quads.columns));
-            }
+    if let Some(quads) = Quads::of(view) {
+        let count = quads.columns * quads.rows;
+        for i in sample_indices(count, SAMPLES) {
+            add(quads.color(i % quads.columns, i / quads.columns));
         }
-        None => {
-            let read = Pixels::new(view);
-            for i in sample_indices(pixels, 65_536) {
-                add(read.at(i % w, i / w));
-            }
+    } else {
+        let read = Pixels::new(view);
+        for i in sample_indices(pixels, SAMPLES) {
+            add(read.at(i % w, i / w));
         }
     }
     let share = |count: u32| count as f32 / samples.max(1) as f32;
@@ -1109,10 +1194,16 @@ pub struct Clipping {
     pub max: f64,
 }
 
-/// Count `frame`'s clipped pixels at native depth: samples of a Mono10 frame
+/// Count `frame`'s clipped pixels at native depth.
+///
+/// Samples of a Mono10 frame
 /// clip at 1023, a Mono8 or RGB8 one at 255, an RGB12 one at 4095 in any
 /// component, each Bayer sample on its own. Packed samples and wide color
 /// components are read where they lie, without unpacking the frame.
+///
+/// # Errors
+/// Returns an error for invalid or oversized dimensions, a pixel format
+/// whose clipping cannot be measured, or truncated source bytes.
 #[cfg(any(test, feature = "testing"))]
 pub fn clipping(frame: &Frame) -> Result<Clipping> {
     clipping_in(FrameRef::whole(frame))
@@ -1171,15 +1262,18 @@ pub(crate) fn clipping_in(view: FrameRef<'_>) -> Result<Clipping> {
         bail!("cannot count clipping in {}", pixel_format_name(format));
     }
     validate_source(frame)?;
-    let wide = wide_gray_bits(format).or_else(|| wide_bayer(format).map(|(_, shift)| 8 + shift));
+    let wide = wide_gray_bits(format)
+        .map(u32::from)
+        .or_else(|| wide_bayer(format).map(|(_, shift)| 8 + shift));
     let (bytes, bits) = match format {
         MONO8 | 0x0108_00b1 | 0x0108_00c6 | 0x0108_0008..=0x0108_000b => (1, 8),
         RGB8 | 0x0218_0015 => (3, 8),
-        _ => match wide {
-            Some(bits) => (2, bits),
-            // Every other layout as its 8-bit conversion, of which only
-            // each pixel's brightest component is worked out.
-            None => {
+        _ => {
+            if let Some(bits) = wide {
+                (2, bits)
+            } else {
+                // Every other layout as its 8-bit conversion, of which only
+                // each pixel's brightest component is worked out.
                 let read = Pixels::new(view);
                 let mut peaks = Vec::new();
                 let tally = Tally::rows(view, move |tally, y| {
@@ -1191,7 +1285,7 @@ pub(crate) fn clipping_in(view: FrameRef<'_>) -> Result<Clipping> {
                 });
                 return Ok(tally.finish(255, pixels));
             }
-        },
+        }
     };
     let full = (1u32 << bits) - 1;
     let stride = frame.width as usize * bytes;
@@ -1222,7 +1316,7 @@ struct Tally {
 impl Tally {
     /// Every frame row of `view` counted by `count`, in blocks of rows
     /// across cores for a large view, each block with its own `count`.
-    fn rows(view: FrameRef<'_>, count: impl FnMut(&mut Tally, usize) + Clone + Send) -> Self {
+    fn rows(view: FrameRef<'_>, count: impl FnMut(&mut Self, usize) + Clone + Send) -> Self {
         let rows = view.y0..view.y0 + view.height;
         let threads = worker_threads(view.pixels());
         let block = view.height.div_ceil(threads).max(1);
@@ -1248,7 +1342,7 @@ impl Tally {
             blocks
                 .into_iter()
                 .map(|block| block.join().expect("a clipping count panicked"))
-                .fold(Tally::default(), |total, block| Tally {
+                .fold(Self::default(), |total, block| Self {
                     high: total.high + block.high,
                     low: total.low + block.low,
                     top: total.top.max(block.top),
@@ -1287,9 +1381,15 @@ pub struct Sharpness {
 }
 
 /// Sharpness of the `[x, y, width, height]` pixel region, clamped to the frame.
+///
 /// At most 65,536 evenly spaced pixels are measured, each against its
 /// full-resolution neighbours, so fine detail still counts in large regions.
 /// A Bayer mosaic is measured over its 2x2 quads, the finest whole colors it has.
+///
+/// # Errors
+/// Returns an error for invalid or oversized dimensions, an unsupported
+/// pixel format, truncated source bytes, or a frame smaller than 3 × 3.
+#[deny(clippy::cast_precision_loss)]
 pub fn sharpness(frame: &Frame, region: [u32; 4]) -> Result<Sharpness> {
     validate_source(frame)?;
     checked_pixels(frame)?;
@@ -1305,16 +1405,44 @@ pub fn sharpness(frame: &Frame, region: [u32; 4]) -> Result<Sharpness> {
         return Ok(sharpness_over(
             (quads.columns, quads.rows),
             region,
-            |x, y| luma(quads.color(x, y)) as f64,
+            |x, y| f64::from(luma(quads.color(x, y))),
         ));
     }
     let (w, h) = (frame.width as usize, frame.height as usize);
     ensure!(w >= 3 && h >= 3, "frame is too small to measure sharpness");
     let pixels = Pixels::new(FrameRef::whole(frame));
     Ok(sharpness_over((w, h), region, |x, y| {
-        pixels.luma(x, y) as f64
+        f64::from(pixels.luma(x, y))
     }))
 }
+/// The focus grid's square stride, computed without floating-point
+/// rounding or narrowing. Current Rust targets have at most 64-bit indices.
+#[deny(clippy::cast_precision_loss)]
+fn sharpness_step(width: usize, height: usize) -> usize {
+    let cells = ((width as u128) * (height as u128)).div_ceil(65_536);
+    let root = cells.isqrt();
+    let step = root + u128::from(root * root < cells);
+    usize::try_from(step.max(1)).unwrap_or(usize::MAX)
+}
+
+/// The phase-shifted focus grid, omitting whole blocks whose shifted
+/// coordinates would fall beyond a thin region's edge.
+fn sharpness_grid(width: usize, height: usize) -> impl Iterator<Item = (usize, usize)> {
+    let step = sharpness_step(width, height);
+    let rows = height.div_ceil(step);
+    (0..rows)
+        .step_by(step)
+        .flat_map(move |block| block..block.saturating_add(width.min(step)).min(rows))
+        .flat_map(move |row| {
+            let columns = (width - row % step).div_ceil(step);
+            let phases = (height - row * step).min(step);
+            (0..columns)
+                .step_by(step)
+                .flat_map(move |block| block..block.saturating_add(phases).min(columns))
+                .map(move |column| (column * step + row % step, row * step + column % step))
+        })
+}
+
 /// `sharpness` of a region of a `w` × `h` grid, at least 3 × 3, whose
 /// luminance at (x, y) is `at`.
 fn sharpness_over(
@@ -1328,23 +1456,13 @@ fn sharpness_over(
     let y0 = y.clamp(1, h - 2);
     let x1 = x.saturating_add(width).clamp(x0 + 1, w - 1);
     let y1 = y.saturating_add(height).clamp(y0 + 1, h - 1);
-    let area = (x1 - x0) as f64 * (y1 - y0) as f64;
-    let step = (area / 65_536.0).sqrt().ceil().max(1.0) as usize;
     let (mut n, mut lap, mut lap2, mut ten, mut bren, mut sum, mut sum2) =
         (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     // Shift each row and column of the sampling grid by a different phase
     // within the stride, so periodic detail (a one-pixel checkerboard or
     // stripes) is never sampled at only one of its phases.
-    let grid = (0..(y1 - y0).div_ceil(step))
-        .flat_map(|row| (0..(x1 - x0).div_ceil(step)).map(move |column| (row, column)));
-    for (row, column) in grid {
-        let (x, y) = (
-            x0 + column * step + row % step,
-            y0 + row * step + column % step,
-        );
-        if x >= x1 || y >= y1 {
-            continue;
-        }
+    for (x, y) in sharpness_grid(x1 - x0, y1 - y0) {
+        let (x, y) = (x0 + x, y0 + y);
         {
             let [a, b, c] = [at(x - 1, y - 1), at(x, y - 1), at(x + 1, y - 1)];
             let [d, e, f] = [at(x - 1, y), at(x, y), at(x + 1, y)];
@@ -1356,7 +1474,7 @@ fn sharpness_over(
             lap += laplacian;
             lap2 += laplacian * laplacian;
             ten += gx * gx + gy * gy;
-            bren += ((f - d).powi(2) + (k - b).powi(2)) / 2.0;
+            bren += (f - d).powi(2).midpoint((k - b).powi(2));
             sum += e;
             sum2 += e * e;
         }
@@ -1364,9 +1482,25 @@ fn sharpness_over(
     let mean = sum / n;
     let variance = (sum2 / n - mean * mean).max(0.0);
     Sharpness {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "focus scores are exposed as f32 after accumulation in f64"
+        )]
         laplacian: (lap2 / n - (lap / n).powi(2)).max(0.0) as f32,
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "focus scores are exposed as f32 after accumulation in f64"
+        )]
         tenengrad: (ten / n) as f32,
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "focus scores are exposed as f32 after accumulation in f64"
+        )]
         brenner: (bren / n) as f32,
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "focus scores are exposed as f32 after accumulation in f64"
+        )]
         variance: if mean > 0.0 { variance / mean } else { 0.0 } as f32,
     }
 }
@@ -1375,12 +1509,21 @@ fn sharpness_over(
 /// well under this.
 pub const MAX_META: usize = 16 * 1024;
 
+/// Encode a still at the default quality, without metadata.
+///
+/// # Errors
+/// Returns the same errors as [`encode_parts`] for the requested image format
+/// at the default quality and without metadata.
 #[cfg(any(test, feature = "testing"))]
 pub fn encode(frame: &Frame, format: &str) -> Result<Vec<u8>> {
     encode_with_meta(frame, format, None)
 }
 
 /// `encode_parts` at the default quality, in one buffer.
+///
+/// # Errors
+/// Returns the same errors as [`encode_parts`] for the requested image format
+/// and metadata, at the default quality.
 #[cfg(any(test, feature = "testing"))]
 pub fn encode_with_meta(
     frame: &Frame,
@@ -1399,7 +1542,9 @@ fn passthrough(frame: &Frame) -> Option<&[u8]> {
         .filter(|jpeg| crate::jpeg::well_formed(jpeg, frame.width, frame.height))
 }
 
-/// Encode a still, writing `meta` (compact provenance JSON) into PNG as an
+/// Encode a still in the requested format.
+///
+/// Write `meta` (compact provenance JSON) into PNG as an
 /// iTXt chunk named `capturefab` and into JPEG as a COM segment. Raw has no
 /// place for it and stays plain. Monochrome PNG of more than 8 bits is
 /// 16-bit gray with the samples at the top bits and an sBIT chunk saying
@@ -1412,6 +1557,13 @@ fn passthrough(frame: &Frame) -> Option<&[u8]> {
 ///
 /// Raw borrows the frame's bytes, so nothing is copied before they are
 /// written.
+///
+/// # Errors
+/// Returns an error if the image format is unknown, metadata exceeds
+/// [`MAX_META`], or the requested encoder fails or is unavailable. Formats
+/// that decode pixels also reject invalid or oversized dimensions,
+/// unsupported pixel layouts, and truncated source bytes. Raw output
+/// preserves the frame bytes without validating the pixel layout.
 pub fn encode_parts<'a>(
     frame: &'a Frame,
     format: &str,
@@ -1425,27 +1577,27 @@ pub fn encode_parts<'a>(
             "capture metadata exceeds {MAX_META} bytes"
         );
     }
+    // The JPEG the source sent, as it is, at the source's quality.
+    if format == "jpeg"
+        && quality.is_none()
+        && let Some(jpeg) = passthrough(frame)
+    {
+        let mut insert = match &json {
+            Some(json) => crate::jpeg::com_segment(json.as_bytes())?,
+            None => Vec::new(),
+        };
+        if !crate::jpeg::has_huffman_tables(jpeg) {
+            insert.extend(crate::jpeg::standard_huffman_tables());
+        }
+        let encoded = if insert.is_empty() {
+            Encoded::new(Body::Borrowed(jpeg))
+        } else {
+            Encoded::with_insert(Body::Borrowed(jpeg), crate::jpeg::com_offset(jpeg)?, insert)
+        };
+        return Ok(encoded.passed_through());
+    }
     match format {
         "raw" => Ok(Encoded::new(Body::Borrowed(&frame.data))),
-        // The JPEG the source sent, as it is, at the source's quality.
-        "jpeg" if let Some(jpeg) = quality.is_none().then(|| passthrough(frame)).flatten() => {
-            let mut insert = match &json {
-                Some(json) => crate::jpeg::com_segment(json.as_bytes())?,
-                None => Vec::new(),
-            };
-            if !crate::jpeg::has_huffman_tables(jpeg) {
-                insert.extend(crate::jpeg::standard_huffman_tables());
-            }
-            let encoded = match insert.is_empty() {
-                true => Encoded::new(Body::Borrowed(jpeg)),
-                false => Encoded::with_insert(
-                    Body::Borrowed(jpeg),
-                    crate::jpeg::com_offset(jpeg)?,
-                    insert,
-                ),
-            };
-            Ok(encoded.passed_through())
-        }
         "jpeg" => {
             let jpeg = crate::jpeg::backend::encode(frame, quality)?;
 
@@ -1499,7 +1651,7 @@ pub fn encode_parts<'a>(
             }
             let mut writer = encoder.write_header()?;
             if let Some(bits) = significant {
-                writer.write_chunk(png::chunk::sBIT, &[bits as u8])?;
+                writer.write_chunk(png::chunk::sBIT, &[bits])?;
             }
             writer.write_image_data(&samples)?;
             drop(writer);
@@ -1522,6 +1674,79 @@ fn description(meta: &serde_json::Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn row_sizes_preserve_packed_rounding_and_reject_native_overflow() {
+        for (width, format, expected) in [
+            (0, MONO8, 0),
+            (3, 0x010a_0046, 4),
+            (5, 0x010a_0046, 7),
+            (3, 0x010c_0004, 5),
+            (4, 0x010c_0004, 6),
+        ] {
+            assert_eq!(checked_row_bytes(width, format), Some(expected));
+            assert_eq!(row_bytes(width, format), expected);
+        }
+        let widest = usize::try_from(136_902_082_529u64).ok();
+        assert_eq!(checked_row_bytes(u32::MAX, 0x00ff_0000), widest);
+        assert_eq!(
+            row_bytes(u32::MAX, 0x00ff_0000),
+            widest.unwrap_or(usize::MAX)
+        );
+        assert_eq!(frame_len(0x00ff_0000, u32::MAX, 1), widest);
+        assert_eq!(frame_len(0x00ff_0000, u32::MAX, u32::MAX), None);
+    }
+
+    #[test]
+    fn focus_grid_preserves_phase_shifted_samples() {
+        for (width, height) in [
+            (0usize, 0usize),
+            (1, 1),
+            (256, 256),
+            (257, 257),
+            (1000, 500),
+            (1_000_000, 1),
+            (1, 1_000_000),
+            (1_000_000, 3),
+            (3, 1_000_000),
+        ] {
+            #[expect(
+                clippy::cast_sign_loss,
+                clippy::cast_possible_truncation,
+                reason = "the reference preserves the original nonnegative floating-point focus-grid calculation"
+            )]
+            let step = ((width as f64 * height as f64 / 65_536.0)
+                .sqrt()
+                .ceil()
+                .max(1.0)) as usize;
+            let reference = (0..height.div_ceil(step))
+                .flat_map(|row| {
+                    (0..width.div_ceil(step))
+                        .map(move |column| (column * step + row % step, row * step + column % step))
+                })
+                .filter(|&(x, y)| x < width && y < height)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                sharpness_grid(width, height).collect::<Vec<_>>(),
+                reference,
+                "{width}x{height}"
+            );
+        }
+    }
+
+    #[test]
+    fn focus_grid_handles_extreme_thin_regions_without_scanning_invalid_candidates() {
+        for (width, height) in [(usize::MAX, 1), (1, usize::MAX)] {
+            let points = sharpness_grid(width, height).collect::<Vec<_>>();
+            assert_ne!(points, [] as [(usize, usize); 0]);
+            assert!(points.len() <= 65_536);
+            assert!(points.iter().all(|&(x, y)| x < width && y < height));
+        }
+        assert_eq!(
+            sharpness_step(usize::MAX, usize::MAX),
+            usize::MAX.div_ceil(256)
+        );
+    }
+
     use super::*;
     #[test]
     fn raw_stills_borrow_the_frame() {
@@ -1529,7 +1754,7 @@ mod tests {
             width: 7,
             height: 5,
             pixel_format,
-            data: (0..35 * bytes).map(|i| (i * 13) as u8).collect(),
+            data: (0..35 * bytes).map(|i| (i * 13).to_le_bytes()[0]).collect(),
             ..Frame::default()
         };
         for (format, bytes) in [(MONO8, 1), (0x010c_0047, 1), (RGB8, 3)] {
@@ -1543,7 +1768,7 @@ mod tests {
         }
         // Stills are PNG, JPEG or raw: no other format is written.
         for format in ["pgm", "ppm", "bmp"] {
-            assert!(encode_parts(&frame(MONO8, 1), format, None, None).is_err());
+            encode_parts(&frame(MONO8, 1), format, None, None).unwrap_err();
         }
     }
     #[cfg(feature = "jpeg")]
@@ -1553,7 +1778,7 @@ mod tests {
             width: 31,
             height: 17,
             pixel_format: MONO8,
-            data: (0..31 * 17).map(|i| (i * 7) as u8).collect(),
+            data: (0u32..31 * 17).map(|i| (i * 7).to_le_bytes()[0]).collect(),
             ..Frame::default()
         };
         let meta = serde_json::json!({"camera": "sim:0", "context": {"lot": "7"}});
@@ -1571,7 +1796,7 @@ mod tests {
             assert_eq!(written, parts.to_vec());
         }
         let wide = serde_json::json!({ "note": "x".repeat(MAX_META) });
-        assert!(encode_parts(&frame, "jpeg", None, Some(&wide)).is_err());
+        encode_parts(&frame, "jpeg", None, Some(&wide)).unwrap_err();
     }
     /// A frame that arrived as a JPEG is stored as that JPEG at the default
     /// quality, with the comment and, where it has none, the standard
@@ -1580,10 +1805,12 @@ mod tests {
     #[test]
     fn source_jpegs_are_stored_as_they_are() {
         let (width, height) = (32usize, 16usize);
-        let pixels: Vec<u8> = (0..width * height * 3).map(|i| (i % 200) as u8).collect();
+        let pixels: Vec<u8> = (0..width * height * 3)
+            .map(|i| u8::try_from(i % 200).unwrap())
+            .collect();
         let jpeg = turbojpeg::compress(
             turbojpeg::Image {
-                pixels: &pixels[..],
+                pixels: &*pixels,
                 width,
                 pitch: width * 3,
                 height,
@@ -1610,8 +1837,8 @@ mod tests {
         let json = serde_json::to_string(&meta).unwrap();
         for source in [&jpeg, &bare] {
             let frame = Frame {
-                width: width as u32,
-                height: height as u32,
+                width: u32::try_from(width).unwrap(),
+                height: u32::try_from(height).unwrap(),
                 pixel_format: RGB8,
                 data: turbojpeg::decompress(source, turbojpeg::PixelFormat::RGB)
                     .unwrap()
@@ -1639,7 +1866,7 @@ mod tests {
             let at = crate::jpeg::com_offset(source).unwrap();
             assert_eq!(
                 stored.to_vec(),
-                [&source[..at], &expected[..], &source[at..]].concat()
+                [&source[..at], (&*expected), &source[at..]].concat()
             );
             // Decoded alone, it is the image the source's tables made.
             let decoded = turbojpeg::decompress(&stored.to_vec(), turbojpeg::PixelFormat::RGB);
@@ -1702,27 +1929,25 @@ mod tests {
             rgb(&f(0x0218_0015, vec![1, 2, 3, 4, 5, 6])).unwrap(),
             vec![3, 2, 1, 6, 5, 4]
         );
-        assert!(rgb(&f(RGB8, vec![0])).is_err());
-        assert!(rgb(&f(0, vec![0; 6])).is_err());
+        rgb(&f(RGB8, vec![0])).unwrap_err();
+        rgb(&f(0, vec![0; 6])).unwrap_err();
         for (format, shift) in [(0x0110_0003, 2), (0x0110_0005, 4), (0x0110_0007, 8)] {
             let data = [(2u16 << shift) - 1, u16::MAX]
                 .into_iter()
                 .flat_map(u16::to_le_bytes)
                 .collect();
             assert_eq!(rgb(&f(format, data)).unwrap(), [1, 1, 1, 255, 255, 255]);
-            assert!(rgb(&f(format, vec![0; 3])).is_err());
+            rgb(&f(format, vec![0; 3])).unwrap_err();
         }
         assert_eq!(
             rgb(&f(RGB8, vec![1, 2, 3, 4, 5, 6, 7])).unwrap(),
             [1, 2, 3, 4, 5, 6]
         );
-        assert!(
-            rgba(&Frame {
-                width: u32::MAX,
-                ..f(MONO8, vec![])
-            })
-            .is_err()
-        );
+        rgba(&Frame {
+            width: u32::MAX,
+            ..f(MONO8, vec![])
+        })
+        .unwrap_err();
     }
     fn reference_bayer(frame: &Frame) -> Vec<u8> {
         let pattern = match frame.pixel_format {
@@ -1731,15 +1956,15 @@ mod tests {
             0x0108_000a => [1, 2, 0, 1],
             _ => [2, 1, 1, 0],
         };
-        let w = frame.width as i32;
-        let h = frame.height as i32;
-        let mut out = vec![0; (w * h * 3) as usize];
+        let w = i32::try_from(frame.width).unwrap();
+        let h = i32::try_from(frame.height).unwrap();
+        let mut out = vec![0; usize::try_from(w * h * 3).unwrap()];
         for y in 0..h {
             for x in 0..w {
                 for c in 0..3 {
-                    let own = pattern[((y & 1) * 2 + (x & 1)) as usize];
+                    let own = pattern[usize::try_from((y & 1) * 2 + (x & 1)).unwrap()];
                     let v = if own == c {
-                        frame.data[(y * w + x) as usize]
+                        frame.data[usize::try_from(y * w + x).unwrap()]
                     } else {
                         let mut sum = 0u32;
                         let mut n = 0;
@@ -1751,18 +1976,22 @@ mod tests {
                                     && xx < w
                                     && yy >= 0
                                     && yy < h
-                                    && pattern[((yy & 1) * 2 + (xx & 1)) as usize] == c
+                                    && pattern[usize::try_from((yy & 1) * 2 + (xx & 1)).unwrap()]
+                                        == c
                                 {
-                                    sum += frame.data[(yy * w + xx) as usize] as u32;
+                                    sum += u32::from(
+                                        frame.data[usize::try_from(yy * w + xx).unwrap()],
+                                    );
                                     n += 1;
                                 }
                             }
                         }
-                        sum.checked_div(n)
-                            .map(|v| v as u8)
-                            .unwrap_or(frame.data[(y * w + x) as usize])
+                        sum.checked_div(n).map_or_else(
+                            || frame.data[usize::try_from(y * w + x).unwrap()],
+                            |v| u8::try_from(v).unwrap(),
+                        )
                     };
-                    out[((y * w + x) * 3 + c) as usize] = v;
+                    out[usize::try_from((y * w + x) * 3 + c).unwrap()] = v;
                 }
             }
         }
@@ -1770,14 +1999,14 @@ mod tests {
     }
     fn random(seed: u64, len: usize) -> Vec<u8> {
         let mut state = seed | 1;
-        (0..len)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                (state >> 24) as u8
-            })
-            .collect()
+        std::iter::repeat_with(|| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24).to_le_bytes()[0]
+        })
+        .take(len)
+        .collect()
     }
     #[test]
     fn bayer_matches_reference_bilinear() {
@@ -1797,7 +2026,10 @@ mod tests {
         for (seed, (width, height)) in sizes.into_iter().enumerate() {
             for pixel_format in 0x0108_0008..=0x0108_000b {
                 let mut frame = f(pixel_format, random(seed as u64 + 1, width * height));
-                (frame.width, frame.height) = (width as u32, height as u32);
+                (frame.width, frame.height) = (
+                    u32::try_from(width).unwrap(),
+                    u32::try_from(height).unwrap(),
+                );
                 assert_eq!(
                     rgb(&frame).unwrap(),
                     reference_bayer(&frame),
@@ -1813,6 +2045,11 @@ mod tests {
         // A smooth scene with fine texture, sampled through each mosaic, against
         // the same pixels demosaiced, which is what the scopes measured before.
         let (width, height) = (640usize, 480usize);
+        #[expect(
+            clippy::cast_sign_loss,
+            clippy::cast_possible_truncation,
+            reason = "the reference scene's clamped intensities retain saturating float-to-byte conversion"
+        )]
         let scene = |x: usize, y: usize, c: usize| {
             // Blown out along the top, crushed along the bottom.
             if !(48..432).contains(&y) {
@@ -1830,8 +2067,8 @@ mod tests {
         for format in 0x0108_0008..=0x0108_000b {
             let pattern = bayer_pattern(format);
             let mosaic = Frame {
-                width: width as u32,
-                height: height as u32,
+                width: u32::try_from(width).unwrap(),
+                height: u32::try_from(height).unwrap(),
                 ..f(
                     format,
                     (0..width * height)
@@ -1839,7 +2076,7 @@ mod tests {
                             scene(
                                 i % width,
                                 i / width,
-                                pattern[((i / width) & 1) * 2 + ((i % width) & 1)],
+                                usize::from(pattern[((i / width) & 1) * 2 + ((i % width) & 1)]),
                             )
                         })
                         .collect(),
@@ -1878,12 +2115,12 @@ mod tests {
                         data: (0..width * height)
                             .map(|i| {
                                 let (x, y) = (i % width, i / width);
-                                let c = pattern[(y & 1) * 2 + (x & 1)];
+                                let c = usize::from(pattern[(y & 1) * 2 + (x & 1)]);
                                 let (x0, x1) = (x.saturating_sub(blur), (x + blur).min(width - 1));
                                 let sum: usize = (x0..=x1)
                                     .map(|x| (x / 8 % 2) * 200 + scene(x, y, c) as usize / 8)
                                     .sum();
-                                (sum / (x1 - x0 + 1)) as u8
+                                u8::try_from(sum / (x1 - x0 + 1)).unwrap()
                             })
                             .collect(),
                         ..mosaic.clone()
@@ -1902,7 +2139,7 @@ mod tests {
                 .collect();
             for pair in sweep.windows(2) {
                 assert!(
-                    pair[0].0 > pair[1].0 && pair[0].1 > pair[1].1,
+                    matches!(pair, [first, second] if first.0 > second.0 && first.1 > second.1),
                     "{format:x}: {sweep:?}"
                 );
             }
@@ -1913,13 +2150,13 @@ mod tests {
             height: 4,
             ..f(0x0108_0009, (0..16).map(|i| i * 15).collect())
         };
-        assert!(sharpness(&tiny, [0, 0, 4, 4]).is_ok());
+        sharpness(&tiny, [0, 0, 4, 4]).unwrap();
     }
     #[test]
     fn conversions_leave_a_core_free() {
         assert_eq!(worker_threads(1000), 1);
         assert_eq!([1, 2, 4, 8, 9, 16].map(spare_cores), [1, 1, 3, 7, 8, 8]);
-        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
         assert!(
             (1..=spare_cores(cores)).contains(&worker_threads(64 << 20)),
             "CAPTUREFAB_THREADS may reduce parallel work, but never exceed available spare cores"
@@ -1947,7 +2184,7 @@ mod tests {
                     height,
                     ..f(
                         format,
-                        random(format as u64, (width * height) as usize * bytes),
+                        random(u64::from(format), (width * height) as usize * bytes),
                     )
                 };
                 let full = rgb(&frame).unwrap();
@@ -1968,8 +2205,8 @@ mod tests {
                 );
             }
         }
-        assert!(rgba(&f(RGB8, vec![0])).is_err());
-        assert!(convert(&f(0, vec![0; 6]), |p| p).is_err());
+        rgba(&f(RGB8, vec![0])).unwrap_err();
+        convert(&f(0, vec![0; 6]), |p| p).unwrap_err();
     }
     #[test]
     fn packed_and_wide_conversions_match_the_per_pixel_reference() {
@@ -2037,7 +2274,7 @@ mod tests {
                     ..f(
                         format,
                         random(
-                            format as u64 ^ width as u64,
+                            u64::from(format) ^ u64::from(width),
                             (width * height) as usize * bytes,
                         ),
                     )
@@ -2066,9 +2303,31 @@ mod tests {
             }
         }
         assert!(!convertible(0));
-        assert!(exposure(&f(0, vec![0; 6])).is_err());
-        assert!(exposure(&f(RGB8, vec![0; 5])).is_err());
+        exposure(&f(0, vec![0; 6])).unwrap_err();
+        exposure(&f(RGB8, vec![0; 5])).unwrap_err();
     }
+    #[test]
+    fn bit_depth_suffixes_are_borrowed_at_utf8_boundaries() {
+        for (name, expected) in [
+            ("Mono12p", Some(12)),
+            ("BayerRG14", Some(14)),
+            ("Coord3D_C16", Some(16)),
+            ("YUV422_8_UYVY", Some(8)),
+            ("RGB10p32", Some(10)),
+            ("RGB8a32", Some(8)),
+            ("像素12p", Some(12)),
+            ("Pixel12é", None),
+            ("Custom4294967295", Some(u32::MAX)),
+            ("Custom4294967296", None),
+            ("Custom0", Some(0)),
+            ("Custom", None),
+            ("Custom_", None),
+            ("", None),
+        ] {
+            assert_eq!(name_bits(name), expected, "{name}");
+        }
+    }
+
     #[test]
     fn clipping_counts_every_pixel_at_native_depth() {
         let clipped = |frame: Frame| {
@@ -2097,7 +2356,7 @@ mod tests {
         let (high, low, max) = clipped(sized(0x0110_0011, le16(&[2047, 0, 4095, 1])));
         assert_eq!((high, low), (1, 1));
         assert!((max - 1.0).abs() < 1e-9);
-        assert!(clipping(&sized(0x0110_00b8, vec![0; 2])).is_err());
+        clipping(&sized(0x0110_00b8, vec![0; 2])).unwrap_err();
     }
     #[test]
     fn ycbcr_is_measured_as_its_rgb_conversion() {
@@ -2251,14 +2510,14 @@ mod tests {
         let flat = sharpness(&image(true), [w / 2 + 2, 0, w / 2, h]).unwrap();
         assert_eq!(flat, Sharpness::default());
         // Regions past the frame are clamped rather than rejected.
-        assert!(sharpness(&image(true), [u32::MAX, u32::MAX, 9, 9]).is_ok());
+        sharpness(&image(true), [u32::MAX, u32::MAX, 9, 9]).unwrap();
         assert!(
             sharpness(&image(true), [0, 0, u32::MAX, u32::MAX])
                 .unwrap()
                 .laplacian
                 > 0.0
         );
-        assert!(sharpness(&f(MONO8, vec![0, 0]), [0, 0, 2, 1]).is_err());
+        sharpness(&f(MONO8, vec![0, 0]), [0, 0, 2, 1]).unwrap_err();
         // One-pixel detail over a region large enough for an even stride.
         let (w, h) = (512u32, 512u32);
         for pattern in [|x: u32, y: u32| (x + y) % 2, |_x: u32, y: u32| y % 2] {
@@ -2268,7 +2527,7 @@ mod tests {
                 ..f(
                     MONO8,
                     (0..w * h)
-                        .map(|i| pattern(i % w, i / w) as u8 * 200)
+                        .map(|i| u8::try_from(pattern(i % w, i / w)).unwrap() * 200)
                         .collect(),
                 )
             };
@@ -2314,7 +2573,7 @@ mod tests {
                 .iter()
                 .map(|sample| u16::from_be_bytes(*sample))
                 .collect::<Vec<_>>();
-            (samples, info.sbit.map(|bits| bits.into_owned()))
+            (samples, info.sbit.map(std::borrow::Cow::into_owned))
         };
         let mono12 = sized(0x0110_0005, le16(&[0x0ABC; 8]));
         assert_eq!(sixteen(&mono12), (vec![0xABC0; 8], Some(vec![12])));
@@ -2383,7 +2642,12 @@ mod tests {
             0x010c_0006,
         ] {
             let bytes = row_bytes(2, fmt);
-            let frame = f(fmt, (0..bytes).map(|i| i as u8 * 77 + 3).collect());
+            let frame = f(
+                fmt,
+                (0..bytes)
+                    .map(|i| u8::try_from(i).unwrap() * 77 + 3)
+                    .collect(),
+            );
             let expected: Vec<u8> = rgb(&frame)
                 .unwrap()
                 .as_chunks::<3>()
@@ -2425,11 +2689,9 @@ mod tests {
         let plain = serde_json::json!({"frame_id":1});
         let (_, _, _, info) = decode_png(&encode_with_meta(&frame, "png", Some(&plain)).unwrap());
         assert_eq!(info.utf8_text.len(), 1);
-        assert!(
-            decode_png(&encode(&frame, "png").unwrap())
-                .3
-                .utf8_text
-                .is_empty()
+        assert_eq!(
+            decode_png(&encode(&frame, "png").unwrap()).3.utf8_text,
+            [] as [png::text_metadata::ITXtChunk; 0]
         );
         // Raw, which has no metadata field, stays byte-identical.
         assert_eq!(
@@ -2437,7 +2699,7 @@ mod tests {
             encode(&frame, "raw").unwrap()
         );
         let huge = serde_json::json!({"context":{"note":"x".repeat(MAX_META)}});
-        assert!(encode_with_meta(&frame, "png", Some(&huge)).is_err());
+        encode_with_meta(&frame, "png", Some(&huge)).unwrap_err();
     }
     #[cfg(feature = "jpeg")]
     #[test]
@@ -2494,7 +2756,7 @@ mod tests {
         ] {
             for width in 1..=11 {
                 let samples: Vec<u16> = (0..width * 9)
-                    .map(|i| ((i * 719 + 91) & ((1 << bits) - 1)) as u16)
+                    .map(|i| u16::try_from((i * 719 + 91) & ((1 << bits) - 1)).unwrap())
                     .collect();
                 let bytes = samples
                     .chunks(width as usize)
@@ -2536,9 +2798,9 @@ mod tests {
                 assert_eq!(direct.into_flattened(), rgb(&reference).unwrap());
                 let mut short = source;
                 short.data.make_mut().pop();
-                assert!(exposure(&short).is_err());
-                assert!(rgba(&short).is_err());
-                assert!(clipping(&short).is_err());
+                exposure(&short).unwrap_err();
+                rgba(&short).unwrap_err();
+                clipping(&short).unwrap_err();
             }
         }
     }
@@ -2546,20 +2808,58 @@ mod tests {
     #[test]
     fn exposure_never_exceeds_its_sample_budget() {
         for count in [65_535, 65_536, 65_537, 131_071, 131_072] {
-            for frame in [
-                sized(MONO8, count, 1, vec![127; count as usize]),
-                sized(0x0108_0009, 2 * count, 2, vec![127; 4 * count as usize]),
-            ] {
-                let exposure = exposure(&frame).unwrap();
-                let samples: u32 = exposure.luma.iter().sum();
-                assert!(samples > 0 && samples <= 65_536, "{samples}");
-                if let Some(channels) = exposure.channels {
-                    for channel in channels {
-                        assert_eq!(channel.iter().sum::<u32>(), samples);
+            for value in [0, 1, 127, 254, 255] {
+                for frame in [
+                    sized(MONO8, count, 1, vec![value; count as usize]),
+                    sized(0x0108_0009, 2 * count, 2, vec![value; 4 * count as usize]),
+                ] {
+                    let exposure = exposure(&frame).unwrap();
+                    let samples: u32 = exposure.luma.iter().sum();
+                    assert_eq!(samples, count.min(65_536));
+                    assert_eq!(exposure.mean, f32::from(value) / 255.0);
+                    assert_eq!(exposure.shadows, f32::from(u8::from(value <= 1)));
+                    assert_eq!(exposure.highlights, f32::from(u8::from(value >= 254)));
+                    if let Some(channels) = exposure.channels {
+                        for channel in channels {
+                            assert_eq!(channel.iter().sum::<u32>(), samples);
+                        }
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn stratified_sampling_handles_the_full_index_range() {
+        assert_eq!(sample_indices(usize::MAX, 0).count(), 0);
+        for (count, limit) in [
+            (usize::MAX, 65_536),
+            (usize::MAX - 1, 65_535),
+            (usize::MAX / 2 + 1, 7),
+            (17, 11),
+        ] {
+            let samples = count.min(limit);
+            let indices = sample_indices(count, limit).collect::<Vec<_>>();
+            assert_eq!(indices.len(), samples);
+            assert!(
+                indices
+                    .windows(2)
+                    .all(|pair| matches!(pair, [first, second] if first < second))
+            );
+            let total = u128::try_from(count).unwrap();
+            let strata = u128::try_from(samples).unwrap();
+            for (i, index) in indices.into_iter().enumerate() {
+                let i = u128::try_from(i).unwrap();
+                let index = u128::try_from(index).unwrap();
+                assert!((i * total / strata..(i + 1) * total / strata).contains(&index));
+            }
+        }
+        assert!(
+            sample_indices(usize::MAX, usize::MAX)
+                .take(1024)
+                .enumerate()
+                .all(|(expected, index)| expected == index)
+        );
     }
 
     #[test]
@@ -2572,7 +2872,11 @@ mod tests {
         for count in [65_535, 65_536, 65_537, 1_048_576] {
             let indices = sample_indices(count, 65_536).collect::<Vec<_>>();
             assert_eq!(indices.len(), count.min(65_536));
-            assert!(indices.windows(2).all(|pair| pair[0] < pair[1]));
+            assert!(
+                indices
+                    .windows(2)
+                    .all(|pair| matches!(pair, [first, second] if first < second))
+            );
             assert!(indices.iter().all(|&i| i < count));
         }
         for pattern in 0..3 {
@@ -2626,7 +2930,10 @@ mod tests {
             let unpacked = unpacked(&frame).unwrap();
             assert_eq!(unpacked.pixel_format, 0x0110_0005, "{format:x}");
             assert_eq!(unpacked.data, le16(&twelve), "{format:x}");
-            let gray: Vec<u8> = twelve.iter().flat_map(|v| [(v >> 4) as u8; 3]).collect();
+            let gray: Vec<u8> = twelve
+                .iter()
+                .flat_map(|v| [u8::try_from(v >> 4).unwrap(); 3])
+                .collect();
             assert_eq!(rgb(&frame).unwrap(), gray, "{format:x}");
         }
         // Mono10p: four samples in five bytes; a fifth starts a new group.
@@ -2649,7 +2956,7 @@ mod tests {
         let short = sized(0x010c_0047, 3, 2, vec![0; 9]);
         let error = rgb(&short).unwrap_err().to_string();
         assert!(error.contains("truncated Mono12p frame"), "{error}");
-        assert!(exposure(&short).is_err());
+        exposure(&short).unwrap_err();
     }
     #[test]
     fn every_bayer_depth_and_packing_keeps_its_color_filter() {
@@ -2701,21 +3008,28 @@ mod tests {
             .map(|&p| u16::from_le_bytes(p) & 0xfff)
             .collect();
         let pairs = samples.as_chunks::<2>().0;
-        let pfnc = pairs
-            .iter()
-            .flat_map(|&[a, b]| [a as u8, (a >> 8) as u8 | (b << 4) as u8, (b >> 4) as u8]);
+        let pfnc = pairs.iter().flat_map(|&[a, b]| {
+            [
+                a.to_le_bytes()[0],
+                a.to_le_bytes()[1] | (b.to_le_bytes()[0] << 4),
+                u8::try_from(b >> 4).unwrap(),
+            ]
+        });
         let gige = pairs.iter().flat_map(|&[a, b]| {
             [
-                (a >> 4) as u8,
-                (a & 0xf) as u8 | (b << 4) as u8,
-                (b >> 4) as u8,
+                u8::try_from(a >> 4).unwrap(),
+                (a.to_le_bytes()[0] & 0xf) | (b.to_le_bytes()[0] << 4),
+                u8::try_from(b >> 4).unwrap(),
             ]
         });
         let reference = sized(
             0x0108_0009,
             width,
             height,
-            samples.iter().map(|v| (v >> 4) as u8).collect(),
+            samples
+                .iter()
+                .map(|v| u8::try_from(v >> 4).unwrap())
+                .collect(),
         );
         for frame in [
             sized(0x0110_0011, width, height, le16(&samples)),
@@ -2770,7 +3084,7 @@ mod tests {
             rows.data.make_mut().truncate(8);
             assert_eq!(rgb(&rows).unwrap(), expected[..12], "{name}");
             rows.data.make_mut().pop();
-            assert!(rgb(&rows).is_err());
+            rgb(&rows).unwrap_err();
         }
     }
     #[test]
@@ -2787,6 +3101,6 @@ mod tests {
             assert_eq!(rgb(&frame).unwrap(), [1, 2, 3, 5, 6, 7]);
             assert!(gray8(&frame).unwrap().is_none());
         }
-        assert!(rgb(&f(0x0220_0016, vec![0; 7])).is_err());
+        rgb(&f(0x0220_0016, vec![0; 7])).unwrap_err();
     }
 }

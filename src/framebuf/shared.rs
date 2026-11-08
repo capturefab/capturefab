@@ -5,17 +5,19 @@
 //! reads it (`jpeg/helper.rs`). Each segment is one buffer of a frame pool;
 //! its descriptor travels to the helper once, over the helper's control
 //! socket, and its id names it in every request after that.
-#![allow(unsafe_code)]
 
+#![deny(trivial_numeric_casts)]
+#![deny(clippy::missing_const_for_fn)]
+#![deny(clippy::panic_in_result_fn)]
 use std::{
     io,
-    os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
+    os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd},
     ptr::NonNull,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 
 /// A shared memory segment mapped read-write into this process.
-pub struct Segment {
+pub(crate) struct Segment {
     id: u64,
     fd: OwnedFd,
     base: NonNull<u8>,
@@ -76,7 +78,7 @@ impl Segment {
     /// `create`, counted against `budget`.
     fn create_within(budget: &'static Budget, len: usize) -> io::Result<Self> {
         if budget.live.fetch_add(1, Ordering::AcqRel) >= budget.most {
-            budget.live.fetch_sub(1, Ordering::AcqRel);
+            let _ = budget.live.fetch_sub(1, Ordering::AcqRel);
             return Err(io::Error::other("too many shared memory segments"));
         }
         let made = (|| {
@@ -84,13 +86,15 @@ impl Segment {
                 .max(1)
                 .checked_next_multiple_of(page())
                 .ok_or_else(|| io::Error::from(io::ErrorKind::OutOfMemory))?;
+            let file_len = libc::off_t::try_from(len)
+                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
             let fd = anonymous()?;
             // SAFETY: a descriptor this process just created and owns.
-            if unsafe { libc::ftruncate(fd.as_raw_fd(), len as libc::off_t) } != 0 {
+            if unsafe { libc::ftruncate(fd.as_raw_fd(), file_len) } != 0 {
                 return Err(io::Error::last_os_error());
             }
             #[cfg(target_os = "linux")]
-            seal(&fd);
+            seal(&fd)?;
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
             Self::map(fd, len, id)
         })();
@@ -100,7 +104,7 @@ impl Segment {
                 Ok(segment)
             }
             Err(error) => {
-                budget.live.fetch_sub(1, Ordering::AcqRel);
+                let _ = budget.live.fetch_sub(1, Ordering::AcqRel);
                 Err(error)
             }
         }
@@ -115,13 +119,19 @@ impl Segment {
                 "an empty segment",
             ));
         }
+        if isize::try_from(len).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "segment length exceeds the addressable slice range",
+            ));
+        }
         // SAFETY: fstat writes a stat into the zeroed buffer it is given.
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: a valid descriptor and an out-pointer to a local.
-        if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
+        if unsafe { libc::fstat(fd.as_raw_fd(), &raw mut stat) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        if u64::try_from(stat.st_size).unwrap_or(0) < len as u64 {
+        if !libc::off_t::try_from(len).is_ok_and(|len| stat.st_size >= len) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "the segment is smaller than its stated length",
@@ -142,7 +152,12 @@ impl Segment {
         if base == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        let base = NonNull::new(base.cast()).ok_or_else(io::Error::last_os_error)?;
+        let Some(base) = NonNull::new(base.cast()) else {
+            // SAFETY: mmap succeeded, so this mapping must be released even
+            // when its address cannot represent a Rust slice.
+            let _ = unsafe { libc::munmap(base, len) };
+            return Err(io::Error::other("segment mapped at a null address"));
+        };
         Ok(Self {
             id,
             fd,
@@ -152,18 +167,18 @@ impl Segment {
         })
     }
 
-    pub(crate) fn id(&self) -> u64 {
+    pub(crate) const fn id(&self) -> u64 {
         self.id
     }
     /// Its mapped length: whole pages.
-    pub(crate) fn len(&self) -> usize {
+    pub(crate) const fn len(&self) -> usize {
         self.len
     }
     pub(crate) fn fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }
     /// The first byte of this process's mapping, page-aligned.
-    pub(crate) fn as_ptr(&self) -> *mut u8 {
+    pub(crate) const fn as_ptr(&self) -> *mut u8 {
         self.base.as_ptr()
     }
     /// Its first `len` bytes.
@@ -181,7 +196,10 @@ impl Segment {
     /// # Safety
     /// Nothing else may read or write them while the slice lives, in this
     /// process or another.
-    #[allow(clippy::mut_from_ref)]
+    #[expect(
+        clippy::mut_from_ref,
+        reason = "mapping metadata is shared; the unsafe caller guarantees exclusive byte access across processes"
+    )]
     pub(crate) unsafe fn bytes_mut(&self, len: usize) -> &mut [u8] {
         assert!(len <= self.len);
         // SAFETY: within the mapping; the caller has it alone.
@@ -193,9 +211,9 @@ impl Drop for Segment {
     fn drop(&mut self) {
         // SAFETY: the mapping `map` made, unmapped once; the descriptor
         // closes with `fd`.
-        unsafe { libc::munmap(self.base.as_ptr().cast(), self.len) };
+        let _ = unsafe { libc::munmap(self.base.as_ptr().cast(), self.len) };
         if let Some(budget) = self.counted {
-            budget.live.fetch_sub(1, Ordering::AcqRel);
+            let _ = budget.live.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
@@ -245,13 +263,14 @@ fn posix() -> io::Result<OwnedFd> {
             std::process::id() % 100_000,
             u64::from_ne_bytes(random)
         );
-        let name = std::ffi::CString::new(name).expect("no NUL in the name");
+        let name = std::ffi::CString::new(name).map_err(io::Error::other)?;
+        let mode: libc::c_uint = 0o600;
         // SAFETY: a NUL-terminated name, valid flags and a mode.
         let fd = unsafe {
             libc::shm_open(
                 name.as_ptr(),
                 libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
-                0o600 as libc::c_uint,
+                mode,
             )
         };
         if fd < 0 {
@@ -264,10 +283,14 @@ fn posix() -> io::Result<OwnedFd> {
         // SAFETY: a new descriptor this process owns.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         // SAFETY: the name just created.
-        unsafe { libc::shm_unlink(name.as_ptr()) };
+        if unsafe { libc::shm_unlink(name.as_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
         // SAFETY: a valid descriptor; FD_CLOEXEC keeps it from programs
         // this process runs, which are handed descriptors explicitly.
-        unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
         return Ok(fd);
     }
     Err(io::Error::from(io::ErrorKind::AlreadyExists))
@@ -275,21 +298,57 @@ fn posix() -> io::Result<OwnedFd> {
 
 /// Fix a memfd's size, so the helper that maps it can rely on it.
 #[cfg(target_os = "linux")]
-fn seal(fd: &OwnedFd) {
-    // SAFETY: a valid descriptor; failing leaves it unsealed, which only
-    // gives up that protection.
-    unsafe {
+fn seal(fd: &OwnedFd) -> io::Result<()> {
+    // SAFETY: a valid descriptor; these seals fix its length while keeping
+    // the shared pixel bytes writable.
+    let result = unsafe {
         libc::fcntl(
             fd.as_raw_fd(),
             libc::F_ADD_SEALS,
             libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_SEAL,
         )
     };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sealed_segments_cannot_be_resized_and_invalid_descriptors_are_refused() {
+        let segment = Segment::create(page()).unwrap();
+        for length in [0, segment.len() + page()] {
+            let length = libc::off_t::try_from(length).unwrap();
+            // SAFETY: a valid owned descriptor and a nonnegative length.
+            let resized = unsafe { libc::ftruncate(segment.fd().as_raw_fd(), length) };
+            assert_eq!(resized, -1);
+            assert_eq!(
+                io::Error::last_os_error().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+        let fd: OwnedFd = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .unwrap()
+            .into();
+        assert_eq!(seal(&fd).unwrap_err().raw_os_error(), Some(libc::EINVAL));
+    }
+
+    #[test]
+    fn posix_descriptors_are_close_on_exec() {
+        let fd = posix().unwrap();
+        // SAFETY: fd owns this live descriptor.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+    }
 
     #[test]
     fn segments_are_whole_zeroed_pages_two_mappings_share() {
@@ -308,7 +367,10 @@ mod tests {
         assert_ne!(other.as_ptr(), segment.as_ptr());
         // SAFETY: as above.
         assert_eq!(unsafe { other.bytes(4) }, &[1, 2, 3, 4]);
+        // SAFETY: both mappings cover at least eight bytes, and earlier
+        // borrowed slices are no longer used. This test is their only user.
         unsafe { other.bytes_mut(8)[7] = 9 };
+        // SAFETY: the write through the other mapping has finished.
         assert_eq!(unsafe { segment.bytes(8) }[7], 9);
         // Ids are new for every segment.
         assert_ne!(Segment::create(1).unwrap().id(), segment.id());
@@ -318,9 +380,22 @@ mod tests {
     fn a_stated_length_beyond_the_segment_is_refused() {
         let segment = Segment::create(page()).unwrap();
         let fd = segment.fd().try_clone_to_owned().unwrap();
-        assert!(Segment::map(fd, segment.len() + page(), 1).is_err());
+        assert_eq!(
+            Segment::map(fd, segment.len() + page(), 1)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
         let fd = segment.fd().try_clone_to_owned().unwrap();
-        assert!(Segment::map(fd, 0, 1).is_err());
+        assert_eq!(
+            Segment::map(fd, 0, 1).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let fd = segment.fd().try_clone_to_owned().unwrap();
+        let oversized = usize::try_from(isize::MAX).unwrap() + 1;
+        let error = Segment::map(fd, oversized, 1).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("addressable slice range"));
     }
 
     /// Past its budget, more segments are refused rather than filling the
@@ -328,8 +403,8 @@ mod tests {
     #[test]
     fn segments_are_bounded() {
         static BUDGET: Budget = Budget::new(3);
-        let held: Vec<_> = (0..3)
-            .map(|_| Segment::create_within(&BUDGET, 1).unwrap())
+        let held: Vec<_> = std::iter::repeat_with(|| Segment::create_within(&BUDGET, 1).unwrap())
+            .take(3)
             .collect();
         let refused = Segment::create_within(&BUDGET, 1).unwrap_err();
         assert!(refused.to_string().contains("too many"), "{refused}");
@@ -343,12 +418,14 @@ mod tests {
         assert_eq!(BUDGET.live.load(Ordering::Acquire), 0);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(target_pointer_width = "64")]
     #[test]
-    fn memfd_segments_cannot_change_size() {
-        let segment = Segment::create(page()).unwrap();
-        // SAFETY: a valid descriptor; the seal refuses the change.
-        let shrunk = unsafe { libc::ftruncate(segment.fd().as_raw_fd(), 0) };
-        assert_ne!(shrunk, 0);
+    fn oversized_segments_fail_without_consuming_the_budget() {
+        static BUDGET: Budget = Budget::new(1);
+        let len = usize::try_from(libc::off_t::MAX).unwrap() + 1;
+        let error = Segment::create_within(&BUDGET, len).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+        let segment = Segment::create_within(&BUDGET, 1).unwrap();
+        assert!(segment.len() >= 1);
     }
 }

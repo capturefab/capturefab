@@ -4,6 +4,8 @@
 //! mosaic of any depth is demosaicked from a ring of three 8-bit rows, so no
 //! full-size intermediate image is ever built: a consumer gets each row
 //! where it wants it (a preview's accumulator, an encoder's input buffer).
+#![deny(clippy::missing_const_for_fn)]
+#![deny(clippy::cast_precision_loss)]
 use super::{FrameRef, Packing, Pixels, bayer_pattern, is_bayer, packing, row_bytes};
 use crate::types::{MONO8, RGB8};
 
@@ -17,10 +19,10 @@ pub(crate) enum Channels {
 }
 
 impl Channels {
-    pub(crate) fn bytes(self) -> usize {
+    pub(crate) const fn bytes(self) -> usize {
         match self {
-            Channels::Gray => 1,
-            Channels::Rgb => 3,
+            Self::Gray => 1,
+            Self::Rgb => 3,
         }
     }
 }
@@ -37,7 +39,7 @@ enum Kind {
     /// Packed monochrome: sample bits, packing, and the shift to 8 bits.
     Packed(u32, Packing, u32),
     /// A Bayer mosaic with its color filter, demosaicked from 8-bit rows.
-    Bayer([usize; 4], Mosaic),
+    Bayer([u8; 4], Mosaic),
     /// Every other layout, decoded a pixel at a time.
     Pixels,
 }
@@ -131,7 +133,7 @@ impl<'a> RowReader<'a> {
     }
 
     /// Whether `row` returns the frame's own bytes for `channels`.
-    pub(crate) fn borrows(&self, channels: Channels) -> bool {
+    pub(crate) const fn borrows(&self, channels: Channels) -> bool {
         matches!(
             (self.kind, channels),
             (Kind::Gray8, Channels::Gray) | (Kind::Rgb8, Channels::Rgb)
@@ -246,7 +248,7 @@ impl<'a> RowReader<'a> {
     fn demosaic(
         &mut self,
         y: usize,
-        pattern: [usize; 4],
+        pattern: [u8; 4],
         mosaic: Mosaic,
         channels: Channels,
         out: &mut [u8],
@@ -287,7 +289,7 @@ fn gray(samples: &[u8], channels: Channels, out: &mut [u8]) {
 
 /// Little-endian 16-bit samples shifted right to 8 bits, as `channels`.
 fn shifted(samples: &[[u8; 2]], shift: u32, channels: Channels, out: &mut [u8]) {
-    let eight = |sample: &[u8; 2]| (u16::from_le_bytes(*sample) >> shift).min(255) as u8;
+    let eight = |sample: &[u8; 2]| super::clamp8(u16::from_le_bytes(*sample) >> shift);
     match channels {
         Channels::Gray => {
             for (value, sample) in out.iter_mut().zip(samples) {
@@ -310,12 +312,12 @@ pub(crate) fn demosaic_row(
     above: Option<&[u8]>,
     row: &[u8],
     below: Option<&[u8]>,
-    pattern: [usize; 4],
+    pattern: [u8; 4],
     y: usize,
     out: &mut [[u8; 3]],
 ) {
     let w = row.len();
-    let color = |x: usize, y: usize| pattern[(y & 1) * 2 + (x & 1)];
+    let color = |x: usize, y: usize| usize::from(pattern[(y & 1) * 2 + (x & 1)]);
     let bounded = |x: usize| bounded(above, row, below, pattern, x, y);
     let (Some(up), Some(down)) = (above, below) else {
         for (x, pixel) in out.iter_mut().enumerate() {
@@ -333,16 +335,25 @@ pub(crate) fn demosaic_row(
     let chroma = color(0, y) + color(1, y) - 1;
     let windows = up.windows(3).zip(row.windows(3)).zip(down.windows(3));
     for (x, ((up, row), down)) in windows.enumerate() {
-        let horizontal = row[0] as u16 + row[2] as u16;
-        let vertical = up[1] as u16 + down[1] as u16;
+        let up: &[u8; 3] = up.try_into().expect("three-pixel window");
+        let row: &[u8; 3] = row.try_into().expect("three-pixel window");
+        let down: &[u8; 3] = down.try_into().expect("three-pixel window");
+        let horizontal = u16::from(row[0]) + u16::from(row[2]);
+        let vertical = u16::from(up[1]) + u16::from(down[1]);
         let (near, green, far) = if color(x + 1, y) == 1 {
-            ((horizontal >> 1) as u8, row[1], (vertical >> 1) as u8)
+            (
+                u8::try_from(horizontal >> 1).expect("two-pixel mean fits eight bits"),
+                row[1],
+                u8::try_from(vertical >> 1).expect("two-pixel mean fits eight bits"),
+            )
         } else {
-            let diagonal = up[0] as u16 + up[2] as u16 + down[0] as u16 + down[2] as u16;
+            let diagonal =
+                u16::from(up[0]) + u16::from(up[2]) + u16::from(down[0]) + u16::from(down[2]);
             (
                 row[1],
-                ((horizontal + vertical) >> 2) as u8,
-                (diagonal >> 2) as u8,
+                u8::try_from((horizontal + vertical) >> 2)
+                    .expect("four-pixel mean fits eight bits"),
+                u8::try_from(diagonal >> 2).expect("four-pixel mean fits eight bits"),
             )
         };
         out[x + 1] = if chroma == 0 {
@@ -359,12 +370,12 @@ fn bounded(
     above: Option<&[u8]>,
     row: &[u8],
     below: Option<&[u8]>,
-    pattern: [usize; 4],
+    pattern: [u8; 4],
     x: usize,
     y: usize,
 ) -> [u8; 3] {
     let w = row.len();
-    let color = |x: usize, y: usize| pattern[(y & 1) * 2 + (x & 1)];
+    let color = |x: usize, y: usize| usize::from(pattern[(y & 1) * 2 + (x & 1)]);
     let rows = [
         above.map(|row| (y - 1, row)),
         Some((y, row)),
@@ -383,7 +394,9 @@ fn bounded(
                 }
             }
         }
-        sum.checked_div(n).map_or(row[x], |v| v as u8)
+        sum.checked_div(n).map_or(row[x], |v| {
+            u8::try_from(v).expect("mean of eight-bit samples fits eight bits")
+        })
     })
 }
 
@@ -452,7 +465,7 @@ pub(crate) fn map<P: Send>(
 }
 
 #[cfg(any(feature = "jpeg", jpeg_helper))]
-/// Where `ycbcr420` writes JFIF (full-range BT.601) Y'CbCr 4:2:0: a luma
+/// Where `ycbcr420` writes JFIF (full-range BT.601) `Y'CbCr` 4:2:0: a luma
 /// plane and the chroma either as two planes (as libjpeg-turbo reads them)
 /// or interleaved (NV12, as a video encoder's surface holds it), each plane
 /// at its own row stride.
@@ -468,7 +481,10 @@ pub(crate) enum Chroma<'a> {
     // libjpeg-turbo and nvJPEG read planar chroma.
     #[cfg_attr(
         not(any(feature = "jpeg", all(jpeg_helper, feature = "nvjpeg"))),
-        allow(dead_code)
+        allow(
+            dead_code,
+            reason = "the shared YCbCr writer handles both layouts; enabled encoders construct only their own layout"
+        )
     )]
     Planar {
         cb: &'a mut [u8],
@@ -481,7 +497,10 @@ pub(crate) enum Chroma<'a> {
             all(feature = "videotoolbox", target_os = "macos"),
             all(jpeg_helper, feature = "vaapi")
         )),
-        allow(dead_code)
+        allow(
+            dead_code,
+            reason = "the shared YCbCr writer handles both layouts; enabled encoders construct only their own layout"
+        )
     )]
     Interleaved { cbcr: &'a mut [u8], stride: usize },
 }
@@ -494,7 +513,7 @@ enum ChromaRows<'a> {
 }
 
 #[cfg(any(feature = "jpeg", jpeg_helper))]
-/// `view` as JFIF Y'CbCr 4:2:0, written straight into `out` from its RGB
+/// `view` as JFIF `Y'CbCr` 4:2:0, written straight into `out` from its RGB
 /// rows two at a time: luma for each pixel and chroma from each 2x2 block's
 /// mean, with the fixed-point coefficients of libjpeg's jccolor.c. An odd
 /// last column or row repeats its own pixels. Large views are split into
@@ -599,7 +618,8 @@ pub(crate) fn ycbcr420(view: FrameRef<'_>, out: Yuv420<'_>) {
 fn write_luma(rgb: &[u8], out: &mut [u8]) {
     for (y, p) in out.iter_mut().zip(rgb.as_chunks::<3>().0) {
         let [r, g, b] = p.map(u32::from);
-        *y = ((19_595 * r + 38_470 * g + 7_471 * b + 32_768) >> 16) as u8;
+        *y = u8::try_from((19_595 * r + 38_470 * g + 7_471 * b + 32_768) >> 16)
+            .expect("normalized luma fits eight bits");
     }
 }
 
@@ -611,6 +631,7 @@ fn chroma_of(top: &[u8], bottom: &[u8]) -> [u8; 2] {
     let last = top.len() - 3;
     let (mut r, mut g, mut b) = (0i32, 0i32, 0i32);
     for p in [&top[..3], &top[last..], &bottom[..3], &bottom[last..]] {
+        let p: &[u8; 3] = p.try_into().expect("one RGB pixel");
         (r, g, b) = (
             r + i32::from(p[0]),
             g + i32::from(p[1]),
@@ -618,7 +639,10 @@ fn chroma_of(top: &[u8], bottom: &[u8]) -> [u8; 2] {
         );
     }
     // Four summed pixels: shift by 18 and round, offset by 128.
-    let scale = |v: i32| ((v + (128 << 18) + (1 << 17)) >> 18).clamp(0, 255) as u8;
+    let scale = |v: i32| {
+        u8::try_from(((v + (128 << 18) + (1 << 17)) >> 18).clamp(0, 255))
+            .expect("clamped chroma fits eight bits")
+    };
     [
         scale(-11_059 * r - 21_709 * g + 32_768 * b),
         scale(32_768 * r - 27_439 * g - 5_329 * b),
@@ -637,12 +661,12 @@ pub(crate) mod tests {
             0x021e, 0x0220, 0x0224, 0x0228, 0x0230, 0x0240,
         ]
         .into_iter()
-        .flat_map(|prefix| (0..=0x12e).map(move |id| prefix << 16 | id))
+        .flat_map(|prefix| (0..=0x12e).map(move |id| (prefix << 16) | id))
         // Capturefab's own planar and semiplanar Y'CbCr codes.
         .chain(
-            [0x820c, 0x8210, 0x8218]
-                .into_iter()
-                .flat_map(|prefix| [1, 2, 3, 4, 0x11, 0x12, 0x13].map(move |id| prefix << 16 | id)),
+            [0x820c, 0x8210, 0x8218].into_iter().flat_map(|prefix| {
+                [1, 2, 3, 4, 0x11, 0x12, 0x13].map(move |id| (prefix << 16) | id)
+            }),
         )
         .filter(|&format| crate::frame::convertible(format))
         .collect()
@@ -651,14 +675,14 @@ pub(crate) mod tests {
     pub(crate) fn noise_frame(format: u32, width: u32, height: u32) -> Frame {
         let mut seed = format ^ 0x2545_f491 ^ width;
         let len = crate::frame::frame_len(format, width, height).unwrap();
-        let data: Vec<u8> = (0..len)
-            .map(|_| {
-                seed ^= seed << 13;
-                seed ^= seed >> 17;
-                seed ^= seed << 5;
-                seed as u8
-            })
-            .collect();
+        let data: Vec<u8> = std::iter::repeat_with(|| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed.to_le_bytes()[0]
+        })
+        .take(len)
+        .collect();
         Frame {
             width,
             height,
@@ -730,7 +754,7 @@ pub(crate) mod tests {
             0x0210_0032,
         ] {
             let width = 1031;
-            let frame = noise_frame(format, width as u32, 520);
+            let frame = noise_frame(format, u32::try_from(width).unwrap(), 520);
             let view = FrameRef::whole(&frame);
             let mut whole = vec![0; view.pixels() * 3];
             decode(view, Channels::Rgb, &mut whole);
@@ -777,24 +801,31 @@ pub(crate) mod tests {
         let jfif = |[r, g, b]: [f64; 3]| {
             [
                 0.299 * r + 0.587 * g + 0.114 * b,
-                128.0 - 0.168736 * r - 0.331264 * g + 0.5 * b,
-                128.0 + 0.5 * r - 0.418688 * g - 0.081312 * b,
+                128.0 - 0.168_736 * r - 0.331_264 * g + 0.5 * b,
+                128.0 + 0.5 * r - 0.418_688 * g - 0.081_312 * b,
             ]
         };
         // Odd sizes repeat their edges; 1031x517 is split across threads.
-        for (width, height) in [(1, 1), (2, 2), (3, 1), (5, 7), (33, 17), (1031, 517)] {
+        for (width, height) in [
+            (1usize, 1usize),
+            (2, 2),
+            (3, 1),
+            (5, 7),
+            (33, 17),
+            (1031, 517),
+        ] {
             let rgb: Vec<[u8; 3]> = (0..width * height)
                 .map(|i| {
                     [
-                        (i * 7) as u8,
-                        (i * 13 + i / width) as u8,
-                        (255 - i % 256) as u8,
+                        (i * 7).to_le_bytes()[0],
+                        (i * 13 + i / width).to_le_bytes()[0],
+                        u8::try_from(255 - i % 256).unwrap(),
                     ]
                 })
                 .collect();
             let frame = Frame {
-                width: width as u32,
-                height: height as u32,
+                width: u32::try_from(width).unwrap(),
+                height: u32::try_from(height).unwrap(),
                 pixel_format: RGB8,
                 data: rgb.as_flattened().to_vec().into(),
                 ..Frame::default()
@@ -862,12 +893,12 @@ pub(crate) mod tests {
                             .map(|(dx, dy)| jfif(at(2 * x + dx, 2 * y + dy)))
                             .iter()
                             .fold([0.0; 2], |s, p| [s[0] + p[1] / 4.0, s[1] + p[2] / 4.0]);
-                        let (cb, cr) = if interleaved {
-                            (planes[0][row + 2 * x], planes[0][row + 2 * x + 1])
+                        let samples = if interleaved {
+                            [planes[0][row + 2 * x], planes[0][row + 2 * x + 1]]
                         } else {
-                            (planes[0][row + x], planes[1][row + x])
+                            [planes[0][row + x], planes[1][row + x]]
                         };
-                        for (component, got) in [cb, cr].into_iter().enumerate() {
+                        for (component, got) in samples.into_iter().enumerate() {
                             assert!(
                                 (f64::from(got) - mean[component].clamp(0.0, 255.0)).abs() <= 0.51,
                                 "{case}: C{component} {x},{y}"

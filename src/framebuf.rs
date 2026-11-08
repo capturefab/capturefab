@@ -17,17 +17,19 @@
 //! writes every byte it delivers may take one with [`FramePool::take_stale`].
 //!
 //! The images frames are converted into for an encoder (a Bayer frame's
-//! Y'CbCr planes for a JPEG) come from a second pool, [`transforms`], so
+//! `Y'CbCr` planes for a JPEG) come from a second pool, [`transforms`], so
 //! they never push a camera's frames out of this one.
 //!
 //! While a GPU JPEG engine is open in this process, its helper resting
 //! included, both pools hand out shared memory segments ([`shared`])
 //! instead of heap vectors, so the helper reads a frame where the camera
 //! wrote it ([`share`]).
+#![deny(let_underscore_drop, unused_results)]
+#![deny(clippy::cast_precision_loss)]
 #[cfg(jpeg_helper)]
 pub(crate) mod shared;
 
-#[cfg(jpeg_helper)]
+#[cfg(any(jpeg_helper, test, feature = "copy-audit"))]
 use std::sync::atomic::Ordering;
 use std::{
     fmt,
@@ -55,7 +57,7 @@ pub fn pool() -> &'static FramePool {
 /// frame a JPEG is compressed from). It is not the frame pool, so encoding
 /// never pushes a camera's buffers out of that, and it keeps one buffer
 /// idle for each encoder thread, within the same share of memory.
-pub fn transforms() -> &'static FramePool {
+pub(crate) fn transforms() -> &'static FramePool {
     static POOL: OnceLock<FramePool> = OnceLock::new();
     POOL.get_or_init(|| {
         FramePool::with_idle(crate::host::threads(usize::MAX), crate::host::memory_budget)
@@ -95,33 +97,35 @@ enum Store {
 impl Store {
     fn capacity(&self) -> usize {
         match self {
-            Store::Heap(vec) => vec.capacity(),
+            Self::Heap(vec) => vec.capacity(),
             #[cfg(jpeg_helper)]
-            Store::Segment(segment) => segment.len(),
+            Self::Segment(segment) => segment.len(),
         }
     }
     /// What holding `len` bytes takes of this kind of memory: whole pages
     /// for a segment.
     fn rounded(&self, len: usize) -> usize {
         match self {
-            Store::Heap(_) => len,
+            Self::Heap(_) => len,
             #[cfg(jpeg_helper)]
-            Store::Segment(_) => len.next_multiple_of(shared::page()),
+            Self::Segment(_) => len.next_multiple_of(shared::page()),
         }
     }
-    fn is_heap(&self) -> bool {
+    #[cfg(any(test, feature = "usb", jpeg_helper))]
+    const fn is_heap(&self) -> bool {
         match self {
-            Store::Heap(_) => true,
+            Self::Heap(_) => true,
             #[cfg(jpeg_helper)]
-            Store::Segment(_) => false,
+            Self::Segment(_) => false,
         }
     }
-    fn fits(&self, want: Want) -> bool {
-        match want {
-            Want::Any => true,
-            Want::Heap => self.is_heap(),
+    const fn fits(&self, want: Want) -> bool {
+        match (self, want) {
+            (_, Want::Any) => true,
+            #[cfg(any(test, feature = "usb"))]
+            (store, Want::Heap) => store.is_heap(),
             #[cfg(jpeg_helper)]
-            Want::Segment => !self.is_heap(),
+            (store, Want::Segment) => !store.is_heap(),
         }
     }
 }
@@ -131,6 +135,7 @@ impl Store {
 enum Want {
     Any,
     /// A vector, to hand to an API that takes one.
+    #[cfg(any(test, feature = "usb"))]
     Heap,
     /// Shared memory, for a helper to read.
     #[cfg(jpeg_helper)]
@@ -144,15 +149,22 @@ enum Want {
 struct Counter(#[cfg(any(test, feature = "copy-audit"))] std::sync::atomic::AtomicU64);
 
 impl Counter {
+    #[cfg_attr(
+        not(any(test, feature = "copy-audit")),
+        expect(
+            clippy::unused_self,
+            reason = "disabled instrumentation retains the counter API with no state or runtime overhead"
+        )
+    )]
     fn add(&self, n: u64) {
         #[cfg(any(test, feature = "copy-audit"))]
-        self.0.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        let _ = self.0.fetch_add(n, Ordering::Relaxed);
         #[cfg(not(any(test, feature = "copy-audit")))]
         let _ = n;
     }
     #[cfg(any(test, feature = "copy-audit"))]
     fn get(&self) -> u64 {
-        self.0.load(std::sync::atomic::Ordering::Relaxed)
+        self.0.load(Ordering::Relaxed)
     }
 }
 
@@ -194,12 +206,7 @@ impl FramePool {
     /// caller must write every byte it hands on. A new one is zeroed by the
     /// allocator, which costs nothing until its pages are touched.
     pub fn take_stale(&self, len: usize) -> PoolVec {
-        let store = self.shared_store(len).unwrap_or_else(|| {
-            self.reuse(len, Want::Any).unwrap_or_else(|| {
-                self.shared.allocations.add(1);
-                Store::Heap(vec![0; len])
-            })
-        });
+        let store = self.take_store(len, || vec![0; len]);
         let mut buffer = self.holding(store);
         buffer.reserve_initialized(len);
         buffer.len = len;
@@ -211,27 +218,21 @@ impl FramePool {
     /// a producer that appends.
     // USB3 Vision assembles frames by appending and hands transfers
     // their buffers.
-    #[cfg_attr(not(feature = "usb"), allow(dead_code))]
+    #[cfg(any(test, feature = "usb"))]
     pub(crate) fn take_empty(&self, capacity: usize) -> PoolVec {
-        let store = self.shared_store(capacity).unwrap_or_else(|| {
-            self.reuse(capacity, Want::Any).unwrap_or_else(|| {
-                self.shared.allocations.add(1);
-                Store::Heap(Vec::with_capacity(capacity))
-            })
-        });
+        let store = self.take_store(capacity, || Vec::with_capacity(capacity));
         self.holding(store)
     }
     /// A vector of `len` stale bytes for an API that takes ownership of one
     /// and gives it back (`adopt`): a USB transfer. Always heap memory.
     // USB3 Vision hands transfers the buffers of whole frames.
-    #[cfg_attr(not(feature = "usb"), allow(dead_code))]
+    #[cfg(any(test, feature = "usb"))]
     pub(crate) fn take_vec(&self, len: usize) -> Vec<u8> {
-        let mut vec = match self.reuse(len, Want::Heap) {
-            Some(Store::Heap(vec)) => vec,
-            _ => {
-                self.shared.allocations.add(1);
-                vec![0; len]
-            }
+        let mut vec = if let Some(Store::Heap(vec)) = self.reuse(len, Want::Heap) {
+            vec
+        } else {
+            self.shared.allocations.add(1);
+            vec![0; len]
         };
         if vec.len() < len {
             vec.resize(len, 0);
@@ -248,13 +249,12 @@ impl FramePool {
     /// poison it.
     #[cfg(jpeg_helper)]
     pub(crate) fn take_shared(&self, len: usize) -> Option<PoolVec> {
-        let store = match self.reuse(len, Want::Segment) {
-            Some(store) => store,
-            None => {
-                let segment = shared::Segment::create(len).ok()?;
-                self.shared.allocations.add(1);
-                Store::Segment(Arc::new(segment))
-            }
+        let store = if let Some(store) = self.reuse(len, Want::Segment) {
+            store
+        } else {
+            let segment = shared::Segment::create(len).ok()?;
+            self.shared.allocations.add(1);
+            Store::Segment(Arc::new(segment))
         };
         let mut buffer = self.holding(store);
         buffer.len = len;
@@ -262,7 +262,7 @@ impl FramePool {
     }
     /// `vec` as a buffer of this pool, which it goes back to when dropped.
     // USB3 Vision hands transfers the buffers of whole frames.
-    #[cfg_attr(not(feature = "usb"), allow(dead_code))]
+    #[cfg(any(test, feature = "usb"))]
     pub(crate) fn adopt(&self, vec: Vec<u8>) -> PoolVec {
         PoolVec {
             len: vec.len(),
@@ -274,7 +274,7 @@ impl FramePool {
     /// pool's buffers: new ones are shared memory.
     #[cfg(jpeg_helper)]
     pub(crate) fn share(&self) -> Sharing {
-        self.shared.sharers.fetch_add(1, Ordering::AcqRel);
+        let _ = self.shared.sharers.fetch_add(1, Ordering::AcqRel);
         Sharing(self.shared.clone())
     }
     #[cfg(any(test, feature = "copy-audit"))]
@@ -292,11 +292,23 @@ impl FramePool {
             home: Some(self.shared.clone()),
         }
     }
+    /// Prefer shared memory for active helpers, then reuse any suitable
+    /// buffer, allocating heap memory only when neither can serve it.
+    fn take_store(&self, len: usize, heap: impl FnOnce() -> Vec<u8>) -> Store {
+        #[cfg(jpeg_helper)]
+        if let Some(store) = self.shared_store(len) {
+            return store;
+        }
+        self.reuse(len, Want::Any).unwrap_or_else(|| {
+            self.shared.allocations.add(1);
+            Store::Heap(heap())
+        })
+    }
     /// A shared memory buffer for `len` bytes while helpers read this
     /// pool's buffers: an idle one, else a new one; None when none read
     /// them, or a new one cannot be had (the heap serves then).
+    #[cfg(jpeg_helper)]
     fn shared_store(&self, len: usize) -> Option<Store> {
-        #[cfg(jpeg_helper)]
         if self.shared.sharers.load(Ordering::Acquire) > 0 {
             return self.reuse(len, Want::Segment).or_else(|| {
                 let segment = shared::Segment::create(len).ok()?;
@@ -304,13 +316,16 @@ impl FramePool {
                 Some(Store::Segment(Arc::new(segment)))
             });
         }
-        let _ = len;
         None
     }
     /// The idle buffer of the kind wanted that fits `len` most closely, if
     /// one fits without wasting more than it holds.
     fn reuse(&self, len: usize, want: Want) -> Option<Store> {
-        let mut idle = self.shared.idle.lock().unwrap_or_else(|e| e.into_inner());
+        let mut idle = self
+            .shared
+            .idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let best = idle
             .iter()
             .enumerate()
@@ -328,18 +343,20 @@ impl FramePool {
 
 /// A pool's frames going to a helper process; dropping it ends that.
 #[cfg(jpeg_helper)]
+#[must_use = "keep sharing enabled while a helper may access pool segments"]
 pub(crate) struct Sharing(Arc<Shared>);
 
 #[cfg(jpeg_helper)]
 impl Drop for Sharing {
     fn drop(&mut self) {
-        self.0.sharers.fetch_sub(1, Ordering::AcqRel);
+        let _ = self.0.sharers.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
 /// Both of this process's pools share their buffers with a helper process
 /// until the guards are dropped.
 #[cfg(jpeg_helper)]
+#[must_use = "retain both sharing guards until the helper releases its frame loans"]
 pub(crate) fn share() -> [Sharing; 2] {
     [pool().share(), transforms().share()]
 }
@@ -357,14 +374,21 @@ impl Shared {
         }
         let mut freed = Vec::new();
         {
-            let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
+            let mut idle = self
+                .idle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             idle.push(store);
             let mut bytes: usize = idle.iter().map(Store::capacity).sum();
-            while idle.len() > self.max_idle || bytes > limit {
-                let oldest = idle.remove(0);
+            let mut evicted = 0;
+            for oldest in idle.iter() {
+                if idle.len() - evicted <= self.max_idle && bytes <= limit {
+                    break;
+                }
                 bytes -= oldest.capacity();
-                freed.push(oldest);
+                evicted += 1;
             }
+            freed.extend(idle.drain(..evicted));
         }
         self.freed.add(freed.len() as u64);
         // Freed outside the lock: unmapping a large buffer takes a while.
@@ -384,10 +408,10 @@ pub struct PoolVec {
 }
 
 impl PoolVec {
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.len
     }
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
     pub fn capacity(&self) -> usize {
@@ -406,7 +430,7 @@ impl PoolVec {
     }
     /// The shared memory it is in, if it is.
     #[cfg(jpeg_helper)]
-    pub(crate) fn segment(&self) -> Option<&Arc<shared::Segment>> {
+    pub(crate) const fn segment(&self) -> Option<&Arc<shared::Segment>> {
         match &self.store {
             Store::Segment(segment) => Some(segment),
             Store::Heap(_) => None,
@@ -414,9 +438,10 @@ impl PoolVec {
     }
     // USB3 Vision assembles frames by appending and hands transfers
     // their buffers.
-    #[cfg_attr(not(feature = "usb"), allow(dead_code))]
+    #[cfg(any(test, feature = "usb"))]
     pub(crate) fn extend_from_slice(&mut self, bytes: &[u8]) {
         let end = self.len + bytes.len();
+        #[cfg(jpeg_helper)]
         self.reserve(end);
         match &mut self.store {
             Store::Heap(vec) if end <= vec.len() => vec[self.len..end].copy_from_slice(bytes),
@@ -446,6 +471,7 @@ impl PoolVec {
     /// Grow to `len` bytes of `value`, or shrink to `len`.
     pub(crate) fn resize(&mut self, len: usize, value: u8) {
         if len > self.len {
+            #[cfg(jpeg_helper)]
             self.reserve(len);
             match &mut self.store {
                 Store::Heap(vec) => {
@@ -471,12 +497,11 @@ impl PoolVec {
     }
     /// Room for `len` bytes: a segment too small for them is left for a
     /// vector, as a vector that grows moves.
+    #[cfg(jpeg_helper)]
     fn reserve(&mut self, len: usize) {
-        #[cfg(jpeg_helper)]
         if matches!(self.store, Store::Segment(_)) && len > self.store.capacity() {
             self.move_to_heap(len);
         }
-        let _ = len;
     }
     /// For a heap buffer, make its first `len` bytes initialized; a segment's
     /// pages all are.
@@ -484,8 +509,13 @@ impl PoolVec {
         match &mut self.store {
             // Bytes past what the buffer ever held are not stale but
             // unwritten; they are zeroed rather than read uninitialized.
-            Store::Heap(vec) if vec.len() < len => vec.resize(len, 0),
-            _ => {}
+            Store::Heap(vec) => {
+                if vec.len() < len {
+                    vec.resize(len, 0);
+                }
+            }
+            #[cfg(jpeg_helper)]
+            Store::Segment(_) => {}
         }
     }
     /// Move the bytes in use into a vector that can hold `capacity`, giving
@@ -562,7 +592,7 @@ enum Backing {
 impl Backing {
     fn bytes(&self) -> &[u8] {
         match self {
-            Backing::Pool(vec) => vec,
+            Self::Pool(vec) => vec,
         }
     }
 }
@@ -594,7 +624,7 @@ impl FrameBuf {
     pub(crate) fn into_pool_vec(self) -> PoolVec {
         match Arc::try_unwrap(self.0) {
             Ok(Backing::Pool(vec)) => vec,
-            Err(shared) => owned_copy(&FrameBuf(shared)),
+            Err(shared) => owned_copy(&Self(shared)),
         }
     }
     /// Whether another frame shares these bytes.
@@ -725,13 +755,38 @@ pub(crate) mod tests {
         let large = pool.take_stale(500_000);
         assert_ne!(large.as_ptr(), address);
         // Only `MAX_IDLE` stay idle; the oldest go first.
-        let held: Vec<_> = (0..MAX_IDLE + 2)
-            .map(|_| pool.take_stale(100_000))
+        let held: Vec<_> = std::iter::repeat_with(|| pool.take_stale(100_000))
+            .take(MAX_IDLE + 2)
             .collect();
         drop((small, large));
         drop(held);
         assert_eq!(pool.shared.idle.lock().unwrap().len(), MAX_IDLE);
         assert!(pool.stats().freed >= 2);
+    }
+
+    #[test]
+    fn a_lower_memory_budget_evicts_multiple_old_buffers_and_keeps_the_newest() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let budget = Arc::new(AtomicU64::new(20_000));
+        let reported = budget.clone();
+        let pool = FramePool::with_idle(4, move || Some(reported.load(Ordering::Relaxed)));
+        let mut held: Vec<_> = [100, 200, 300, 400]
+            .into_iter()
+            .map(|size| pool.take_stale(size))
+            .collect();
+        let newest = held.pop().unwrap();
+        let address = newest.as_ptr();
+        drop(held);
+        budget.store(10_000, Ordering::Relaxed);
+        drop(newest);
+
+        assert_eq!(pool.stats().freed, 3);
+        let retained = pool.take_stale(400);
+        assert_eq!(retained.as_ptr(), address);
+        assert_eq!(pool.stats().allocations, 4);
+        assert_eq!(pool.stats().reuses, 1);
+        assert!(pool.shared.idle.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -759,7 +814,7 @@ pub(crate) mod tests {
         assert!(buffer.iter().all(|&b| b == POISON));
         buffer.truncate(4);
         buffer.extend_from_slice(&[1, 2]);
-        assert_eq!(&buffer[..], &[POISON, POISON, POISON, POISON, 1, 2]);
+        assert_eq!(&*buffer, &[POISON, POISON, POISON, POISON, 1, 2]);
         buffer.resize(8, 7);
         assert_eq!(&buffer[4..], &[1, 2, 7, 7]);
         buffer.resize(20, 9);
@@ -768,7 +823,7 @@ pub(crate) mod tests {
         let mut empty = pool.take_empty(4);
         assert!(empty.is_empty() && empty.capacity() >= 4);
         empty.extend_from_slice(&[3; 10]);
-        assert_eq!(&empty[..], &[3; 10]);
+        assert_eq!(&*empty, &[3; 10]);
         let frame = empty.freeze();
         assert_eq!(frame, [3; 10]);
         assert_eq!(format!("{frame:?}"), "FrameBuf(10 bytes)");
@@ -807,7 +862,7 @@ pub(crate) mod tests {
         let held = shared.clone();
         let mut owned = shared.into_pool_vec();
         owned[0] = 6;
-        assert_eq!((&owned[..], &held[..]), (&[6, 5][..], &[4, 5][..]));
+        assert_eq!(((&*owned), (&*held)), (&[6, 5][..], &[4, 5][..]));
         assert_eq!(held.into_pool_vec().len(), 2);
     }
 
@@ -848,7 +903,7 @@ pub(crate) mod tests {
         let again = pool.take_stale(4000);
         assert_eq!(again.segment().map(|s| s.id()), Some(segment.id()));
         drop(again);
-        assert!(pool.take_vec(100).len() == 100);
+        assert_eq!(pool.take_vec(100).len(), 100);
         let mut appended = pool.take_empty(shared::page());
         let room = appended.capacity();
         appended.extend_from_slice(&vec![1; room]);

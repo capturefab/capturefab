@@ -3,13 +3,15 @@
 //! `{"error":{code,message,hint?,details?}}` otherwise; no null values, and
 //! at most ten distinct warnings. People get text on stdout and errors on
 //! stderr.
+#![deny(clippy::missing_const_for_fn)]
+#![deny(clippy::panic_in_result_fn)]
 use crate::types::{ErrorKind, classify, printable_text};
 use serde_json::{Value, json};
-use std::io::{self, Write};
+use std::io::{self, Write as _};
 
 /// How this invocation reports.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct Output {
+pub(crate) struct Output {
     pub json: bool,
     pub quiet: bool,
     pub verbose: bool,
@@ -24,17 +26,17 @@ static CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 /// result or error, goes to stderr.
 static TO_STDERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Send this invocation's document to stderr from now on.
-pub fn document_to_stderr() {
+pub(crate) fn document_to_stderr() {
     TO_STDERR.store(true, std::sync::atomic::Ordering::Release);
 }
 /// Take the right to print this invocation's document; false when a result
 /// or error already took it, as when a signal arrives as a command ends.
-pub fn claim() -> bool {
+pub(crate) fn claim() -> bool {
     !CLAIMED.swap(true, std::sync::atomic::Ordering::AcqRel)
 }
 
 /// A command's result: the JSON document, and the text people read.
-pub struct Report {
+pub(crate) struct Report {
     pub value: Value,
     pub text: Option<String>,
     /// The text holds terminal graphics its command drew on purpose, and
@@ -42,20 +44,20 @@ pub struct Report {
     pub drawn: bool,
 }
 impl Report {
-    pub fn json(value: Value) -> Self {
+    pub(crate) const fn json(value: Value) -> Self {
         Self {
             value,
             text: None,
             drawn: false,
         }
     }
-    pub fn text(mut self, text: impl Into<String>) -> Self {
+    pub(crate) fn text(mut self, text: impl Into<String>) -> Self {
         self.text = Some(text.into());
         self
     }
     /// Text with terminal graphics in it, which prints as it is: everything
     /// else in it must already be [`crate::types::printable_text`].
-    pub fn drawn(mut self, text: impl Into<String>) -> Self {
+    pub(crate) fn drawn(mut self, text: impl Into<String>) -> Self {
         self.text = Some(text.into());
         self.drawn = true;
         self
@@ -65,13 +67,13 @@ impl Report {
 impl Output {
     /// A line on stderr for people: progress, notes, next steps. Never in
     /// JSON mode or with `-q`.
-    pub fn note(&self, line: impl std::fmt::Display) {
+    pub(crate) fn note(self, line: impl std::fmt::Display) {
         if !self.json && !self.quiet {
             eprintln!("{line}");
         }
     }
     /// Print a result. Returns the exit code: 0, or 0 after a closed pipe.
-    pub fn result(&self, report: Report) -> i32 {
+    pub(crate) fn result(self, report: Report) -> i32 {
         if !claim() {
             return super::signals::exit_code();
         }
@@ -79,7 +81,7 @@ impl Output {
     }
     /// Print a result as one of several, as a shell does for each command:
     /// whether this invocation printed before does not matter.
-    pub fn print(&self, report: Report) -> i32 {
+    pub(crate) fn print(self, report: Report) -> i32 {
         super::term::before_output();
         let written = if self.json {
             write_json(&document(report.value))
@@ -97,15 +99,12 @@ impl Output {
         }
     }
     /// Report an error; returns its exit code.
-    pub fn error(&self, error: &anyhow::Error) -> i32 {
-        match self.error_once(error) {
-            Some(exit) => exit,
-            None => exit_code(error),
-        }
+    pub(crate) fn error(self, error: &anyhow::Error) -> i32 {
+        self.error_once(error).unwrap_or_else(|| exit_code(error))
     }
     /// Report an error unless this invocation already printed its
     /// document; its exit code, or None when it did not print.
-    pub fn error_once(&self, error: &anyhow::Error) -> Option<i32> {
+    pub(crate) fn error_once(self, error: &anyhow::Error) -> Option<i32> {
         if closed_pipe(error) {
             // The reader went away, as with `| head`: nothing to report.
             return Some(0);
@@ -117,7 +116,7 @@ impl Output {
     }
     /// Report an error as one of several, as a shell does for each
     /// command; its exit code.
-    pub fn print_error(&self, error: &anyhow::Error) -> i32 {
+    pub(crate) fn print_error(self, error: &anyhow::Error) -> i32 {
         if closed_pipe(error) {
             return 0;
         }
@@ -154,9 +153,11 @@ impl Output {
 /// show what cameras and the network named, so nothing in it steers the
 /// terminal unless its command drew it there on purpose.
 fn text(report: Report) -> String {
-    let text = report
-        .text
-        .unwrap_or_else(|| serde_json::to_string_pretty(&report.value).unwrap_or_default() + "\n");
+    let text = report.text.unwrap_or_else(|| {
+        let mut text = serde_json::to_string_pretty(&report.value).unwrap_or_default();
+        text.push('\n');
+        text
+    });
     if report.drawn {
         return text;
     }
@@ -177,7 +178,7 @@ fn closed_pipe(error: &anyhow::Error) -> bool {
 
 /// The exit code `error` ends the process with: its reason's category, and
 /// for an interruption the signal's.
-pub fn exit_code(error: &anyhow::Error) -> i32 {
+pub(crate) fn exit_code(error: &anyhow::Error) -> i32 {
     let kind = classify(error).kind;
     if kind == ErrorKind::Interrupted {
         super::signals::exit_code()
@@ -188,7 +189,7 @@ pub fn exit_code(error: &anyhow::Error) -> i32 {
 
 /// A result document as `--json` prints it: no nulls, warnings bounded and
 /// deduplicated, and never a top-level `error` key.
-pub fn document(value: Value) -> Value {
+pub(crate) fn document(value: Value) -> Value {
     let mut value = without_nulls(value);
     if let Some(object) = value.as_object_mut() {
         debug_assert!(!object.contains_key("error"), "a result has no error key");
@@ -209,11 +210,11 @@ pub fn document(value: Value) -> Value {
     value
 }
 
-pub fn without_nulls(value: Value) -> Value {
+pub(crate) fn without_nulls(value: Value) -> Value {
     crate::types::without_nulls(value)
 }
 
-pub fn write_json(value: &Value) -> io::Result<()> {
+pub(crate) fn write_json(value: &Value) -> io::Result<()> {
     // One write, so the line is never split by other output.
     let mut line = serde_json::to_vec(value)?;
     line.push(b'\n');
@@ -228,26 +229,28 @@ pub fn write_json(value: &Value) -> io::Result<()> {
 
 /// The reason and exit code `error` reports with, from its typed causes.
 #[cfg(test)]
-pub fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
+pub(crate) fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
     classify(error).kind.code()
 }
 
 /// Whether `--json` is on before clap has parsed: the flag anywhere in the
-/// arguments, or CAPTUREFAB_JSON.
-pub fn json_requested(args: &[std::ffi::OsString]) -> bool {
+/// arguments, or `CAPTUREFAB_JSON`.
+pub(crate) fn json_requested(args: &[std::ffi::OsString]) -> bool {
     args.iter().skip(1).any(|arg| arg == "--json")
-        || std::env::var("CAPTUREFAB_JSON").is_ok_and(|value| {
-            !matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "" | "0" | "false" | "no" | "off"
-            )
-        })
+        || std::env::var("CAPTUREFAB_JSON").is_ok_and(|value| json_env_enabled(&value))
+}
+
+fn json_env_enabled(value: &str) -> bool {
+    let value = value.trim();
+    ["", "0", "false", "no", "off"]
+        .into_iter()
+        .all(|disabled| !value.eq_ignore_ascii_case(disabled))
 }
 
 /// The `--json` error for an argument-parsing failure: clap's first line as
 /// the message, and what an agent needs to fix it as `details`. `group` is
 /// the command and its subcommands when one is missing.
-pub fn clap_error(error: &clap::Error, group: Option<(String, Vec<String>)>) -> Value {
+pub(crate) fn clap_error(error: &clap::Error, group: Option<(String, Vec<String>)>) -> Value {
     use clap::error::{ContextKind, ContextValue, ErrorKind as Clap};
     let rendered = error.render().to_string();
     let message = rendered
@@ -352,6 +355,27 @@ pub fn clap_error(error: &clap::Error, group: Option<(String, Vec<String>)>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_environment_keeps_its_false_spellings_and_default() {
+        for value in [
+            "",
+            " ",
+            "0",
+            " false ",
+            "FaLsE",
+            "NO",
+            "oFf",
+            "\u{a0}OFF\u{2003}",
+        ] {
+            assert!(!json_env_enabled(value), "{value:?}");
+        }
+        for value in [
+            "1", "true", "yes", "on", "anything", "false!", "０", "falsé",
+        ] {
+            assert!(json_env_enabled(value), "{value:?}");
+        }
+    }
 
     #[test]
     fn result_text_cannot_steer_the_terminal() {

@@ -1,3 +1,11 @@
+// The testing feature exposes the full intended API; without it, those
+// re-exports disappear and intentionally public items can look unreachable.
+#![cfg_attr(feature = "testing", deny(unreachable_pub))]
+#![deny(rustdoc::broken_intra_doc_links)]
+// Product output uses structured results or terminal-aware diagnostics.
+// Test binaries also print measurements and subprocess-fixture protocols.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
+
 /// Diagnostics on stderr that never panic. std's `eprintln!` panics when
 /// writing fails, as it does with EIO once the terminal hangs up, which is
 /// SIGHUP's usual cause: shutdown would then stop halfway. This one drops the
@@ -5,24 +13,24 @@
 /// characters other than line breaks and tabs do not reach the terminal: a
 /// message can quote what a camera or the network sent. Defined before the
 /// modules, it stands in for std's in all of them.
-#[macro_export]
 macro_rules! eprintln {
     () => {{
         use ::std::io::Write as _;
         $crate::cli::term::before_output();
-        let _ = ::std::writeln!(::std::io::stderr());
+        ::std::mem::drop(::std::writeln!(::std::io::stderr()));
     }};
     ($($arg:tt)*) => {{
         use ::std::io::Write as _;
         $crate::cli::term::before_output();
         let line = ::std::format!($($arg)*);
-        let _ = ::std::writeln!(
+        ::std::mem::drop(::std::writeln!(
             ::std::io::stderr(),
             "{}",
             $crate::types::printable_text(&line)
-        );
+        ));
     }};
 }
+pub(crate) use eprintln;
 
 pub(crate) mod auto;
 pub(crate) mod camera;
@@ -58,6 +66,8 @@ pub(crate) mod setup;
 pub(crate) mod storage;
 #[cfg(test)]
 mod test_cameras;
+#[cfg(test)]
+mod test_io;
 pub(crate) mod transport;
 pub(crate) mod types;
 pub(crate) mod volumes;

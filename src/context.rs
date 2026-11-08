@@ -1,17 +1,18 @@
 //! Capture context: short key/value tags (label, line, station, part, lot,
 //! note) carried with captures and recordings, and usable in
 //! output names as {tag:KEY}.
+#![forbid(unsafe_code)]
 use anyhow::{Result, ensure};
 
-pub type Context = std::collections::BTreeMap<String, String>;
+pub(crate) type Context = std::collections::BTreeMap<String, String>;
 
-pub const MAX_ENTRIES: usize = 16;
+pub(crate) const MAX_ENTRIES: usize = 16;
 /// Keys match `^[a-z][a-z0-9_]{0,31}$`.
-pub const MAX_KEY: usize = 32;
+pub(crate) const MAX_KEY: usize = 32;
 /// Values are at most this many bytes, without control characters.
-pub const MAX_VALUE: usize = 256;
+pub(crate) const MAX_VALUE: usize = 256;
 
-pub fn validate(context: &Context) -> Result<()> {
+pub(crate) fn validate(context: &Context) -> Result<()> {
     ensure!(
         context.len() <= MAX_ENTRIES,
         "context accepts at most {MAX_ENTRIES} entries"
@@ -24,7 +25,7 @@ pub fn validate(context: &Context) -> Result<()> {
 }
 
 /// Whether `key` matches `^[a-z][a-z0-9_]{0,31}$`.
-pub fn is_valid_key(key: &str) -> bool {
+pub(crate) fn is_valid_key(key: &str) -> bool {
     let mut bytes = key.bytes();
     key.len() <= MAX_KEY
         && bytes.next().is_some_and(|b| b.is_ascii_lowercase())
@@ -49,17 +50,17 @@ fn validate_value(key: &str, value: &str) -> Result<()> {
 }
 
 /// Parse one `KEY=VALUE` pair for clap, splitting on the first '='.
-pub fn parse_pair(s: &str) -> Result<(String, String), String> {
+pub(crate) fn parse_pair(s: &str) -> Result<(String, String), String> {
     let (key, value) = s
         .split_once('=')
-        .ok_or_else(|| "context must look like KEY=VALUE, such as line=L1".to_string())?;
+        .ok_or_else(|| "context must look like KEY=VALUE, such as line=L1".to_owned())?;
     validate_key(key).map_err(|e| e.to_string())?;
     validate_value(key, value).map_err(|e| e.to_string())?;
     Ok((key.to_owned(), value.to_owned()))
 }
 
 /// Collect parsed pairs, refusing a key given twice.
-pub fn from_pairs(pairs: &[(String, String)]) -> Result<Context> {
+pub(crate) fn from_pairs(pairs: &[(String, String)]) -> Result<Context> {
     let mut context = Context::new();
     for (key, value) in pairs {
         ensure!(
@@ -82,11 +83,11 @@ mod tests {
         for bad in ["=x", "Line=x", "1a=x", "a-b=x", "noequals", "a=x\ny"] {
             assert!(parse_pair(bad).is_err(), "{bad}");
         }
-        assert!(parse_pair(&format!("{}=x", "a".repeat(33))).is_err());
-        assert!(parse_pair(&format!("a={}", "x".repeat(257))).is_err());
+        parse_pair(&format!("{}=x", "a".repeat(33))).unwrap_err();
+        parse_pair(&format!("a={}", "x".repeat(257))).unwrap_err();
         let many: Context = (0..17).map(|i| (format!("k{i}"), "v".into())).collect();
         assert!(validate(&many).is_err());
-        let pairs = vec![("a".to_string(), "1".to_string()); 2];
-        assert!(from_pairs(&pairs).is_err());
+        let pairs = vec![("a".to_owned(), "1".to_owned()); 2];
+        from_pairs(&pairs).unwrap_err();
     }
 }

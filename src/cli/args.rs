@@ -6,7 +6,7 @@ use std::time::Duration;
 
 /// One camera.
 #[derive(Debug, Clone, Default, Args)]
-pub struct CameraArg {
+pub(crate) struct CameraArg {
     /// Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)
     #[arg(
         short = 'c',
@@ -20,7 +20,7 @@ pub struct CameraArg {
 
 /// One or more cameras, `-c` repeated.
 #[derive(Debug, Clone, Default, Args)]
-pub struct CamerasArg {
+pub(crate) struct CamerasArg {
     /// Camera, repeatable: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)
     #[arg(
         short = 'c',
@@ -37,7 +37,7 @@ pub struct CamerasArg {
 /// last use, started if none holds the camera. Without it a command keeps
 /// its camera warm for `WARM`; `--keep 0` runs it alone.
 #[derive(Debug, Clone, Default, Args)]
-pub struct KeepArg {
+pub(crate) struct KeepArg {
     /// Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)
     #[arg(
         long,
@@ -48,11 +48,10 @@ pub struct KeepArg {
     pub keep: Option<Duration>,
 }
 impl KeepArg {
-    pub fn route(&self) -> super::Route {
-        match self.keep {
-            None => super::Route::warm(),
-            Some(keep) => super::Route::keep(Some(keep).filter(|keep| !keep.is_zero())),
-        }
+    pub(crate) fn route(&self) -> super::Route {
+        self.keep.map_or_else(super::Route::warm, |keep| {
+            super::Route::keep(Some(keep).filter(|keep| !keep.is_zero()))
+        })
     }
 }
 
@@ -63,17 +62,17 @@ fn typed(error: anyhow::Error) -> Categorized {
 }
 
 /// A duration with a unit (`250ms`, `2s`, `1h30m`) or `0`.
-pub fn duration(text: &str) -> Result<Duration, Categorized> {
+pub(super) fn duration(text: &str) -> Result<Duration, Categorized> {
     crate::types::parse_duration(text).map_err(typed)
 }
 
 /// A wait that may also be `none`: no limit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Wait {
+pub(crate) enum Wait {
     For(Duration),
     Forever,
 }
-pub fn wait(text: &str) -> Result<Wait, Categorized> {
+pub(super) fn wait(text: &str) -> Result<Wait, Categorized> {
     if text.trim().eq_ignore_ascii_case("none") {
         return Ok(Wait::Forever);
     }
@@ -83,8 +82,8 @@ pub fn wait(text: &str) -> Result<Wait, Categorized> {
 /// A time: `HH:MM[:SS]` in this computer's local time (today, or tomorrow
 /// once that time has passed), or RFC 3339. The result is a UTC instant,
 /// so a session in another time zone runs it at the same moment.
-pub fn time(text: &str) -> Result<chrono::DateTime<chrono::Utc>, Categorized> {
-    use chrono::TimeZone;
+pub(super) fn time(text: &str) -> Result<chrono::DateTime<chrono::Utc>, Categorized> {
+    use chrono::TimeZone as _;
     let text = text.trim();
     if let Ok(time) = chrono::DateTime::parse_from_rfc3339(text) {
         return Ok(time.with_timezone(&chrono::Utc));
@@ -131,7 +130,7 @@ mod tests {
         assert_eq!(at.to_rfc3339(), "2026-10-31T13:00:00+00:00");
         let soon = time("23:59").unwrap();
         assert!(soon > chrono::Utc::now() - chrono::Duration::seconds(1));
-        assert!(time("25:00").is_err());
-        assert!(time("tomorrow").is_err());
+        time("25:00").unwrap_err();
+        time("tomorrow").unwrap_err();
     }
 }

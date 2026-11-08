@@ -1,10 +1,27 @@
 //! `inspect` and `auto` on the simulator: a short document an agent can
 //! act on, a private bounded preview, and exposure settled then held.
+#![deny(clippy::doc_markdown)]
 mod support;
 
 use serde_json::json;
 use std::path::Path;
 use support::cli::Home;
+
+#[test]
+fn oversized_sampling_durations_are_rejected_before_capture() {
+    let home = Home::new("inspect-duration-limit");
+    let error = home.fails(
+        2,
+        &["inspect", "-c", "sim:0", "--for", "18446744073709551615s"],
+    );
+    assert_eq!(error["code"], "invalid_duration");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("longer than ten years")
+    );
+}
 
 /// `--timeout none` waits for a triggered frame for as long as it takes;
 /// a wait of 0 or past 10 minutes is a usage error.
@@ -78,9 +95,7 @@ fn inspect_measures_a_fresh_frame_and_leaves_a_private_preview() {
     // Which frame it was, by the camera's clock and the host's.
     assert!(measured["frame"]["id"].as_u64().unwrap() > 0, "{measured}");
     assert!(measured["frame"]["device_ts_ns"].is_u64(), "{measured}");
-    assert!(
-        chrono::DateTime::parse_from_rfc3339(measured["frame"]["time"].as_str().unwrap()).is_ok()
-    );
+    chrono::DateTime::parse_from_rfc3339(measured["frame"]["time"].as_str().unwrap()).unwrap();
     for key in ["mean", "p1", "p50", "p99", "clipped_low", "clipped_high"] {
         let share = measured["exposure"][key].as_f64().unwrap();
         assert!((0.0..=1.0).contains(&share), "{key}: {measured}");
@@ -94,7 +109,7 @@ fn inspect_measures_a_fresh_frame_and_leaves_a_private_preview() {
     assert!(preview.starts_with(home.sessions.join("inspect")));
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt as _;
         let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(preview), 0o600);
         assert_eq!(mode(preview.parent().unwrap()), 0o700);

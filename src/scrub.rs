@@ -6,6 +6,7 @@
 //! worded without secrets in the first place; this only catches what a
 //! dependency might echo. URL credentials in free text such as log lines
 //! and job errors are redacted by [`redact_urls`].
+#![forbid(unsafe_code)]
 use std::{
     borrow::Cow,
     cmp::Reverse,
@@ -58,7 +59,11 @@ impl Scrubber {
         while let Some(Reverse((start, end, index))) = matches.pop() {
             let secret = &self.0[index];
             let from = start + secret.chars().next().expect("nonempty secret").len_utf8();
-            if let Some(offset) = text[from..].find(secret.as_str()) {
+            if let Some(offset) = text
+                .get(from..)
+                .expect("a secret match starts on a character boundary")
+                .find(secret.as_str())
+            {
                 let next = from + offset;
                 matches.push(Reverse((next, next + secret.len(), index)));
             }
@@ -67,7 +72,10 @@ impl Scrubber {
                     *previous_end = (*previous_end).max(end);
                 }
                 Some((previous_start, previous_end)) => {
-                    result.push_str(&text[copied..*previous_start]);
+                    result.push_str(
+                        text.get(copied..*previous_start)
+                            .expect("ordered secret matches delimit valid UTF-8"),
+                    );
                     result.push_str(REDACTED);
                     copied = *previous_end;
                     pending = Some((start, end));
@@ -76,11 +84,17 @@ impl Scrubber {
             }
         }
         if let Some((start, end)) = pending {
-            result.push_str(&text[copied..start]);
+            result.push_str(
+                text.get(copied..start)
+                    .expect("ordered secret matches delimit valid UTF-8"),
+            );
             result.push_str(REDACTED);
             copied = end;
         }
-        result.push_str(&text[copied..]);
+        result.push_str(
+            text.get(copied..)
+                .expect("a secret match ends on a character boundary"),
+        );
         Cow::Owned(result)
     }
 }
@@ -88,7 +102,7 @@ impl Scrubber {
 static SECRETS: Mutex<Scrubber> = Mutex::new(Scrubber::new());
 
 /// Remember a secret so [`scrub`] removes it from outgoing text.
-pub fn register(secret: &str) {
+pub(crate) fn register(secret: &str) {
     SECRETS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -96,7 +110,7 @@ pub fn register(secret: &str) {
 }
 
 /// Replace every registered secret in `text`.
-pub fn scrub(text: &str) -> Cow<'_, str> {
+pub(crate) fn scrub(text: &str) -> Cow<'_, str> {
     SECRETS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -104,7 +118,7 @@ pub fn scrub(text: &str) -> Cow<'_, str> {
 }
 
 /// Whether any secret has been registered, so callers can skip work.
-pub fn active() -> bool {
+pub(crate) fn active() -> bool {
     !SECRETS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -112,38 +126,87 @@ pub fn active() -> bool {
         .is_empty()
 }
 
+/// Follow the current URL's query across potential URL boundaries. A URL-like
+/// substring in a credential value must stay inside that value's redaction.
+#[derive(Default)]
+struct CredentialQuery {
+    active: bool,
+    key: Option<usize>,
+    secret: bool,
+}
+
+impl CredentialQuery {
+    fn advance(&mut self, text: &str, from: usize, end: usize) {
+        let part = text
+            .get(from..end)
+            .expect("ordered URL boundaries delimit valid UTF-8");
+        for (offset, delimiter) in part.match_indices(['?', '&', '=']) {
+            let at = from + offset;
+            match delimiter {
+                "?" if !self.active => {
+                    self.active = true;
+                    self.key = Some(at + 1);
+                }
+                "&" if self.active => {
+                    self.key = Some(at + 1);
+                    self.secret = false;
+                }
+                "=" => {
+                    if let Some(start) = self.key.take() {
+                        let key = text
+                            .get(start..at)
+                            .expect("query delimiters lie on character boundaries");
+                        self.secret = crate::media::credential_query_key(key);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 /// `text` with the credentials of every URL in it redacted, including in
 /// diagnostics that name several sources.
-pub fn redact_urls(text: &str) -> String {
-    text.split_inclusive(char::is_whitespace)
-        .map(|part| {
-            let body = part.trim_end_matches(char::is_whitespace);
-            let starts: Vec<_> = body
-                .match_indices("://")
-                .map(|(at, _)| {
-                    body[..at]
-                        .char_indices()
-                        .rev()
-                        .take_while(|(_, character)| {
-                            character.is_ascii_alphanumeric()
-                                || matches!(character, '+' | '-' | '.')
-                        })
-                        .last()
-                        .map_or(at, |(start, _)| start)
+pub(crate) fn redact_urls(text: &str) -> String {
+    let mut redacted = String::new();
+    for part in text.split_inclusive(char::is_whitespace) {
+        let (body, spacing) = part.split_at(part.trim_end_matches(char::is_whitespace).len());
+        let mut starts = body.match_indices("://").map(|(at, _)| {
+            body.split_at(at)
+                .0
+                .char_indices()
+                .rev()
+                .take_while(|(_, character)| {
+                    character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
                 })
-                .collect();
-            if starts.is_empty() {
-                return part.to_owned();
+                .last()
+                .map_or(at, |(start, _)| start)
+        });
+        if let Some(start) = starts.next() {
+            let (prefix, mut remaining) = body.split_at(start);
+            redacted.push_str(prefix);
+            let mut previous = start;
+            let mut inspected = start;
+            let mut query = CredentialQuery::default();
+            for next in starts {
+                query.advance(body, inspected, next);
+                inspected = next;
+                if query.secret {
+                    continue;
+                }
+                let (url, tail) = remaining.split_at(next - previous);
+                redacted.push_str(&crate::media::redact_url(url));
+                remaining = tail;
+                previous = next;
+                query = CredentialQuery::default();
             }
-            let mut redacted = body[..starts[0]].to_owned();
-            for (index, start) in starts.iter().enumerate() {
-                let end = starts.get(index + 1).copied().unwrap_or(body.len());
-                redacted.push_str(&crate::media::redact_url(&body[*start..end]));
-            }
-            redacted.push_str(&part[body.len()..]);
-            redacted
-        })
-        .collect()
+            redacted.push_str(&crate::media::redact_url(remaining));
+        } else {
+            redacted.push_str(body);
+        }
+        redacted.push_str(spacing);
+    }
+    redacted
 }
 
 #[cfg(test)]
@@ -192,6 +255,13 @@ mod tests {
         let mut scrubber = Scrubber::new();
         scrubber.register("éééé");
         assert_eq!(scrubber.scrub("ééééé"), "<redacted>");
+        for secrets in [["é🙂é", "🙂é🙂"], ["🙂é🙂", "é🙂é"]] {
+            let mut scrubber = Scrubber::new();
+            for secret in secrets {
+                scrubber.register(secret);
+            }
+            assert_eq!(scrubber.scrub("前é🙂é🙂後"), "前<redacted>後");
+        }
     }
 
     #[test]
@@ -210,6 +280,47 @@ mod tests {
             "{text}"
         );
         assert_eq!(redact_urls("no address here\n"), "no address here\n");
+    }
+    #[test]
+    fn adjacent_urls_and_unicode_spacing_are_preserved() {
+        assert_eq!(
+            redact_urls("雪🙂\u{3000}(rtsp://利用者:密碼@cam/画面),https://cam?token=clé\t終\n"),
+            "雪🙂\u{3000}(rtsp://<redacted>@cam/画面),https://cam?token=<redacted>\t終\n"
+        );
+        let urls = "rtsp://利用者:密碼@cam/画面,".repeat(2048);
+        let expected = "rtsp://<redacted>@cam/画面,".repeat(2048);
+        assert_eq!(redact_urls(&urls), expected);
+        for text in ["", "雪🙂", "前\u{3000}後\t終\n", " :// :// "] {
+            assert_eq!(redact_urls(text), text);
+        }
+    }
+    #[test]
+    fn url_delimiters_inside_query_credentials_do_not_expose_their_prefix() {
+        for (input, expected) in [
+            (
+                "http://cam/live?password=PREFIXsecretRTSP://user:pass@two/live&fps=30",
+                "http://cam/live?password=<redacted>&fps=30",
+            ),
+            (
+                "http://cam?ToKeN=雪rtsp://one?next=srt://two&fps=30",
+                "http://cam?ToKeN=<redacted>&fps=30",
+            ),
+            (
+                "http://cam?p%61ssword=秘密rtsp://one&token=別srt://two",
+                "http://cam?p%61ssword=<redacted>&token=<redacted>",
+            ),
+            (
+                "http://cam?name=value&password=prefixrtsp://one/path&fps=30,rtsp://user:pass@two/live",
+                "http://cam?name=value&password=<redacted>&fps=30,rtsp://<redacted>@two/live",
+            ),
+        ] {
+            assert_eq!(redact_urls(input), expected, "{input}");
+        }
+        let dense = format!(
+            "http://cam?password={}&fps=30",
+            "SECRETproto://".repeat(2048)
+        );
+        assert_eq!(redact_urls(&dense), "http://cam?password=<redacted>&fps=30");
     }
     #[test]
     fn camera_password_parameters_are_redacted_in_diagnostics() {

@@ -1,19 +1,22 @@
 //! Additional PFNC component layouts. Codes and component order follow the
 //! EMVA Pixel Format Values (2025-10-07) and PFNC 2.4, sections 3, 6 and 8:
-//! https://www.emva.org/wp-content/uploads/GenICamPixelFormatValues.pdf
-//! https://www.emva.org/wp-content/uploads/GenICam_PFNC_2_4.pdf
+//! <https://www.emva.org/wp-content/uploads/GenICamPixelFormatValues.pdf>
+//! <https://www.emva.org/wp-content/uploads/GenICam_PFNC_2_4.pdf>
 //!
-//! Video decoded by FFmpeg also arrives in planar and semiplanar Y'CbCr
+//! Video decoded by `FFmpeg` also arrives in planar and semiplanar `Y'CbCr`
 //! that PFNC has no code for (every planar layout, limited-range
 //! semiplanar 4:2:0, and full-range BT.709). Those carry Capturefab's own
 //! codes, with PFNC's custom bit (31) set and its color flag and bits per
 //! pixel, named in PFNC's style: `YCbCr` is full-range BT.601 (JFIF),
 //! `YCbCr601` and `YCbCr709` limited-range BT.601 and BT.709, and
 //! `YCbCr709Full` full-range BT.709.
+#![forbid(unsafe_code)]
+#![deny(clippy::missing_const_for_fn)]
+#![deny(clippy::cast_precision_loss)]
 use crate::types::{Frame, MONO8, RGB8};
 use anyhow::{Result, ensure};
 
-/// A Y'CbCr layout's color space.
+/// A `Y'CbCr` layout's color space.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Matrix {
     /// Full-range BT.601, as JFIF and PFNC's YUV and YCbCr formats.
@@ -60,7 +63,7 @@ enum Layout {
     },
 }
 
-/// Capturefab's code for planar Y'CbCr subsampled `sub` in `matrix`'s
+/// Capturefab's code for planar `Y'CbCr` subsampled `sub` in `matrix`'s
 /// color space, PFNC's custom bit set.
 const fn planar(sub: (usize, usize), matrix: Matrix) -> u32 {
     let bits = match sub {
@@ -68,7 +71,7 @@ const fn planar(sub: (usize, usize), matrix: Matrix) -> u32 {
         (2, 1) => 16,
         _ => 24,
     };
-    0x8200_0000 | bits << 16 | (1 + matrix as u32)
+    0x8200_0000 | (bits << 16) | (1 + matrix as u32)
 }
 /// Semiplanar 4:2:0 (NV12 order) in limited-range BT.601 and BT.709 and
 /// full-range BT.709: `0x820c_0010` plus `planar`'s matrix number.
@@ -118,18 +121,18 @@ fn layout(format: u32) -> Option<(&'static str, Layout)> {
         sub,
         interleaved: None,
     };
-    const P420: u32 = planar((2, 2), Matrix::Full);
-    const P420_601: u32 = planar((2, 2), Matrix::Bt601);
-    const P420_709: u32 = planar((2, 2), Matrix::Bt709);
-    const P422: u32 = planar((2, 1), Matrix::Full);
-    const P422_601: u32 = planar((2, 1), Matrix::Bt601);
-    const P422_709: u32 = planar((2, 1), Matrix::Bt709);
-    const P444: u32 = planar((1, 1), Matrix::Full);
-    const P444_601: u32 = planar((1, 1), Matrix::Bt601);
-    const P444_709: u32 = planar((1, 1), Matrix::Bt709);
-    const P420_709_FULL: u32 = planar((2, 2), Matrix::Full709);
-    const P422_709_FULL: u32 = planar((2, 1), Matrix::Full709);
-    const P444_709_FULL: u32 = planar((1, 1), Matrix::Full709);
+    const P420: u32 = planar((2, 2), Full);
+    const P420_601: u32 = planar((2, 2), Bt601);
+    const P420_709: u32 = planar((2, 2), Bt709);
+    const P422: u32 = planar((2, 1), Full);
+    const P422_601: u32 = planar((2, 1), Bt601);
+    const P422_709: u32 = planar((2, 1), Bt709);
+    const P444: u32 = planar((1, 1), Full);
+    const P444_601: u32 = planar((1, 1), Bt601);
+    const P444_709: u32 = planar((1, 1), Bt709);
+    const P420_709_FULL: u32 = planar((2, 2), Full709);
+    const P422_709_FULL: u32 = planar((2, 1), Full709);
+    const P444_709_FULL: u32 = planar((1, 1), Full709);
     Some(match format {
         0x0108_0002 => ("Mono8s", SignedMono),
         0x0101_0037 => ("Mono1p", Mono { bits: 1 }),
@@ -288,11 +291,15 @@ const CODES: [u32; 70] = [
     planar((1, 1), Matrix::Full709),
 ];
 
-/// The code of planar or semiplanar 8-bit Y'CbCr subsampled `sub` in
+/// The code of planar or semiplanar 8-bit `Y'CbCr` subsampled `sub` in
 /// `matrix`'s color space, chroma interleaved Cb first (NV12) or in planes:
-/// FFmpeg's decoded layouts. None for the other semiplanar 4:2:2 and 4:4:4
+/// `FFmpeg`'s decoded layouts. None for the other semiplanar 4:2:2 and 4:4:4
 /// layouts, which nothing produces.
-pub(crate) fn ycbcr_planes(sub: (usize, usize), matrix: Matrix, interleaved: bool) -> Option<u32> {
+pub(crate) const fn ycbcr_planes(
+    sub: (usize, usize),
+    matrix: Matrix,
+    interleaved: bool,
+) -> Option<u32> {
     Some(match (interleaved, sub, matrix) {
         (false, _, _) => planar(sub, matrix),
         (true, (2, 2), Matrix::Full) => 0x020c_0112,
@@ -349,7 +356,7 @@ pub(super) fn name(format: u32) -> Option<&'static str> {
 }
 
 /// The significant bits of each component: what the name's digits do not
-/// always say (RGB10p32 is 10, RGB8_Planar 8). RGB565p counts its widest,
+/// always say (`RGB10p32` is 10, `RGB8_Planar` 8). `RGB565p` counts its widest,
 /// six-bit, component; YUV and YCbCr are 8.
 pub(super) fn sample_bits(format: u32) -> Option<u32> {
     Some(match layout(format)?.1 {
@@ -415,7 +422,8 @@ fn packed_sample(row: &[u8], bit: usize, bits: u32) -> u16 {
     for (i, &byte) in row[at..].iter().take(3).enumerate() {
         value |= u32::from(byte) << (8 * i);
     }
-    ((value >> (bit & 7)) & ((1 << bits) - 1)) as u16
+    u16::try_from((value >> (bit & 7)) & ((1 << bits) - 1))
+        .expect("packed samples have at most sixteen bits")
 }
 
 /// Native RGB components and their bit depth, after `validate` succeeds.
@@ -479,7 +487,7 @@ impl ChromaAt {
 
     /// The Cb and Cr of pixel (x, y), whose chroma sample covers its block.
     #[inline(always)]
-    fn at(&self, data: &[u8], x: usize, y: usize) -> (u8, u8) {
+    const fn at(&self, data: &[u8], x: usize, y: usize) -> (u8, u8) {
         let i = ((y >> self.shift.1) * self.columns + (x >> self.shift.0)) * self.step;
         (data[self.cb + i], data[self.cr + i])
     }
@@ -552,7 +560,7 @@ impl<'a> Decoder<'a> {
         Some((if bgr { [rgb[2], rgb[1], rgb[0]] } else { rgb }, bits))
     }
 
-    /// Pixel (x, y) as 8-bit R'G'B'. Y'CbCr, which decoded video arrives
+    /// Pixel (x, y) as 8-bit R'G'B'. `Y'CbCr`, which decoded video arrives
     /// in, is read here; other layouts in `other_rgb`, so that this stays
     /// small enough to inline into a caller's sampling loop.
     #[inline(always)]
@@ -567,7 +575,7 @@ impl<'a> Decoder<'a> {
     }
 
     /// The brightest of pixel (x, y)'s components as `rgb` gives them,
-    /// without working out the other two of a Y'CbCr layout.
+    /// without working out the other two of a `Y'CbCr` layout.
     #[inline(always)]
     pub(super) fn brightest(&self, x: usize, y: usize) -> u8 {
         match self.layout {
@@ -600,7 +608,7 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    /// `brightest_row` of a Y'CbCr layout in `matrix`'s color space. The
+    /// `brightest_row` of a `Y'CbCr` layout in `matrix`'s color space. The
     /// pixels a planar layout's chroma sample covers share its chroma terms.
     #[inline(always)]
     fn ycbcr_peaks(&self, matrix: Matrix, x0: usize, y: usize, out: &mut [u8]) {
@@ -625,7 +633,7 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    /// `rgb` of the layouts other than Y'CbCr.
+    /// `rgb` of the layouts other than `Y'CbCr`.
     #[inline(never)]
     fn other_rgb(&self, x: usize, y: usize) -> [u8; 3] {
         let data = self.data;
@@ -633,17 +641,19 @@ impl<'a> Decoder<'a> {
         match self.layout {
             Layout::Mono { bits } => {
                 let value = packed_sample(self.row(y), x * bits as usize, bits);
-                [(u32::from(value) * 255 / ((1 << bits) - 1)) as u8; 3]
+                [u8::try_from(u32::from(value) * 255 / ((1 << bits) - 1))
+                    .expect("scaled sample fits eight bits"); 3]
             }
             Layout::SignedMono => [data[i] ^ 128; 3],
             Layout::Rgb { .. } => {
                 let (rgb, bits) = self.native_color(x, y).expect("an RGB layout");
-                rgb.map(|v| (v >> bits.saturating_sub(8)).min(255) as u8)
+                rgb.map(|v| super::clamp8(v >> bits.saturating_sub(8)))
             }
             Layout::Rgb565 { bgr } => {
                 let value = u16::from_le_bytes([data[2 * i], data[2 * i + 1]]);
                 let expand = |v: u16, max: u16| {
-                    ((u32::from(v) * 255 + u32::from(max) / 2) / u32::from(max)) as u8
+                    u8::try_from((u32::from(v) * 255 + u32::from(max) / 2) / u32::from(max))
+                        .expect("expanded RGB565 component fits eight bits")
                 };
                 let rgb = [
                     expand(value & 31, 31),
@@ -656,7 +666,7 @@ impl<'a> Decoder<'a> {
         }
     }
 
-    /// The luma, Cb and Cr of pixel (x, y) of a Y'CbCr layout: planar and
+    /// The luma, Cb and Cr of pixel (x, y) of a `Y'CbCr` layout: planar and
     /// 4:2:2, what decoded video and webcams send, here; the rest in
     /// `other_ycbcr`.
     #[inline(always)]
@@ -670,11 +680,12 @@ impl<'a> Decoder<'a> {
                 group: 2, cb_first, ..
             } => {
                 let p = &self.row(y)[(x / 2) * 4..];
+                let &[first, second] = p.first_chunk::<2>().expect("one packed 4:2:2 pixel");
                 // Match the existing 4:2:2 decoder for a lone last pixel.
                 if cb_first {
-                    [p[1 + 2 * (x & 1)], p[0], p.get(2).copied().unwrap_or(128)]
+                    [p[1 + 2 * (x & 1)], first, p.get(2).copied().unwrap_or(128)]
                 } else {
-                    [p[2 * (x & 1)], p[1], p.get(3).copied().unwrap_or(128)]
+                    [p[2 * (x & 1)], second, p.get(3).copied().unwrap_or(128)]
                 }
             }
             _ => self.other_ycbcr(x, y),
@@ -692,7 +703,9 @@ impl<'a> Decoder<'a> {
         };
         let row = self.row(y);
         if group == 1 {
-            let p = &row[3 * x..];
+            let p = row[3 * x..]
+                .first_chunk::<3>()
+                .expect("one packed 4:4:4 pixel");
             return if cb_first {
                 [p[1], p[0], p[2]]
             } else {
@@ -710,7 +723,7 @@ impl<'a> Decoder<'a> {
     }
 }
 
-/// A Y'CbCr sample as R'G'B'.
+/// A `Y'CbCr` sample as R'G'B'.
 #[inline(always)]
 pub(super) fn to_rgb(matrix: Matrix, luma: u8, cb: u8, cr: u8) -> [u8; 3] {
     let (luma, chroma) = terms(matrix, luma, cb, cr);
@@ -727,7 +740,7 @@ pub(super) fn brightest(matrix: Matrix, luma: u8, cb: u8, cr: u8) -> u8 {
     component(matrix, luma + r.max(g).max(b))
 }
 
-/// A Y'CbCr sample's luma term and the chroma terms of its R', G' and B',
+/// A `Y'CbCr` sample's luma term and the chroma terms of its R', G' and B',
 /// each of which `component` turns, added to the luma term, into one.
 #[inline(always)]
 fn terms(matrix: Matrix, luma: u8, cb: u8, cr: u8) -> (i32, [i32; 3]) {
@@ -780,11 +793,12 @@ fn top_term(matrix: Matrix, cb: u8, cr: u8) -> i32 {
 /// 16.16 fixed point where `terms` keeps it, and clamped to 8 bits.
 #[inline(always)]
 fn component(matrix: Matrix, sum: i32) -> u8 {
-    match matrix {
+    let rounded = match matrix {
         Matrix::Full => sum,
         _ => (sum + 32_768) >> 16,
     }
-    .clamp(0, 255) as u8
+    .clamp(0, 255);
+    u8::try_from(rounded).expect("clamped component fits eight bits")
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -864,7 +878,7 @@ mod tests {
         let expected = colors
             .into_iter()
             .flatten()
-            .map(|v| v as u8)
+            .map(|v| u8::try_from(v).unwrap())
             .collect::<Vec<_>>();
         for (format, bits, bgr, planar, alpha) in [
             (0x0230_0018, 10, false, false, false),
@@ -908,7 +922,7 @@ mod tests {
                 .flat_map(|sample| {
                     let v = sample << (bits - 8);
                     if bits == 8 {
-                        vec![v as u8]
+                        vec![u8::try_from(v).unwrap()]
                     } else {
                         v.to_le_bytes().to_vec()
                     }
@@ -918,7 +932,7 @@ mod tests {
             assert_eq!(decoded(&source), expected, "{}", name(format).unwrap());
             assert_eq!(Decoder::new(&source).unwrap().rgb(1, 1), [5, 10, 15]);
             source.data.make_mut().pop();
-            assert!(unpacked(&source).is_err());
+            unpacked(&source).unwrap_err();
         }
     }
 
@@ -965,8 +979,9 @@ mod tests {
                     .map(|y| {
                         (0..width)
                             .flat_map(|x| {
-                                let rgb = [((x * 97 + y * 31) % 256) as u16, 77, 200];
-                                expected.extend(rgb.map(|v| v as u8));
+                                let rgb =
+                                    [u16::try_from((x * 97 + y * 31) % 256).unwrap(), 77, 200];
+                                expected.extend(rgb.map(|v| u8::try_from(v).unwrap()));
                                 let mut samples = if bgr {
                                     vec![rgb[2], rgb[1], rgb[0]]
                                 } else {
@@ -1007,7 +1022,7 @@ mod tests {
             [255, 0, 255, 0, 255, 0, 255, 0, 255, 0]
         );
         assert_eq!(
-            decoded(&frame(0x0102_0038, 4, 1, vec![0b11100100])),
+            decoded(&frame(0x0102_0038, 4, 1, vec![0b1110_0100])),
             [0, 85, 170, 255]
         );
         assert_eq!(
@@ -1072,11 +1087,11 @@ mod tests {
         ] {
             let length = super::super::row_bytes(4, format) * 2;
             let mut source = frame(format, 4, 2, vec![128; length]);
-            assert!(unpacked(&source).is_ok());
+            unpacked(&source).unwrap();
             source.data.make_mut().pop();
             assert!(unpacked(&source).is_err(), "{format:#x}");
             source.width = 0;
-            assert!(unpacked(&source).is_err());
+            unpacked(&source).unwrap_err();
         }
         assert!(unpacked(&frame(0, 1, 1, vec![0])).unwrap().is_none());
         assert!(validate(&frame(0, 1, 1, vec![0])).is_none());
@@ -1157,7 +1172,7 @@ mod tests {
         }
     }
 
-    /// Planar and semiplanar Y'CbCr expand their range and use their
+    /// Planar and semiplanar `Y'CbCr` expand their range and use their
     /// matrix: black, white and red in each color space.
     #[test]
     fn decoded_video_planes_use_their_range_and_matrix() {
@@ -1250,14 +1265,14 @@ mod tests {
             0x0230, 0x0240,
         ]
         .into_iter()
-        .flat_map(|size| (0..=0x12e).map(move |id| size << 16 | id))
+        .flat_map(|size| (0..=0x12e).map(move |id| (size << 16) | id))
         .chain(CODES.into_iter().filter(|code| code >> 31 == 1))
         .filter(|&format| name(format).is_some())
         {
             exercised += 1;
             let length = conversion::frame_len(format, 12, 8).unwrap();
             let data = (0..length + 3)
-                .map(|i| (i as u8).wrapping_mul(71).wrapping_add(29))
+                .map(|i| i.to_le_bytes()[0].wrapping_mul(71).wrapping_add(29))
                 .collect();
             let source = frame(format, 12, 8, data);
             let normalized = unpacked(&source).unwrap().unwrap();

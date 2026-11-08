@@ -7,7 +7,11 @@
 //! frames' order. The queue's bound follows the memory the host and its
 //! cgroup leave, so a burst on a small board drops frames rather than
 //! exhausting it.
-use super::*;
+use super::{
+    Acquisition, Arc, BTreeMap, Condvar, Context as _, Frame, Mutex, PathBuf, Receiver, Result,
+    Source, Value, VecDeque, WorkerHandle, image_file, inspector, interrupted, json, mpsc,
+    save_sidecar, saved, still_meta,
+};
 use std::sync::mpsc::Sender;
 
 /// The most frame bytes the encoders hold, waiting and being encoded: a
@@ -50,7 +54,7 @@ pub(super) struct Save {
     /// The client's own free-space floor.
     pub(super) min_free: Option<u64>,
     /// The job's manifest, which gets a line once the file is published.
-    pub(super) manifest: Option<Arc<super::saved::Manifest>>,
+    pub(super) manifest: Option<Arc<saved::Manifest>>,
     pub(super) source: Source,
     pub(super) context: crate::context::Context,
     /// Measure the frame and preview it, as inspect does: the job's last.
@@ -80,9 +84,9 @@ pub(super) struct SavedShot {
 
 /// A published file, waiting for its turn to be reported.
 pub(super) struct Written {
-    pub(super) file: super::saved::SavedFile,
+    pub(super) file: saved::SavedFile,
     /// Its manifest line, appended when it is reported.
-    pub(super) line: Option<(Arc<super::saved::Manifest>, Value)>,
+    pub(super) line: Option<(Arc<saved::Manifest>, Value)>,
     pub(super) shot: SavedShot,
 }
 
@@ -108,7 +112,9 @@ struct Waiting {
 }
 impl Queue {
     fn lock(&self) -> std::sync::MutexGuard<'_, Waiting> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -224,7 +230,7 @@ impl Saver {
 
     /// Take back job `job`'s shots no encoder has started, so a stopped job
     /// saves no files after its end; they end as interrupted.
-    pub(super) fn discard(&mut self, job: u64) {
+    pub(super) fn discard(&self, job: u64) {
         let mut state = self.queue.lock();
         let mut taken = Vec::new();
         let mut emptied = Vec::new();
@@ -313,7 +319,7 @@ impl Encoder {
                         .queue
                         .ready
                         .wait(state)
-                        .unwrap_or_else(|e| e.into_inner());
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
             };
             let bytes = shot.frame.data.len();
@@ -351,7 +357,9 @@ fn report(
     number: u64,
     results: Vec<(u64, u32, Result<Written>)>,
 ) {
-    let mut order = order.lock().unwrap_or_else(|e| e.into_inner());
+    let mut order = order
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     order.done.insert(number, results);
     loop {
         let next = order.next;
@@ -427,7 +435,7 @@ fn write(h: &WorkerHandle, shot: &Shot, save: &Save) -> Result<Written> {
                 &save.source.id,
                 None,
                 crate::inspect::default_edge(),
-                Default::default(),
+                crate::inspect::PreviewFormat::default(),
                 None,
             )
         })

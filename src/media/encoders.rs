@@ -1,7 +1,7 @@
 //! Choosing a recording's encoder: the codec families and the encoders
 //! of each, tried in order, each proved by a test encode at the
 //! recording's size before it is used, and the answers remembered for the
-//! FFmpeg build and the boot. Jetson's GStreamer encoders are checked the
+//! `FFmpeg` build and the boot. Jetson's `GStreamer` encoders are checked the
 //! same way.
 use super::*;
 
@@ -14,9 +14,9 @@ pub(super) fn codec_family(codec: &str) -> Result<&'static str> {
         _ => bail!("unsupported forwarding codec {codec}; use h264, hevc, av1 or ffv1"),
     }
 }
-/// The codec an FFmpeg encoder writes, `h264`, `hevc` or `av1`, or None for
+/// The codec an `FFmpeg` encoder writes, `h264`, `hevc` or `av1`, or None for
 /// encoders of other codecs.
-pub fn encoder_family(encoder: &str) -> Option<&'static str> {
+pub(crate) fn encoder_family(encoder: &str) -> Option<&'static str> {
     match encoder {
         "h264" | "libx264" | "libx264rgb" | "libopenh264" | "nvv4l2h264enc" => Some("h264"),
         "hevc" | "libx265" | "nvv4l2h265enc" => Some("hevc"),
@@ -28,7 +28,7 @@ pub fn encoder_family(encoder: &str) -> Option<&'static str> {
         _ => None,
     }
 }
-pub fn validate_encoder(codec: &str, encoder: &str) -> Result<()> {
+pub(crate) fn validate_encoder(codec: &str, encoder: &str) -> Result<()> {
     let family = codec_family(codec)?;
     ensure!(
         !encoder.is_empty()
@@ -48,10 +48,10 @@ pub fn validate_encoder(codec: &str, encoder: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn validate_bitrate(bitrate: &str) -> Result<()> {
+pub(crate) fn validate_bitrate(bitrate: &str) -> Result<()> {
     bits_per_second(bitrate).map(|_| ())
 }
-/// What probing one FFmpeg found: remembered for the process and, beside a
+/// What probing one `FFmpeg` found: remembered for the process and, beside a
 /// shared extracted copy, for the rest of the boot. A missing, corrupt or
 /// older file is ignored and the probes run again.
 #[derive(Default, Serialize, Deserialize)]
@@ -94,7 +94,7 @@ impl Found {
     /// The answer, unless it is a failure found too long ago.
     pub(super) fn current(self) -> Option<bool> {
         let age = crate::scheduling::now_ms().checked_sub(self.at_ms);
-        (self.works || age.is_some_and(|age| age < FAILURE_KEPT.as_millis() as u64))
+        (self.works || age.is_some_and(|age| u128::from(age) < FAILURE_KEPT.as_millis()))
             .then_some(self.works)
     }
     /// The later of two answers.
@@ -110,7 +110,7 @@ pub(super) fn with_probes<T>(exe: &Executable, read: impl FnOnce(&mut Probes) ->
     let mut memo = PROBES
         .get_or_init(Default::default)
         .lock()
-        .unwrap_or_else(|e| e.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     read(
         memo.entry(exe.path.clone())
             .or_insert_with(|| load_probes(exe)),
@@ -139,7 +139,7 @@ pub(super) fn remember(exe: &Executable, change: impl FnOnce(&mut Probes)) {
     with_probes(exe, |probes| {
         change(probes);
         save_probes(exe, probes);
-    })
+    });
 }
 pub(super) fn load_probes(exe: &Executable) -> Probes {
     let stored = exe
@@ -157,7 +157,7 @@ pub(super) fn save_probes(exe: &Executable, probes: &mut Probes) {
     };
     // Keep what other processes found since this one read the file.
     let stored = load_probes(exe);
-    probes.boot = boot.to_owned();
+    boot.clone_into(&mut probes.boot);
     probes.listing = probes.listing.take().or(stored.listing);
     probes.hwaccels = probes.hwaccels.take().or(stored.hwaccels);
     probes.decoder_listing = probes.decoder_listing.take().or(stored.decoder_listing);
@@ -225,7 +225,7 @@ pub(super) fn listed(listing: &str, encoder: &str) -> bool {
         .any(|line| line.split_whitespace().nth(1) == Some(encoder))
 }
 /// A probe's key: the encoder, how its input is converted, the pixel
-/// format the frames reach FFmpeg in (`lavfi` for a generated test frame)
+/// format the frames reach `FFmpeg` in (`lavfi` for a generated test frame)
 /// and the size, such as `h264_nvenc yuv bayer_rggb8 1920x1080`.
 pub(super) fn probe_key(
     encoder: &str,
@@ -242,7 +242,7 @@ pub(super) fn probe_key(
     format!("{encoder} {input} {source} {width}x{height}")
 }
 /// One test frame at the recording's size, in the pixel format the
-/// recording's frames will reach FFmpeg in when that is known: hardware
+/// recording's frames will reach `FFmpeg` in when that is known: hardware
 /// encoders have size limits that a small probe would pass, and a format
 /// conversion the encoder's input needs can fail where another does not.
 /// A probe that cannot tell, because it timed out or was killed from
@@ -277,7 +277,7 @@ pub(super) fn jetson_works(exe: &Executable, encoder: &str) -> Result<Option<boo
         || Ok(probe_jetson(encoder)),
     )
 }
-/// The encoder is in this FFmpeg build, or is a Jetson GStreamer element,
+/// The encoder is in this `FFmpeg` build, or is a Jetson `GStreamer` element,
 /// and encodes a test frame of this size, in `source`'s format when it is
 /// known; `None` when its test encode could not tell.
 pub(super) fn usable(
@@ -302,15 +302,14 @@ pub(super) fn usable(
 }
 /// The size probed before a recording's first frame says its real size.
 pub(super) const PROBE_SIZE: (u32, u32) = (640, 480);
-/// Encoders to try for a codec on this OS, all in the bundled FFmpeg or on
+/// Encoders to try for a codec on this OS, all in the bundled `FFmpeg` or on
 /// Jetson: vendor encoders first, then cross-vendor Vulkan Video, then
-/// software. Another FFmpeg's encoders are used when a forward names one.
-pub(super) fn encoder_candidates(family: &str) -> Vec<&'static str> {
+/// software. Another `FFmpeg`'s encoders are used when a forward names one.
+pub(super) fn encoder_candidates(family: &str) -> &'static [&'static str] {
     match (family, std::env::consts::OS) {
-        ("h264", "macos") => vec!["h264_videotoolbox", "libx264"],
-        ("hevc", "macos") => vec!["hevc_videotoolbox"],
-        ("av1", "macos") => vec![],
-        ("h264", "linux") => vec![
+        ("h264", "macos") => &["h264_videotoolbox", "libx264"],
+        ("hevc", "macos") => &["hevc_videotoolbox"],
+        ("h264", "linux") => &[
             "h264_nvenc",
             "nvv4l2h264enc",
             "h264_amf",
@@ -318,15 +317,15 @@ pub(super) fn encoder_candidates(family: &str) -> Vec<&'static str> {
             "h264_v4l2m2m",
             "libx264",
         ],
-        ("hevc", "linux") => vec![
+        ("hevc", "linux") => &[
             "hevc_nvenc",
             "nvv4l2h265enc",
             "hevc_amf",
             "hevc_vulkan",
             "hevc_v4l2m2m",
         ],
-        ("av1", "linux") => vec!["av1_nvenc", "nvv4l2av1enc", "av1_amf", "av1_vulkan"],
-        ("h264", "windows") => vec![
+        ("av1", "linux") => &["av1_nvenc", "nvv4l2av1enc", "av1_amf", "av1_vulkan"],
+        ("h264", "windows") => &[
             "h264_nvenc",
             "h264_qsv",
             "h264_amf",
@@ -334,22 +333,22 @@ pub(super) fn encoder_candidates(family: &str) -> Vec<&'static str> {
             "h264_mf",
             "libx264",
         ],
-        ("hevc", "windows") => vec![
+        ("hevc", "windows") => &[
             "hevc_nvenc",
             "hevc_qsv",
             "hevc_amf",
             "hevc_vulkan",
             "hevc_mf",
         ],
-        ("av1", "windows") => vec!["av1_nvenc", "av1_qsv", "av1_amf", "av1_vulkan", "av1_mf"],
+        ("av1", "windows") => &["av1_nvenc", "av1_qsv", "av1_amf", "av1_vulkan", "av1_mf"],
         // Lossless, in FFmpeg itself on every OS.
-        ("ffv1", _) => vec!["ffv1"],
-        ("h264", _) => vec!["libx264"],
-        ("hevc", _) => vec![],
-        _ => vec!["av1_nvenc"],
+        ("ffv1", _) => &["ffv1"],
+        ("h264", _) => &["libx264"],
+        ("av1", "macos") | ("hevc", _) => &[],
+        _ => &["av1_nvenc"],
     }
 }
-/// Every candidate must be in the FFmpeg build and pass a real test encode
+/// Every candidate must be in the `FFmpeg` build and pass a real test encode
 /// at the recording's size before it is chosen. `skip` holds encoders that
 /// already failed this recording.
 pub(super) fn select_encoder(
@@ -374,7 +373,7 @@ pub(super) fn select_encoder(
         return Ok(config.encoder.clone());
     }
     let mut undecided = Vec::new();
-    for candidate in encoder_candidates(family) {
+    for &candidate in encoder_candidates(family) {
         if skip.iter().any(|failed| failed == candidate) {
             continue;
         }
@@ -424,7 +423,7 @@ pub(crate) fn check_codec(config: &ForwardConfig) -> Result<()> {
         unsupported_codec(&exe, family, None),
     ))
 }
-/// Says which codecs do work, since the bundled FFmpeg has no software HEVC
+/// Says which codecs do work, since the bundled `FFmpeg` has no software HEVC
 /// or AV1 encoder and many hosts have no hardware one either.
 pub(super) fn unsupported_codec(
     exe: &Executable,
@@ -475,10 +474,10 @@ pub(super) fn validate_encoder_listing(listing: &str, encoder: &str, family: &st
     );
     Ok(())
 }
-/// NVIDIA Jetson hardware encoders, reached through NVIDIA's GStreamer
-/// elements: on Jetson the video engine is a V4L2 device that FFmpeg's NVENC
-/// and generic V4L2 wrappers cannot drive. GStreamer runs as a separate
-/// process that encodes to MPEG-TS for FFmpeg to remux and deliver.
+/// NVIDIA Jetson hardware encoders, reached through NVIDIA's `GStreamer`
+/// elements: on Jetson the video engine is a V4L2 device that `FFmpeg`'s NVENC
+/// and generic V4L2 wrappers cannot drive. `GStreamer` runs as a separate
+/// process that encodes to MPEG-TS for `FFmpeg` to remux and deliver.
 pub(super) fn jetson_encoder(encoder: &str) -> bool {
     matches!(encoder, "nvv4l2h264enc" | "nvv4l2h265enc" | "nvv4l2av1enc")
 }
@@ -490,18 +489,19 @@ pub(super) fn jetson_parser(encoder: &str) -> &'static str {
     }
 }
 
-/// GStreamer fraction fields use signed 32-bit numerator and denominator.
+/// `GStreamer` fraction fields use signed 32-bit numerator and denominator.
 /// Continued fractions recover rates such as 30000/1001 without rounding to
 /// decimal milliseconds. Accept a rate only if the fraction reproduces the
 /// requested floating-point value exactly.
+#[deny(clippy::cast_precision_loss)]
 pub(super) fn jetson_framerate(fps: f64) -> Result<(u32, u32)> {
     ensure!(
         fps.is_finite() && (0.1..=240.0).contains(&fps),
         "forwarding FPS must be a finite number within 0.1..240"
     );
-    const LIMIT: u64 = i32::MAX as u64;
-    let (mut previous_numerator, mut numerator) = (0u64, 1u64);
-    let (mut previous_denominator, mut denominator) = (1u64, 0u64);
+    const LIMIT: u32 = i32::MAX as u32;
+    let (mut previous_numerator, mut numerator) = (0u32, 1u32);
+    let (mut previous_denominator, mut denominator) = (1u32, 0u32);
     let mut remainder = fps;
     for _ in 0..64 {
         let coefficient = remainder.floor();
@@ -511,18 +511,24 @@ pub(super) fn jetson_framerate(fps: f64) -> Result<(u32, u32)> {
         let denominator_limit = (LIMIT - previous_denominator)
             .checked_div(denominator)
             .unwrap_or(LIMIT);
+        // Bound both next values by LIMIT, so their products and sums fit u32.
         let maximum = numerator_limit.min(denominator_limit);
-        let multiplier = if coefficient <= maximum as f64 {
-            coefficient as u64
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "the floored coefficient is nonnegative and bounded by the signed 32-bit fraction limit"
+        )]
+        let multiplier = if coefficient <= f64::from(maximum) {
+            coefficient as u32
         } else {
             maximum
         };
         let next_numerator = multiplier * numerator + previous_numerator;
         let next_denominator = multiplier * denominator + previous_denominator;
-        if next_denominator > 0 && next_numerator as f64 / next_denominator as f64 == fps {
-            return Ok((next_numerator as u32, next_denominator as u32));
+        if next_denominator > 0 && f64::from(next_numerator) / f64::from(next_denominator) == fps {
+            return Ok((next_numerator, next_denominator));
         }
-        if multiplier as f64 != coefficient {
+        if f64::from(multiplier) != coefficient {
             break;
         }
         let fraction = remainder - coefficient;
@@ -598,12 +604,10 @@ pub(super) fn bits_per_second(bitrate: &str) -> Result<u64> {
         !bitrate.is_empty() && bitrate.len() <= 32,
         "forwarding bitrate needs a positive bit rate, for example 4M or 2500k"
     );
-    let (number, power) = match bitrate.chars().last() {
-        Some('k' | 'K') => (&bitrate[..bitrate.len() - 1], 3u32),
-        Some('M') => (&bitrate[..bitrate.len() - 1], 6),
-        Some('G') => (&bitrate[..bitrate.len() - 1], 9),
-        _ => (bitrate, 0),
-    };
+    let (number, power) = [('k', 3u32), ('K', 3), ('M', 6), ('G', 9)]
+        .into_iter()
+        .find_map(|(suffix, power)| bitrate.strip_suffix(suffix).map(|number| (number, power)))
+        .unwrap_or((bitrate, 0));
     let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
     ensure!(
         !number.is_empty()
@@ -615,8 +619,10 @@ pub(super) fn bits_per_second(bitrate: &str) -> Result<u64> {
         "invalid forwarding bitrate; use a number with an optional k, M or G suffix (for example 4M)"
     );
     let fraction = fraction.trim_end_matches('0');
+    let digits = u32::try_from(fraction.len())
+        .context("forwarding bitrate has too many fractional digits")?;
     ensure!(
-        fraction.len() <= power as usize,
+        digits <= power,
         "forwarding bitrate must resolve to a whole number of bits per second"
     );
     let whole = if whole.is_empty() {
@@ -629,21 +635,18 @@ pub(super) fn bits_per_second(bitrate: &str) -> Result<u64> {
     let fractional = if fraction.is_empty() {
         0
     } else {
-        fraction.parse::<u64>()? * 10u64.pow(power - fraction.len() as u32)
+        fraction.parse::<u64>()? * 10u64.pow(power - digits)
     };
-    let value = whole
+    whole
         .checked_mul(10u64.pow(power))
-        .and_then(|whole| whole.checked_add(fractional));
-    ensure!(
-        value.is_some_and(|value| (1..=u32::MAX as u64).contains(&value)),
-        "forwarding bitrate must be within 1..4294967295 bits per second"
-    );
-    Ok(value.unwrap())
+        .and_then(|whole| whole.checked_add(fractional))
+        .filter(|value| (1..=u64::from(u32::MAX)).contains(value))
+        .context("forwarding bitrate must be within 1..4294967295 bits per second")
 }
-/// Pixel layout handed to the encoder after FFmpeg's input conversion.
+/// Pixel layout handed to the encoder after `FFmpeg`'s input conversion.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum EncoderInput {
-    /// Planar or semi-planar 4:2:0 converted by FFmpeg's SIMD swscale.
+    /// Planar or semi-planar 4:2:0 converted by `FFmpeg`'s SIMD swscale.
     Yuv,
     /// Packed RGB; the encoder's own color-conversion hardware makes YUV.
     Rgb,
@@ -686,44 +689,42 @@ pub(super) fn probe_encoder(
     height: u32,
 ) -> Result<Option<bool>> {
     let mut args = ["-hide_banner", "-loglevel", "error"]
-        .map(str::to_string)
-        .to_vec();
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
     let mut frame = Vec::new();
-    let pix_fmt = match source {
-        Some(raw) => {
-            let pix_fmt = raw.input_pix_fmt(candidate);
-            args.extend(
-                [
-                    "-f",
-                    "rawvideo",
-                    "-pix_fmt",
-                    pix_fmt,
-                    "-video_size",
-                    &format!("{width}x{height}"),
-                ]
-                .map(str::to_string),
-            );
-            args.extend(raw.color_options().iter().map(|option| option.to_string()));
-            args.extend(["-i".into(), "pipe:0".into()]);
-            // Neutral YUV chroma, so a black frame really is one.
-            frame = vec![if raw.pairs() { 128 } else { 0 }; raw.pipe_len(width, height)?];
-            pix_fmt
-        }
-        None => {
-            args.extend(
-                [
-                    "-nostdin",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    &format!("color=size={width}x{height}:rate=1"),
-                ]
-                .map(str::to_string),
-            );
-            "yuv420p"
-        }
+    let pix_fmt = if let Some(raw) = source {
+        let pix_fmt = raw.input_pix_fmt(candidate);
+        args.extend(
+            [
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                pix_fmt,
+                "-video_size",
+                &format!("{width}x{height}"),
+            ]
+            .map(str::to_owned),
+        );
+        args.extend(raw.color_options().iter().map(ToString::to_string));
+        args.extend(["-i".into(), "pipe:0".into()]);
+        // Neutral YUV chroma, so a black frame really is one.
+        frame = vec![if raw.pairs() { 128 } else { 0 }; raw.pipe_len(width, height)?];
+        pix_fmt
+    } else {
+        args.extend(
+            [
+                "-nostdin",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("color=size={width}x{height}:rate=1"),
+            ]
+            .map(str::to_owned),
+        );
+        "yuv420p"
     };
-    args.extend(["-frames:v", "1", "-c:v", candidate].map(str::to_string));
+    args.extend(["-frames:v", "1", "-c:v", candidate].map(str::to_owned));
     args.extend(encoder_device_options(candidate));
     args.extend(encoder_output_options(candidate, input, pix_fmt));
     // As the recording runs it: x264's defaults would size its threads by
@@ -734,7 +735,7 @@ pub(super) fn probe_encoder(
     ));
     args.extend(["-f".into(), "null".into(), "-".into()]);
     // Large sensors take longer to encode even once.
-    let pixels = width as u64 * height as u64;
+    let pixels = u64::from(width) * u64::from(height);
     let timeout = Duration::from_secs(3) + Duration::from_millis(pixels / 10_000);
     let (works, _, timed_out) = timed_output(exe, &args, &frame, timeout)?;
     Ok((!timed_out).then_some(works))
@@ -778,13 +779,34 @@ pub(super) fn encoder_device_options(encoder: &str) -> Vec<String> {
         // The first Vulkan device with video encode; FFmpeg loads the system
         // Vulkan loader at run time.
         ["-init_hw_device", "vulkan=vk", "-filter_hw_device", "vk"]
+            .into_iter()
             .map(str::to_owned)
-            .to_vec()
+            .collect::<Vec<_>>()
     } else {
         Vec::new()
     }
 }
-/// Output options for `encoder` reading `input` from frames in FFmpeg's
+/// Preserve each raw recording frame's wall-clock time at microsecond
+/// precision, including frames the pipe delivered within one nominal tick.
+pub(super) fn recording_clock_options(mut options: Vec<String>) -> Vec<String> {
+    const CLOCK: &str = "settb=AVTB,setpts=(RTCTIME-RTCSTART)/(TB*1000000)";
+    let mut filtered = false;
+    for [flag, value] in options.as_chunks_mut::<2>().0 {
+        if flag == "-vf" {
+            value.insert(0, ',');
+            value.insert_str(0, CLOCK);
+            filtered = true;
+            break;
+        }
+    }
+    if !filtered {
+        options.extend(["-vf".to_owned(), CLOCK.to_owned()]);
+    }
+    options.extend(["-enc_time_base", "1:1000000"].map(str::to_owned));
+    options
+}
+
+/// Output options for `encoder` reading `input` from frames in `FFmpeg`'s
 /// pixel format `source`.
 pub(super) fn encoder_output_options(
     encoder: &str,
@@ -794,7 +816,10 @@ pub(super) fn encoder_output_options(
     if encoder == "ffv1" {
         // Every frame intra-coded at the camera's own pixel layout, so the
         // file is lossless frame by frame; no padding or 4:2:0.
-        return ["-level", "3", "-g", "1"].map(str::to_owned).to_vec();
+        return ["-level", "3", "-g", "1"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
     }
     // A mosaic is demosaicked to RGB24 first: the bundled FFmpeg's swscale
     // makes 4:2:0 from RGB24 2.6 times faster than its direct Bayer to

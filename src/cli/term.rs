@@ -2,10 +2,12 @@
 //! stderr are one, its size, the status line that says what a slow command
 //! is doing, the camera picker, and frames drawn inline. Escape sequences
 //! go only to a terminal that takes them.
+#![deny(clippy::missing_const_for_fn)]
+#![deny(clippy::significant_drop_tightening)]
 use anyhow::{Context as _, Result, bail};
 use std::{
     fmt::Write as _,
-    io::{self, BufRead, IsTerminal, Write},
+    io::{self, BufRead, IsTerminal as _, Write},
     sync::{
         Condvar, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, Ordering},
@@ -145,15 +147,16 @@ impl Line {
         };
         let age = now.saturating_duration_since(entry.since);
         // What is shown stays until the operation begun since is due.
-        if age < DELAY {
-            return Some(DELAY - age);
+        if let Some(left) = DELAY.checked_sub(age).filter(|left| !left.is_zero()) {
+            return Some(left);
         }
         let cols = size().map_or(80, |(cols, _)| cols);
         let text = status_text(&entry.text, age, entry.progress, cols);
         let progress = entry.progress;
         self.draw(text);
-        (!progress)
-            .then(|| Duration::from_secs(1) - Duration::from_nanos(age.subsec_nanos().into()))
+        (!progress).then(|| {
+            Duration::from_secs(1).saturating_sub(Duration::from_nanos(age.subsec_nanos().into()))
+        })
     }
 }
 
@@ -183,7 +186,7 @@ pub(crate) fn fit(text: &str, cols: u16) -> String {
         .collect()
 }
 
-fn ticker() {
+fn ticker() -> ! {
     let mut line = line();
     loop {
         let wait = line.refresh(Instant::now());
@@ -226,6 +229,7 @@ pub(crate) fn activity(text: impl Into<String>) -> Activity {
             .spawn(ticker)
             .is_ok();
     }
+    drop(line);
     CHANGED.notify_all();
     Activity { id }
 }
@@ -240,6 +244,7 @@ impl Activity {
             entry.text = text;
             entry.progress = progress;
         }
+        drop(line);
         CHANGED.notify_all();
     }
     /// Show how far it is: a line that carries its own elapsed time, such
@@ -258,6 +263,7 @@ impl Drop for Activity {
         if line.stack.is_empty() {
             line.erase();
         }
+        drop(line);
         CHANGED.notify_all();
     }
 }
@@ -292,12 +298,14 @@ pub(crate) fn pause() -> Paused {
     let mut line = line();
     line.paused += 1;
     line.erase();
+    drop(line);
     Paused(())
 }
 impl Drop for Paused {
     fn drop(&mut self) {
         let mut line = line();
         line.paused = line.paused.saturating_sub(1);
+        drop(line);
         CHANGED.notify_all();
     }
 }
@@ -310,7 +318,7 @@ impl Drop for Paused {
 pub(crate) fn can_pick(json: bool) -> bool {
     may_pick(json, stdin_is_tty(), stderr_is_tty())
 }
-fn may_pick(json: bool, stdin: bool, stderr: bool) -> bool {
+const fn may_pick(json: bool, stdin: bool, stderr: bool) -> bool {
     !json && stdin && stderr
 }
 
@@ -386,7 +394,7 @@ pub(crate) fn pick_until<I: BufRead>(
 pub(crate) enum Graphics {
     /// The kitty graphics protocol: kitty, Ghostty.
     Kitty,
-    /// iTerm2 inline images: iTerm2, WezTerm.
+    /// iTerm2 inline images: iTerm2, `WezTerm`.
     Iterm,
     /// Half blocks in 24-bit colour.
     TrueColor,
@@ -395,7 +403,7 @@ pub(crate) enum Graphics {
 }
 
 /// The graphics this terminal takes, from its environment; None for one
-/// that takes no escape sequences. CAPTUREFAB_IMAGES (kitty, iterm,
+/// that takes no escape sequences. `CAPTUREFAB_IMAGES` (kitty, iterm,
 /// truecolor, 256 or none) overrides what the variables suggest.
 pub(crate) fn graphics() -> Option<Graphics> {
     if !escapes() {
@@ -407,21 +415,29 @@ pub(crate) fn graphics() -> Option<Graphics> {
 pub(crate) fn graphics_from(var: impl Fn(&str) -> Option<String>) -> Option<Graphics> {
     let is = |name: &str, value: &str| var(name).is_some_and(|set| set == value);
     if let Some(chosen) = var("CAPTUREFAB_IMAGES") {
-        match chosen.trim().to_ascii_lowercase().as_str() {
-            "kitty" => return Some(Graphics::Kitty),
-            "iterm" | "iterm2" => return Some(Graphics::Iterm),
-            "truecolor" | "24bit" => return Some(Graphics::TrueColor),
-            "256" => return Some(Graphics::Colors256),
-            "none" | "off" | "0" => return None,
-            _ => {}
+        let chosen = chosen.trim();
+        for (name, graphics) in [
+            ("kitty", Some(Graphics::Kitty)),
+            ("iterm", Some(Graphics::Iterm)),
+            ("iterm2", Some(Graphics::Iterm)),
+            ("truecolor", Some(Graphics::TrueColor)),
+            ("24bit", Some(Graphics::TrueColor)),
+            ("256", Some(Graphics::Colors256)),
+            ("none", None),
+            ("off", None),
+            ("0", None),
+        ] {
+            if chosen.eq_ignore_ascii_case(name) {
+                return graphics;
+            }
         }
     }
     if is("TERM", "dumb") {
         return None;
     }
-    let truecolor = var("COLORTERM")
-        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "truecolor" | "24bit"))
-        || var("WT_SESSION").is_some();
+    let truecolor = var("COLORTERM").is_some_and(|value| {
+        value.eq_ignore_ascii_case("truecolor") || value.eq_ignore_ascii_case("24bit")
+    }) || var("WT_SESSION").is_some();
     let half = if truecolor {
         Graphics::TrueColor
     } else {
@@ -476,11 +492,12 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Rgb> {
 fn decode_png(bytes: &[u8]) -> Result<Rgb> {
     let mut decoder = png::Decoder::new(bytes);
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-    let mut reader = decoder.read_info().context("reading the preview")?;
-    let (width, height) = (reader.info().width, reader.info().height);
+    let header = decoder.read_header_info().context("reading the preview")?;
+    let (width, height) = (header.width, header.height);
     if u64::from(width) * u64::from(height) > MAX_PIXELS {
         bail!("the preview is too large to draw ({width}x{height})");
     }
+    let mut reader = decoder.read_info().context("reading the preview")?;
     let mut buffer = vec![0; reader.output_buffer_size()];
     let frame = reader
         .next_frame(&mut buffer)
@@ -505,16 +522,25 @@ fn decode_png(bytes: &[u8]) -> Result<Rgb> {
 
 #[cfg(feature = "jpeg")]
 fn decode_jpeg(bytes: &[u8]) -> Result<Rgb> {
-    let image =
-        turbojpeg::decompress(bytes, turbojpeg::PixelFormat::RGB).context("reading the preview")?;
-    let (width, height) = (image.width, image.height);
-    if (width as u64) * (height as u64) > MAX_PIXELS {
+    let mut decoder = turbojpeg::Decompressor::new().context("reading the preview")?;
+    let header = decoder.read_header(bytes).context("reading the preview")?;
+    let (width, height) = (header.width, header.height);
+    if width.saturating_mul(height) > usize::try_from(MAX_PIXELS)? {
         bail!("the preview is too large to draw ({width}x{height})");
     }
-    let mut pixels = Vec::with_capacity(width * height * 3);
-    for row in image.pixels.chunks(image.pitch).take(height) {
-        pixels.extend_from_slice(&row[..width * 3]);
-    }
+    let mut pixels = vec![0; width * height * 3];
+    decoder
+        .decompress(
+            bytes,
+            turbojpeg::Image {
+                pixels: pixels.as_mut_slice(),
+                width,
+                pitch: width * 3,
+                height,
+                format: turbojpeg::PixelFormat::RGB,
+            },
+        )
+        .context("reading the preview")?;
     Ok(Rgb {
         width: u32::try_from(width)?,
         height: u32::try_from(height)?,
@@ -528,10 +554,14 @@ fn decode_jpeg(_: &[u8]) -> Result<Rgb> {
 
 /// `image` scaled to `width` × `height`, each pixel the mean of the ones it
 /// covers.
-fn resize(image: &Rgb, width: u32, height: u32) -> Rgb {
+fn resize(image: &Rgb, width: u32, height: u32) -> Result<Rgb> {
+    let (width, height) = (width.max(1), height.max(1));
     let (sw, sh) = (u64::from(image.width), u64::from(image.height));
-    let (tw, th) = (u64::from(width.max(1)), u64::from(height.max(1)));
-    let mut pixels = Vec::with_capacity((tw * th * 3) as usize);
+    let (tw, th) = (u64::from(width), u64::from(height));
+    if tw * th > MAX_PIXELS {
+        bail!("terminal preview of {width}x{height} exceeds the pixel limit");
+    }
+    let mut pixels = Vec::with_capacity(usize::try_from(tw * th * 3)?);
     for y in 0..th {
         let (y0, y1) = (
             y * sh / th,
@@ -544,35 +574,47 @@ fn resize(image: &Rgb, width: u32, height: u32) -> Rgb {
             );
             let mut sum = [0u64; 3];
             for sy in y0..y1 {
-                let row = (sy * sw) as usize * 3;
+                let row = usize::try_from(sy * sw)? * 3;
                 for sx in x0..x1 {
-                    let at = row + sx as usize * 3;
+                    let at = row + usize::try_from(sx)? * 3;
                     for (total, value) in sum.iter_mut().zip(&image.pixels[at..at + 3]) {
                         *total += u64::from(*value);
                     }
                 }
             }
             let count = ((y1 - y0) * (x1 - x0)).max(1);
-            pixels.extend(sum.map(|total| (total / count) as u8));
+            pixels.extend(sum.map(|total| {
+                u8::try_from(total / count).expect("a mean RGB channel is within 0..255")
+            }));
         }
     }
-    Rgb {
-        width: tw as u32,
-        height: th as u32,
+    Ok(Rgb {
+        width,
+        height,
         pixels,
-    }
+    })
 }
 
 /// The cells an image of `width` × `height` pixels fills within `cols` ×
 /// `rows`, keeping its shape: a cell is about twice as tall as wide.
 pub(crate) fn cells(width: u32, height: u32, cols: u16, rows: u16) -> (u16, u16) {
-    let (width, height) = (f64::from(width.max(1)), f64::from(height.max(1)));
-    let scale = (f64::from(cols.max(1)) / width).min(2.0 * f64::from(rows.max(1)) / height);
-    let fit = |value: f64, most: u16| (value.round().max(1.0) as u16).min(most.max(1));
-    (
-        fit(width * scale, cols),
-        fit((height * scale / 2.0).ceil(), rows),
-    )
+    let (width, height) = (u64::from(width.max(1)), u64::from(height.max(1)));
+    let (cols, rows) = (cols.max(1), rows.max(1));
+    let across = u64::from(cols) * height;
+    let down = 2 * u64::from(rows) * width;
+    if across <= down {
+        let fitted_rows = across.div_ceil(2 * width).max(1);
+        (
+            cols,
+            u16::try_from(fitted_rows).expect("fitted rows are within the terminal"),
+        )
+    } else {
+        let fitted_cols = ((down + height / 2) / height).max(1);
+        (
+            u16::try_from(fitted_cols).expect("fitted columns are within the terminal"),
+            rows,
+        )
+    }
 }
 
 /// What draws an image in a terminal: `rows` lines from the cursor's line,
@@ -596,7 +638,7 @@ pub(crate) fn picture(
     let (cols, rows) = cells(image.width, image.height, cols, rows);
     let text = match graphics {
         Graphics::TrueColor | Graphics::Colors256 => {
-            half_blocks(&image, cols, rows, graphics == Graphics::TrueColor)
+            half_blocks(&image, cols, rows, graphics == Graphics::TrueColor)?
         }
         Graphics::Kitty => {
             let png = if encoded.starts_with(b"\x89PNG") {
@@ -689,8 +731,8 @@ fn color256([r, g, b]: [u8; 3]) -> u8 {
 
 /// `image` as rows of upper half blocks, a cell showing two pixels: the
 /// upper one in its foreground colour, the lower in its background.
-fn half_blocks(image: &Rgb, cols: u16, rows: u16, truecolor: bool) -> String {
-    let small = resize(image, u32::from(cols), u32::from(rows) * 2);
+fn half_blocks(image: &Rgb, cols: u16, rows: u16, truecolor: bool) -> Result<String> {
+    let small = resize(image, u32::from(cols), u32::from(rows) * 2)?;
     let width = small.width as usize;
     let pixel = |x: usize, y: usize| {
         let at = (y * width + x) * 3;
@@ -721,7 +763,7 @@ fn half_blocks(image: &Rgb, cols: u16, rows: u16, truecolor: bool) -> String {
         }
         text.push_str("\x1b[0m\n");
     }
-    text
+    Ok(text)
 }
 
 /// The most cells a picture takes: the terminal's width, and its height
@@ -748,13 +790,15 @@ pub(crate) fn preview_edge(graphics: Graphics, cols: u16, rows: u16) -> u32 {
 
 #[cfg(unix)]
 mod platform {
-    pub(super) fn escapes() -> bool {
+    pub(super) const fn escapes() -> bool {
         true
     }
     pub(super) fn size() -> Option<(u16, u16)> {
         [1, 2, 0].into_iter().find_map(|fd| {
-            // SAFETY: TIOCGWINSZ writes one winsize into the local.
+            // SAFETY: winsize contains integer fields, for which zero is valid.
             let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+            // SAFETY: TIOCGWINSZ writes one winsize into the local and
+            // reports an error for an invalid or non-terminal descriptor.
             let read = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) } == 0;
             (read && size.ws_col > 0 && size.ws_row > 0).then_some((size.ws_col, size.ws_row))
         })
@@ -776,17 +820,16 @@ mod platform {
         *ON.get_or_init(|| {
             let mut on = true;
             for which in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-                // SAFETY: console calls on this process's own handles,
-                // writing into a local.
-                unsafe {
-                    let handle = GetStdHandle(which);
-                    let mut mode = 0;
-                    if GetConsoleMode(handle, &mut mode) != 0
-                        && mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING == 0
-                        && SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) == 0
-                    {
-                        on = false;
-                    }
+                // SAFETY: which names this process's stdout or stderr.
+                let handle = unsafe { GetStdHandle(which) };
+                let mut mode = 0;
+                // SAFETY: the console API validates the handle and writes to a local.
+                if unsafe { GetConsoleMode(handle, &raw mut mode) } != 0
+                    && mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING == 0
+                    // SAFETY: this handle is a console; only its processing mode changes.
+                    && unsafe { SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) } == 0
+                {
+                    on = false;
                 }
             }
             on
@@ -796,17 +839,20 @@ mod platform {
         [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
             .into_iter()
             .find_map(|which| {
-                // SAFETY: as above.
-                unsafe {
-                    let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
-                    if GetConsoleScreenBufferInfo(GetStdHandle(which), &mut info) == 0 {
-                        return None;
-                    }
-                    let window = info.srWindow;
-                    let cols = u16::try_from(window.Right - window.Left + 1).ok()?;
-                    let rows = u16::try_from(window.Bottom - window.Top + 1).ok()?;
-                    (cols > 0 && rows > 0).then_some((cols, rows))
+                // SAFETY: zero initializes all fields before the console API fills them.
+                let mut info: CONSOLE_SCREEN_BUFFER_INFO = unsafe { std::mem::zeroed() };
+                // SAFETY: which names this process's stdout or stderr.
+                let handle = unsafe { GetStdHandle(which) };
+                // SAFETY: info is writable; the API validates the console handle.
+                if unsafe { GetConsoleScreenBufferInfo(handle, &raw mut info) } == 0 {
+                    return None;
                 }
+                let window = info.srWindow;
+                let cols =
+                    u16::try_from(i32::from(window.Right) - i32::from(window.Left) + 1).ok()?;
+                let rows =
+                    u16::try_from(i32::from(window.Bottom) - i32::from(window.Top) + 1).ok()?;
+                (cols > 0 && rows > 0).then_some((cols, rows))
             })
     }
 }
@@ -893,6 +939,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn graphics_overrides_keep_aliases_case_and_precedence() {
+        for (name, expected) in [
+            ("kitty", Some(Graphics::Kitty)),
+            ("iterm", Some(Graphics::Iterm)),
+            ("iterm2", Some(Graphics::Iterm)),
+            ("truecolor", Some(Graphics::TrueColor)),
+            ("24bit", Some(Graphics::TrueColor)),
+            ("256", Some(Graphics::Colors256)),
+            ("none", None),
+            ("off", None),
+            ("0", None),
+        ] {
+            let chosen = format!(" \t{}\n", name.to_ascii_uppercase());
+            assert_eq!(
+                detect(&[("TERM", "dumb"), ("CAPTUREFAB_IMAGES", &chosen)]),
+                expected
+            );
+        }
+        assert_eq!(
+            detect(&[("COLORTERM", "TRUECOLOR")]),
+            Some(Graphics::TrueColor)
+        );
+        assert_eq!(
+            detect(&[("COLORTERM", " truecolor ")]),
+            Some(Graphics::Colors256)
+        );
+        assert_eq!(
+            detect(&[("TERM", "xterm-kitty"), ("CAPTUREFAB_IMAGES", "unknown")]),
+            Some(Graphics::Kitty)
+        );
+    }
+
     fn rgb(width: u32, height: u32, pixels: &[[u8; 3]]) -> Rgb {
         Rgb {
             width,
@@ -907,18 +986,36 @@ mod tests {
         let blue = [0, 0, 255];
         let image = rgb(2, 2, &[red, red, blue, red]);
         assert_eq!(
-            half_blocks(&image, 2, 1, true),
+            half_blocks(&image, 2, 1, true).unwrap(),
             "\x1b[2K\x1b[38;2;255;0;0m\x1b[48;2;0;0;255m▀\x1b[48;2;255;0;0m▀\x1b[0m\n"
         );
         assert_eq!(
-            half_blocks(&image, 2, 1, false),
+            half_blocks(&image, 2, 1, false).unwrap(),
             "\x1b[2K\x1b[38;5;196m\x1b[48;5;21m▀\x1b[48;5;196m▀\x1b[0m\n"
         );
         // Two cells' rows from four pixel rows, each its own line.
         let tall = rgb(1, 4, &[red, blue, blue, red]);
-        let text = half_blocks(&tall, 1, 2, true);
+        let text = half_blocks(&tall, 1, 2, true).unwrap();
         assert_eq!(text.lines().count(), 2);
         assert!(text.starts_with("\x1b[2K\x1b[38;2;255;0;0m\x1b[48;2;0;0;255m▀"));
+    }
+
+    #[test]
+    fn terminal_geometry_handles_ratios_and_extreme_dimensions() {
+        for (width, height, cols, rows, expected) in [
+            (3, 4, 5, 7, (5, 4)),
+            (7, 3, 10, 2, (9, 2)),
+            (5, 4, 9, 1, (3, 1)),
+            (u32::MAX, u32::MAX, u16::MAX, u16::MAX, (u16::MAX, 32_768)),
+            (u32::MAX, 1, 80, 24, (80, 1)),
+            (1, u32::MAX, 80, 24, (1, 24)),
+            (0, 0, 0, 0, (1, 1)),
+        ] {
+            assert_eq!(cells(width, height, cols, rows), expected);
+        }
+        let image = rgb(1, 1, &[[0, 0, 0]]);
+        resize(&image, u32::MAX, u32::MAX).unwrap_err();
+        half_blocks(&image, u16::MAX, u16::MAX, true).unwrap_err();
     }
 
     #[test]
@@ -928,7 +1025,7 @@ mod tests {
             2,
             &[[0, 0, 0], [200, 100, 50], [100, 50, 0], [100, 50, 50]],
         );
-        assert_eq!(resize(&image, 1, 1).pixels, vec![100, 50, 25]);
+        assert_eq!(resize(&image, 1, 1).unwrap().pixels, vec![100, 50, 25]);
         // A 4:3 frame in 80x24 cells: as wide as fits, half as many rows
         // as pixel rows.
         assert_eq!(cells(640, 480, 80, 24), (64, 24));
@@ -957,7 +1054,7 @@ mod tests {
         assert_eq!(decode(&gray).unwrap(), rgb(2, 1, &[[255; 3], [128; 3]]));
         let color = encode_png(&rgb(1, 1, &[[1, 2, 3]])).unwrap();
         assert_eq!(decode(&color).unwrap(), rgb(1, 1, &[[1, 2, 3]]));
-        assert!(decode(b"GIF89a").is_err());
+        decode(b"GIF89a").unwrap_err();
         // Each graphics kind draws in the rows it says.
         for graphics in [
             Graphics::Kitty,
@@ -978,6 +1075,60 @@ mod tests {
         );
         let iterm = picture(&gray, Graphics::Iterm, 10, 5, None).unwrap().text;
         assert!(iterm.contains("\x1b]1337;File=inline=1;size="), "{iterm:?}");
+    }
+
+    #[test]
+    fn png_preview_limits_are_checked_before_reading_image_metadata() {
+        let mut bytes = Vec::new();
+        png::Encoder::new(&mut bytes, 2049, 2048)
+            .write_header()
+            .unwrap();
+        assert_eq!(
+            decode(&bytes).unwrap_err().to_string(),
+            "the preview is too large to draw (2049x2048)"
+        );
+    }
+
+    #[cfg(feature = "jpeg")]
+    #[test]
+    fn jpeg_preview_limits_are_checked_before_decoding_pixels() {
+        let jpeg = turbojpeg::compress(
+            turbojpeg::Image {
+                pixels: &[96; 3],
+                width: 1,
+                pitch: 3,
+                height: 1,
+                format: turbojpeg::PixelFormat::RGB,
+            },
+            90,
+            turbojpeg::Subsamp::None,
+        )
+        .unwrap()
+        .to_vec();
+        let image = decode(&jpeg).unwrap();
+        assert_eq!((image.width, image.height), (1, 1));
+        assert_eq!(image.pixels, [96; 3]);
+
+        let mut oversized = jpeg;
+        let sof = oversized
+            .windows(2)
+            .position(|bytes| bytes == [0xff, 0xc0])
+            .unwrap();
+        oversized[sof + 5..sof + 7].copy_from_slice(&2048u16.to_be_bytes());
+        oversized[sof + 7..sof + 9].copy_from_slice(&2049u16.to_be_bytes());
+        let scan = oversized
+            .windows(2)
+            .position(|bytes| bytes == [0xff, 0xda])
+            .unwrap();
+        let length = usize::from(u16::from_be_bytes([
+            oversized[scan + 2],
+            oversized[scan + 3],
+        ]));
+        oversized.truncate(scan + 2 + length);
+        assert_eq!(
+            decode(&oversized).unwrap_err().to_string(),
+            "the preview is too large to draw (2049x2048)"
+        );
     }
 
     #[test]
@@ -1019,21 +1170,21 @@ mod tests {
     fn the_picker_takes_a_number_or_enter() {
         let cameras = ["gige:a".to_owned(), "u3v:b  Cam\x1b[2J".to_owned()];
         let mut shown = Vec::new();
-        let picked = pick(&cameras, &mut "\n".as_bytes(), &mut shown).unwrap();
+        let picked = pick(&cameras, &mut b"\n".as_slice(), &mut shown).unwrap();
         assert_eq!(picked, Some(0));
         let shown = String::from_utf8(shown).unwrap();
         assert!(
             shown.contains("  1) gige:a\n  2) u3v:b  Cam\u{fffd}[2J\n"),
             "{shown}"
         );
-        let picked = pick(&cameras, &mut "x\n9\n2\n".as_bytes(), &mut Vec::new()).unwrap();
+        let picked = pick(&cameras, &mut b"x\n9\n2\n".as_slice(), &mut Vec::new()).unwrap();
         assert_eq!(picked, Some(1));
         assert_eq!(
-            pick(&cameras, &mut "".as_bytes(), &mut Vec::new()).unwrap(),
+            pick(&cameras, &mut b"".as_slice(), &mut Vec::new()).unwrap(),
             None
         );
         assert_eq!(
-            pick(&cameras, &mut "a\nb\nc\n1\n".as_bytes(), &mut Vec::new()).unwrap(),
+            pick(&cameras, &mut b"a\nb\nc\n1\n".as_slice(), &mut Vec::new()).unwrap(),
             None
         );
         // Nothing asks where no one can answer, or where JSON is read:
@@ -1057,7 +1208,7 @@ mod tests {
     #[test]
     fn a_signal_stops_the_picker_without_a_camera() {
         let cameras = || vec!["gige:a".to_owned(), "u3v:b".to_owned()];
-        let picked = pick_until(cameras(), || "2\n".as_bytes(), io::sink(), &|| false);
+        let picked = pick_until(cameras(), || b"2\n".as_slice(), io::sink(), &|| false);
         assert_eq!(picked.unwrap(), Some(1));
         // Ctrl-C while the prompt waits: no camera, at once, though no line
         // came, nor would Enter pick the first one afterwards.

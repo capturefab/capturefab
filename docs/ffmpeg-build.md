@@ -25,11 +25,13 @@ encoders remain. Audio/subtitle encoders, legacy video and non-preview still-ima
 encoders, audio capture, screen capture and device playback are omitted. Capturefab's
 stills use its own JPEG/PNG paths. All container muxers remain available.
 Filters are limited to scaling, padding, frame rate and pixel format conversion,
+microsecond recording clocks,
 hardware frame transfers, pass-through and synthetic test/probe sources.
 Unavailable platform encoders remain governed by their existing hardware switches
 and FFmpeg's dependency checks. No new software HEVC/AV1 encoder is introduced, so HEVC and AV1 recordings need a working hardware encoder; Capturefab refuses them before recording, naming the codecs that work, when none does.
 
 Native builds check essential decoder, format, filter and camera-device listings,
+verify that the recording clock preserves adjacent frames,
 then encode H.264 into MP4, Matroska, MPEG-TS and FLV and decode each back through
 the scaling/padding/FPS pipeline to raw RGB and the PPM preview pipe. These checks
 complement the existing SRT and encoder checks; physical cameras and GPU drivers still need

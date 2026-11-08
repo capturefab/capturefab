@@ -1,6 +1,7 @@
 //! JPEG stills, encoded in process by libjpeg-turbo's SIMD encoder (`jpeg`
 //! feature). Frames libjpeg-turbo reads (RGB8, BGR8, Mono8) are encoded in
 //! place, and the JPEG stays in the buffer libjpeg-turbo wrote it to.
+#![deny(clippy::missing_const_for_fn)]
 use crate::{
     frame::{Body, Samples},
     types::{Frame, MONO8},
@@ -21,7 +22,7 @@ pub(crate) mod videotoolbox;
 
 /// Fixed quality and 4:2:0 chroma (gray for monochrome), so the same frame
 /// produces comparable files wherever it is encoded.
-pub const QUALITY: i32 = 90;
+pub(crate) const QUALITY: i32 = 90;
 
 pub(crate) fn monochrome(pixel_format: u32) -> bool {
     matches!(
@@ -41,6 +42,11 @@ pub struct Raster<'a> {
 }
 
 impl<'a> Raster<'a> {
+    /// Prepare a frame as a gray or RGB raster.
+    ///
+    /// # Errors
+    /// Returns an error for invalid or oversized image dimensions, an unsupported
+    /// pixel format, truncated source bytes, or a missing monochrome conversion.
     pub fn new(frame: &'a Frame) -> Result<Self> {
         let (channels, data) = if monochrome(frame.pixel_format) {
             // One pass straight to 8-bit gray; no RGB triplication.
@@ -61,7 +67,7 @@ impl<'a> Raster<'a> {
         })
     }
     /// A raster of samples already in hand, such as a preview.
-    pub(crate) fn of(width: u32, height: u32, channels: usize, data: &'a [u8]) -> Self {
+    pub(crate) const fn of(width: u32, height: u32, channels: usize, data: &'a [u8]) -> Self {
         Self {
             width,
             height,
@@ -98,10 +104,10 @@ impl Clone for Jpeg {
 
 /// `frame` at `quality` (1–100). libjpeg-turbo reads RGB8, BGR8 and Mono8
 /// frames in place. Other monochrome formats are converted to 8-bit gray,
-/// and other color formats straight to the Y'CbCr 4:2:0 planes JPEG stores
+/// and other color formats straight to the `Y'CbCr` 4:2:0 planes JPEG stores
 /// (`encode_planes`).
 #[cfg(feature = "jpeg")]
-pub fn encode(frame: &Frame, quality: i32) -> Result<Body<'static>> {
+pub(crate) fn encode(frame: &Frame, quality: i32) -> Result<Body<'static>> {
     use turbojpeg::PixelFormat;
     let (format, channels) = match frame.pixel_format {
         crate::types::RGB8 => (PixelFormat::RGB, 3),
@@ -126,16 +132,16 @@ pub fn encode(frame: &Frame, quality: i32) -> Result<Body<'static>> {
     )
 }
 #[cfg(not(feature = "jpeg"))]
-pub fn encode(frame: &Frame, quality: i32) -> Result<Body<'static>> {
+pub(crate) fn encode(frame: &Frame, quality: i32) -> Result<Body<'static>> {
     software_quality(&Raster::new(frame)?, quality)
 }
 
-/// Planar full-range BT.601 Y'CbCr 4:2:0, as MJPEG and full-range video
+/// Planar full-range BT.601 `Y'CbCr` 4:2:0, as MJPEG and full-range video
 /// decode to: the very planes a JPEG stores.
 #[cfg(feature = "jpeg")]
 const JFIF_420: u32 = 0x820c_0001;
 
-/// A frame of JFIF Y'CbCr 4:2:0 planes compressed from its own buffer; one
+/// A frame of JFIF `Y'CbCr` 4:2:0 planes compressed from its own buffer; one
 /// of odd size goes through `encode_planes`, which pads its luma.
 #[cfg(feature = "jpeg")]
 fn compress_jfif(frame: &Frame, quality: i32) -> Result<Body<'static>> {
@@ -157,7 +163,7 @@ fn compress_jfif(frame: &Frame, quality: i32) -> Result<Body<'static>> {
     )
 }
 
-/// libjpeg-turbo compressing Y'CbCr 4:2:0 planes, luma `luma_stride` wide.
+/// libjpeg-turbo compressing `Y'CbCr` 4:2:0 planes, luma `luma_stride` wide.
 #[cfg(feature = "jpeg")]
 fn compress_yuv(
     luma: &[u8],
@@ -186,7 +192,7 @@ fn compress_yuv(
     Ok(Body::Jpeg(Jpeg(jpeg)))
 }
 
-/// A color frame as JFIF Y'CbCr 4:2:0 planes written straight from its rows
+/// A color frame as JFIF `Y'CbCr` 4:2:0 planes written straight from its rows
 /// into one pooled buffer (1.5 bytes a pixel, where RGB would take 3) and
 /// compressed without libjpeg-turbo's own color conversion and
 /// downsampling, which the rows' conversion does across cores: a 12 MP
@@ -212,7 +218,7 @@ fn encode_planes(frame: &Frame, quality: i32) -> Result<Body<'static>> {
     )
 }
 
-/// The layout of a frame's JFIF Y'CbCr 4:2:0 planes in one buffer, as
+/// The layout of a frame's JFIF `Y'CbCr` 4:2:0 planes in one buffer, as
 /// libjpeg-turbo and nvJPEG read them: luma in whole 2x2 blocks (an odd
 /// last column or row repeated into the padding, as libjpeg-turbo pads RGB
 /// itself), then Cb, then Cr.
@@ -225,22 +231,22 @@ pub(crate) struct Planes {
 
 #[cfg(any(feature = "jpeg", all(jpeg_helper, feature = "nvjpeg")))]
 impl Planes {
-    pub(crate) fn of(width: usize, height: usize) -> Self {
+    pub(crate) const fn of(width: usize, height: usize) -> Self {
         Self {
             luma_width: width.next_multiple_of(2),
             luma_rows: height.next_multiple_of(2),
         }
     }
-    pub(crate) fn luma_len(&self) -> usize {
+    pub(crate) const fn luma_len(&self) -> usize {
         self.luma_width * self.luma_rows
     }
-    pub(crate) fn chroma_width(&self) -> usize {
+    pub(crate) const fn chroma_width(&self) -> usize {
         self.luma_width / 2
     }
-    pub(crate) fn chroma_len(&self) -> usize {
+    pub(crate) const fn chroma_len(&self) -> usize {
         self.chroma_width() * self.luma_rows / 2
     }
-    pub(crate) fn len(&self) -> usize {
+    pub(crate) const fn len(&self) -> usize {
         self.luma_len() + 2 * self.chroma_len()
     }
     /// `view`'s planes, written from its rows into `planes`.
@@ -275,15 +281,20 @@ impl Planes {
     }
 }
 
+/// Compress a raster in software at the default JPEG quality.
+///
+/// # Errors
+/// Returns an error if JPEG support is unavailable, the raster is invalid,
+/// or the software encoder cannot initialize or compress it.
 #[cfg(any(test, feature = "testing"))]
-pub fn software(raster: &Raster) -> Result<Body<'static>> {
+pub fn software(raster: &Raster<'_>) -> Result<Body<'static>> {
     software_quality(raster, QUALITY)
 }
 
 /// libjpeg-turbo at a chosen quality (1–100), from a converted raster: for
 /// previews, and for stills of formats `encode` cannot read in place.
 #[cfg(feature = "jpeg")]
-pub fn software_quality(raster: &Raster, quality: i32) -> Result<Body<'static>> {
+pub(crate) fn software_quality(raster: &Raster<'_>, quality: i32) -> Result<Body<'static>> {
     use turbojpeg::PixelFormat;
     let format = if raster.channels == 1 {
         PixelFormat::GRAY
@@ -324,13 +335,13 @@ fn compress(
 }
 
 #[cfg(not(feature = "jpeg"))]
-pub fn software_quality(_: &Raster, _: i32) -> Result<Body<'static>> {
+pub(crate) fn software_quality(_: &Raster<'_>, _: i32) -> Result<Body<'static>> {
     bail!("JPEG is unsupported in this build; rebuild with --features jpeg or capture png")
 }
 
 /// A complete baseline JPEG: SOI, a frame header with the expected size,
 /// EOI. A hardware engine's output must be one before it is kept.
-pub fn well_formed(bytes: &[u8], width: u32, height: u32) -> bool {
+pub(crate) fn well_formed(bytes: &[u8], width: u32, height: u32) -> bool {
     if bytes.len() < 4 || bytes[..2] != [0xFF, 0xD8] || bytes[bytes.len() - 2..] != [0xFF, 0xD9] {
         return false;
     }
@@ -340,10 +351,13 @@ pub fn well_formed(bytes: &[u8], width: u32, height: u32) -> bool {
         let length = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
         // Baseline, extended or progressive Huffman frame header.
         if matches!(marker, 0xC0..=0xC2) {
-            return bytes.get(i + 5..i + 9).is_some_and(|size| {
-                u16::from_be_bytes([size[0], size[1]]) as u32 == height
-                    && u16::from_be_bytes([size[2], size[3]]) as u32 == width
-            });
+            return bytes
+                .get(i + 5..)
+                .and_then(<[u8]>::first_chunk::<4>)
+                .is_some_and(|size| {
+                    u32::from(u16::from_be_bytes([size[0], size[1]])) == height
+                        && u32::from(u16::from_be_bytes([size[2], size[3]])) == width
+                });
         }
         if marker == 0xDA || length < 2 {
             return false;
@@ -356,7 +370,7 @@ pub fn well_formed(bytes: &[u8], width: u32, height: u32) -> bool {
 /// Whether a JPEG has Huffman tables of its own before its first scan.
 /// Motion JPEG from many webcams leaves them out (AVI1) for the standard
 /// ones, which a file read alone must carry.
-pub fn has_huffman_tables(jpeg: &[u8]) -> bool {
+pub(crate) fn has_huffman_tables(jpeg: &[u8]) -> bool {
     let mut i = 2;
     while i + 4 <= jpeg.len() && jpeg[i] == 0xFF {
         match jpeg[i + 1] {
@@ -414,8 +428,11 @@ pub(crate) mod huffman {
 
 /// The typical Huffman tables of ITU-T T.81 annex K.3 as one DHT segment:
 /// what a JPEG without tables of its own is decoded with.
-pub fn standard_huffman_tables() -> Vec<u8> {
-    use huffman::*;
+pub(crate) fn standard_huffman_tables() -> Vec<u8> {
+    use huffman::{
+        AC_CHROMINANCE, AC_CHROMINANCE_VALUES, AC_LUMINANCE, AC_LUMINANCE_VALUES, DC_CHROMINANCE,
+        DC_LUMINANCE, DC_VALUES,
+    };
     // Table class and destination, then the code counts and values.
     let tables: [(u8, &[u8], &[u8]); 4] = [
         (0x00, &DC_LUMINANCE, &DC_VALUES),
@@ -428,7 +445,11 @@ pub fn standard_huffman_tables() -> Vec<u8> {
         .map(|(_, counts, values)| 1 + counts.len() + values.len())
         .sum::<usize>();
     let mut segment = vec![0xFF, 0xC4];
-    segment.extend_from_slice(&(length as u16).to_be_bytes());
+    segment.extend_from_slice(
+        &u16::try_from(length)
+            .expect("the four fixed Huffman tables fit a JPEG segment")
+            .to_be_bytes(),
+    );
     for (class, counts, values) in tables {
         segment.push(class);
         segment.extend_from_slice(counts);
@@ -438,9 +459,9 @@ pub fn standard_huffman_tables() -> Vec<u8> {
 }
 
 /// Where a COM (comment) segment goes in an encoded JPEG: after SOI and any
-/// leading APPn segments, so a JFIF or EXIF header stays first. It works on
+/// leading `APPn` segments, so a JFIF or EXIF header stays first. It works on
 /// the finished bytes, so the comment does not depend on which encoder ran.
-pub fn com_offset(jpeg: &[u8]) -> Result<usize> {
+pub(crate) fn com_offset(jpeg: &[u8]) -> Result<usize> {
     anyhow::ensure!(
         jpeg.len() >= 4 && jpeg[..2] == [0xFF, 0xD8],
         "not a JPEG image"
@@ -457,19 +478,24 @@ pub fn com_offset(jpeg: &[u8]) -> Result<usize> {
     Ok(at)
 }
 /// A COM segment holding `payload`.
-pub fn com_segment(payload: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn com_segment(payload: &[u8]) -> Result<Vec<u8>> {
     anyhow::ensure!(
         payload.len() <= usize::from(u16::MAX) - 2,
         "JPEG comment is too long"
     );
     let mut segment = Vec::with_capacity(payload.len() + 4);
     segment.extend_from_slice(&[0xFF, 0xFE]);
-    segment.extend_from_slice(&(payload.len() as u16 + 2).to_be_bytes());
+    let length = u16::try_from(payload.len() + 2)?;
+    segment.extend_from_slice(&length.to_be_bytes());
     segment.extend_from_slice(payload);
     Ok(segment)
 }
 /// The JPEG with a COM segment holding `payload` in its place, in one
 /// buffer; stills write the two as parts instead.
+///
+/// # Errors
+/// Returns an error if the payload exceeds a JPEG comment segment
+/// or the JPEG header cannot be parsed to find the insertion position.
 #[cfg(any(test, feature = "testing"))]
 pub fn insert_com(jpeg: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
     let segment = com_segment(payload)?;
@@ -480,6 +506,17 @@ pub fn insert_com(jpeg: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn comment_segments_preserve_the_full_wire_length() {
+        let mut payload = vec![0x41; usize::from(u16::MAX) - 2];
+        let segment = com_segment(&payload).unwrap();
+        assert_eq!(&segment[..2], &[0xFF, 0xFE]);
+        assert_eq!(u16::from_be_bytes([segment[2], segment[3]]), u16::MAX);
+        assert_eq!(&segment[4..], payload);
+        payload.push(0x41);
+        com_segment(&payload).unwrap_err();
+    }
+
     #[test]
     fn comments_follow_app_segments() {
         // SOI, APP0 of length 4, a frame header, EOI.
@@ -494,11 +531,10 @@ mod tests {
         // Straight after SOI when there is no APPn.
         let bare = insert_com(&[0xFF, 0xD8, 0xFF, 0xD9], b"x").unwrap();
         assert_eq!(bare, [0xFF, 0xD8, 0xFF, 0xFE, 0, 3, b'x', 0xFF, 0xD9]);
-        assert!(insert_com(&jpeg, &vec![0; 65_534]).is_err());
-        assert!(insert_com(b"\x89PNG", b"x").is_err());
-        assert!(insert_com(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 40, 0xFF, 0xD9], b"x").is_err());
+        insert_com(&jpeg, &vec![0; 65_534]).unwrap_err();
+        insert_com(b"\x89PNG", b"x").unwrap_err();
+        insert_com(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 40, 0xFF, 0xD9], b"x").unwrap_err();
     }
-    #[cfg(feature = "jpeg")]
     use crate::types::RGB8;
     fn frame(pixel_format: u32, width: u32, height: u32, bytes: usize) -> Frame {
         Frame {
@@ -509,7 +545,7 @@ mod tests {
             device_ts_ns: None,
             wall_ms: 0,
             data: (0..width as usize * height as usize * bytes)
-                .map(|i| (i * 7 + i / 64) as u8)
+                .map(|i| (i * 7 + i / 64).to_le_bytes()[0])
                 .collect(),
             jpeg: None,
         }
@@ -530,16 +566,16 @@ mod tests {
         let bayer = Raster::new(&mosaic).unwrap();
         assert_eq!((bayer.channels, bayer.data.len()), (3, 72));
         // 8-bit gray and RGB are the frame's own bytes.
-        for (format, bytes) in [(MONO8, 1), (crate::types::RGB8, 3)] {
+        for (format, bytes) in [(MONO8, 1), (RGB8, 3)] {
             let source = frame(format, 6, 4, bytes);
             let raster = Raster::new(&source).unwrap();
             assert_eq!(raster.data.as_ptr(), source.data.as_ptr(), "{format:x}");
         }
         // Mono14 and packed Mono12p stay gray; packed BayerRG12p is color.
-        for (format, bytes) in [(0x0110_0025, 2.0), (0x010c_0047, 1.5), (0x010c_0059, 1.5)] {
-            let size = (6.0 * 4.0 * bytes) as usize;
+        for (format, bits) in [(0x0110_0025, 16usize), (0x010c_0047, 12), (0x010c_0059, 12)] {
+            let size = (6 * 4 * bits).div_ceil(8);
             let packed = Frame {
-                data: (0..size).map(|i| (i * 37) as u8).collect(),
+                data: (0..size).map(|i| (i * 37).to_le_bytes()[0]).collect(),
                 ..frame(format, 6, 4, 0)
             };
             let raster = Raster::new(&packed).unwrap();
@@ -588,7 +624,7 @@ mod tests {
             assert!(!well_formed(&jpeg, width + 1, height));
             // Component count in SOF0: 1 for gray, 3 for color.
             let sof = jpeg.windows(2).position(|w| w == [0xFF, 0xC0]).unwrap();
-            assert_eq!(jpeg[sof + 9], raster.channels as u8);
+            assert_eq!(jpeg[sof + 9], u8::try_from(raster.channels).unwrap());
         }
     }
     #[cfg(feature = "jpeg")]
@@ -605,11 +641,11 @@ mod tests {
             software_quality(&raster, QUALITY).unwrap()
         );
         for quality in [0, 101] {
-            assert!(software_quality(&raster, quality).is_err());
+            software_quality(&raster, quality).unwrap_err();
         }
     }
 
-    /// Color stills compressed from Y'CbCr planes look as the RGB path's
+    /// Color stills compressed from `Y'CbCr` planes look as the RGB path's
     /// did: within a fraction of a decibel of the frame, at every size.
     #[cfg(feature = "jpeg")]
     #[test]
@@ -643,7 +679,7 @@ mod tests {
                 .data
                 .iter()
                 .enumerate()
-                .map(|(i, _)| ((i * 3) / 7 % 256) as u8)
+                .map(|(i, _)| u8::try_from((i * 3) / 7 % 256).unwrap())
                 .collect();
             frame.data = smooth.into();
             let source = crate::frame::rgb(&frame).unwrap();
@@ -673,9 +709,11 @@ mod tests {
         for (width, height) in [(64u32, 48u32), (63, 47)] {
             let (w, h) = (width as usize, height as usize);
             let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
-            let mut data: Vec<u8> = (0..w * h).map(|i| (i % w * 255 / w) as u8).collect();
-            data.extend((0..cw * ch).map(|i| (100 + i % cw) as u8));
-            data.extend((0..cw * ch).map(|i| (150 - i / cw) as u8));
+            let mut data: Vec<u8> = (0..w * h)
+                .map(|i| u8::try_from(i % w * 255 / w).unwrap())
+                .collect();
+            data.extend((0..cw * ch).map(|i| u8::try_from(100 + i % cw).unwrap()));
+            data.extend((0..cw * ch).map(|i| u8::try_from(150 - i / cw).unwrap()));
             let frame = Frame {
                 width,
                 height,

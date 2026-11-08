@@ -6,6 +6,7 @@
 //!
 //! `cargo test --features copy-audit --test copies -- --nocapture` prints
 //! the per-frame numbers.
+#![deny(clippy::doc_markdown)]
 #![cfg(feature = "copy-audit")]
 mod support;
 
@@ -171,14 +172,12 @@ fn counted_env(home: &Home, env: &[(&str, &str)], out: &str, args: &[&str]) -> (
         &[&["--json"][..], args].concat(),
     );
     let result = run.success();
-    let files = std::fs::read_dir(home.path(out))
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|entry| entry.metadata().unwrap().len() as i64)
-                .sum()
-        })
-        .unwrap_or(0);
+    let files = std::fs::read_dir(home.path(out)).map_or(0, |entries| {
+        entries
+            .flatten()
+            .map(|entry| i64::try_from(entry.metadata().unwrap().len()).unwrap())
+            .sum()
+    });
     (counts(&folder), result, files)
 }
 
@@ -220,6 +219,10 @@ fn capture_delta_env(
 
 /// One line of per-frame numbers.
 fn show(name: &str, delta: &Value, frames: i64) {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "per-frame reports intentionally round floating-point averages to signed integer counters"
+    )]
     let per = |bytes: i64| json!((bytes as f64 / frames as f64).round() as i64);
     let classes: Map<String, Value> = classes(delta)
         .into_iter()
@@ -276,7 +279,10 @@ fn raw_captures_copy_nothing_in_user_space() {
             40,
             "{format}: a raw file and its sidecar"
         );
-        assert!(files > 20 * frame_bytes(format) as i64, "{format}");
+        assert!(
+            files > 20 * i64::try_from(frame_bytes(format)).unwrap(),
+            "{format}"
+        );
         assert_pooled(format, &delta);
         assert!(
             large_beside_pool(&delta) as f64 / 20.0 <= LARGE_PER_FRAME,
@@ -298,7 +304,11 @@ fn still_captures_encode_from_the_frame_in_place() {
             // within the budget.
             let n = if name == "png" { 10 } else { 20 };
             let (delta, files) = capture_delta(&home, format, extra, n);
-            show(&format!("capture -f {name} {format}"), &delta, n as i64);
+            show(
+                &format!("capture -f {name} {format}"),
+                &delta,
+                i64::try_from(n).unwrap(),
+            );
             assert_eq!(
                 class_bytes(&delta, "avoidable"),
                 0,
@@ -311,7 +321,10 @@ fn still_captures_encode_from_the_frame_in_place() {
                 // The PNG encoder's own compressed-data buffer grows by
                 // doubling inside the png crate, beside the one output
                 // buffer: one allocation per doubling past 256 KiB.
-                let doublings = (files / n as i64 / (256 << 10)).max(1).ilog2() + 2;
+                let doublings = (files / i64::try_from(n).unwrap() / (256 << 10))
+                    .max(1)
+                    .ilog2()
+                    + 2;
                 assert!(per_file <= f64::from(doublings) + 1.0, "{format}: {delta}");
             } else {
                 // libjpeg-turbo writes into its own (C) buffer.
@@ -340,7 +353,10 @@ fn stdout_captures_write_the_frame_once() {
     let report = counts(&folder);
     show("capture -o - -f raw Mono8", &report, 1);
     assert_eq!(run.raw.len(), WIDTH * HEIGHT);
-    assert_eq!(site(&report, "stdout_write"), (WIDTH * HEIGHT) as i64);
+    assert_eq!(
+        site(&report, "stdout_write"),
+        i64::try_from(WIDTH * HEIGHT).unwrap()
+    );
     assert_eq!(calls(&report, "stdout_write"), 1);
     assert_eq!(class_bytes(&report, "avoidable"), 0, "{report}");
 }
@@ -350,7 +366,7 @@ fn counting_session(home: &Home, name: &str, folder: &Path) -> support::cli::Ses
     std::fs::create_dir_all(folder).unwrap();
     let mut command = home.command();
     command.env("CAPTUREFAB_COPY_REPORT", folder);
-    home.serve_in(&mut command, name, &["sim:0"], &[])
+    Home::serve_in(&mut command, name, &["sim:0"], &[])
 }
 
 /// What `inspections` more inspections of a session camera in `format`
@@ -401,7 +417,7 @@ fn inspections_shrink_the_frame_in_place() {
             largest_class(&delta)
         );
         assert!(
-            largest_class(&delta) <= preview.next_power_of_two() as i64,
+            largest_class(&delta) <= i64::try_from(preview.next_power_of_two()).unwrap(),
             "{format}: {delta}"
         );
     }
@@ -451,7 +467,7 @@ fn every_format_converts_once_into_its_encoder() {
             let n = if name == "png" { 5 } else { 20 };
             let (delta, files) = capture_delta(&home, format, extra, n);
             let label = format!("capture -f {name} {format}");
-            show(&label, &delta, n as i64);
+            show(&label, &delta, i64::try_from(n).unwrap());
             assert_no_avoidable(&label, &delta);
             assert_eq!(site(&delta, "file_write"), files, "{label}");
             assert_pooled(&label, &delta);
@@ -461,7 +477,10 @@ fn every_format_converts_once_into_its_encoder() {
                 // The png crate's compressed-data buffer grows by doubling
                 // beside the one output buffer (see above).
                 "png" => {
-                    let doublings = (files / n as i64 / (256 << 10)).max(1).ilog2() + 2;
+                    let doublings = (files / i64::try_from(n).unwrap() / (256 << 10))
+                        .max(1)
+                        .ilog2()
+                        + 2;
                     assert!(per_file <= f64::from(doublings) + 1.0, "{label}: {delta}");
                 }
                 // Converted formats also take a transform buffer per encoder
@@ -510,7 +529,7 @@ fn the_jpeg_engine_encodes_from_the_frame() {
         let n = 20;
         let (delta, files) = capture_delta_env(&home, &engine, format, &["-f", "jpg"], n);
         let label = format!("capture -f jpg {format} (VideoToolbox)");
-        show(&label, &delta, n as i64);
+        show(&label, &delta, i64::try_from(n).unwrap());
         assert_no_avoidable(&label, &delta);
         assert_eq!(calls(&delta, "output_copy"), 0, "{label}: {delta}");
         assert_eq!(site(&delta, "file_write"), files, "{label}");
@@ -566,13 +585,13 @@ fn the_gpu_jpeg_engines_encode_from_the_frame() {
             let n = 20;
             let (delta, files) = capture_delta_env(&home, &engine, format, &["-f", "jpg"], n);
             let label = format!("capture -f jpg {format} ({name})");
-            show(&label, &delta, n as i64);
+            show(&label, &delta, i64::try_from(n).unwrap());
             assert_no_avoidable(&label, &delta);
             assert_eq!(site(&delta, "file_write"), files, "{label}");
             // Frames are read where the camera wrote them: none is copied
             // for the helper once it runs.
             assert!(
-                site(&delta, "gpu_upload") <= frame_bytes(format) as i64,
+                site(&delta, "gpu_upload") <= i64::try_from(frame_bytes(format)).unwrap(),
                 "{label}: {delta}"
             );
         }
@@ -594,7 +613,7 @@ fn every_format_inspects_in_place() {
             assert_no_avoidable(&label, &delta);
             let preview = WIDTH * HEIGHT * 3 / 4;
             assert!(
-                largest_class(&delta) <= preview.next_power_of_two() as i64,
+                largest_class(&delta) <= i64::try_from(preview.next_power_of_two()).unwrap(),
                 "{label}: {delta}"
             );
         }
@@ -669,7 +688,7 @@ fn recordings_pipe_the_frame_or_unpack_it_once() {
             "{format}: {report}"
         );
         if converted {
-            let narrowed = (WIDTH * HEIGHT) as i64 * written;
+            let narrowed = i64::try_from(WIDTH * HEIGHT).unwrap() * written;
             assert_eq!(
                 site(&report, "ffmpeg_unpack"),
                 narrowed,

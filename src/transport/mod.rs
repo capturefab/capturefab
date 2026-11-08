@@ -1,4 +1,4 @@
-pub mod gige;
-pub mod simulator;
+pub(crate) mod gige;
+pub(crate) mod simulator;
 #[cfg(feature = "usb")]
-pub mod usb;
+pub(crate) mod usb;

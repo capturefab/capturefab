@@ -1,5 +1,6 @@
 //! Camera commands that read or configure: list, info, features, get, set,
 //! exec.
+#![forbid(unsafe_code)]
 use super::{Client, Global, args::CameraArg, args::CamerasArg, args::KeepArg, output::Report};
 use crate::controls::{Assignment, FeatureFilter, Name};
 use crate::session::SessionCommand;
@@ -8,10 +9,11 @@ use anyhow::Result;
 use clap::{Args, ValueEnum};
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::fmt::Write as _;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum Kind {
+pub(crate) enum Kind {
     Gige,
     U3v,
     Webcam,
@@ -21,18 +23,18 @@ pub enum Kind {
 }
 
 #[derive(Debug, Args)]
-pub struct ListArgs {
+pub(crate) struct ListArgs {
     /// Only these kinds (comma-separated); screen captures and sim:0 are listed only when named
     #[arg(long, value_delimiter = ',', value_name = "KIND")]
     pub kind: Vec<Kind>,
-    /// How long GigE and ONVIF broadcasts collect answers
-    #[arg(long, default_value = "1s", value_name = "DUR", value_parser = super::args::duration)]
+    /// How long `GigE` and ONVIF broadcasts collect answers
+    #[arg(help = "How long GigE and ONVIF broadcasts collect answers", long, default_value = "1s", value_name = "DUR", value_parser = super::args::duration)]
     pub timeout: std::time::Duration,
 }
 
 /// One `list` row.
 #[derive(Debug, Clone, Serialize)]
-pub struct Row {
+pub(super) struct Row {
     pub id: String,
     pub kind: &'static str,
     pub vendor: String,
@@ -48,13 +50,13 @@ pub struct Row {
 
 /// The `list` result.
 #[derive(Debug, Serialize)]
-pub struct ListResult {
+pub(super) struct ListResult {
     pub cameras: Vec<Row>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
 impl ListResult {
-    pub const FIELDS: &[(&str, &str)] = &[
+    pub(super) const FIELDS: &[(&str, &str)] = &[
         (
             "cameras",
             "[{id,kind:gige|u3v|webcam|screen|onvif|stream|file|sim,vendor,model,serial,address,held_by?:{session,idle_releases_in_s?}}] — pass id to -c; held_by: a session keeps it open, the auto session for idle_releases_in_s more seconds unless used",
@@ -66,7 +68,7 @@ impl ListResult {
     ];
 }
 
-pub fn row(info: &CameraInfo) -> Row {
+pub(super) fn row(info: &CameraInfo) -> Row {
     let media = info.transport == crate::types::Transport::Media;
     Row {
         id: crate::media::redact_url(&info.id),
@@ -107,7 +109,7 @@ fn held(rows: &mut [Row]) {
     }
 }
 
-pub fn list(global: &Global, args: ListArgs) -> Result<Report> {
+pub(super) fn list(global: &Global, args: &ListArgs) -> Result<Report> {
     let named = |kind| args.kind.contains(&kind);
     let all = args.kind.is_empty();
     let kinds = crate::camera::Kinds {
@@ -150,7 +152,7 @@ pub fn list(global: &Global, args: ListArgs) -> Result<Report> {
     } else {
         text.push_str(&table(
             &["ID", "KIND", "MODEL", "SERIAL", "ADDRESS", "HELD BY"],
-            result
+            &result
                 .cameras
                 .iter()
                 .map(|row| {
@@ -167,7 +169,7 @@ pub fn list(global: &Global, args: ListArgs) -> Result<Report> {
                             .unwrap_or_default(),
                     ]
                 })
-                .collect(),
+                .collect::<Vec<_>>(),
         ));
     }
     if !global.json {
@@ -179,63 +181,82 @@ pub fn list(global: &Global, args: ListArgs) -> Result<Report> {
 }
 
 /// Columns sized to their cells; a column empty in every row is left out.
-pub(super) fn table(headers: &[&str], rows: Vec<Vec<String>>) -> String {
-    let shown = (0..headers.len())
+pub(super) fn table(headers: &[&str], rows: &[Vec<String>]) -> String {
+    let columns = (0..headers.len())
         .filter(|&column| column == 0 || rows.iter().any(|row| !row[column].is_empty()))
+        .map(|column| {
+            let width = rows
+                .iter()
+                .map(|row| row[column].chars().count())
+                .chain([headers[column].len()])
+                .max()
+                .unwrap_or(0);
+            (column, width)
+        })
         .collect::<Vec<_>>();
-    let width = |column: usize| {
-        rows.iter()
-            .map(|row| row[column].chars().count())
-            .chain([headers[column].len()])
-            .max()
-            .unwrap_or(0)
-    };
-    let widths = shown
-        .iter()
-        .map(|&column| width(column))
-        .collect::<Vec<_>>();
-    let line = |cells: Vec<&str>| {
-        let mut line = String::new();
-        for (position, &column) in shown.iter().enumerate() {
-            let cell = cells[column];
-            line.push_str(cell);
-            if position + 1 < shown.len() {
-                line.push_str(&" ".repeat(widths[position] - cell.chars().count() + 2));
+    #[allow(
+        single_use_lifetimes,
+        reason = "Rust 1.89 requires a named lifetime for references in impl Trait"
+    )]
+    fn line<'a>(
+        text: &mut String,
+        columns: &[(usize, usize)],
+        cells: impl IntoIterator<Item = &'a str>,
+    ) {
+        let start = text.len();
+        let mut cells = cells.into_iter().enumerate();
+        for (position, &(column, width)) in columns.iter().enumerate() {
+            let (_, cell) = cells
+                .find(|(index, _)| *index == column)
+                .expect("table rows match their headers");
+            text.push_str(cell);
+            if position + 1 < columns.len() {
+                text.extend(std::iter::repeat_n(' ', width - cell.chars().count() + 2));
             }
         }
-        line.trim_end().to_owned() + "\n"
-    };
-    let mut text = line(headers.to_vec());
-    for row in &rows {
-        text.push_str(&line(row.iter().map(String::as_str).collect()));
+        let length = text
+            .get(start..)
+            .expect("appended table cells start on a character boundary")
+            .trim_end()
+            .len();
+        text.truncate(start + length);
+        text.push('\n');
+    }
+    let mut text = String::new();
+    line(&mut text, &columns, headers.iter().copied());
+    for row in rows {
+        line(&mut text, &columns, row.iter().map(String::as_str));
     }
     text
 }
 
 #[derive(Debug, Args)]
-pub struct InfoArgs {
+pub(crate) struct InfoArgs {
     #[command(flatten)]
     pub camera: CameraArg,
     #[command(flatten)]
     pub keep: KeepArg,
 }
 
-pub fn info(global: &Global, args: InfoArgs) -> Result<Report> {
+pub(super) fn info(global: &Global, args: &InfoArgs) -> Result<Report> {
     let client = Client::open_with(global, args.camera.camera.as_deref(), args.keep.route())?;
     let value = client.call(SessionCommand::Info)?;
     let text = info_text(&value);
     Ok(Report::json(value).text(text))
 }
 
-fn shown(value: &Value) -> String {
+fn shown(value: &Value) -> Cow<'_, str> {
     match value {
-        Value::Null => String::new(),
-        Value::String(text) => text.clone(),
+        Value::Null => Cow::Borrowed(""),
+        Value::String(text) => Cow::Borrowed(text),
         Value::Number(number) => {
-            let text = number.to_string();
-            text.strip_suffix(".0").map(str::to_owned).unwrap_or(text)
+            let mut text = number.to_string();
+            if text.ends_with(".0") {
+                text.truncate(text.len() - 2);
+            }
+            Cow::Owned(text)
         }
-        other => other.to_string(),
+        other => Cow::Owned(other.to_string()),
     }
 }
 
@@ -270,54 +291,52 @@ fn info_text(value: &Value) -> String {
         let _ = writeln!(text, "  gain        {} {}", get("gain"), get("gain_unit"));
     }
     if value.get("fps").is_some() || value.get("fps_limit").is_some() {
-        let _ = writeln!(
+        let _ = write!(
             text,
-            "  fps         {}{}",
-            value.get("fps").map(shown).unwrap_or_else(|| "?".into()),
-            value
-                .get("fps_limit")
-                .map(|limit| format!(" (limit {})", shown(limit)))
-                .unwrap_or_default()
+            "  fps         {}",
+            value.get("fps").map_or_else(|| "?".into(), shown)
         );
+        if let Some(limit) = value.get("fps_limit") {
+            let _ = write!(text, " (limit {})", shown(limit));
+        }
+        text.push('\n');
     }
     if let Some(trigger) = value.get("trigger") {
-        let _ = writeln!(
+        let _ = write!(
             text,
-            "  trigger     {}{}{}",
-            trigger["mode"].as_str().unwrap_or("Off"),
-            trigger["source"]
-                .as_str()
-                .map(|source| format!(" from {source}"))
-                .unwrap_or_default(),
-            trigger["activation"]
-                .as_str()
-                .filter(|_| trigger["mode"] == "On")
-                .map(|activation| format!(" on {activation}"))
-                .unwrap_or_default()
+            "  trigger     {}",
+            trigger["mode"].as_str().unwrap_or("Off")
         );
+        if let Some(source) = trigger["source"].as_str() {
+            let _ = write!(text, " from {source}");
+        }
+        if let Some(activation) = trigger["activation"]
+            .as_str()
+            .filter(|_| trigger["mode"] == "On")
+        {
+            let _ = write!(text, " on {activation}");
+        }
+        text.push('\n');
     }
     if let Some(controls) = value["controls"].as_object().filter(|c| !c.is_empty()) {
-        let _ = writeln!(
-            text,
-            "  controls    {}",
-            controls
-                .iter()
-                .map(|(name, control)| format!(
-                    "{name}={}",
-                    control
-                        .get("value")
-                        .map(shown)
-                        .unwrap_or_else(|| "?".into())
-                ))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
+        text.push_str("  controls    ");
+        for (index, (name, control)) in controls.iter().enumerate() {
+            if index > 0 {
+                text.push(' ');
+            }
+            let _ = write!(
+                text,
+                "{name}={}",
+                control.get("value").map_or_else(|| "?".into(), shown)
+            );
+        }
+        text.push('\n');
     }
     text
 }
 
 #[derive(Debug, Args)]
-pub struct FeaturesArgs {
+pub(crate) struct FeaturesArgs {
     #[command(flatten)]
     pub camera: CameraArg,
     /// Only names containing this text, or matching a glob such as 'Exposure*'
@@ -326,14 +345,18 @@ pub struct FeaturesArgs {
     /// Every visibility level (Expert, Guru); a PATTERN or --category also searches every level
     #[arg(long)]
     pub all: bool,
-    /// Only this category, such as ImageFormatControl
-    #[arg(long, value_name = "NAME")]
+    /// Only this category, such as `ImageFormatControl`
+    #[arg(
+        help = "Only this category, such as ImageFormatControl",
+        long,
+        value_name = "NAME"
+    )]
     pub category: Option<String>,
     #[command(flatten)]
     pub keep: KeepArg,
 }
 
-pub fn features(global: &Global, args: FeaturesArgs) -> Result<Report> {
+pub(super) fn features(global: &Global, args: FeaturesArgs) -> Result<Report> {
     let filter = FeatureFilter {
         pattern: args.pattern,
         all: args.all,
@@ -356,8 +379,12 @@ pub fn features(global: &Global, args: FeaturesArgs) -> Result<Report> {
             };
             vec![
                 row["name"].as_str().unwrap_or_default().to_owned(),
-                row.get("value").map(shown).unwrap_or_default(),
-                row.get("unit").map(shown).unwrap_or_default(),
+                row.get("value")
+                    .map(|value| shown(value).into_owned())
+                    .unwrap_or_default(),
+                row.get("unit")
+                    .map(|value| shown(value).into_owned())
+                    .unwrap_or_default(),
                 row["access"].as_str().unwrap_or_default().to_owned(),
                 range,
                 row.get("locked_by")
@@ -369,7 +396,7 @@ pub fn features(global: &Global, args: FeaturesArgs) -> Result<Report> {
     let mut text = if rows.is_empty() {
         "No features match.\n".to_owned()
     } else {
-        table(&["NAME", "VALUE", "UNIT", "ACCESS", "RANGE", "NOTE"], rows)
+        table(&["NAME", "VALUE", "UNIT", "ACCESS", "RANGE", "NOTE"], &rows)
     };
     if let Some(truncated) = value.get("truncated") {
         let _ = writeln!(
@@ -381,17 +408,21 @@ pub fn features(global: &Global, args: FeaturesArgs) -> Result<Report> {
 }
 
 #[derive(Debug, Args)]
-pub struct GetArgs {
+pub(crate) struct GetArgs {
     #[command(flatten)]
     pub cameras: CamerasArg,
-    /// Features, banks (TriggerMode[FrameStart]) or controls (exposure, gain, fps, roi, format, trigger, auto_exposure, auto_wb)
-    #[arg(required = true, value_name = "NAME")]
+    /// Features, banks such as `TriggerMode[FrameStart]`, or canonical controls.
+    #[arg(
+        required = true,
+        value_name = "NAME",
+        help = "Features, banks (TriggerMode[FrameStart]) or controls (exposure, gain, fps, roi, format, trigger, auto_exposure, auto_wb)"
+    )]
     pub names: Vec<String>,
     #[command(flatten)]
     pub keep: KeepArg,
 }
 
-pub fn get(global: &Global, args: GetArgs) -> Result<Report> {
+pub(super) fn get(global: &Global, args: &GetArgs) -> Result<Report> {
     let names = args
         .names
         .iter()
@@ -404,12 +435,13 @@ pub fn get(global: &Global, args: GetArgs) -> Result<Report> {
         })
     };
     let lines = |value: &Value| -> String {
-        value["values"]
-            .as_object()
-            .into_iter()
-            .flatten()
-            .map(|(name, value)| format!("{name} = {}\n", shown(value)))
-            .collect()
+        let mut text = String::new();
+        if let Some(values) = value["values"].as_object() {
+            for (name, value) in values {
+                let _ = writeln!(text, "{name} = {}", shown(value));
+            }
+        }
+        text
     };
     if args.cameras.cameras.len() <= 1 {
         let value = read(args.cameras.cameras.first().map(String::as_str))?;
@@ -440,11 +472,15 @@ pub fn get(global: &Global, args: GetArgs) -> Result<Report> {
 }
 
 #[derive(Debug, Args)]
-pub struct SetArgs {
+pub(crate) struct SetArgs {
     #[command(flatten)]
     pub camera: CameraArg,
-    /// NAME=VALUE: a feature (ExposureTime=10ms), a bank (TriggerMode[FrameStart]=On) or a control (exposure=5ms, roi=0,0,640,480)
-    #[arg(required = true, value_name = "NAME=VALUE")]
+    /// `NAME=VALUE` assignments for features, banks and canonical controls.
+    #[arg(
+        required = true,
+        value_name = "NAME=VALUE",
+        help = "NAME=VALUE: a feature (ExposureTime=10ms), a bank (TriggerMode[FrameStart]=On) or a control (exposure=5ms, roi=0,0,640,480)"
+    )]
     pub values: Vec<String>,
     /// Check every value against the camera and show the writes in order; change nothing
     #[arg(long)]
@@ -453,7 +489,7 @@ pub struct SetArgs {
     pub keep: KeepArg,
 }
 
-pub fn set(global: &Global, args: SetArgs) -> Result<Report> {
+pub(super) fn set(global: &Global, args: &SetArgs) -> Result<Report> {
     let values = args
         .values
         .iter()
@@ -483,8 +519,8 @@ pub fn set(global: &Global, args: SetArgs) -> Result<Report> {
             "{}{}: {} → {}",
             if args.dry_run { "  " } else { "" },
             row["name"].as_str().unwrap_or_default(),
-            row.get("from").map(shown).unwrap_or_else(|| "?".into()),
-            row.get("to").map(shown).unwrap_or_else(|| "?".into())
+            row.get("from").map_or_else(|| "?".into(), shown),
+            row.get("to").map_or_else(|| "?".into(), shown)
         );
     }
     for warning in value["warnings"].as_array().into_iter().flatten() {
@@ -494,17 +530,20 @@ pub fn set(global: &Global, args: SetArgs) -> Result<Report> {
 }
 
 #[derive(Debug, Args)]
-pub struct ExecArgs {
+pub(crate) struct ExecArgs {
     #[command(flatten)]
     pub camera: CameraArg,
-    /// A command feature, optionally at a bank: TriggerSoftware, UserSetSave[UserSet1]
-    #[arg(value_name = "COMMAND")]
+    /// A command feature, optionally at a bank.
+    #[arg(
+        value_name = "COMMAND",
+        help = "A command feature, optionally at a bank: TriggerSoftware, UserSetSave[UserSet1]"
+    )]
     pub command: String,
     #[command(flatten)]
     pub keep: KeepArg,
 }
 
-pub fn exec(global: &Global, args: ExecArgs) -> Result<Report> {
+pub(super) fn exec(global: &Global, args: &ExecArgs) -> Result<Report> {
     let name = Name::parse(&args.command)?;
     let client = Client::open_with(global, args.camera.camera.as_deref(), args.keep.route())?;
     let value = client.call(SessionCommand::Exec { name })?;
@@ -517,7 +556,7 @@ pub fn exec(global: &Global, args: ExecArgs) -> Result<Report> {
 }
 
 /// Result fields of these commands, for `schema`.
-pub const GET_FIELDS: &[(&str, &str)] = &[
+pub(super) const GET_FIELDS: &[(&str, &str)] = &[
     ("camera", "string — camera ID"),
     (
         "values",
@@ -525,7 +564,7 @@ pub const GET_FIELDS: &[(&str, &str)] = &[
     ),
     ("cameras", "[{camera,values}] — with -c repeated"),
 ];
-pub const EXEC_FIELDS: &[(&str, &str)] = &[
+pub(super) const EXEC_FIELDS: &[(&str, &str)] = &[
     ("camera", "string — camera ID"),
     ("executed", "string — the command run, with its bank"),
 ];
@@ -535,10 +574,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn info_text_preserves_optional_fields_and_spacing() {
+        let value = json!({
+            "camera": "sim:0", "vendor": "Capturefab", "model": "Test", "kind": "sim",
+            "fps": 25.0, "fps_limit": 30.0,
+            "trigger": {"mode": "On", "source": "Line0", "activation": "RisingEdge"},
+            "controls": {"exposure": {"value": "5ms"}, "gain": {"value": 2.0}, "other": {}}
+        });
+        assert_eq!(
+            info_text(&value),
+            "sim:0  Capturefab Test (sim)\n  fps         25 (limit 30)\n  trigger     On from Line0 on RisingEdge\n  controls    exposure=5ms gain=2 other=?\n"
+        );
+        for (fields, expected) in [
+            (json!({"fps_limit": 30}), "  fps         ? (limit 30)\n"),
+            (json!({"fps": null}), "  fps         \n"),
+            (json!({"trigger": null}), "  trigger     Off\n"),
+            (
+                json!({"trigger": {"mode": "Off", "source": "Software", "activation": "RisingEdge"}}),
+                "  trigger     Off from Software\n",
+            ),
+            (json!({"controls": {}}), ""),
+            (
+                json!({"controls": {"gain": {"value": null}}}),
+                "  controls    gain=\n",
+            ),
+        ] {
+            assert_eq!(info_text(&fields), format!("    ()\n{expected}"));
+        }
+    }
+
+    #[test]
+    fn tables_keep_blank_rows_and_trim_only_the_current_row() {
+        let rows = [
+            vec!["one".into(), String::new(), "x   ".into()],
+            vec![String::new(), String::new(), String::new()],
+            vec!["two".into(), String::new(), String::new()],
+            vec!["é".into(), String::new(), "v".into()],
+        ];
+        assert_eq!(
+            table(&["ID", "HIDDEN", "VALUE"], &rows),
+            "ID   VALUE\none  x\n\ntwo\né    v\n"
+        );
+        assert_eq!(table(&["ID", "HIDDEN"], &[]), "ID\n");
+    }
+
+    #[test]
     fn tables_align_and_drop_empty_columns() {
         let text = table(
             &["ID", "KIND", "SERIAL"],
-            vec![
+            &[
                 vec!["sim:0".into(), "sim".into(), String::new()],
                 vec!["gige:00c0df".into(), "gige".into(), String::new()],
             ],

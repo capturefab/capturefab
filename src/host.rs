@@ -3,7 +3,6 @@
 //! `systemd-run -p MemoryMax=128M`) limit them, so thread pools and frame
 //! queues scale from a 128 MiB board to a many-core server busy with other
 //! work.
-#![allow(unsafe_code)]
 use serde_json::{Value, json};
 use std::{
     sync::{Mutex, OnceLock},
@@ -12,18 +11,18 @@ use std::{
 
 /// Overrides the processing thread limit, for example `CAPTUREFAB_THREADS=1`
 /// on a computer that also runs inference.
-pub const THREADS_ENV: &str = "CAPTUREFAB_THREADS";
+pub(crate) const THREADS_ENV: &str = "CAPTUREFAB_THREADS";
 
 /// The CPUs this process may run on: its affinity mask and cgroup CPU
 /// quota, as the standard library reads them on Linux. At least one.
-pub fn cpus() -> usize {
+pub(crate) fn cpus() -> usize {
     static CPUS: OnceLock<usize> = OnceLock::new();
-    *CPUS.get_or_init(|| std::thread::available_parallelism().map_or(1, |cpus| cpus.get()))
+    *CPUS.get_or_init(|| std::thread::available_parallelism().map_or(1, std::num::NonZero::get))
 }
 
 /// Threads for CPU-bound processing: `wanted`, at most the CPUs this process
 /// may use (up to eight), or at most `CAPTUREFAB_THREADS` when that is set.
-pub fn threads(wanted: usize) -> usize {
+pub(crate) fn threads(wanted: usize) -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
     let limit =
         *LIMIT.get_or_init(|| thread_limit(std::env::var(THREADS_ENV).ok().as_deref(), cpus()));
@@ -34,16 +33,16 @@ fn thread_limit(setting: Option<&str>, cores: usize) -> usize {
     setting
         .and_then(|setting| setting.trim().parse::<usize>().ok())
         .filter(|threads| *threads > 0)
-        .map_or(cores.clamp(1, 8), |threads| threads.min(256))
+        .map_or_else(|| cores.clamp(1, 8), |threads| threads.min(256))
 }
 
 /// What the host and the cgroups this process is in say about memory, in
 /// bytes; None where they say nothing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Memory {
+pub(crate) struct Memory {
     /// The host's memory.
     pub total: Option<u64>,
-    /// What the host can still give without swapping: Linux's MemAvailable,
+    /// What the host can still give without swapping: Linux's `MemAvailable`,
     /// macOS's memory status level.
     pub available: Option<u64>,
     /// The tightest cgroup memory limit, and what that cgroup uses of it
@@ -57,7 +56,7 @@ impl Memory {
     /// The bytes this process may still allocate without pressing the host
     /// or its cgroup: the least of what the host has available and the room
     /// under its cgroups.
-    pub fn budget(&self) -> Option<u64> {
+    pub(crate) fn budget(&self) -> Option<u64> {
         match (self.available, self.room) {
             (Some(available), Some(room)) => Some(available.min(room)),
             (available, room) => available.or(room),
@@ -67,15 +66,17 @@ impl Memory {
 
 /// The memory this process may still use, as `Memory::budget`, read at most
 /// once a second: queues size themselves by it as frames arrive.
-pub fn memory_budget() -> Option<u64> {
+pub(crate) fn memory_budget() -> Option<u64> {
     memory().budget()
 }
 
 /// What the host and cgroups say about memory now, read at most once a
 /// second.
-pub fn memory() -> Memory {
+pub(crate) fn memory() -> Memory {
     static READ: Mutex<Option<(Instant, Memory)>> = Mutex::new(None);
-    let mut read = READ.lock().unwrap_or_else(|e| e.into_inner());
+    let mut read = READ
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some((at, memory)) = *read
         && at.elapsed() < Duration::from_secs(1)
     {
@@ -93,21 +94,25 @@ pub fn memory() -> Memory {
 /// under a small memory cgroup could be killed for it. A fixed threshold
 /// maps every frame-sized buffer and unmaps it when freed, as musl does.
 /// For camera workers, before they start threads.
-pub fn return_freed_frames() {
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub(crate) fn return_freed_frames() {
     // SAFETY: mallopt only changes the allocator's settings.
     unsafe {
         libc::mallopt(libc::M_MMAP_THRESHOLD, 128 << 10);
     }
 }
 
+/// Allocator setup on platforms without glibc's mmap threshold setting.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub(crate) const fn return_freed_frames() {}
+
 /// The cgroup CPU quota, in CPUs, when one is set (`cpu.max`).
-pub fn cpu_quota() -> Option<f64> {
+pub(crate) fn cpu_quota() -> Option<f64> {
     platform::cpu_quota()
 }
 
 /// What doctor reports of the host.
-pub fn report() -> Value {
+pub(crate) fn report() -> Value {
     let memory = memory();
     json!({
         "cpus": cpus(),
@@ -280,19 +285,19 @@ mod platform {
     fn sysctl(name: &str) -> Option<u64> {
         let name = std::ffi::CString::new(name).ok()?;
         let mut value = 0u64;
-        let mut size = std::mem::size_of::<u64>();
+        let mut size = size_of::<u64>();
         // SAFETY: a NUL-terminated name, and a buffer of `size` bytes the
         // call fills; the size it reports back says how much it wrote.
         let status = unsafe {
             libc::sysctlbyname(
                 name.as_ptr(),
                 (&raw mut value).cast(),
-                &mut size,
+                &raw mut size,
                 std::ptr::null_mut(),
                 0,
             )
         };
-        (status == 0 && size <= std::mem::size_of::<u64>()).then_some(value)
+        (status == 0 && size <= size_of::<u64>()).then_some(value)
     }
 
     /// macOS reports how much of memory is available as a percentage
@@ -310,7 +315,7 @@ mod platform {
         }
     }
 
-    pub(super) fn cpu_quota() -> Option<f64> {
+    pub(super) const fn cpu_quota() -> Option<f64> {
         None
     }
 }
@@ -324,9 +329,10 @@ mod platform {
         // SAFETY: MEMORYSTATUSEX is plain data; the call requires dwLength
         // set to its size and fills the rest.
         let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
-        status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        status.dwLength = u32::try_from(size_of::<MEMORYSTATUSEX>())
+            .expect("Windows memory status size fits DWORD");
         // SAFETY: `status` is a valid MEMORYSTATUSEX with dwLength set.
-        if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
+        if unsafe { GlobalMemoryStatusEx(&raw mut status) } == 0 {
             return Memory::default();
         }
         Memory {
@@ -418,7 +424,9 @@ mod tests {
         // its size, so a burst after it stayed in the heap.
         drop(vec![1u8; 6 << 20]);
         let before = resident();
-        let burst = (0..10).map(|_| vec![1u8; 6 << 20]).collect::<Vec<_>>();
+        let burst = std::iter::repeat_with(|| vec![1u8; 6 << 20])
+            .take(10)
+            .collect::<Vec<_>>();
         assert!(resident() > before + (50 << 20));
         drop(burst);
         let after = resident();

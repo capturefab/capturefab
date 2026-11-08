@@ -6,11 +6,11 @@
 //! thread ends the process, which its coordinator sees.
 use super::protocol::{self, Input, MAX_LINE, MAX_REQUEST, Output, PROTOCOL};
 use crate::engine::{WorkerHandle, events::Events, events::Next};
-use anyhow::{Context, Result};
+use anyhow::{Context as _, Result};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
-    io::{BufRead, Read, Write},
+    io::{BufRead as _, Read as _, Write as _},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -65,7 +65,7 @@ struct LineRef<'a> {
 }
 
 /// Run as a camera worker; `args` follow `__worker`.
-pub fn run_worker(args: impl Iterator<Item = std::ffi::OsString>) -> Result<()> {
+pub(crate) fn run_worker(args: impl Iterator<Item = std::ffi::OsString>) -> Result<()> {
     crate::host::return_freed_frames();
     let args = arguments(args)?;
     // A panic on any thread, the camera's or a helper's, ends the process,
@@ -108,7 +108,7 @@ pub fn run_worker(args: impl Iterator<Item = std::ffi::OsString>) -> Result<()> 
     if args.session != super::DIRECT {
         let _ = super::SERVED.set(args.session.clone());
     }
-    let handle = WorkerHandle::serving(events.clone(), args.session, output);
+    let handle = WorkerHandle::serving(events.clone(), &args.session, output);
     let stopping = Arc::new(AtomicBool::new(false));
     {
         // The camera thread ends only when told to; if it ends otherwise
@@ -152,8 +152,9 @@ pub fn run_worker(args: impl Iterator<Item = std::ffi::OsString>) -> Result<()> 
 fn read_requests(handle: &WorkerHandle, events: &Events) -> Result<()> {
     let stdin = std::io::stdin();
     let mut reader = stdin.lock();
+    let mut data = Vec::new();
     loop {
-        let mut data = Vec::new();
+        data.clear();
         reader
             .by_ref()
             .take(MAX_REQUEST as u64 + 1)
@@ -205,7 +206,9 @@ fn read_requests(handle: &WorkerHandle, events: &Events) -> Result<()> {
             Input::Ping { id } => answer(
                 events,
                 id,
-                Ok(json!({"heartbeat_age_ms": handle.heartbeat_age().as_millis() as u64})),
+                Ok(
+                    json!({"heartbeat_age_ms": u64::try_from(handle.heartbeat_age().as_millis()).unwrap_or(u64::MAX)}),
+                ),
             ),
             Input::Shutdown => return Ok(()),
         }
@@ -321,8 +324,9 @@ fn scrub_strings(value: &mut Value) {
 
 #[cfg(unix)]
 mod platform {
-    use anyhow::{Context, Result};
-    use std::os::fd::FromRawFd;
+
+    use anyhow::{Context as _, Result};
+    use std::os::fd::FromRawFd as _;
 
     /// The pipe the coordinator passed as descriptor `fd`.
     pub(super) fn inherited(fd: u64) -> Result<std::fs::File> {
@@ -330,48 +334,75 @@ mod platform {
         // SAFETY: the coordinator passed this descriptor for this process
         // alone to write one image to and close; it is set close-on-exec so
         // FFmpeg never holds it.
-        unsafe {
-            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-            Ok(std::fs::File::from_raw_fd(fd))
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error().into());
         }
+        // SAFETY: fcntl verified the inherited descriptor, whose ownership
+        // the coordinator transferred to this worker.
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
     }
 
     /// Keep the original stdout for the protocol alone, and point fd 1 at
     /// stderr: a stray print, or a child that inherits stdout, cannot
     /// corrupt the protocol.
     pub(super) fn protocol_output() -> Result<std::fs::File> {
-        // SAFETY: dup, fcntl and dup2 on this process's own standard
-        // descriptors; the duplicate is owned by the returned file.
-        unsafe {
-            let fd = libc::dup(1);
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-            if libc::dup2(2, 1) < 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            Ok(std::fs::File::from_raw_fd(fd))
+        // SAFETY: duplicate this process's standard output.
+        let fd = unsafe { libc::dup(1) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: dup returned a new descriptor owned by this file, including
+        // when either of the following operations fails.
+        let output = unsafe { std::fs::File::from_raw_fd(fd) };
+        // SAFETY: fd is the live descriptor owned by output.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: redirect this process's standard output to standard error.
+        if unsafe { libc::dup2(2, 1) } < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(output)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::os::fd::{AsRawFd as _, IntoRawFd as _};
+
+        #[test]
+        fn inherited_descriptors_are_checked_and_kept_out_of_children() {
+            inherited(u64::try_from(i32::MAX).unwrap()).unwrap_err();
+            let (_reader, writer) = std::io::pipe().unwrap();
+            let file = inherited(u64::try_from(writer.into_raw_fd()).unwrap()).unwrap();
+            // SAFETY: file owns this live descriptor.
+            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags >= 0);
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
         }
     }
 }
 
 #[cfg(windows)]
 mod platform {
-    use anyhow::Result;
-    use std::os::windows::io::FromRawHandle;
+
+    use anyhow::{Context as _, Result};
+    use std::os::windows::io::FromRawHandle as _;
 
     /// The pipe the coordinator passed as handle `handle`. It is made
-    /// uninheritable first, so FFmpeg never holds it: the image's reader
-    /// would wait for FFmpeg to exit to see its end.
+    /// uninheritable first, so `FFmpeg` never holds it: the image's reader
+    /// would wait for `FFmpeg` to exit to see its end.
     pub(super) fn inherited(handle: u64) -> Result<std::fs::File> {
-        let handle = handle as usize as HANDLE;
+        let handle =
+            usize::try_from(handle).context("--output-fd exceeds host handle size")? as HANDLE;
         // SAFETY: the coordinator made this pipe handle inheritable for this
         // process alone to write one image to and close.
-        unsafe {
-            SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
-            Ok(std::fs::File::from_raw_handle(handle as _))
+        let file = unsafe { std::fs::File::from_raw_handle(handle.cast()) };
+        // SAFETY: file owns this inherited handle while its flag changes.
+        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
         }
+        Ok(file)
     }
     use windows_sys::Win32::{
         Foundation::{
@@ -388,30 +419,40 @@ mod platform {
     /// inherits, and make stderr the standard output: a stray print, or a
     /// child that inherits stdout, cannot corrupt the protocol.
     pub(super) fn protocol_output() -> Result<std::fs::File> {
-        // SAFETY: duplicating and replacing this process's own standard
-        // handles; the duplicate is owned by the returned file.
-        unsafe {
-            let original = GetStdHandle(STD_OUTPUT_HANDLE);
-            let mut protocol: HANDLE = std::ptr::null_mut();
-            if DuplicateHandle(
-                GetCurrentProcess(),
+        // SAFETY: read this process's own standard handles.
+        let original = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+        // SAFETY: read this process's own standard error handle.
+        let errors = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+        // SAFETY: the pseudo-handle is valid in this process and is not owned.
+        let process = unsafe { GetCurrentProcess() };
+        let mut protocol: HANDLE = std::ptr::null_mut();
+        // SAFETY: duplicate our stdout within this process, into a writable
+        // handle slot, with inheritance disabled.
+        if unsafe {
+            DuplicateHandle(
+                process,
                 original,
-                GetCurrentProcess(),
-                &mut protocol,
+                process,
+                &raw mut protocol,
                 0,
                 0,
                 DUPLICATE_SAME_ACCESS,
-            ) == 0
-            {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            if SetStdHandle(STD_OUTPUT_HANDLE, GetStdHandle(STD_ERROR_HANDLE)) == 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            // The inheritable original would keep the pipe open in FFmpeg.
-            CloseHandle(original);
-            Ok(std::fs::File::from_raw_handle(protocol as _))
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error().into());
         }
+        // SAFETY: DuplicateHandle succeeded and transferred a new handle to us.
+        // File closes it if replacing stdout below fails.
+        let output = unsafe { std::fs::File::from_raw_handle(protocol.cast()) };
+        // SAFETY: replace this process's stdout with its standard error handle.
+        if unsafe { SetStdHandle(STD_OUTPUT_HANDLE, errors) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: stdout no longer names original; close the old inheritable
+        // handle so FFmpeg cannot keep its pipe open.
+        unsafe { CloseHandle(original) };
+        Ok(output)
     }
 }
 

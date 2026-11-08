@@ -156,12 +156,12 @@ mod tests {
         events.progress(2, json!({"saved": 1}));
         events.log("info", "quiet");
         events.log("warn", "loud");
-        let lines = (0..4)
-            .map(|_| match events.next(Duration::ZERO) {
-                Next::Line(line) => serde_json::to_value(line).unwrap(),
-                _ => panic!("missing line"),
-            })
-            .collect::<Vec<_>>();
+        let lines = std::iter::repeat_with(|| match events.next(Duration::ZERO) {
+            Next::Line(line) => serde_json::to_value(line).unwrap(),
+            _ => panic!("missing line"),
+        })
+        .take(4)
+        .collect::<Vec<_>>();
         assert_eq!(lines[0]["progress"], json!({"saved": 2}));
         assert_eq!(lines[1]["event"], "accepted");
         assert_eq!(lines[2]["job"], 2);

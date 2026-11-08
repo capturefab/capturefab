@@ -1,7 +1,9 @@
 //! Apply camera-side pacing without guessing host-wide privileged settings.
+#![forbid(unsafe_code)]
 use crate::{camera::Camera, network::NetworkTuning};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context as _, Result, ensure};
 use serde_json::Value;
+use std::borrow::Cow;
 
 /// Limiter enables, SFNC first, then older Point Grey and Daheng names.
 const FRAME_RATE_ENABLES: [&str; 3] = [
@@ -10,10 +12,10 @@ const FRAME_RATE_ENABLES: [&str; 3] = [
     "AcquisitionFrameRateMode",
 ];
 
-fn plain(value: &Value) -> String {
+fn plain(value: &Value) -> Cow<'_, str> {
     value
         .as_str()
-        .map_or_else(|| value.to_string(), str::to_owned)
+        .map_or_else(|| Cow::Owned(value.to_string()), Cow::Borrowed)
 }
 
 fn read(camera: &mut Camera, names: &[&str]) -> Option<f64> {
@@ -86,6 +88,12 @@ fn set_number(camera: &mut Camera, name: &str, target: f64, round_up: bool) -> R
     Ok(actual)
 }
 
+/// Whole bytes per second, rounded down without saturating an invalid readback.
+fn byte_rate(rate: f64) -> Option<u64> {
+    let rate = u64::try_from(crate::types::integral_float(rate.floor())?).ok()?;
+    (rate > 0).then_some(rate)
+}
+
 pub(super) fn apply(camera: &mut Camera, requested: u64) -> Result<NetworkTuning> {
     let mut tuning = camera.optimize_network()?;
     let physical = crate::network::camera_link_bytes_per_second(camera);
@@ -98,7 +106,7 @@ pub(super) fn apply(camera: &mut Camera, requested: u64) -> Result<NetworkTuning
         }
     }
     let budget = physical.map_or(requested, |speed| {
-        requested.min((speed * 0.8).max(1.0) as u64)
+        requested.min(byte_rate((speed * 0.8).max(1.0)).unwrap_or(u64::MAX))
     });
     camera.set_network_budget_bytes_per_second(budget);
     let mut failures = Vec::new();
@@ -132,13 +140,18 @@ pub(super) fn apply(camera: &mut Camera, requested: u64) -> Result<NetworkTuning
         if !camera.is_writable(feature) {
             continue;
         }
-        let result = (|| -> Result<f64> {
+        let result = (|| -> Result<(f64, u64)> {
             // SFNC declares bytes per second; some vendors declare MBps.
             let scale =
                 crate::network::bytes_per_second_scale(camera.feature_unit(feature), 1.0)
                     .with_context(|| format!("unknown unit {:?}", camera.feature_unit(feature)))?;
             let actual = set_number(camera, feature, budget as f64 / scale, false)? * scale;
-            ensure!(actual > 0.0, "camera throughput readback must be positive");
+            let bytes = byte_rate(actual)
+                .context("camera throughput readback must fit a positive byte rate")?;
+            ensure!(
+                bytes <= budget,
+                "camera throughput readback exceeds the network budget"
+            );
             if feature == "DeviceLinkThroughputLimit" && camera.has("DeviceLinkThroughputLimitMode")
             {
                 if camera.get("DeviceLinkThroughputLimitMode")? != "On" {
@@ -149,12 +162,12 @@ pub(super) fn apply(camera: &mut Camera, requested: u64) -> Result<NetworkTuning
                     "camera throughput limiter is not enabled"
                 );
             }
-            Ok(actual)
+            Ok((actual, bytes))
         })();
         match result {
-            Ok(actual) => {
+            Ok((actual, bytes)) => {
                 tuning.warnings.extend(failures);
-                tuning.throughput_limit_bps = Some(actual as u64);
+                tuning.throughput_limit_bps = Some(bytes);
                 tuning.changes.push(format!(
                     "{feature}: {:.1} MB/s per camera (shared link budget)",
                     actual / 1e6
@@ -175,7 +188,7 @@ pub(super) fn apply(camera: &mut Camera, requested: u64) -> Result<NetworkTuning
             tuning.packet_size,
         )
     {
-        let bytes = packet as f64 + 38.0;
+        let bytes = f64::from(packet) + 38.0;
         // Without a camera link-speed reading, omitting serialization time
         // adds safe headroom rather than assuming the host and camera match.
         let serialization = physical.map_or(0.0, |wire| bytes / wire);
@@ -282,10 +295,26 @@ mod tests {
     }
     impl RegisterIo for Fake {
         fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
-            Ok(self.memory.lock().unwrap()[address as usize..address as usize + length].to_vec())
+            let start = usize::try_from(address)?;
+            let end = start.checked_add(length).context("fake address overflow")?;
+            Ok(self
+                .memory
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test fixture lock is poisoned"))?
+                .get(start..end)
+                .context("fake read outside memory")?
+                .to_vec())
         }
         fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
-            self.memory.lock().unwrap()[address as usize..address as usize + data.len()]
+            let start = usize::try_from(address)?;
+            let end = start
+                .checked_add(data.len())
+                .context("fake address overflow")?;
+            self.memory
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test fixture lock is poisoned"))?
+                .get_mut(start..end)
+                .context("fake write outside memory")?
                 .copy_from_slice(data);
             Ok(())
         }
@@ -339,13 +368,36 @@ mod tests {
     }
 
     #[test]
+    fn byte_rates_reject_invalid_and_out_of_range_readbacks() {
+        for rate in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -1.0,
+            0.0,
+            0.5,
+            18_446_744_073_709_551_616.0,
+        ] {
+            assert_eq!(byte_rate(rate), None, "{rate}");
+        }
+        for (rate, expected) in [
+            (1.0, 1),
+            (1000.9, 1000),
+            (18_446_744_073_709_549_568.0, 18_446_744_073_709_549_568),
+        ] {
+            assert_eq!(byte_rate(rate), Some(expected));
+        }
+    }
+
+    #[test]
     fn throughput_shares_are_rounded_down_and_limiter_is_enabled() {
-        let features = int(
+        let mut features = int(
             "DeviceLinkThroughputLimit",
             4,
             "<Min>1000</Min><Max>100000000</Max><Inc>1000</Inc>",
             "RW",
-        ) + &enumeration("DeviceLinkThroughputLimitMode", 8);
+        );
+        features.push_str(&enumeration("DeviceLinkThroughputLimitMode", 8));
         let mut camera = camera(&features, &[(4, 100_000_000)]);
         let tuned = apply(&mut camera, 33_333_333).unwrap();
         assert_eq!(tuned.throughput_limit_bps, Some(33_333_000));
@@ -355,12 +407,13 @@ mod tests {
 
     #[test]
     fn budget_never_exceeds_camera_link_even_with_faster_host() {
-        let features = int(
+        let mut features = int(
             "DeviceLinkThroughputLimit",
             4,
             "<Min>1</Min><Max>2000000000</Max>",
             "RW",
-        ) + &int("GevLinkSpeed", 8, "", "RO");
+        );
+        features.push_str(&int("GevLinkSpeed", 8, "", "RO"));
         let mut camera = camera(&features, &[(4, 1_000_000_000), (8, 1000)]);
         assert_eq!(
             apply(&mut camera, 1_000_000_000)
@@ -373,12 +426,13 @@ mod tests {
 
     #[test]
     fn standard_device_link_speed_is_bytes_per_second() {
-        let features = int(
+        let mut features = int(
             "DeviceLinkThroughputLimit",
             4,
             "<Min>1</Min><Max>1000000000</Max>",
             "RW",
-        ) + &int("DeviceLinkSpeed", 8, "", "RO");
+        );
+        features.push_str(&int("DeviceLinkSpeed", 8, "", "RO"));
         let mut camera = camera(&features, &[(4, 1_000_000_000), (8, 125_000_000)]);
         assert_eq!(
             apply(&mut camera, 1_000_000_000)
@@ -390,12 +444,13 @@ mod tests {
 
     #[test]
     fn unknown_speed_with_known_ticks_uses_conservative_packet_delay() {
-        let features = int(
+        let mut features = int(
             "GevSCPD",
             4,
             "<Min>0</Min><Max>10000000</Max><Inc>8</Inc>",
             "RW",
-        ) + &int("GevTimestampTickFrequency", 12, "", "RO");
+        );
+        features.push_str(&int("GevTimestampTickFrequency", 12, "", "RO"));
         let mut camera = camera(&features, &[(12, 125_000_000)]);
         let tuned = apply(&mut camera, 50_000_000).unwrap();
         let delay = camera.get("GevSCPD").unwrap().as_u64().unwrap();
@@ -410,13 +465,14 @@ mod tests {
 
     #[test]
     fn packet_delay_is_rounded_up_with_verified_tick_frequency() {
-        let features = int(
+        let mut features = int(
             "GevSCPD",
             4,
             "<Min>0</Min><Max>10000000</Max><Inc>8</Inc>",
             "RW",
-        ) + &int("GevLinkSpeed", 8, "", "RO")
-            + &int("GevTimestampTickFrequency", 12, "", "RO");
+        );
+        features.push_str(&int("GevLinkSpeed", 8, "", "RO"));
+        features.push_str(&int("GevTimestampTickFrequency", 12, "", "RO"));
         let mut camera = camera(&features, &[(8, 1000), (12, 125_000_000)]);
         let tuned = apply(&mut camera, 50_000_000).unwrap();
         let delay = camera.get("GevSCPD").unwrap().as_u64().unwrap();
@@ -433,7 +489,7 @@ mod tests {
         let tuned = apply(&mut camera, 50_000_000).unwrap();
         assert_eq!(camera.get("GevSCPD").unwrap(), 123);
         assert!(tuned.throughput_limit_bps.is_none());
-        assert!(!tuned.warnings.is_empty());
+        assert_ne!(tuned.warnings, [] as [String; 0]);
     }
 
     #[test]
@@ -455,12 +511,13 @@ mod tests {
 
     #[test]
     fn allied_vision_bandwidth_control_selects_stream_bytes_per_second() {
-        let features = int(
+        let mut features = int(
             "StreamBytesPerSecond",
             4,
             "<Min>1000000</Min><Max>124000000</Max>",
             "RW",
-        ) + "<Enumeration Name='BandwidthControlMode'><EnumEntry Name='StreamBytesPerSecond'><Value>0</Value></EnumEntry><EnumEntry Name='SCPD'><Value>1</Value></EnumEntry><EnumEntry Name='Both'><Value>2</Value></EnumEntry><pValue>ModeReg</pValue></Enumeration><IntReg Name='ModeReg'><Address>8</Address><Length>4</Length><AccessMode>RW</AccessMode></IntReg>";
+        );
+        features.push_str("<Enumeration Name='BandwidthControlMode'><EnumEntry Name='StreamBytesPerSecond'><Value>0</Value></EnumEntry><EnumEntry Name='SCPD'><Value>1</Value></EnumEntry><EnumEntry Name='Both'><Value>2</Value></EnumEntry><pValue>ModeReg</pValue></Enumeration><IntReg Name='ModeReg'><Address>8</Address><Length>4</Length><AccessMode>RW</AccessMode></IntReg>");
         let mut camera = camera(&features, &[(4, 124_000_000), (8, 1)]);
         let tuned = apply(&mut camera, 40_000_000).unwrap();
         assert_eq!(tuned.throughput_limit_bps, Some(40_000_000));
@@ -473,12 +530,13 @@ mod tests {
     #[test]
     fn frame_rate_fallback_enables_the_limiter_first_and_restores_it_on_failure() {
         // A Blackfly S keeps AcquisitionFrameRate locked while its enable is off.
-        let features = int(
+        let mut features = int(
             "AcquisitionFrameRate",
             12,
             "<Min>1</Min><Max>1000</Max><pIsLocked>RateLocked</pIsLocked>",
             "RW",
-        ) + "<Boolean Name='AcquisitionFrameRateEnable'><pValue>EnableReg</pValue></Boolean><IntReg Name='EnableReg'><Address>16</Address><Length>4</Length><AccessMode>RW</AccessMode></IntReg><IntSwissKnife Name='RateLocked'><pVariable Name='E'>EnableReg</pVariable><Formula>E=0</Formula></IntSwissKnife>";
+        );
+        features.push_str("<Boolean Name='AcquisitionFrameRateEnable'><pValue>EnableReg</pValue></Boolean><IntReg Name='EnableReg'><Address>16</Address><Length>4</Length><AccessMode>RW</AccessMode></IntReg><IntSwissKnife Name='RateLocked'><pVariable Name='E'>EnableReg</pVariable><Formula>E=0</Formula></IntSwissKnife>");
         let mut limited = camera(&features, &[(12, 30)]);
         let tuned = apply(&mut limited, 21_000_000).unwrap();
         assert_eq!(limited.get("AcquisitionFrameRate").unwrap(), 20);
@@ -510,19 +568,20 @@ mod tests {
 
     #[test]
     fn external_trigger_rate_is_preserved_and_low_budget_is_reported() {
-        let features = int(
+        let mut features = int(
             "DeviceLinkThroughputLimit",
             4,
             "<Min>10000</Min><Max>100000000</Max>",
             "RW",
-        ) + &enumeration("TriggerMode", 8)
-            + &int(
-                "AcquisitionFrameRate",
-                12,
-                "<Min>1</Min><Max>1000</Max>",
-                "RW",
-            )
-            + &enumeration("AcquisitionFrameRateMode", 16);
+        );
+        features.push_str(&enumeration("TriggerMode", 8));
+        features.push_str(&int(
+            "AcquisitionFrameRate",
+            12,
+            "<Min>1</Min><Max>1000</Max>",
+            "RW",
+        ));
+        features.push_str(&enumeration("AcquisitionFrameRateMode", 16));
         let mut camera = camera(&features, &[(4, 100_000_000), (8, 1), (12, 30)]);
         let tuned = apply(&mut camera, 1000).unwrap();
         assert_eq!(

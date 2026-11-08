@@ -1,19 +1,20 @@
-//! V4L2 queries that FFmpeg's v4l2 input does not make: whether a device
+//! V4L2 queries that `FFmpeg`'s v4l2 input does not make: whether a device
 //! node captures video, and the frame intervals of each format and size.
 
+#![deny(clippy::missing_const_for_fn)]
 const VIDEO_CAPTURE: u32 = 0x1;
 const VIDEO_CAPTURE_MPLANE: u32 = 0x1000;
 const VIDEO_M2M_MPLANE: u32 = 0x4000;
 const VIDEO_M2M: u32 = 0x8000;
 const DEVICE_CAPS: u32 = 0x8000_0000;
 
-/// Whether VIDIOC_QUERYCAP capabilities describe a video capture node, as
-/// systemd's v4l_id decides. `capabilities` covers every node of the
-/// physical device, so a UVC camera's metadata node reports VIDEO_CAPTURE
+/// Whether `VIDIOC_QUERYCAP` capabilities describe a video capture node, as
+/// systemd's `v4l_id` decides. `capabilities` covers every node of the
+/// physical device, so a UVC camera's metadata node reports `VIDEO_CAPTURE`
 /// there; `device_caps` describes the opened node alone. Codec and ISP
 /// memory-to-memory nodes are not cameras. Nodes that report both capture
 /// and output stay, as v4l2loopback virtual cameras do.
-pub(super) fn captures(capabilities: u32, device_caps: u32) -> bool {
+pub(super) const fn captures(capabilities: u32, device_caps: u32) -> bool {
     let caps = if capabilities & DEVICE_CAPS != 0 {
         device_caps
     } else {
@@ -45,7 +46,7 @@ mod device {
     use std::{
         fs::{File, OpenOptions},
         io,
-        os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
+        os::{fd::AsRawFd as _, unix::fs::OpenOptionsExt as _},
         path::Path,
     };
 
@@ -108,7 +109,8 @@ mod device {
         loop {
             // SAFETY: `request` encodes the size of the repr(C) `T` it fills,
             // and `value` is exclusively borrowed for the call.
-            if unsafe { libc::ioctl(device.as_raw_fd(), request, value as *mut T) } != -1 {
+            if unsafe { libc::ioctl(device.as_raw_fd(), request, std::ptr::from_mut(value)) } != -1
+            {
                 return Ok(());
             }
             let error = io::Error::last_os_error();
@@ -125,7 +127,7 @@ mod device {
     /// Whether the node at `path` captures video. A node that cannot be
     /// opened or queried, for example without permission, is kept, so that
     /// opening it reports why.
-    pub fn captures_video(path: &Path) -> bool {
+    pub(crate) fn captures_video(path: &Path) -> bool {
         open(path)
             .and_then(|device| capability(&device))
             .map_or(true, |capability| {
@@ -133,15 +135,15 @@ mod device {
             })
     }
 
-    /// A capture node's formats, for the frame intervals FFmpeg's format
+    /// A capture node's formats, for the frame intervals `FFmpeg`'s format
     /// listing leaves out.
-    pub struct Formats {
+    pub(crate) struct Formats {
         device: File,
-        /// Each format's description, as FFmpeg lists it, and fourcc.
+        /// Each format's description, as `FFmpeg` lists it, and fourcc.
         formats: Vec<(String, u32)>,
     }
     impl Formats {
-        pub fn open(path: &Path) -> io::Result<Self> {
+        pub(crate) fn open(path: &Path) -> io::Result<Self> {
             let device = open(path)?;
             // FFmpeg picks the buffer type from the device-wide capabilities.
             let kind = if capability(&device)?.capabilities & super::VIDEO_CAPTURE != 0 {
@@ -168,10 +170,10 @@ mod device {
             }
             Ok(Self { device, formats })
         }
-        /// The frame rate bounds of the format FFmpeg lists as
+        /// The frame rate bounds of the format `FFmpeg` lists as
         /// `description`, at a size, or `None` when the driver does not
         /// enumerate frame intervals.
-        pub fn frame_rates(
+        pub(crate) fn frame_rates(
             &self,
             description: &str,
             width: u32,

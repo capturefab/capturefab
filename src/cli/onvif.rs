@@ -9,13 +9,14 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 #[derive(Debug, Subcommand)]
-pub enum OnvifCommand {
+pub(crate) enum OnvifCommand {
     /// List an ONVIF camera's profiles and their RTSP stream URIs
     #[command(
         after_help = "Examples:\n  capturefab onvif resolve cam.local\n  capturefab onvif resolve http://10.0.0.9/onvif/device_service --profile Profile_1\n  capturefab login add onvif://cam.local --user admin --password-stdin   # save its sign-in first"
     )]
     Resolve {
-        /// HOST[:PORT], http://HOST/onvif/device_service, or onvif://HOST
+        /// An ONVIF host or device-service URL.
+        #[arg(help = "HOST[:PORT], http://HOST/onvif/device_service, or onvif://HOST")]
         host: String,
         /// Only this profile token
         #[arg(long, value_name = "TOKEN")]
@@ -27,7 +28,7 @@ pub enum OnvifCommand {
 }
 
 /// The `onvif resolve` result.
-pub const FIELDS: &[(&str, &str)] = &[
+pub(super) const FIELDS: &[(&str, &str)] = &[
     ("endpoint", "string — the ONVIF device service asked"),
     (
         "streams",
@@ -47,7 +48,7 @@ fn source(host: &str) -> String {
     }
 }
 
-pub fn run(_global: &Global, command: OnvifCommand) -> Result<Report> {
+pub(super) fn run(_global: &Global, command: OnvifCommand) -> Result<Report> {
     let OnvifCommand::Resolve {
         host,
         profile,

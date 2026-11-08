@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Args)]
-pub struct AutoArgs {
+pub(crate) struct AutoArgs {
     #[command(flatten)]
     pub camera: CameraArg,
     /// Turn the camera's auto exposure, gain and white balance off, keeping their values
@@ -39,7 +39,7 @@ pub struct AutoArgs {
 /// is one short request, or a register read or two.
 const POLL: Duration = Duration::from_millis(25);
 
-pub fn run(global: &Global, args: AutoArgs) -> Result<Report> {
+pub(super) fn run(global: &Global, args: &AutoArgs) -> Result<Report> {
     signals::take_over();
     let client = Client::open_with(global, args.camera.camera.as_deref(), args.keep.route())?;
     let value = if args.off {
@@ -91,7 +91,7 @@ fn text(value: &Value) -> String {
 
 /// Refuse a camera whose exposure cannot be adjusted, or that sends frames
 /// only when triggered: there is nothing to meter between triggers. A
-/// trigger whose source is the camera's own timing (Freerun, FixedRate)
+/// trigger whose source is the camera's own timing (Freerun, `FixedRate`)
 /// holds no frames back.
 fn adjustable(info: &Value) -> Result<()> {
     let camera = info["camera"].as_str().unwrap_or("the camera");
@@ -197,7 +197,10 @@ pub(super) fn settle(client: &Client, timeout: Duration, limits: &Limits) -> Res
             .count(),
         "mean": auto["brightness"].as_f64().map(|mean| (mean * 10_000.0).round() / 10_000.0),
     });
-    let notes = auto["notes"].as_array().cloned().unwrap_or_default();
+    let notes = auto["notes"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
     let noted = |start: &str| {
         notes
             .iter()
@@ -221,8 +224,8 @@ pub(super) fn settle(client: &Client, timeout: Duration, limits: &Limits) -> Res
     Ok(crate::types::without_nulls(value))
 }
 
-/// The camera's own auto functions with a Once mode: ExposureAuto, and
-/// GainAuto beside it, and BalanceWhiteAuto on a color camera, which the
+/// The camera's own auto functions with a Once mode: `ExposureAuto`, and
+/// `GainAuto` beside it, and `BalanceWhiteAuto` on a color camera, which the
 /// image then needs balanced as much as exposed.
 fn once_features(client: &Client, info: &Value) -> Result<Vec<String>> {
     let listed = client.call(SessionCommand::FeatureList {
@@ -321,7 +324,7 @@ fn settle_once(
                 fresh: 1,
                 timeout_ms: 0,
                 max_dimension: 0,
-                format: Default::default(),
+                format: crate::inspect::PreviewFormat::default(),
                 region: None,
                 preview: None,
                 min_free: None,
@@ -439,7 +442,7 @@ fn continuous(client: &Client) -> Result<Value> {
 }
 
 /// Result fields, for `schema`.
-pub const FIELDS: &[(&str, &str)] = &[
+pub(super) const FIELDS: &[(&str, &str)] = &[
     ("camera", "string — camera ID"),
     (
         "settled",
@@ -491,6 +494,6 @@ mod tests {
         assert_eq!(with_once(&listed, &mono), ["ExposureAuto", "GainAuto"]);
         // White balance alone is not exposure.
         let balance_only = json!({"features": [row("ExposureAuto", &["Off", "Continuous"]), row("BalanceWhiteAuto", &["Off", "Once"])]});
-        assert!(with_once(&balance_only, &color).is_empty());
+        assert_eq!(with_once(&balance_only, &color), [] as [String; 0]);
     }
 }

@@ -16,8 +16,6 @@
 //! A landed message whose frame changed meanwhile (completed, dropped or
 //! given a new buffer by an earlier one) is dropped: its packet is lost,
 //! and asked for again like any other.
-// Elsewhere batches run only in tests.
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 use super::{Assembler, Frame, Result, Site, Slot};
 use std::time::Instant;
 
@@ -25,7 +23,7 @@ use std::time::Instant;
 pub(super) const BATCH: usize = 32;
 
 /// How one message of a batch arrived.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Received {
     /// Its datagram's length, and whether it was cut to fit.
     pub(super) len: usize,
@@ -79,28 +77,29 @@ impl Batch {
         now: Instant,
     ) -> Option<Result<Option<Frame>>> {
         // Copy out every message that did not land, before any is taken in.
-        let mut fates = Vec::with_capacity(received.len());
+        let mut fates: [_; BATCH] = std::array::from_fn(|_| Fate::Stray);
         for (index, message) in received.iter().enumerate() {
             let fate = match slots.get(index) {
                 _ if !message.from_camera => Fate::Stray,
                 Some(slot) => {
                     let header = &self.headers[index][..slot.header];
-                    match assembler.lands(slot, (header, message.len, message.truncated)) {
-                        Some(packet) => Fate::Landed(packet),
-                        None => {
-                            let scratch = &mut self.scratch[index];
-                            scratch.clear();
-                            scratch.extend_from_slice(&header[..message.len.min(slot.header)]);
-                            let rest = message.len.saturating_sub(slot.header);
-                            let in_slot = rest.min(slot.len);
-                            if let Some(place) = assembler.slot_mut(slot) {
-                                scratch.extend_from_slice(&place[..in_slot]);
-                            }
-                            let beyond = (rest - in_slot).min(self.rests[index].len());
-                            scratch.extend_from_slice(&self.rests[index][..beyond]);
-                            crate::copies::record(Site::GvspFallback, scratch.len());
-                            Fate::Moved
+                    if let Some(packet) =
+                        Assembler::lands(slot, (header, message.len, message.truncated))
+                    {
+                        Fate::Landed(packet)
+                    } else {
+                        let scratch = &mut self.scratch[index];
+                        scratch.clear();
+                        scratch.extend_from_slice(&header[..message.len.min(slot.header)]);
+                        let rest = message.len.saturating_sub(slot.header);
+                        let in_slot = rest.min(slot.len);
+                        if let Some(place) = assembler.slot_mut(slot) {
+                            scratch.extend_from_slice(&place[..in_slot]);
                         }
+                        let beyond = (rest - in_slot).min(self.rests[index].len());
+                        scratch.extend_from_slice(&self.rests[index][..beyond]);
+                        crate::copies::record(Site::GvspFallback, scratch.len());
+                        Fate::Moved
                     }
                 }
                 None => Fate::Whole(message.len.min(self.rests[index].len())),
@@ -108,13 +107,13 @@ impl Batch {
             if !matches!(fate, Fate::Stray) {
                 crate::copies::record(Site::GvspReceive, message.len);
             }
-            fates.push(fate);
+            fates[index] = fate;
         }
         // Then take them in, in the order they came.
         let mut completed = Vec::new();
         let mut error = None;
         let mut taken = false;
-        for (index, fate) in fates.into_iter().enumerate() {
+        for (index, fate) in fates.into_iter().take(received.len()).enumerate() {
             let result = match fate {
                 Fate::Stray => continue,
                 Fate::Landed(packet) => {
@@ -157,6 +156,7 @@ impl Batch {
 /// (its trailer), else one (a leader, after which the next can be
 /// predicted), so a new frame's packets are not received whole in the
 /// same call; copying every packet, as many as come.
+#[cfg(target_os = "linux")]
 pub(super) fn wanted(scatter: bool, slots: &[Slot]) -> usize {
     match (scatter, slots.len()) {
         (false, _) => BATCH,
@@ -169,23 +169,25 @@ pub(super) fn wanted(scatter: bool, slots: &[Slot]) -> usize {
 /// `slots.len()` scattered into their header, their slot of the frame
 /// whose buffer starts at `base` and their rest, the others whole. Blocks
 /// for the first as the socket's timeout allows, then takes what has
-/// arrived. How each message arrived, from `camera` (not its control
-/// port `gvcp`) or elsewhere.
+/// arrived. Fill the first returned-count entries of `received` with how
+/// each message arrived, from `camera` (not its control port `gvcp`) or elsewhere.
 #[cfg(target_os = "linux")]
 pub(super) fn receive(
     socket: &std::net::UdpSocket,
     batch: &mut Batch,
     (slots, base, count): (&[Slot], *mut u8, usize),
     (camera, gvcp): (std::net::IpAddr, std::net::SocketAddr),
-) -> std::io::Result<Vec<Received>> {
-    use std::os::fd::AsRawFd;
+    received: &mut [Received; BATCH],
+) -> std::io::Result<usize> {
+    use std::os::fd::AsRawFd as _;
     let iovec = |pointer: *mut u8, len: usize| libc::iovec {
         iov_base: pointer.cast(),
         iov_len: len,
     };
-    let mut iovecs: Vec<[libc::iovec; 3]> = Vec::with_capacity(BATCH);
-    for (index, (header, rest)) in batch.headers.iter_mut().zip(&mut batch.rests).enumerate() {
-        iovecs.push(match slots.get(index) {
+    let mut iovecs: [_; BATCH] = std::array::from_fn(|index| {
+        let header = &mut batch.headers[index];
+        let rest = &mut batch.rests[index];
+        match slots.get(index) {
             // SAFETY: each slot lies inside the frame's buffer, which starts
             // at `base` and is not touched until the call returns, and the
             // slots of one batch never overlap.
@@ -199,24 +201,29 @@ pub(super) fn receive(
                 iovec(std::ptr::null_mut(), 0),
                 iovec(std::ptr::null_mut(), 0),
             ],
-        });
-    }
+        }
+    });
     // SAFETY: an all-zero sockaddr_storage and mmsghdr are valid values.
-    let mut names: Vec<libc::sockaddr_storage> = vec![unsafe { std::mem::zeroed() }; BATCH];
-    let mut messages: Vec<libc::mmsghdr> = iovecs
-        .iter_mut()
-        .zip(&mut names)
-        .enumerate()
-        .map(|(index, (iovecs, name))| {
-            // SAFETY: as above.
-            let mut message: libc::mmsghdr = unsafe { std::mem::zeroed() };
-            message.msg_hdr.msg_name = (name as *mut libc::sockaddr_storage).cast();
-            message.msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as _;
-            message.msg_hdr.msg_iov = iovecs.as_mut_ptr();
-            message.msg_hdr.msg_iovlen = if index < slots.len() { 3 } else { 1 };
-            message
-        })
-        .collect();
+    let mut names: [libc::sockaddr_storage; BATCH] = unsafe { std::mem::zeroed() };
+    let mut messages: [_; BATCH] = std::array::from_fn(|index| {
+        let iovecs = &mut iovecs[index];
+        let name = &mut names[index];
+        // SAFETY: as above.
+        let mut message: libc::mmsghdr = unsafe { std::mem::zeroed() };
+        message.msg_hdr.msg_name = std::ptr::from_mut(name).cast();
+        message.msg_hdr.msg_namelen =
+            libc::socklen_t::try_from(size_of::<libc::sockaddr_storage>())
+                .expect("sockaddr_storage fits socklen_t");
+        message.msg_hdr.msg_iov = iovecs.as_mut_ptr();
+        message.msg_hdr.msg_iovlen = if index < slots.len() { 3 } else { 1 };
+        message
+    });
+    // musl declares the flags unsigned; GNU libc declares them signed.
+    #[cfg(target_env = "musl")]
+    let flags = u32::try_from(libc::MSG_WAITFORONE).map_err(std::io::Error::other)?;
+    #[cfg(not(target_env = "musl"))]
+    let flags = libc::MSG_WAITFORONE;
+    let count = u32::try_from(count.clamp(1, BATCH)).map_err(std::io::Error::other)?;
     // SAFETY: every message points at buffers that live, unmoved, until the
     // call returns, each iovec within its buffer; the kernel writes at most
     // their lengths and the sockaddr_storage it is given.
@@ -224,26 +231,21 @@ pub(super) fn receive(
         libc::recvmmsg(
             socket.as_raw_fd(),
             messages.as_mut_ptr(),
-            count.clamp(1, BATCH) as _,
-            libc::MSG_WAITFORONE as _,
+            count,
+            flags,
             std::ptr::null_mut(),
         )
     };
-    if count < 0 {
-        return Err(std::io::Error::last_os_error());
+    let count = usize::try_from(count).map_err(|_| std::io::Error::last_os_error())?;
+    for ((message, name), received) in messages[..count].iter().zip(&names).zip(received) {
+        let source = socket_address(name);
+        *received = Received {
+            len: message.msg_len as usize,
+            truncated: message.msg_hdr.msg_flags & libc::MSG_TRUNC != 0,
+            from_camera: source.is_some_and(|source| source.ip() == camera && source != gvcp),
+        };
     }
-    Ok(messages[..count as usize]
-        .iter()
-        .zip(&names)
-        .map(|(message, name)| {
-            let source = socket_address(name);
-            Received {
-                len: message.msg_len as usize,
-                truncated: message.msg_hdr.msg_flags & libc::MSG_TRUNC != 0,
-                from_camera: source.is_some_and(|source| source.ip() == camera && source != gvcp),
-            }
-        })
-        .collect())
+    Ok(count)
 }
 
 /// The IPv4 or IPv6 address the kernel wrote.
@@ -253,8 +255,7 @@ fn socket_address(name: &libc::sockaddr_storage) -> Option<std::net::SocketAddr>
     match i32::from(name.ss_family) {
         libc::AF_INET => {
             // SAFETY: the kernel wrote a sockaddr_in, which fits.
-            let address =
-                unsafe { &*(name as *const libc::sockaddr_storage).cast::<libc::sockaddr_in>() };
+            let address = unsafe { &*std::ptr::from_ref(name).cast::<libc::sockaddr_in>() };
             Some(SocketAddr::V4(SocketAddrV4::new(
                 Ipv4Addr::from(u32::from_be(address.sin_addr.s_addr)),
                 u16::from_be(address.sin_port),
@@ -262,8 +263,7 @@ fn socket_address(name: &libc::sockaddr_storage) -> Option<std::net::SocketAddr>
         }
         libc::AF_INET6 => {
             // SAFETY: the kernel wrote a sockaddr_in6, which fits.
-            let address =
-                unsafe { &*(name as *const libc::sockaddr_storage).cast::<libc::sockaddr_in6>() };
+            let address = unsafe { &*std::ptr::from_ref(name).cast::<libc::sockaddr_in6>() };
             Some(SocketAddr::V6(SocketAddrV6::new(
                 Ipv6Addr::from(address.sin6_addr.s6_addr),
                 u16::from_be(address.sin6_port),

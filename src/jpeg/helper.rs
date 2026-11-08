@@ -24,10 +24,16 @@
 //! releasing its driver, and starts again for the next frame; the pools
 //! keep sharing meanwhile, so the frames written while it rests need no
 //! copy when it starts again.
-#![allow(unsafe_code)]
+#![deny(clippy::missing_const_for_fn)]
+#![deny(clippy::panic_in_result_fn)]
 // Engines use helpers on Linux; elsewhere the code is built for its tests.
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
-
+#![cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "helper protocol and fake encoder fixtures are tested on hosts and builds without the Linux JPEG backend"
+    )
+)]
 use super::backend::{Backend, Kind, Unready, Unsupported};
 use crate::{
     copies::{self, Site},
@@ -35,15 +41,15 @@ use crate::{
     framebuf::{FrameBuf, PoolVec, Sharing, shared::Segment},
     types::Frame,
 };
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
 use std::{
     collections::{HashMap, VecDeque},
     ffi::{CStr, CString, c_int, c_void},
-    io::{self, Write},
+    io::{self, Write as _},
     os::{
-        fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
+        fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd},
         unix::net::UnixStream,
     },
     process::{Child, Command, Stdio},
@@ -55,7 +61,7 @@ use std::{
 /// The hidden first argument that runs a helper.
 pub(crate) const ARG: &str = "__jpeg-helper";
 
-/// The longest line either side writes.
+/// Maximum wire-message length, including its terminating newline.
 const MAX_LINE: usize = 16 * 1024;
 /// How long a helper may take to load its driver and say it is ready.
 pub(crate) const STARTUP: Duration = Duration::from_secs(20);
@@ -144,7 +150,7 @@ struct Incoming {
 }
 
 impl Incoming {
-    fn new(socket: UnixStream) -> Self {
+    const fn new(socket: UnixStream) -> Self {
         Self {
             socket,
             buffer: Vec::new(),
@@ -155,16 +161,18 @@ impl Incoming {
     /// a line not complete by then is a `TimedOut` error.
     fn line(&mut self, until: Option<Instant>) -> io::Result<Option<Vec<u8>>> {
         loop {
-            if let Some(end) = self.buffer.iter().position(|&byte| byte == b'\n') {
-                let mut line: Vec<u8> = self.buffer.drain(..=end).collect();
-                line.pop();
-                return Ok(Some(line));
-            }
-            if self.buffer.len() > MAX_LINE {
+            let end = self.buffer.iter().position(|&byte| byte == b'\n');
+            // The limit includes the newline, just as it does for the writer.
+            if end.unwrap_or(self.buffer.len()) >= MAX_LINE {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "a line longer than the protocol allows",
                 ));
+            }
+            if let Some(end) = end {
+                let mut line: Vec<u8> = self.buffer.drain(..=end).collect();
+                line.pop();
+                return Ok(Some(line));
             }
             if let Some(until) = until {
                 let left = until.saturating_duration_since(Instant::now());
@@ -196,6 +204,23 @@ impl Incoming {
 /// The most descriptors one message carries.
 const MAX_FDS: usize = 8;
 
+// GNU Linux and Android use size_t; musl and Darwin use socklen_t.
+#[cfg(any(
+    target_os = "android",
+    all(target_os = "linux", not(target_env = "musl"))
+))]
+const fn control_buffer_length(length: usize) -> usize {
+    length
+}
+
+#[cfg(not(any(
+    target_os = "android",
+    all(target_os = "linux", not(target_env = "musl"))
+)))]
+fn control_buffer_length(length: usize) -> libc::socklen_t {
+    libc::socklen_t::try_from(length).expect("descriptor control buffers fit socklen_t")
+}
+
 /// Bytes from `socket` into `buffer`, and any descriptors that came with
 /// them onto `fds`.
 fn receive(
@@ -203,6 +228,8 @@ fn receive(
     buffer: &mut [u8],
     fds: &mut VecDeque<OwnedFd>,
 ) -> io::Result<usize> {
+    // SAFETY: CMSG_LEN only computes the size of an empty control-message header.
+    let header_length = usize::try_from(unsafe { libc::CMSG_LEN(0) }).map_err(io::Error::other)?;
     // Aligned room for one message of MAX_FDS descriptors.
     let mut control = [0u64; 16];
     let mut iov = libc::iovec {
@@ -212,46 +239,73 @@ fn receive(
     // SAFETY: a zeroed msghdr is valid; the pointers set below outlive the
     // call.
     let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-    message.msg_iov = &mut iov;
+    message.msg_iov = &raw mut iov;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = std::mem::size_of_val(&control) as _;
+    message.msg_controllen = control_buffer_length(size_of_val(&control));
     #[cfg(target_os = "linux")]
     let flags = libc::MSG_CMSG_CLOEXEC;
     #[cfg(not(target_os = "linux"))]
     let flags = 0;
     let read = loop {
         // SAFETY: a valid socket and a message whose buffers are live.
-        let read = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut message, flags) };
+        let read = unsafe { libc::recvmsg(socket.as_raw_fd(), &raw mut message, flags) };
         if read >= 0 {
-            break read as usize;
+            break read.cast_unsigned();
         }
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
             return Err(error);
         }
     };
-    // SAFETY: walking the control messages recvmsg wrote, within
-    // `msg_controllen`; each SCM_RIGHTS payload is an array of descriptors
-    // that now belong to this process.
-    unsafe {
-        let mut header = libc::CMSG_FIRSTHDR(&message);
-        while !header.is_null() {
-            let cmsg = &*header;
-            if cmsg.cmsg_level == libc::SOL_SOCKET && cmsg.cmsg_type == libc::SCM_RIGHTS {
-                let data = libc::CMSG_DATA(header).cast::<c_int>();
-                let bytes = cmsg.cmsg_len as usize - libc::CMSG_LEN(0) as usize;
-                for i in 0..bytes / size_of::<c_int>() {
-                    let fd = OwnedFd::from_raw_fd(data.add(i).read_unaligned());
-                    #[cfg(not(target_os = "linux"))]
-                    libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
-                    fds.push_back(fd);
+    let original_fds = fds.len();
+    #[cfg(not(target_os = "linux"))]
+    let mut inheritance_error = None;
+    // SAFETY: the initialized message contains recvmsg's control buffer.
+    let mut header = unsafe { libc::CMSG_FIRSTHDR(&raw const message) };
+    while !header.is_null() {
+        // SAFETY: CMSG_FIRSTHDR/NXTHDR bounded this header by msg_controllen.
+        let cmsg = unsafe { &*header };
+        if cmsg.cmsg_level == libc::SOL_SOCKET && cmsg.cmsg_type == libc::SCM_RIGHTS {
+            // SAFETY: the header describes a received control message.
+            let data = unsafe { libc::CMSG_DATA(header) }.cast::<[u8; size_of::<c_int>()]>();
+            #[cfg(any(
+                target_os = "android",
+                all(target_os = "linux", not(target_env = "musl"))
+            ))]
+            let length = cmsg.cmsg_len;
+            #[cfg(not(any(
+                target_os = "android",
+                all(target_os = "linux", not(target_env = "musl"))
+            )))]
+            let length = usize::try_from(cmsg.cmsg_len).map_err(io::Error::other)?;
+            let bytes = length - header_length;
+            for i in 0..bytes / size_of::<c_int>() {
+                // SAFETY: each index is within the received descriptor array.
+                let at = unsafe { data.add(i) };
+                // SAFETY: a byte-array read has alignment one and stays in that payload.
+                let raw = c_int::from_ne_bytes(unsafe { at.read() });
+                // SAFETY: SCM_RIGHTS delivered a new descriptor owned by this process.
+                let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+                #[cfg(not(target_os = "linux"))]
+                if let Err(error) = close_on_exec(fd.as_raw_fd()) {
+                    inheritance_error.get_or_insert(error);
                 }
+                fds.push_back(fd);
             }
-            header = libc::CMSG_NXTHDR(&message, header);
         }
+        // SAFETY: `header` is the current header in this received message.
+        header = unsafe { libc::CMSG_NXTHDR(&raw const message, header) };
+    }
+    // Every delivered descriptor is now owned, including ones after a failed
+    // flag update. Discard this receive's descriptors together on failure.
+    #[cfg(not(target_os = "linux"))]
+    if let Some(error) = inheritance_error {
+        fds.truncate(original_fds);
+        return Err(error);
     }
     if message.msg_flags & libc::MSG_CTRUNC != 0 {
+        fds.truncate(original_fds);
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "descriptors were cut off",
@@ -260,36 +314,73 @@ fn receive(
     Ok(read)
 }
 
+#[cfg(not(target_os = "linux"))]
+fn close_on_exec(fd: std::os::fd::RawFd) -> io::Result<()> {
+    // SAFETY: fcntl validates the descriptor and does not access memory.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// All of `bytes` to `socket`, the descriptors with the first of them.
 fn send(socket: &UnixStream, bytes: &[u8], fds: &[BorrowedFd<'_>]) -> io::Result<()> {
     if fds.is_empty() {
         return (&*socket).write_all(bytes);
     }
-    assert!(fds.len() <= MAX_FDS && !bytes.is_empty());
-    let payload = (fds.len() * size_of::<c_int>()) as u32;
+    if fds.len() > MAX_FDS || bytes.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("descriptor sends need a nonempty payload and at most {MAX_FDS} descriptors"),
+        ));
+    }
+    let payload = u32::try_from(fds.len() * size_of::<c_int>()).map_err(io::Error::other)?;
     // SAFETY: CMSG_SPACE is arithmetic.
     let space = unsafe { libc::CMSG_SPACE(payload) } as usize;
-    let mut control = vec![0u64; space.div_ceil(8)];
+    let mut control = [0u64; 16];
+    let control = control.get_mut(..space.div_ceil(8)).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "descriptor control buffer exceeds capacity",
+        )
+    })?;
     let mut iov = libc::iovec {
         iov_base: bytes.as_ptr().cast_mut().cast(),
         iov_len: bytes.len(),
     };
     // SAFETY: as in `receive`.
     let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-    message.msg_iov = &mut iov;
+    message.msg_iov = &raw mut iov;
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = space as _;
-    // SAFETY: the control buffer holds one header and its descriptors.
-    unsafe {
-        let header = libc::CMSG_FIRSTHDR(&message);
-        (*header).cmsg_level = libc::SOL_SOCKET;
-        (*header).cmsg_type = libc::SCM_RIGHTS;
-        (*header).cmsg_len = libc::CMSG_LEN(payload) as _;
-        let data = libc::CMSG_DATA(header).cast::<c_int>();
-        for (i, fd) in fds.iter().enumerate() {
-            data.add(i).write_unaligned(fd.as_raw_fd());
-        }
+    message.msg_controllen = control_buffer_length(space);
+    // SAFETY: the aligned control buffer holds one header and its descriptors.
+    let header = unsafe { libc::CMSG_FIRSTHDR(&raw const message) };
+    // SAFETY: the header points into our exclusively borrowed control buffer.
+    let header = unsafe { &mut *header };
+    header.cmsg_level = libc::SOL_SOCKET;
+    header.cmsg_type = libc::SCM_RIGHTS;
+    // SAFETY: CMSG_LEN computes the header plus bounded payload length.
+    let length = unsafe { libc::CMSG_LEN(payload) };
+    // GNU libc and Android use size_t; musl and Darwin use socklen_t.
+    #[cfg(any(
+        target_os = "android",
+        all(target_os = "linux", not(target_env = "musl"))
+    ))]
+    let length = usize::try_from(length).map_err(io::Error::other)?;
+    header.cmsg_len = length;
+    // SAFETY: this initialized header describes our control buffer's payload.
+    let data = unsafe { libc::CMSG_DATA(std::ptr::from_mut(header)) };
+    // SAFETY: CMSG_SPACE reserved at least this many payload bytes, exclusively owned here.
+    let data = unsafe { std::slice::from_raw_parts_mut(data, fds.len() * size_of::<c_int>()) };
+    for (place, fd) in data
+        .as_chunks_mut::<{ size_of::<c_int>() }>()
+        .0
+        .iter_mut()
+        .zip(fds)
+    {
+        place.copy_from_slice(&fd.as_raw_fd().to_ne_bytes());
     }
     #[cfg(target_os = "linux")]
     let flags = libc::MSG_NOSIGNAL;
@@ -297,9 +388,9 @@ fn send(socket: &UnixStream, bytes: &[u8], fds: &[BorrowedFd<'_>]) -> io::Result
     let flags = 0;
     let sent = loop {
         // SAFETY: a valid socket and a message whose buffers are live.
-        let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &message, flags) };
+        let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &raw const message, flags) };
         if sent >= 0 {
-            break sent as usize;
+            break sent.cast_unsigned();
         }
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::Interrupted {
@@ -334,9 +425,15 @@ impl Library {
     /// The function `name` as `T`, a function pointer type.
     ///
     /// # Safety
-    /// `T` must be the symbol's C signature.
+    /// `T` must be the symbol's C function-pointer type, including its ABI
+    /// and signature. The library must remain loaded whenever the returned
+    /// function is called.
     pub(crate) unsafe fn symbol<T: Copy>(&self, name: &CStr) -> Result<T> {
-        assert_eq!(size_of::<T>(), size_of::<*mut c_void>());
+        ensure!(
+            size_of::<T>() == size_of::<*mut c_void>(),
+            "{} has an incompatible function pointer size",
+            name.to_string_lossy()
+        );
         // SAFETY: a live handle and a NUL-terminated name.
         let symbol = unsafe { libc::dlsym(self.0.as_ptr(), name.as_ptr()) };
         ensure!(
@@ -405,15 +502,21 @@ pub(crate) fn run(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<
         // Ending with the worker, even one that is killed: a helper the
         // worker cannot reach any more only holds the GPU.
         // SAFETY: prctl with a signal number.
-        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+            return Err(io::Error::last_os_error())
+                .context("cannot set JPEG helper parent-death signal");
+        }
         // A worker that ended before that would never send the signal.
         // (Its pid, not the parent's: CAPTUREFAB_EXECUTABLE may name a
         // wrapper that runs the helper as its own child.)
-        // SAFETY: kill with signal 0 only checks that the process exists.
-        let gone = |pid: u32| unsafe { libc::kill(pid as libc::pid_t, 0) } != 0
-            && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-        if parent.is_some_and(gone) {
-            return Ok(());
+        if let Some(pid) = parent {
+            let pid = parent_pid(pid)?;
+            // SAFETY: signal 0 checks one validated positive process ID.
+            if unsafe { libc::kill(pid, 0) } != 0
+                && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                return Ok(());
+            }
         }
     }
     let _ = parent;
@@ -431,6 +534,14 @@ pub(crate) fn run(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<
         )),
     };
     serve(socket, opened)
+}
+
+#[cfg(target_os = "linux")]
+fn parent_pid(pid: u32) -> Result<libc::pid_t> {
+    let pid =
+        libc::pid_t::try_from(pid).context("JPEG helper parent PID exceeds process ID range")?;
+    ensure!(pid > 0, "JPEG helper parent PID must be positive");
+    Ok(pid)
 }
 
 /// Say hello, then answer the worker's requests on `socket` until it is
@@ -547,7 +658,13 @@ pub(crate) enum Launch {
     Program(std::path::PathBuf),
     /// `serve` on a thread of this process, for tests.
     #[cfg(test)]
-    #[cfg_attr(not(feature = "jpeg"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "jpeg"),
+        allow(
+            dead_code,
+            reason = "helper protocol and fake encoder fixtures are tested on hosts and builds without the Linux JPEG backend"
+        )
+    )]
     Thread(Arc<dyn Fn() -> Opened + Send + Sync>),
 }
 
@@ -560,28 +677,28 @@ enum Process {
 impl Process {
     fn kill(&mut self) {
         match self {
-            Process::Child(child) => {
+            Self::Child(child) => {
                 let _ = child.kill();
             }
             #[cfg(test)]
-            Process::Thread(_) => {}
+            Self::Thread(_) => {}
         }
     }
     /// Wait for it to end; None when it does not end itself by `until`.
     fn wait_until(&mut self, until: Instant) -> Option<String> {
         loop {
             match self {
-                Process::Child(child) => match child.try_wait() {
+                Self::Child(child) => match child.try_wait() {
                     Ok(Some(status)) => return Some(describe_exit(status)),
                     Err(error) => return Some(format!("an unknown status ({error})")),
                     Ok(None) => {}
                 },
                 #[cfg(test)]
-                Process::Thread(handle) if handle.is_finished() => {
+                Self::Thread(handle) if handle.is_finished() => {
                     return Some("the end of its thread".into());
                 }
                 #[cfg(test)]
-                Process::Thread(_) => {}
+                Self::Thread(_) => {}
             }
             if Instant::now() >= until {
                 return None;
@@ -592,11 +709,11 @@ impl Process {
     /// Wait for it to end, however long that takes.
     fn wait(self) {
         match self {
-            Process::Child(mut child) => {
+            Self::Child(mut child) => {
                 let _ = child.wait();
             }
             #[cfg(test)]
-            Process::Thread(handle) => {
+            Self::Thread(handle) => {
                 let _ = handle.join();
             }
         }
@@ -604,7 +721,7 @@ impl Process {
 }
 
 fn describe_exit(status: std::process::ExitStatus) -> String {
-    use std::os::unix::process::ExitStatusExt;
+    use std::os::unix::process::ExitStatusExt as _;
     match (status.code(), status.signal()) {
         (_, Some(signal)) => format!("signal {signal}"),
         (Some(code), _) => format!("exit status {code}"),
@@ -615,10 +732,9 @@ fn describe_exit(status: std::process::ExitStatus) -> String {
 /// What a request lent the helper: freed only once it has answered or
 /// ended, by dropping it.
 #[derive(Default)]
-#[allow(dead_code)]
 struct Lent {
-    input: Option<FrameBuf>,
-    output: Option<PoolVec>,
+    _input: Option<FrameBuf>,
+    _output: Option<PoolVec>,
 }
 
 /// A running helper.
@@ -800,6 +916,10 @@ impl Helper {
             });
         if spawned.is_err() {
             // Without a thread to wait for it, what it was lent stays lent.
+            #[expect(
+                clippy::mem_forget,
+                reason = "If reaper creation fails, retain the helper's lent memory until process exit rather than let it be reused while the helper may still access it"
+            )]
             std::mem::forget(held);
         }
     }
@@ -843,14 +963,6 @@ impl Client {
             answer_within: None,
         })
     }
-
-    fn deadline(&self, frame: &Frame) -> Duration {
-        #[cfg(test)]
-        if let Some(within) = self.answer_within {
-            return within;
-        }
-        super::backend::deadline(frame)
-    }
 }
 
 /// The most a baseline JPEG of `frame` can take, as libjpeg-turbo reckons
@@ -887,16 +999,15 @@ impl Backend for Client {
             self.wake()?;
         }
         // The frame's own shared memory, or a copy in a segment.
-        let input = match frame.data.segment() {
-            Some(_) => frame.data.clone(),
-            None => {
-                let mut copy = crate::framebuf::transforms()
-                    .take_shared(frame.data.len())
-                    .ok_or_else(|| Unready("no shared memory for the frame".into()))?;
-                copy.copy_from_slice(&frame.data);
-                copies::record(Site::GpuUpload, frame.data.len());
-                copy.freeze()
-            }
+        let input = if frame.data.segment().is_some() {
+            frame.data.clone()
+        } else {
+            let mut copy = crate::framebuf::transforms()
+                .take_shared(frame.data.len())
+                .ok_or_else(|| Unready("no shared memory for the frame".into()))?;
+            copy.copy_from_slice(&frame.data);
+            copies::record(Site::GpuUpload, frame.data.len());
+            copy.freeze()
         };
         let capacity = jpeg_bound(frame);
         let output = crate::framebuf::transforms()
@@ -916,7 +1027,10 @@ impl Backend for Client {
             output: output_segment.id(),
             capacity,
         };
-        let until = Instant::now() + self.deadline(frame);
+        let wait = super::backend::deadline(frame);
+        #[cfg(test)]
+        let wait = self.answer_within.unwrap_or(wait);
+        let until = Instant::now() + wait;
         let helper = self.helper.as_mut().expect("woken");
         let answered = helper.exchange(&input_segment, &output_segment, job, until);
         drop((input_segment, output_segment));
@@ -931,8 +1045,8 @@ impl Backend for Client {
             Ok(Reply { ok: true, .. }) => {
                 let helper = self.helper.take().expect("running");
                 helper.abandon(Lent {
-                    input: Some(input),
-                    output: Some(output),
+                    _input: Some(input),
+                    _output: Some(output),
                 });
                 bail!("its helper reported a JPEG longer than its segment")
             }
@@ -949,8 +1063,8 @@ impl Backend for Client {
             Err(error) => {
                 let helper = self.helper.take().expect("running");
                 helper.abandon(Lent {
-                    input: Some(input),
-                    output: Some(output),
+                    _input: Some(input),
+                    _output: Some(output),
                 });
                 Err(error)
             }
@@ -962,13 +1076,10 @@ impl Backend for Client {
     }
 
     fn rest(&mut self) -> bool {
-        match self.helper.take() {
-            Some(helper) => {
-                helper.stop();
-                true
-            }
-            None => false,
-        }
+        self.helper.take().is_some_and(|helper| {
+            helper.stop();
+            true
+        })
     }
 
     fn wake(&mut self) -> Result<()> {
@@ -998,16 +1109,26 @@ pub(crate) fn engine(kind: Kind) -> super::backend::Engine {
         Kind::Vaapi => super::vaapi::absent,
         _ => unreachable!("no helper for {kind:?}"),
     };
-    super::backend::Engine::new(kind, move || {
-        Client::open(kind, Launch::Executable, STARTUP)
-    })
-    .absent_when(absent)
-    .open_within(STARTUP)
+    engine_with(kind, Launch::Executable).absent_when(absent)
+}
+
+/// The helper's startup budget also covers opening its engine wrapper.
+#[cfg(any(target_os = "linux", all(test, feature = "jpeg")))]
+fn engine_with(kind: Kind, launch: Launch) -> super::backend::Engine {
+    super::backend::Engine::new(kind, move || Client::open(kind, launch, STARTUP))
+        .open_within(STARTUP)
 }
 
 #[cfg(test)]
 // Without libjpeg-turbo the fake helper has nothing to encode with.
-#[cfg_attr(not(feature = "jpeg"), allow(dead_code, unused_imports))]
+#[cfg_attr(
+    not(feature = "jpeg"),
+    allow(
+        dead_code,
+        unused_imports,
+        reason = "helper protocol and fake encoder fixtures are tested on hosts and builds without the Linux JPEG backend"
+    )
+)]
 pub(crate) mod tests {
     use super::*;
     use crate::jpeg::QUALITY;
@@ -1053,13 +1174,16 @@ pub(crate) mod tests {
             if Some(frame.width) == self.decline_width {
                 return Err(Unsupported("too wide".into()).into());
             }
-            self.seen.lock().unwrap().push(Seen {
-                frame: frame.data.as_ptr() as usize,
-                segment: input.as_ptr() as usize,
-                id: input.id(),
-                first: frame.data[0],
-                out: out.as_ptr() as usize,
-            });
+            self.seen
+                .lock()
+                .map_err(|_| anyhow!("fake JPEG observation lock is poisoned"))?
+                .push(Seen {
+                    frame: frame.data.as_ptr() as usize,
+                    segment: input.as_ptr() as usize,
+                    id: input.id(),
+                    first: frame.data[0],
+                    out: out.as_ptr() as usize,
+                });
             let jpeg = crate::jpeg::encode(frame, quality)?;
             out[..jpeg.len()].copy_from_slice(&jpeg);
             Ok(jpeg.len())
@@ -1098,7 +1222,7 @@ pub(crate) mod tests {
 
     /// A script standing in for a helper.
     pub(crate) fn script(name: &str, body: &str) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt as _;
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
             "capturefab-jpeg-helper-{name}-{}-{}",
@@ -1221,7 +1345,7 @@ pub(crate) mod tests {
             .encode(FrameRef::whole(&truncated), QUALITY)
             .unwrap_err();
         assert!(error.is::<Unready>(), "{error:#}");
-        assert!(client.encode(FrameRef::whole(&frame), QUALITY).is_ok());
+        client.encode(FrameRef::whole(&frame), QUALITY).unwrap();
     }
 
     /// A helper that crashes, hangs, writes garbage or refuses to start is
@@ -1294,15 +1418,10 @@ pub(crate) mod tests {
     #[cfg(feature = "jpeg")]
     #[test]
     fn a_crashing_helper_leaves_frames_to_the_cpu() {
-        use super::super::backend::Engine;
         let path = script("crash", &format!("{READY}; read line; kill -SEGV $$"));
         let frame = shared_frame(crate::types::RGB8, 64, 32, 1);
         let cpu = crate::jpeg::encode(&frame, QUALITY).unwrap();
-        let launch = Launch::Program(path.clone());
-        let engine = Engine::new(Kind::Nvjpeg, move || {
-            Client::open(Kind::Nvjpeg, launch, STARTUP)
-        })
-        .any_size();
+        let engine = engine_with(Kind::Nvjpeg, Launch::Program(path.clone())).any_size();
         // Checked beside the first frame, which the CPU encodes.
         assert_eq!(engine.encode(&frame, QUALITY, false).unwrap(), cpu);
         let reason = engine.settled().unavailable().unwrap();
@@ -1332,7 +1451,11 @@ pub(crate) mod tests {
                 quality: i32,
                 out: &mut [u8],
             ) -> Result<usize> {
-                drop(self.0.lock().unwrap());
+                drop(
+                    self.0
+                        .lock()
+                        .map_err(|_| anyhow!("fake JPEG gate lock is poisoned"))?,
+                );
                 Fake::default().encode(frame, input, quality, out)
             }
         }
@@ -1434,6 +1557,88 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn invalid_descriptor_sends_return_input_errors() {
+        use std::os::fd::AsFd as _;
+
+        let (socket, _peer) = UnixStream::pair().unwrap();
+        let descriptors = vec![socket.as_fd(); MAX_FDS + 1];
+        assert_eq!(
+            send(&socket, b"x", &descriptors).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            send(&socket, &[], &descriptors[..1]).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        send(&socket, &[], &[]).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn parent_ids_cannot_address_process_groups_or_wrap() {
+        assert_eq!(parent_pid(1).unwrap(), 1);
+        assert_eq!(parent_pid(i32::MAX.cast_unsigned()).unwrap(), i32::MAX);
+        parent_pid(0).unwrap_err();
+        parent_pid(i32::MAX.cast_unsigned() + 1).unwrap_err();
+        parent_pid(u32::MAX).unwrap_err();
+    }
+
+    #[test]
+    fn a_full_descriptor_batch_preserves_order() {
+        use std::{io::Read as _, os::fd::AsFd as _};
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let (sockets, mut peers): (Vec<_>, Vec<_>) =
+            std::iter::repeat_with(|| UnixStream::pair().unwrap())
+                .take(MAX_FDS)
+                .unzip();
+        let borrowed: Vec<_> = sockets.iter().map(|socket| socket.as_fd()).collect();
+        send(&sender, b"x", &borrowed).unwrap();
+        let mut fds = VecDeque::new();
+        assert_eq!(receive(&receiver, &mut [0; 1], &mut fds).unwrap(), 1);
+        assert_eq!(fds.len(), MAX_FDS);
+        for (index, (fd, peer)) in fds.into_iter().zip(&mut peers).enumerate() {
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut socket = UnixStream::from(fd);
+            let expected = [u8::try_from(index).unwrap()];
+            socket.write_all(&expected).unwrap();
+            let mut actual = [0];
+            peer.read_exact(&mut actual).unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn complete_lines_obey_the_protocol_size_limit() {
+        for length in [MAX_LINE - 1, MAX_LINE, MAX_LINE + 1] {
+            let (socket, _peer) = UnixStream::pair().unwrap();
+            let mut incoming = Incoming::new(socket);
+            incoming.buffer.resize(length, b'x');
+            incoming.buffer.extend_from_slice(b"\nnext\n");
+            let line = incoming.line(None);
+            if length >= MAX_LINE {
+                assert_eq!(
+                    line.as_ref().err().map(io::Error::kind),
+                    Some(io::ErrorKind::InvalidData)
+                );
+            } else {
+                assert_eq!(line.unwrap().unwrap().len(), length);
+                assert_eq!(incoming.line(None).unwrap().unwrap(), b"next");
+            }
+        }
+        assert_eq!(line(&"x".repeat(MAX_LINE - 3)).unwrap().len(), MAX_LINE);
+        line(&"x".repeat(MAX_LINE - 2)).unwrap_err();
+    }
+
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn invalid_descriptors_cannot_be_marked_close_on_exec() {
+        assert_eq!(
+            close_on_exec(-1).unwrap_err().raw_os_error(),
+            Some(libc::EBADF)
+        );
+    }
+
+    #[test]
     fn descriptors_travel_with_their_line() {
         let (a, b) = UnixStream::pair().unwrap();
         let segment = Segment::create(4096).unwrap();
@@ -1443,6 +1648,10 @@ pub(crate) mod tests {
         let mut incoming = Incoming::new(b);
         assert_eq!(incoming.line(None).unwrap().unwrap(), b"{\"x\":1}");
         let fd = incoming.fds.pop_front().unwrap();
+        // SAFETY: `fd` is owned and remains open for this flag query.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
         let mapped = Segment::map(fd, 4096, 9).unwrap();
         // SAFETY: as above.
         assert_eq!(unsafe { mapped.bytes(1) }, &[42]);
@@ -1474,9 +1683,12 @@ pub(crate) mod tests {
             // SAFETY: getpid's C signature.
             let getpid: unsafe extern "C" fn() -> c_int =
                 unsafe { library.symbol(c"getpid") }.unwrap();
-            assert_eq!(unsafe { getpid() } as u32, std::process::id());
+            // SAFETY: the symbol has getpid's signature and library is live.
+            let pid = unsafe { getpid() };
+            assert_eq!(u32::try_from(pid).unwrap(), std::process::id());
+            // SAFETY: the missing symbol is never invoked or dereferenced.
             let missing = unsafe { library.symbol::<unsafe extern "C" fn()>(c"capturefab_none") };
-            assert!(missing.is_err());
+            missing.unwrap_err();
         }
     }
 }

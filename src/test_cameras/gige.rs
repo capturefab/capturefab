@@ -1,9 +1,10 @@
 //! GVCP/GVSP test camera. Layouts match the bootstrap registers consumed by
 //! our native transport and the public Aravis protocol headers.
-//! https://github.com/AravisProject/aravis/blob/main/src/arvgvcpprivate.h
+//! <https://github.com/AravisProject/aravis/blob/main/src/arvgvcpprivate.h>
+#![deny(clippy::cast_precision_loss)]
 use super::{LatestFrame, ServerOptions};
 use crate::{camera::Camera, types::Frame};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context as _, Result, ensure};
 use std::{
     collections::{BTreeMap, VecDeque},
     net::{Ipv4Addr, SocketAddr, UdpSocket},
@@ -16,7 +17,7 @@ use std::{
 };
 
 const SOURCE_BASE: u64 = 0x10000;
-const XML_BASE: u64 = 0x100000;
+const XML_BASE: u64 = 0x0010_0000;
 const PRIVILEGE: u32 = 0x0a00;
 const HEARTBEAT: u32 = 0x0938;
 const STREAM_PORT: u32 = 0x0d00;
@@ -29,7 +30,7 @@ const MAX_STREAM_DELAY: u32 = 10_000_000;
 const MAX_CACHE_BYTES: usize = 32 * 1024 * 1024;
 type AcquisitionCommands = BTreeMap<u64, (u64, u64)>;
 /// SFNC transport layer features on the bootstrap registers, which keep
-/// their GigE Vision addresses and byte order.
+/// their `GigE` Vision addresses and byte order.
 const TRANSPORT_FEATURES: &str = concat!(
     r#"<Category Name="TransportLayerControl"><pFeature>GevSCPSPacketSize</pFeature><pFeature>GevSCPD</pFeature><pFeature>GevTimestampTickFrequency</pFeature></Category>"#,
     r#"<Integer Name="GevSCPSPacketSize"><pValue>GevSCPSPacketSizeReg</pValue><Min>576</Min><Max>9000</Max><Unit>B</Unit></Integer>"#,
@@ -53,7 +54,7 @@ struct State {
     registers: BTreeMap<u32, u32>,
     controller: Option<SocketAddr>,
     heartbeat: Instant,
-    cache: VecDeque<(u16, Arc<Vec<Vec<u8>>>)>,
+    cache: VecDeque<(u16, Vec<Vec<u8>>)>,
 }
 impl State {
     fn reg(&self, address: u32) -> u32 {
@@ -62,15 +63,15 @@ impl State {
     fn destination(&self) -> SocketAddr {
         SocketAddr::from((
             Ipv4Addr::from(self.reg(STREAM_ADDRESS)),
-            self.reg(STREAM_PORT) as u16,
+            be16(&self.reg(STREAM_PORT).to_be_bytes(), 2),
         ))
     }
 }
 /// Device memory. Bootstrap registers hold the same values through register
 /// and memory commands, as on a camera.
 struct Device {
-    bootstrap: Arc<Vec<u8>>,
-    xml: Arc<Vec<u8>>,
+    bootstrap: Arc<[u8]>,
+    xml: Vec<u8>,
     source: Arc<Mutex<Camera>>,
     commands: AcquisitionCommands,
     acquisition: Arc<AtomicBool>,
@@ -100,7 +101,10 @@ impl Device {
             address.is_multiple_of(4) && data.len().is_multiple_of(4),
             Status(0x8005, "unaligned register write")
         );
-        for (address, word) in (address as u32..).step_by(4).zip(data.as_chunks::<4>().0) {
+        for (address, word) in (u32::try_from(address)?..)
+            .step_by(4)
+            .zip(data.as_chunks::<4>().0)
+        {
             self.write_register(state, peer, address, u32::from_be_bytes(*word))?;
         }
         Ok(())
@@ -136,7 +140,7 @@ impl Device {
         match address {
             // pylon sets an hour while debugging; GigE Vision only sets a floor.
             HEARTBEAT => ensure!(value >= 500, "heartbeat range"),
-            STREAM_PORT => ensure!(value <= u16::MAX as u32, "invalid stream port"),
+            STREAM_PORT => ensure!(u16::try_from(value).is_ok(), "invalid stream port"),
             STREAM_ADDRESS => ensure!(
                 !Ipv4Addr::from(value).is_multicast() && value != u32::MAX,
                 "invalid stream destination"
@@ -148,18 +152,18 @@ impl Device {
                 if value & 0x8000_0000 != 0 && state.reg(STREAM_PORT) != 0 {
                     let _ = self
                         .stream
-                        .send_to(&vec![0; size as usize - 28], state.destination());
+                        .send_to(&vec![0; usize::try_from(size)? - 28], state.destination());
                 }
                 return Ok(());
             }
             STREAM_DELAY => ensure!(value <= MAX_STREAM_DELAY, "stream packet delay range"),
             _ if (USER_NAME..USER_NAME + 16).contains(&address) => {}
-            _ if (address as usize) < self.bootstrap.len() => {
+            _ if usize::try_from(address).is_ok_and(|address| address < self.bootstrap.len()) => {
                 anyhow::bail!(Status(0x8004, "read-only bootstrap register"))
             }
             _ => {
                 return write_memory(
-                    address as u64,
+                    u64::from(address),
                     &value.to_be_bytes(),
                     &self.source,
                     &self.commands,
@@ -174,13 +178,16 @@ impl Device {
         state.controller = None;
         state.registers.insert(PRIVILEGE, 0);
         self.acquisition.store(false, Ordering::Relaxed);
-        self.source.lock().unwrap_or_else(|e| e.into_inner()).stop()
+        self.source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stop()
     }
 }
 /// Lays big-endian register values over the bootstrap bytes they cover.
 fn overlay(registers: &BTreeMap<u32, u32>, address: u64, bytes: &mut [u8]) {
     for (&register, value) in registers {
-        for (offset, byte) in (register as u64..).zip(value.to_be_bytes()) {
+        for (offset, byte) in (u64::from(register)..).zip(value.to_be_bytes()) {
             if let Some(target) = offset
                 .checked_sub(address)
                 .and_then(|offset| usize::try_from(offset).ok())
@@ -214,14 +221,13 @@ impl GigEServer {
         );
         let source_xml = camera
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .xml()
             .to_owned();
         let (xml, commands) = wire_xml(&source_xml)?;
         let xml_length = xml.len();
         let mut xml = xml.into_bytes();
         xml.resize(xml.len().next_multiple_of(4), 0);
-        let xml = Arc::new(xml);
         let mut bootstrap = vec![0; 0x1000];
         bootstrap[0..4].copy_from_slice(&[0, 2, 0, 0]);
         bootstrap[4..8].copy_from_slice(&0x8000_0001u32.to_be_bytes());
@@ -248,7 +254,12 @@ impl GigEServer {
             16,
             &format!("SIM{:08X}", u32::from(options.advertise)),
         );
-        put_text(&mut bootstrap, USER_NAME as usize, 16, &options.name);
+        put_text(
+            &mut bootstrap,
+            usize::try_from(USER_NAME)?,
+            16,
+            &options.name,
+        );
         put_text(
             &mut bootstrap,
             0x200,
@@ -258,7 +269,7 @@ impl GigEServer {
         bootstrap[0x600..0x604].copy_from_slice(&1u32.to_be_bytes());
         bootstrap[0x64c..0x650].copy_from_slice(&options.advertise.octets());
         bootstrap[0x65c..0x660].copy_from_slice(&[255, 255, 255, 0]);
-        let bootstrap = Arc::new(bootstrap);
+        let bootstrap: Arc<[u8]> = bootstrap.into();
         let state = Arc::new(Mutex::new(State {
             registers: BTreeMap::from([
                 (PRIVILEGE, 0),
@@ -270,7 +281,7 @@ impl GigEServer {
                 (0x0940, 1_000_000_000),
                 (0x0900, 0),
                 (0x0904, 1),
-                (0x0d1c, stream.local_addr()?.port() as u32),
+                (0x0d1c, u32::from(stream.local_addr()?.port())),
                 (STREAM_SIZE, 1500),
                 (STREAM_PORT, 0),
                 (STREAM_DELAY, 0),
@@ -308,9 +319,13 @@ impl GigEServer {
                                     && let Some((0x0002, id, _)) = command(&buffer[..length])
                                 {
                                     let mut data = bootstrap[..0xf8].to_vec();
-                                    let state = state.lock().unwrap_or_else(|e| e.into_inner());
+                                    let state = state
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                                     overlay(&state.registers, 0, &mut data);
-                                    let _ = replies.send_to(&ack(0, 0x0002, id, &data), peer);
+                                    if let Some(reply) = ack(0, 0x0002, id, &data) {
+                                        let _ = replies.send_to(&reply, peer);
+                                    }
                                 }
                             }
                         }
@@ -334,10 +349,14 @@ impl GigEServer {
                     let mut buffer = [0u8; 8192];
                     while !stopped.load(Ordering::Relaxed) {
                         {
-                            let mut state = state_control.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut state = state_control
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             if state.controller.is_some()
                                 && state.heartbeat.elapsed()
-                                    > Duration::from_millis(state.reg(HEARTBEAT).max(500) as u64)
+                                    > Duration::from_millis(u64::from(
+                                        state.reg(HEARTBEAT).max(500),
+                                    ))
                             {
                                 let _ = device.release(&mut state);
                             }
@@ -348,7 +367,9 @@ impl GigEServer {
                         let Some((command, id, payload)) = command(&buffer[..length]) else {
                             continue;
                         };
-                        let mut state = state_control.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut state = state_control
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         if state.controller == Some(peer) {
                             state.heartbeat = Instant::now();
                         }
@@ -373,7 +394,7 @@ impl GigEServer {
                                     );
                                     // READ_REGISTER is also a four-byte memory
                                     // access. GenApi applies the XML byte order.
-                                    data.extend(device.read(&state, address as u64, 4)?);
+                                    data.extend(device.read(&state, u64::from(address), 4)?);
                                 }
                                 Ok(data)
                             }
@@ -385,7 +406,7 @@ impl GigEServer {
                                 for (index, pair) in payload.as_chunks::<8>().0.iter().enumerate() {
                                     // A failed acknowledgement carries the
                                     // number of writes already applied.
-                                    written = Some(index as u32);
+                                    written = Some(u32::try_from(index)?);
                                     device.write_register(
                                         &mut state,
                                         peer,
@@ -393,15 +414,15 @@ impl GigEServer {
                                         be32(pair, 4),
                                     )?;
                                 }
-                                Ok((payload.len() as u32 / 8).to_be_bytes().to_vec())
+                                Ok(u32::try_from(payload.len() / 8)?.to_be_bytes().to_vec())
                             }
                             0x0084 => {
                                 ensure!(payload.len() == 8, "invalid memory read");
                                 let address = be32(payload, 0);
-                                let length = be16(payload, 6) as usize;
+                                let length = usize::from(be16(payload, 6));
                                 ensure!((1..=512).contains(&length), "memory read limit");
                                 let mut result = address.to_be_bytes().to_vec();
-                                result.extend(device.read(&state, address as u64, length)?);
+                                result.extend(device.read(&state, u64::from(address), length)?);
                                 Ok(result)
                             }
                             0x0086 => {
@@ -412,11 +433,11 @@ impl GigEServer {
                                 device.write(
                                     &mut state,
                                     peer,
-                                    be32(payload, 0) as u64,
+                                    u64::from(be32(payload, 0)),
                                     &payload[4..],
                                 )?;
                                 // Reserved, then the data index (bytes written).
-                                let written = (payload.len() - 4) as u16;
+                                let written = u16::try_from(payload.len() - 4)?;
                                 Ok([[0, 0], written.to_be_bytes()].concat())
                             }
                             0x0040 => {
@@ -429,8 +450,8 @@ impl GigEServer {
                                     "invalid resend request"
                                 );
                                 let block = be16(payload, 2);
-                                let first = be32(payload, 4) as usize;
-                                let last = be32(payload, 8) as usize;
+                                let first = usize::try_from(be32(payload, 4))?;
+                                let last = usize::try_from(be32(payload, 8))?;
                                 if let Some((_, cached)) =
                                     state.cache.iter().find(|(id, _)| *id == block)
                                 {
@@ -445,7 +466,8 @@ impl GigEServer {
                                 } else if state.reg(STREAM_PORT) != 0 {
                                     // PACKET_UNAVAILABLE ends the receiver's
                                     // wait for a block that left the cache.
-                                    let mut unavailable = packet(block, first & 0xff_ffff, 3, &[]);
+                                    let mut unavailable = packet(block, first & 0xff_ffff, 3, &[])
+                                        .context("invalid resend packet number")?;
                                     unavailable[..2].copy_from_slice(&0x800cu16.to_be_bytes());
                                     let _ =
                                         device.stream.send_to(&unavailable, state.destination());
@@ -466,7 +488,9 @@ impl GigEServer {
                                 written.map_or(Vec::new(), |index| index.to_be_bytes().to_vec()),
                             ),
                         };
-                        let _ = control.send_to(&ack(status, command, id, &data), peer);
+                        if let Some(reply) = ack(status, command, id, &data) {
+                            let _ = control.send_to(&reply, peer);
+                        }
                     }
                 })
                 .context("starting virtual GigE control")?,
@@ -488,22 +512,27 @@ impl GigEServer {
                             continue;
                         }
                         let (destination, size, delay) = {
-                            let state = state.lock().unwrap_or_else(|e| e.into_inner());
+                            let state = state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             if state.reg(STREAM_PORT) == 0 || state.reg(STREAM_ADDRESS) == 0 {
                                 continue;
                             }
                             (
                                 state.destination(),
-                                (state.reg(STREAM_SIZE) & 0xffff) as usize,
+                                usize::from(be16(&state.reg(STREAM_SIZE).to_be_bytes(), 2)),
                                 // Timestamp ticks run at 1 GHz.
-                                Duration::from_nanos(state.reg(STREAM_DELAY) as u64),
+                                Duration::from_nanos(u64::from(state.reg(STREAM_DELAY))),
                             )
                         };
                         block = block.wrapping_add(1).max(1);
-                        let packets =
-                            Arc::new(frame_packets(block, &frame, size.saturating_sub(36).max(1)));
+                        let Some(packets) =
+                            frame_packets(block, &frame, size.saturating_sub(36).max(1))
+                        else {
+                            continue;
+                        };
                         let mut owed = Duration::ZERO;
-                        for packet in packets.iter() {
+                        for packet in &packets {
                             if shutdown.load(Ordering::Relaxed) {
                                 break;
                             }
@@ -517,7 +546,9 @@ impl GigEServer {
                             }
                         }
                         if frame.data.len() <= MAX_CACHE_BYTES / 2 {
-                            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut state = state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             if state.cache.len() == 2 {
                                 state.cache.pop_front();
                             }
@@ -589,16 +620,19 @@ fn discovery_sockets(bind: Ipv4Addr, port: u16) -> Option<(Vec<UdpSocket>, u32)>
 }
 /// A GVCP command header: command, request ID and payload.
 fn command(packet: &[u8]) -> Option<(u16, u16, &[u8])> {
-    (packet.len() >= 8 && packet[0] == 0x42 && be16(packet, 4) as usize == packet.len() - 8)
+    (packet.len() >= 8 && packet[0] == 0x42 && usize::from(be16(packet, 4)) == packet.len() - 8)
         .then(|| (be16(packet, 2), be16(packet, 6), &packet[8..]))
 }
-fn ack(status: u16, command: u16, id: u16, data: &[u8]) -> Vec<u8> {
-    let mut reply = status.to_be_bytes().to_vec();
-    reply.extend((command + 1).to_be_bytes());
-    reply.extend((data.len() as u16).to_be_bytes());
+#[deny(clippy::arithmetic_side_effects)]
+fn ack(status: u16, command: u16, id: u16, data: &[u8]) -> Option<Vec<u8>> {
+    let length = u16::try_from(data.len()).ok()?;
+    let mut reply = Vec::with_capacity(data.len().checked_add(8)?);
+    reply.extend(status.to_be_bytes());
+    reply.extend(command.wrapping_add(1).to_be_bytes());
+    reply.extend(length.to_be_bytes());
     reply.extend(id.to_be_bytes());
     reply.extend(data);
-    reply
+    Some(reply)
 }
 fn be16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap())
@@ -619,13 +653,16 @@ fn read_memory(
     source: &Mutex<Camera>,
 ) -> Result<Vec<u8>> {
     let end = address
-        .checked_add(length as u64)
+        .checked_add(u64::try_from(length).context("memory length overflow")?)
         .context("address overflow")?;
-    if end <= bootstrap.len() as u64 {
-        return Ok(bootstrap[address as usize..end as usize].to_vec());
+    if let Some(bytes) = memory_region(bootstrap, address, length) {
+        return Ok(bytes.to_vec());
     }
-    if address >= XML_BASE && end <= XML_BASE + xml.len() as u64 {
-        return Ok(xml[(address - XML_BASE) as usize..(end - XML_BASE) as usize].to_vec());
+    if let Some(bytes) = address
+        .checked_sub(XML_BASE)
+        .and_then(|offset| memory_region(xml, offset, length))
+    {
+        return Ok(bytes.to_vec());
     }
     ensure!(
         address >= SOURCE_BASE && end <= XML_BASE,
@@ -633,8 +670,13 @@ fn read_memory(
     );
     source
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .read_memory(address - SOURCE_BASE, length)
+}
+#[deny(clippy::arithmetic_side_effects)]
+fn memory_region(bytes: &[u8], offset: u64, length: usize) -> Option<&[u8]> {
+    let start = usize::try_from(offset).ok()?;
+    bytes.get(start..start.checked_add(length)?)
 }
 fn write_memory(
     address: u64,
@@ -644,13 +686,21 @@ fn write_memory(
     acquisition: &AtomicBool,
 ) -> Result<()> {
     ensure!(
-        address >= SOURCE_BASE && address.saturating_add(data.len() as u64) < XML_BASE,
+        address >= SOURCE_BASE
+            && u64::try_from(data.len())
+                .ok()
+                .and_then(|length| address.checked_add(length))
+                .is_some_and(|end| end < XML_BASE),
         Status(0x8003, "invalid memory address")
     );
-    let mut source = source.lock().unwrap_or_else(|e| e.into_inner());
+    let mut source = source
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some((start, stop)) = commands.get(&address) {
         ensure!(data.len() == 4, "acquisition command must be four bytes");
-        let value = u32::from_le_bytes(data.try_into().unwrap()) as u64;
+        let value = u64::from(u32::from_le_bytes(data.try_into().map_err(|_| {
+            anyhow::anyhow!("acquisition command must contain four bytes")
+        })?));
         if value == *start {
             source.start()?;
             acquisition.store(true, Ordering::Relaxed);
@@ -741,7 +791,9 @@ fn wire_xml(source: &str) -> Result<(String, AcquisitionCommands)> {
             let at = match register.children().find(|n| n.has_tag_name("AccessMode")) {
                 Some(mode) => mode.range().end,
                 None => {
-                    source[register.range()]
+                    source
+                        .get(register.range())
+                        .context("register XML range is invalid")?
                         .rfind("</")
                         .context("register closing tag missing")?
                         + register.range().start
@@ -765,7 +817,10 @@ fn wire_xml(source: &str) -> Result<(String, AcquisitionCommands)> {
         if let Some(root) = doc
             .descendants()
             .find(|n| n.has_tag_name("Category") && n.attribute("Name") == Some("Root"))
-            && let Some(close) = source[root.range()].rfind("</")
+            && let Some(close) = source
+                .get(root.range())
+                .context("root XML range is invalid")?
+                .rfind("</")
         {
             let close = close + root.range().start;
             edits.push((
@@ -789,56 +844,123 @@ fn wire_xml(source: &str) -> Result<(String, AcquisitionCommands)> {
     // version follows the served content. The root attribute precedes every
     // other edit, so its range is unchanged.
     if let Some(version) = doc.root_element().attribute_node("VersionGuid") {
-        use sha2::Digest;
-        let hex = sha2::Sha256::digest(result.as_bytes())
-            .iter()
-            .take(16)
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
-        result.replace_range(
-            version.range_value(),
-            &format!(
-                "{}-{}-{}-{}-{}",
-                &hex[..8],
-                &hex[8..12],
-                &hex[12..16],
-                &hex[16..20],
-                &hex[20..]
-            ),
-        );
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(result.as_bytes());
+        let bytes = digest
+            .first_chunk::<16>()
+            .context("version digest is too short")?;
+        result.replace_range(version.range_value(), &crate::types::format_uuid(bytes));
     }
     Ok((result, commands))
 }
-fn packet(block: u16, id: usize, kind: u32, data: &[u8]) -> Vec<u8> {
-    let mut packet = vec![0, 0];
+#[deny(clippy::arithmetic_side_effects)]
+fn packet(block: u16, id: usize, kind: u8, data: &[u8]) -> Option<Vec<u8>> {
+    let id = u32::try_from(id).ok()?.to_be_bytes();
+    if id[0] != 0 {
+        return None;
+    }
+    let mut packet = Vec::with_capacity(data.len().checked_add(8)?);
+    packet.extend([0, 0]);
     packet.extend(block.to_be_bytes());
-    packet.extend(((kind << 24) | (id as u32)).to_be_bytes());
+    packet.extend([kind, id[1], id[2], id[3]]);
     packet.extend(data);
-    packet
+    Some(packet)
 }
-fn frame_packets(block: u16, frame: &Frame, chunk: usize) -> Vec<Vec<u8>> {
+#[deny(clippy::arithmetic_side_effects)]
+fn frame_packet_count(length: usize, chunk: usize) -> Option<usize> {
+    let payloads = length
+        .checked_div(chunk)?
+        .checked_add(usize::from(length.checked_rem(chunk)? != 0))?;
+    let count = payloads.checked_add(2)?;
+    // Leader and trailer IDs must also fit GVSP's 24-bit packet number.
+    (count <= 0x0100_0000).then_some(count)
+}
+fn frame_packets(block: u16, frame: &Frame, chunk: usize) -> Option<Vec<Vec<u8>>> {
+    let count = frame_packet_count(frame.data.len(), chunk)?;
     let mut leader = vec![0, 0, 0, 1];
     leader.extend(frame.device_ts_ns.unwrap_or_default().to_be_bytes());
     leader.extend(frame.pixel_format.to_be_bytes());
     leader.extend(frame.width.to_be_bytes());
     leader.extend(frame.height.to_be_bytes());
     leader.extend([0; 12]);
-    let mut packets = vec![packet(block, 0, 1, &leader)];
+    let mut packets = Vec::with_capacity(count);
+    packets.push(packet(block, 0, 1, &leader)?);
     for payload in frame.data.chunks(chunk) {
-        packets.push(packet(block, packets.len(), 3, payload));
+        packets.push(packet(block, packets.len(), 3, payload)?);
     }
     packets.push(packet(
         block,
         packets.len(),
         2,
         &[1u32.to_be_bytes(), frame.height.to_be_bytes()].concat(),
-    ));
-    packets
+    )?);
+    Some(packets)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packet_numbers_cannot_overwrite_the_packet_type() {
+        assert_eq!(
+            packet(0x1234, 0xab_cdef, 3, &[5, 6]),
+            Some(vec![0, 0, 0x12, 0x34, 3, 0xab, 0xcd, 0xef, 5, 6])
+        );
+        assert_eq!(
+            packet(1, 0xff_ffff, 2, &[]).unwrap()[4..],
+            [2, 255, 255, 255]
+        );
+        assert_eq!(packet(1, 0x0100_0000, 3, &[]), None);
+        assert_eq!(packet(1, usize::MAX, 3, &[]), None);
+    }
+
+    #[test]
+    fn frame_packet_counts_include_leader_trailer_and_partial_payloads() {
+        assert_eq!(frame_packet_count(0, 540), Some(2));
+        assert_eq!(frame_packet_count(540, 540), Some(3));
+        assert_eq!(frame_packet_count(541, 540), Some(4));
+        assert_eq!(frame_packet_count(0x00ff_fffe, 1), Some(0x0100_0000));
+        assert_eq!(frame_packet_count(0x00ff_ffff, 1), None);
+        assert_eq!(frame_packet_count(usize::MAX, 1), None);
+        assert_eq!(frame_packet_count(1, 0), None);
+        assert_eq!(frame_packet_count(0, 0), None);
+    }
+
+    #[test]
+    fn acknowledgements_check_the_wire_length_without_truncation() {
+        let data = vec![7; usize::from(u16::MAX)];
+        let reply = ack(0, 2, 42, &data).unwrap();
+        assert_eq!(&reply[..8], &[0, 0, 0, 3, 255, 255, 0, 42]);
+        assert_eq!(&reply[8..], data);
+        assert_eq!(ack(0, 2, 42, &vec![7; usize::from(u16::MAX) + 1]), None);
+    }
+
+    #[test]
+    fn an_unsupported_maximum_command_does_not_stop_the_control_thread() {
+        let (_server, camera) = loopback_camera();
+        let socket = client();
+        socket
+            .send_to(&[0x42, 1, 255, 255, 0, 0, 0, 42], camera)
+            .unwrap();
+        let mut reply = [0; 16];
+        let (length, peer) = socket.recv_from(&mut reply).unwrap();
+        assert_eq!(peer, camera);
+        assert_eq!(&reply[..length], &[0x80, 1, 0, 0, 0, 0, 0, 42]);
+        assert_eq!(gvcp(&socket, camera, 0x0002, 43, &[]).0, 0);
+    }
+
+    #[test]
+    fn memory_regions_check_offsets_lengths_and_empty_boundaries() {
+        let bytes = [10, 20, 30, 40];
+        assert_eq!(memory_region(&bytes, 1, 2), Some(&bytes[1..3]));
+        assert_eq!(memory_region(&bytes, 4, 0), Some(&bytes[4..]));
+        assert_eq!(memory_region(&[], 0, 0), Some([].as_slice()));
+        for (offset, length) in [(4, 1), (5, 0), (1, usize::MAX), (u64::MAX, 1)] {
+            assert_eq!(memory_region(&bytes, offset, length), None);
+        }
+    }
+
     /// The first link of `xml` to a node it does not have.
     fn camera_nodes_unresolved(xml: &str) -> Option<(String, String)> {
         crate::genicam::NodeMap::parse(xml).unwrap().unresolved()
@@ -858,7 +980,7 @@ mod tests {
             fps: 30.0,
             bitrate: "2M".into(),
         };
-        let server = super::super::VirtualCameraServer::start(source, options).unwrap();
+        let server = super::super::VirtualCameraServer::start(source, &options).unwrap();
         let mut camera = Camera::open(&format!("gige:{ip}"), &[], Duration::from_secs(2)).unwrap();
         assert_eq!(camera.get("Width").unwrap(), 64);
         camera.set("Gain", "3").unwrap();
@@ -905,13 +1027,11 @@ mod tests {
         drop(camera);
         // A discovered camera opens by the MAC-based ID discovery reports.
         let info = crate::transport::gige::probe(ip, Duration::from_secs(2)).unwrap();
-        assert!(
-            info.id
-                .strip_prefix("gige:")
-                .unwrap()
-                .parse::<Ipv4Addr>()
-                .is_err()
-        );
+        info.id
+            .strip_prefix("gige:")
+            .unwrap()
+            .parse::<Ipv4Addr>()
+            .unwrap_err();
         let id = info.id.clone();
         let camera =
             Camera::open(&id, std::slice::from_ref(&info), Duration::from_secs(2)).unwrap();
@@ -928,7 +1048,7 @@ mod tests {
             .map(|entry| entry.path())
             .filter(|path| std::fs::read_to_string(path).is_ok_and(|xml| xml == served))
             .collect::<Vec<_>>();
-        assert!(!kept.is_empty());
+        assert_ne!(kept, [] as [std::path::PathBuf; 0]);
         let dangling = served.replacen("<pValue>", "<pValue>Missing", 1);
         assert!(camera_nodes_unresolved(&dangling).is_some());
         for broken in ["<RegisterDescription", dangling.as_str()] {
@@ -950,7 +1070,7 @@ mod tests {
         assert!(!crate::camera::still_there(&other));
         // Its discovery ID is looked for on GigE alone, and the search ends
         // as soon as it answers; then the cache names it.
-        let began = std::time::Instant::now();
+        let began = Instant::now();
         let (found, _) = crate::camera::lookup(&id, Duration::from_secs(20));
         assert!(found.iter().any(|camera| camera.id == id), "{found:?}");
         let (cached, _) = crate::camera::lookup(&id, Duration::from_secs(20));
@@ -1002,7 +1122,7 @@ mod tests {
         {
             let children: Vec<_> = register
                 .children()
-                .filter(|n| n.is_element())
+                .filter(roxmltree::Node::is_element)
                 .map(|n| n.tag_name().name())
                 .collect();
             let mode = children.iter().position(|n| *n == "AccessMode").unwrap();
@@ -1039,7 +1159,7 @@ mod tests {
             fps: 30.0,
             bitrate: "2M".into(),
         };
-        let server = super::super::VirtualCameraServer::start(source, options).unwrap();
+        let server = super::super::VirtualCameraServer::start(source, &options).unwrap();
         let port = server.port();
         (server, SocketAddr::from((ip, port)))
     }
@@ -1060,7 +1180,7 @@ mod tests {
     ) -> (u16, Vec<u8>) {
         let mut request = vec![0x42, 0x01];
         request.extend(command.to_be_bytes());
-        request.extend((payload.len() as u16).to_be_bytes());
+        request.extend(u16::try_from(payload.len()).unwrap().to_be_bytes());
         request.extend(id.to_be_bytes());
         request.extend(payload);
         socket.send_to(&request, camera).unwrap();
@@ -1068,7 +1188,11 @@ mod tests {
         let (length, from) = socket.recv_from(&mut reply).unwrap();
         assert_eq!(from, camera);
         assert_eq!(
-            (be16(&reply, 2), be16(&reply, 4) as usize, be16(&reply, 6)),
+            (
+                be16(&reply, 2),
+                usize::from(be16(&reply, 4)),
+                be16(&reply, 6)
+            ),
             (command + 1, length - 8, id)
         );
         (be16(&reply, 0), reply[8..length].to_vec())
@@ -1334,7 +1458,7 @@ mod tests {
             fps: 30.0,
             bitrate: "2M".into(),
         };
-        let server = super::super::VirtualCameraServer::start(source, options).unwrap();
+        let server = super::super::VirtualCameraServer::start(source, &options).unwrap();
         let port = server.port();
         let client = UdpSocket::bind((ip, 0)).unwrap();
         client.set_broadcast(true).unwrap();
@@ -1344,16 +1468,8 @@ mod tests {
         for (id, destination) in [(0x1234u16, subnet), (0x1235, Ipv4Addr::BROADCAST)] {
             // DISCOVERY_CMD with the acknowledge-required and broadcast-allowed
             // flags, as Aravis sends it (arvgvcp.c).
-            let request = [
-                0x42,
-                0x11,
-                0x00,
-                0x02,
-                0x00,
-                0x00,
-                (id >> 8) as u8,
-                id as u8,
-            ];
+            let [id_hi, id_lo] = id.to_be_bytes();
+            let request = [0x42, 0x11, 0x00, 0x02, 0x00, 0x00, id_hi, id_lo];
             if client.send_to(&request, (destination, port)).is_err() {
                 return;
             }

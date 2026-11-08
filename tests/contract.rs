@@ -1,6 +1,7 @@
 //! The command-line contract agents rely on: one JSON document per call,
 //! exit codes from typed reasons, the name and duration grammars, atomic
 //! `set`, and a schema that describes what commands really print.
+#![deny(clippy::doc_markdown)]
 mod support;
 
 use serde_json::{Value, json};
@@ -688,7 +689,10 @@ fn an_environment_session_yields_to_no_session_and_binary_stdout() {
     );
     assert_eq!(run.success()["values"]["Width"], 640);
     let run = home.run_env(&env, &["--json", "session", "status"]);
-    assert!(run.success()["cameras"].as_array().unwrap().is_empty());
+    assert_eq!(
+        run.success()["cameras"].as_array().unwrap().as_slice(),
+        [] as [Value; 0]
+    );
     // Both typed is a contradiction.
     let error = home.fails(2, &["--session", "first", "--no-session", "list"]);
     assert_eq!(error["code"], "usage");
@@ -712,7 +716,10 @@ fn an_environment_session_yields_to_no_session_and_binary_stdout() {
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert_eq!(run.raw.len(), 4096);
     let run = home.run_env(&env, &["--json", "session", "status"]);
-    assert!(run.success()["cameras"].as_array().unwrap().is_empty());
+    assert_eq!(
+        run.success()["cameras"].as_array().unwrap().as_slice(),
+        [] as [Value; 0]
+    );
     // CAPTUREFAB_KEEP is a default too: --no-session and binary stdout
     // leave it out, where a typed --keep is a mistake.
     let keep = [("CAPTUREFAB_KEEP", "5m")];
@@ -731,7 +738,7 @@ fn an_environment_session_yields_to_no_session_and_binary_stdout() {
         "--json", "capture", "-c", "sim:env", "-o", "-", "--keep", "5m",
     ]);
     assert_eq!(typed.code, Some(2));
-    assert!(typed.raw.is_empty());
+    assert_eq!(typed.raw, [] as [u8; 0]);
     let error: Value = serde_json::from_str(&typed.stderr).unwrap();
     assert_eq!(error["error"]["code"], "usage");
 }
@@ -839,13 +846,15 @@ fn schema_describes_every_command_and_its_results() {
             "{name}"
         );
         // Every argument schema names is one --help shows.
-        let help = home.run(&[&words[..], &["--help"]].concat()).stdout;
+        let help = home.run(&[(&*words), &["--help"]].concat()).stdout;
         for arg in described["args"].as_array().unwrap() {
             let shown = arg["long"]
                 .as_str()
-                .or(arg["value_name"].as_str())
-                .map(str::to_owned)
-                .unwrap_or_else(|| arg["name"].as_str().unwrap().to_uppercase());
+                .or_else(|| arg["value_name"].as_str())
+                .map_or_else(
+                    || arg["name"].as_str().unwrap().to_uppercase(),
+                    str::to_owned,
+                );
             assert!(
                 help.contains(&shown) || help.contains(&shown.replace('_', "-")),
                 "{words:?} --help lacks {shown}"
@@ -1064,18 +1073,27 @@ fn row_keys(row: &str) -> BTreeSet<&str> {
             '{' | '[' => depth += 1,
             '}' | ']' if depth == 0 => {
                 if naming {
-                    names.insert(&row[start..index]);
+                    names.insert(
+                        row.get(start..index)
+                            .expect("schema fields lie on character boundaries"),
+                    );
                 }
                 break;
             }
             '}' | ']' => depth -= 1,
             ':' | '?' if depth == 0 && naming => {
-                names.insert(&row[start..index]);
+                names.insert(
+                    row.get(start..index)
+                        .expect("schema fields lie on character boundaries"),
+                );
                 naming = false;
             }
             ',' if depth == 0 => {
                 if naming {
-                    names.insert(&row[start..index]);
+                    names.insert(
+                        row.get(start..index)
+                            .expect("schema fields lie on character boundaries"),
+                    );
                 }
                 start = index + 1;
                 naming = true;
@@ -1488,7 +1506,7 @@ fn refusing_onvif() -> String {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
             std::thread::spawn(move || {
-                use std::io::{Read, Write};
+                use std::io::{Read as _, Write as _};
                 stream
                     .set_read_timeout(Some(std::time::Duration::from_secs(2)))
                     .unwrap();
@@ -1501,7 +1519,9 @@ fn refusing_onvif() -> String {
                     request.extend_from_slice(&buffer[..n]);
                     let text = String::from_utf8_lossy(&request);
                     if let Some(head) = text.find("\r\n\r\n") {
-                        let length = text[..head]
+                        let length = text
+                            .split_at(head)
+                            .0
                             .lines()
                             .find_map(|line| {
                                 let (name, value) = line.split_once(':')?;
@@ -1705,7 +1725,7 @@ fn a_camera_password_parameter_stays_out_of_results_and_logs() {
 #[cfg(unix)]
 #[test]
 fn doctor_says_how_to_make_shared_folders_private() {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::PermissionsExt as _;
     let home = Home::new("doctor-private");
     std::fs::create_dir_all(&home.sessions).unwrap();
     std::fs::set_permissions(&home.sessions, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1774,7 +1794,7 @@ fn unreadable_presets_are_listed_and_can_be_removed() {
     std::fs::create_dir_all(&dir).unwrap();
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt as _;
         for private in [&home.sessions, &std::path::PathBuf::from(&dir)] {
             std::fs::set_permissions(private, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
@@ -1840,7 +1860,7 @@ fn gpu_jpeg_encoders_say_why_they_cannot_be_used() {
 #[test]
 fn the_jpeg_helper_says_hello_on_its_socket() {
     use std::{
-        io::{BufRead, BufReader},
+        io::{BufRead as _, BufReader},
         os::{fd::OwnedFd, unix::net::UnixStream},
         process::{Command, Stdio},
         time::Duration,
@@ -1859,14 +1879,14 @@ fn the_jpeg_helper_says_hello_on_its_socket() {
         let mut hello = String::new();
         BufReader::new(&ours).read_line(&mut hello).unwrap();
         let hello: Value = serde_json::from_str(&hello).unwrap_or_else(|e| panic!("{hello}: {e}"));
-        if hello["ok"] != true {
+        if hello["ok"] == true {
+            assert!(hello["about"].is_object(), "{hello}");
+        } else {
             let error = hello["error"].as_str().unwrap();
             assert!(!error.is_empty(), "{kind}: {hello}");
             if kind == "none" {
                 assert!(error.contains("no none JPEG helper"), "{error}");
             }
-        } else {
-            assert!(hello["about"].is_object(), "{hello}");
         }
         drop(ours);
         let status = helper.wait().unwrap();

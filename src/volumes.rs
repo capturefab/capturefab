@@ -1,6 +1,9 @@
 //! A guard against writing to an external volume that is not mounted: an
 //! unplugged drive's mount point is otherwise just an empty directory on the
 //! system disk.
+#![forbid(unsafe_code)]
+#![deny(clippy::missing_const_for_fn)]
+#![deny(clippy::cast_precision_loss)]
 use anyhow::Result;
 use std::path::{Component, Path, PathBuf};
 
@@ -17,20 +20,17 @@ fn unescape(field: &str) -> String {
                 .iter()
                 .all(|b| (b'0'..=b'7').contains(b))
         {
-            let value = (bytes[i + 1] - b'0') as u16 * 64
-                + (bytes[i + 2] - b'0') as u16 * 8
-                + (bytes[i + 3] - b'0') as u16;
-            if value <= u8::MAX as u16 {
-                out.push(value as u8);
+            let value = u16::from(bytes[i + 1] - b'0') * 64
+                + u16::from(bytes[i + 2] - b'0') * 8
+                + u16::from(bytes[i + 3] - b'0');
+            if let Ok(value) = u8::try_from(value) {
+                out.push(value);
                 i += 4;
                 continue;
             }
-            out.push(bytes[i]);
-            i += 1;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
         }
+        out.push(bytes[i]);
+        i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
 }
@@ -39,8 +39,8 @@ fn unescape(field: &str) -> String {
 /// parent directory.
 #[cfg(unix)]
 fn mounted(path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let parent = path.parent().unwrap_or(Path::new("/"));
+    use std::os::unix::fs::MetadataExt as _;
+    let parent = path.parent().unwrap_or_else(|| Path::new("/"));
     match (std::fs::metadata(path), std::fs::metadata(parent)) {
         (Ok(own), Ok(up)) => own.is_dir() && own.dev() != up.dev(),
         _ => false,
@@ -56,20 +56,18 @@ fn from_fstab(table: &str) -> Vec<PathBuf> {
     table
         .lines()
         .filter_map(|line| {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            let [device, mount, fs, ref rest @ ..] = fields[..] else {
-                return None;
-            };
-            let bind = rest
-                .first()
+            let mut fields = line.split_whitespace();
+            let device = fields.next()?;
+            let mount = fields.next()?;
+            let fs = fields.next()?;
+            let bind = fields
+                .next()
                 .is_some_and(|options| options.split(',').any(|o| o == "bind" || o == "rbind"));
+            if device.starts_with('#') || !mount.starts_with('/') || fs == "swap" || bind {
+                return None;
+            }
             let path = PathBuf::from(unescape(mount));
-            (!device.starts_with('#')
-                && mount.starts_with('/')
-                && path != Path::new("/")
-                && fs != "swap"
-                && !bind)
-                .then_some(path)
+            (path != Path::new("/")).then_some(path)
         })
         .collect()
 }
@@ -94,7 +92,7 @@ fn declared() -> Vec<PathBuf> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn declared() -> Vec<PathBuf> {
+const fn declared() -> Vec<PathBuf> {
     Vec::new()
 }
 
@@ -178,7 +176,7 @@ fn real(path: &Path) -> PathBuf {
 /// Refuse a path on an external volume, or under a mount point fstab
 /// declares, that is not mounted, instead of silently creating its
 /// directories on the system disk.
-pub fn ensure_present(path: &Path) -> Result<()> {
+pub(crate) fn ensure_present(path: &Path) -> Result<()> {
     present_in(path, &declared())
 }
 

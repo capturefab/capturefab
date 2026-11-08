@@ -11,10 +11,13 @@
 //! explicit, the path is compared exactly, and a query or fragment is
 //! ignored. A changed user name or address therefore never reads another
 //! entry's secret.
+#![deny(clippy::panic_in_result_fn)]
+#![deny(clippy::missing_const_for_fn)]
+#![deny(clippy::cast_precision_loss)]
 use crate::types::{Categorized, ErrorKind};
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context as _, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
-use std::{fs, io::Read, path::PathBuf, sync::Arc};
+use std::{fs, io::Read as _, path::PathBuf, sync::Arc};
 use zeroize::Zeroizing;
 
 #[cfg(all(feature = "keychain", not(test)))]
@@ -31,7 +34,7 @@ const MAX_PASSWORD: usize = 4096 - SECRET_PREFIX.len();
 const SCHEMES: &str = "sign-in is supported for rtsp://, rtsps:// and onvif: addresses";
 
 /// Whether this build can save sign-ins in the OS credential store.
-pub fn can_remember() -> bool {
+pub(crate) const fn can_remember() -> bool {
     cfg!(feature = "keychain")
 }
 
@@ -41,20 +44,23 @@ fn usage(message: impl Into<String>) -> anyhow::Error {
 
 /// The normalized address a sign-in is saved under.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct LoginKey {
+pub(crate) struct LoginKey {
     pub address: String,
 }
 
 /// Normalize a credential-free camera address to the address its sign-in
 /// is saved under.
-pub fn key(selector: &str) -> Result<LoginKey> {
+pub(crate) fn key(selector: &str) -> Result<LoginKey> {
     let selector = selector.trim();
     ensure!(
         selector.len() <= 16384 && !selector.chars().any(char::is_control),
         usage("camera address is too long or contains control characters")
     );
     if crate::onvif::is_source(selector) {
-        if authority_of(&selector[6..]).is_some_and(|authority| authority.contains('@')) {
+        let (_, locator) = selector
+            .split_once(':')
+            .context("ONVIF locator needs a colon")?;
+        if authority_of(locator).is_some_and(|authority| authority.contains('@')) {
             return Err(usage(
                 "leave the user name and password out of the address; use --user and --password-stdin",
             ));
@@ -69,14 +75,12 @@ pub fn key(selector: &str) -> Result<LoginKey> {
         return Ok(LoginKey { address });
     }
     let (scheme, rest) = selector.split_once("://").ok_or_else(|| usage(SCHEMES))?;
-    let scheme = scheme.to_ascii_lowercase();
-    let default_port = match scheme.as_str() {
-        "rtsp" => 554,
-        "rtsps" => 322,
-        _ => return Err(usage(SCHEMES)),
-    };
+    let (scheme, default_port) = [("rtsp", 554), ("rtsps", 322)]
+        .into_iter()
+        .find(|(name, _)| scheme.eq_ignore_ascii_case(name))
+        .ok_or_else(|| usage(SCHEMES))?;
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..end];
+    let (authority, tail) = rest.split_at(end);
     if authority.contains('@') {
         return Err(usage(
             "leave the user name and password out of the address; use --user and --password-stdin",
@@ -84,9 +88,7 @@ pub fn key(selector: &str) -> Result<LoginKey> {
     }
     let (host, port) = split_host_port(authority, default_port)
         .ok_or_else(|| usage("camera address needs a host and an optional numeric port"))?;
-    let tail = &rest[end..];
-    let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
-    let path = match &tail[..path_end] {
+    let path = match tail.split(['?', '#']).next().unwrap_or_default() {
         "" => "/",
         path => path,
     };
@@ -98,15 +100,15 @@ pub fn key(selector: &str) -> Result<LoginKey> {
 /// `host` lowercased (IPv6 kept in brackets) and the port, defaulted.
 pub(crate) fn split_host_port(authority: &str, default_port: u16) -> Option<(String, u16)> {
     let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
-        let close = rest.find(']')?;
-        let host = &rest[..close];
-        let after = &rest[close + 1..];
+        let (host, after) = rest.split_once(']')?;
         let port = match after.strip_prefix(':') {
             Some(port) => port.parse().ok()?,
             None if after.is_empty() => default_port,
             None => return None,
         };
-        (format!("[{}]", host.to_ascii_lowercase()), port)
+        let mut host = format!("[{host}]");
+        host.make_ascii_lowercase();
+        (host, port)
     } else if let Some((host, port)) = authority.rsplit_once(':') {
         (host.to_ascii_lowercase(), port.parse().ok()?)
     } else {
@@ -118,19 +120,21 @@ pub(crate) fn split_host_port(authority: &str, default_port: u16) -> Option<(Str
 /// The authority after `scheme://`, when the text has one.
 fn authority_of(text: &str) -> Option<&str> {
     let (_, rest) = text.split_once("://")?;
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    Some(&rest[..end])
+    rest.split(['/', '?', '#']).next()
 }
 
 /// Percent-encode everything except RFC 3986 unreserved characters, with
 /// uppercase hexadecimal.
-pub fn encode(text: &str) -> String {
+pub(crate) fn encode(text: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut encoded = String::with_capacity(text.len());
     for byte in text.bytes() {
         if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
-            encoded.push(byte as char);
+            encoded.push(char::from(byte));
         } else {
-            encoded.push_str(&format!("%{byte:02X}"));
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
         }
     }
     encoded
@@ -138,30 +142,30 @@ pub fn encode(text: &str) -> String {
 
 /// The keychain account: user name and address, so changing either never
 /// reads another entry's secret.
-pub fn account(user: &str, address: &str) -> String {
+pub(crate) fn account(user: &str, address: &str) -> String {
     format!("{}@{address}", encode(user))
 }
 
 /// A short form for messages and the UI: the address without its scheme,
 /// the scheme's default port or the default ONVIF path, for example
 /// `cam.local/live` or `cam.local` for `onvif:http://cam.local:80/onvif/device_service`.
-pub fn short(address: &str) -> String {
+pub(crate) fn short(address: &str) -> String {
     let address = crate::media::redact_url(address);
     let onvif = address.strip_prefix("onvif:");
     let inner = onvif.unwrap_or(&address);
     let (scheme, rest) = inner.split_once("://").unwrap_or(("", inner));
-    let default_port = match scheme.to_ascii_lowercase().as_str() {
-        "rtsp" => ":554",
-        "rtsps" => ":322",
-        "http" => ":80",
-        "https" => ":443",
-        _ => "",
-    };
+    let default_port = [
+        ("rtsp", ":554"),
+        ("rtsps", ":322"),
+        ("http", ":80"),
+        ("https", ":443"),
+    ]
+    .into_iter()
+    .find_map(|(name, port)| scheme.eq_ignore_ascii_case(name).then_some(port));
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, tail) = rest.split_at(end);
-    let authority = (!default_port.is_empty())
-        .then(|| authority.strip_suffix(default_port))
-        .flatten()
+    let authority = default_port
+        .and_then(|port| authority.strip_suffix(port))
         .unwrap_or(authority);
     let tail = match tail {
         "/" => "",
@@ -218,7 +222,7 @@ impl std::fmt::Debug for CameraLogin {
 /// only.
 impl Serialize for CameraLogin {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
+        use serde::ser::SerializeStruct as _;
         let mut state = serializer.serialize_struct("CameraLogin", 2)?;
         state.serialize_field("user", &self.user)?;
         state.serialize_field("password", self.password.as_str())?;
@@ -236,7 +240,7 @@ impl<'de> Deserialize<'de> for CameraLogin {
         }
         let wire = Wire::deserialize(deserializer)?;
         let password = Zeroizing::new(wire.password);
-        CameraLogin::new(wire.user, password.as_str()).map_err(serde::de::Error::custom)
+        Self::new(wire.user, password.as_str()).map_err(serde::de::Error::custom)
     }
 }
 
@@ -270,69 +274,67 @@ pub(crate) fn percent_decode(text: &str) -> Result<String> {
     Ok(decoded)
 }
 
-/// Byte range of the `user[:password]@` prefix of the authority, if any.
-fn userinfo_range(url: &str) -> Option<(usize, usize)> {
-    let start = url.find("://")? + 3;
-    let end = url[start..]
-        .find(['/', '?', '#'])
-        .map_or(url.len(), |n| start + n);
-    let at = url[start..end].rfind('@')?;
-    Some((start, start + at + 1))
+/// The `user[:password]` and remainder after `@`, from the text after `scheme://`.
+fn authority_userinfo(rest: &str) -> Option<(&str, &str)> {
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let at = authority.rfind('@')?;
+    let (userinfo, host) = rest.split_at(at);
+    Some((userinfo, host.strip_prefix('@')?))
 }
 
 /// Split credentials out of an address: the address without them, and the
 /// decoded login when it had one.
-pub fn split_userinfo(url: &str) -> Result<(String, Option<CameraLogin>)> {
-    let Some((start, end)) = userinfo_range(url) else {
+pub(crate) fn split_userinfo(url: &str) -> Result<(String, Option<CameraLogin>)> {
+    let Some((scheme, rest)) = url.split_once("://") else {
         return Ok((url.to_owned(), None));
     };
-    let userinfo = &url[start..end - 1];
+    let Some((userinfo, host)) = authority_userinfo(rest) else {
+        return Ok((url.to_owned(), None));
+    };
     let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
     let password = Zeroizing::new(percent_decode(password)?);
     let login = CameraLogin::new(percent_decode(user)?, password.as_str())?;
-    Ok((format!("{}{}", &url[..start], &url[end..]), Some(login)))
+    Ok((format!("{scheme}://{host}"), Some(login)))
 }
 
 /// Best-effort removal of credentials from text that may be a half-typed
 /// address. A complete `user[:password]@` prefix is
 /// removed; so is a `:password` still being typed before its `@` (a
 /// non-numeric port), keeping the user name.
-pub fn strip_userinfo(text: &str) -> String {
-    if let Some((start, end)) = userinfo_range(text) {
-        return format!("{}{}", &text[..start], &text[end..]);
-    }
-    let Some(start) = text.find("://").map(|n| n + 3) else {
+pub(crate) fn strip_userinfo(text: &str) -> String {
+    let Some((scheme, rest)) = text.split_once("://") else {
         return text.to_owned();
     };
-    let end = text[start..]
-        .find(['/', '?', '#'])
-        .map_or(text.len(), |n| start + n);
-    let authority = &text[start..end];
+    if let Some((_, host)) = authority_userinfo(rest) {
+        return format!("{scheme}://{host}");
+    }
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
     if !authority.starts_with('[')
-        && let Some(colon) = authority.find(':')
-        && !authority[colon + 1..].bytes().all(|b| b.is_ascii_digit())
+        && let Some((user, password)) = authority.split_once(':')
+        && !password.bytes().all(|b| b.is_ascii_digit())
     {
-        return format!("{}{}", &text[..start + colon], &text[end..]);
+        return format!("{scheme}://{user}{tail}");
     }
     text.to_owned()
 }
 
 /// The address with these credentials, percent-encoded, in its authority.
-pub fn with_credentials(url: &str, login: &CameraLogin) -> Result<Zeroizing<String>> {
-    let start = url.find("://").context("camera address has no authority")? + 3;
-    let stripped_from = userinfo_range(url).map_or(start, |(_, end)| end);
+pub(crate) fn with_credentials(url: &str, login: &CameraLogin) -> Result<Zeroizing<String>> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .context("camera address has no authority")?;
+    let host = authority_userinfo(rest).map_or(rest, |(_, host)| host);
     Ok(Zeroizing::new(format!(
-        "{}{}:{}@{}",
-        &url[..start],
+        "{scheme}://{}:{}@{host}",
         encode(&login.user),
         encode(login.expose()),
-        &url[stripped_from..]
     )))
 }
 
 /// The error for a camera that asked for, or refused, a sign-in.
 /// `address` must already be credential-free.
-pub fn auth_error(address: &str, had_credentials: bool) -> anyhow::Error {
+pub(crate) fn auth_error(address: &str, had_credentials: bool) -> anyhow::Error {
     let address = crate::media::redact_url(address);
     if had_credentials {
         return Categorized::error(
@@ -358,7 +360,7 @@ pub fn auth_error(address: &str, had_credentials: bool) -> anyhow::Error {
 }
 
 /// Whether an error is a sign-in request or refusal.
-pub fn is_auth_error(error: &anyhow::Error) -> bool {
+pub(crate) fn is_auth_error(error: &anyhow::Error) -> bool {
     matches!(
         crate::types::error_transport_code(error),
         Some("auth_required" | "auth_rejected")
@@ -404,7 +406,12 @@ impl Store for MemoryStore {
             !self.fail.load(Ordering::SeqCst),
             "the credential store is locked"
         );
-        Ok(self.secrets.lock().unwrap().get(account).cloned())
+        Ok(self
+            .secrets
+            .lock()
+            .map_err(|_| anyhow::anyhow!("test fixture lock is poisoned"))?
+            .get(account)
+            .cloned())
     }
     fn write(&self, account: &str, secret: &str) -> Result<()> {
         ensure!(
@@ -417,12 +424,15 @@ impl Store for MemoryStore {
         );
         self.secrets
             .lock()
-            .unwrap()
+            .map_err(|_| anyhow::anyhow!("test fixture lock is poisoned"))?
             .insert(account.into(), Zeroizing::new(secret.into()));
         Ok(())
     }
     fn delete(&self, account: &str) -> Result<()> {
-        self.secrets.lock().unwrap().remove(account);
+        self.secrets
+            .lock()
+            .map_err(|_| anyhow::anyhow!("test fixture lock is poisoned"))?
+            .remove(account);
         Ok(())
     }
 }
@@ -430,7 +440,7 @@ impl Store for MemoryStore {
 /// One saved sign-in, as listed. Never holds the password.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Entry {
+pub(crate) struct Entry {
     pub address: String,
     pub user: String,
     pub saved_at: String,
@@ -447,14 +457,14 @@ struct File {
 
 /// What [`Logins::save`] replaced.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Saved {
+pub(crate) struct Saved {
     pub entry: Entry,
     pub replaced: bool,
 }
 
 /// A saved sign-in looked up for a camera that is being opened.
 #[derive(Debug)]
-pub enum Remembered {
+pub(crate) enum Remembered {
     /// No sign-in is saved for this address.
     None,
     Login(CameraLogin),
@@ -466,7 +476,7 @@ pub enum Remembered {
 
 /// The saved sign-ins of one state directory and credential store.
 #[derive(Clone)]
-pub struct Logins {
+pub(crate) struct Logins {
     /// None: the state folder, found when a sign-in is first looked up, so
     /// a camera that needs none never looks for it.
     dir: Option<PathBuf>,
@@ -494,7 +504,7 @@ fn missing(address: &str) -> anyhow::Error {
 impl Logins {
     /// The real state directory and OS credential store. Unit tests get a
     /// shared in-memory store instead, so they never reach a keychain.
-    pub fn system() -> Self {
+    pub(crate) fn system() -> Self {
         #[cfg(test)]
         {
             static STORE: std::sync::OnceLock<Arc<MemoryStore>> = std::sync::OnceLock::new();
@@ -521,16 +531,15 @@ impl Logins {
         }
     }
     fn dir(&self) -> Result<PathBuf> {
-        match &self.dir {
-            Some(dir) => Ok(dir.clone()),
-            None => crate::dirs::state(),
-        }
+        self.dir
+            .as_ref()
+            .map_or_else(crate::dirs::state, |dir| Ok(dir.clone()))
     }
     fn path(&self) -> Result<PathBuf> {
         Ok(self.dir()?.join(INDEX))
     }
     /// The non-secret index file, for messages.
-    pub fn index_path(&self) -> Result<PathBuf> {
+    pub(crate) fn index_path(&self) -> Result<PathBuf> {
         self.path()
     }
     fn read(&self) -> Result<File> {
@@ -592,7 +601,7 @@ impl Logins {
         update: impl FnOnce(&mut File) -> Result<T>,
         rollback: impl FnOnce(&T) -> Result<()>,
     ) -> Result<T> {
-        use fs2::FileExt;
+        use fs2::FileExt as _;
         let lock = self.open_lock()?;
         lock.lock_exclusive()?;
         let mut file = self.read()?;
@@ -609,12 +618,12 @@ impl Logins {
         self.store.as_ref().ok_or_else(unsupported)
     }
 
-    pub fn list(&self) -> Result<Vec<Entry>> {
+    pub(crate) fn list(&self) -> Result<Vec<Entry>> {
         Ok(self.read()?.logins)
     }
     /// The saved entry for an address (index only). Without a state
     /// folder, as on a read-only system, nothing was saved.
-    pub fn entry(&self, address: &str) -> Result<Option<Entry>> {
+    pub(crate) fn entry(&self, address: &str) -> Result<Option<Entry>> {
         if self.dir().is_err() {
             return Ok(None);
         }
@@ -626,15 +635,17 @@ impl Logins {
     }
     /// Save a sign-in that worked. The secret is written first; when the
     /// index cannot be written the previous secret is restored.
-    pub fn save(&self, address: &str, login: &CameraLogin) -> Result<Saved> {
+    pub(crate) fn save(&self, address: &str, login: &CameraLogin) -> Result<Saved> {
         let store = self.store()?.clone();
         let account = account(&login.user, address);
         let secret = Zeroizing::new(format!("{SECRET_PREFIX}{}", login.expose()));
         let previous = store.read(&account)?;
         store.write(&account, &secret)?;
-        let restore = |previous: &Option<Zeroizing<String>>| match previous {
-            Some(previous) => store.write(&account, previous),
-            None => store.delete(&account),
+        let restore = |previous: &Option<Zeroizing<String>>| {
+            previous.as_ref().map_or_else(
+                || store.delete(&account),
+                |previous| store.write(&account, previous),
+            )
         };
         let entry = Entry {
             address: address.to_owned(),
@@ -680,7 +691,7 @@ impl Logins {
     }
     /// Forget a saved sign-in: the index entry first, then its secret.
     /// Returns whether the secret was deleted.
-    pub fn forget(&self, address: &str) -> Result<bool> {
+    pub(crate) fn forget(&self, address: &str) -> Result<bool> {
         let store = self.store()?.clone();
         let removed = self.locked(
             |file| {
@@ -697,7 +708,7 @@ impl Logins {
     }
     /// The saved sign-in for an address. The index is read first, so an
     /// address without an entry never touches the credential store.
-    pub fn remembered(&self, address: &str) -> Result<Remembered> {
+    pub(crate) fn remembered(&self, address: &str) -> Result<Remembered> {
         let Some(store) = &self.store else {
             return Ok(Remembered::None);
         };
@@ -726,8 +737,8 @@ impl Logins {
     }
     /// Record when a saved sign-in was last used. Best effort: skipped when
     /// another process holds the lock, and never an error.
-    pub fn touch(&self, address: &str) {
-        use fs2::FileExt;
+    pub(crate) fn touch(&self, address: &str) {
+        use fs2::FileExt as _;
         let Ok(lock) = self.open_lock() else {
             return;
         };
@@ -777,6 +788,8 @@ mod tests {
             ("rtsp://cam/Live?token=1#f", "rtsp://cam:554/Live"),
             ("rtsp://[FE80::1]/s", "rtsp://[fe80::1]:554/s"),
             ("rtsp://[::1]:9000/s", "rtsp://[::1]:9000/s"),
+            ("RtSp://CAM/画面?token=é#部分", "rtsp://cam:554/画面"),
+            ("rtsp://例え.テスト/画面", "rtsp://例え.テスト:554/画面"),
             ("onvif://cam", "onvif:http://cam:80/onvif/device_service"),
             (
                 "onvif:http://CAM:80/onvif/device_service",
@@ -822,6 +835,17 @@ mod tests {
         );
         assert_eq!(short("rtsp://cam:80/live"), "cam:80/live");
         assert_eq!(short("rtsps://cam:322/live"), "cam/live");
+        for (address, expected) in [
+            ("RTSP://Cam:554/画面", "Cam/画面"),
+            ("RtSpS://[::1]:322/live", "[::1]/live"),
+            ("HTTP://Cam:80/", "Cam"),
+            ("hTtPs://Cam:443/path?x=1#part", "Cam/path?x=1#part"),
+            ("https://Cam:80/path", "Cam:80/path"),
+            ("custom://Cam:80/path", "Cam:80/path"),
+            ("Cam:554/path", "Cam:554/path"),
+        ] {
+            assert_eq!(short(address), expected, "{address}");
+        }
     }
 
     #[test]
@@ -861,14 +885,12 @@ mod tests {
         let json = serde_json::to_string(&login).unwrap();
         let back: CameraLogin = serde_json::from_str(&json).unwrap();
         assert_eq!(back, login);
-        assert!(serde_json::from_str::<CameraLogin>(r#"{"user":"","password":"x"}"#).is_err());
-        assert!(
-            serde_json::from_str::<CameraLogin>(r#"{"user":"a","password":"x","extra":1}"#)
-                .is_err()
-        );
-        assert!(CameraLogin::new("a", "x\ny").is_err());
-        assert!(CameraLogin::new("a", "x".repeat(MAX_PASSWORD + 1)).is_err());
-        assert!(CameraLogin::new("a", "").is_ok());
+        serde_json::from_str::<CameraLogin>(r#"{"user":"","password":"x"}"#).unwrap_err();
+        serde_json::from_str::<CameraLogin>(r#"{"user":"a","password":"x","extra":1}"#)
+            .unwrap_err();
+        CameraLogin::new("a", "x\ny").unwrap_err();
+        CameraLogin::new("a", "x".repeat(MAX_PASSWORD + 1)).unwrap_err();
+        CameraLogin::new("a", "").unwrap();
     }
 
     #[test]
@@ -898,12 +920,51 @@ mod tests {
             ("rtsp://admin:pw@cam/live", "rtsp://cam/live"),
             ("rtsp://admin:pw", "rtsp://admin"),
             ("rtsp://admin:p", "rtsp://admin"),
+            ("rtsp://利用者:密碼", "rtsp://利用者"),
+            ("rtsp://利用者:密碼/画面?印=é", "rtsp://利用者/画面?印=é"),
+            ("rtsp://カメラ:554/画面", "rtsp://カメラ:554/画面"),
             ("rtsp://cam:554/live", "rtsp://cam:554/live"),
             ("rtsp://[::1]:554/x", "rtsp://[::1]:554/x"),
             ("rtsp://admin", "rtsp://admin"),
             ("cam", "cam"),
         ] {
             assert_eq!(strip_userinfo(typed), expected, "{typed}");
+        }
+    }
+
+    #[test]
+    fn unicode_userinfo_preserves_the_address_and_round_trips() {
+        for (url, clean, user, password) in [
+            (
+                "RTSP://利用者:密碼@カメラ/画面?x=@印#部分",
+                "RTSP://カメラ/画面?x=@印#部分",
+                "利用者",
+                "密碼",
+            ),
+            (
+                "onvif://élève:clé@cam/画像",
+                "onvif://cam/画像",
+                "élève",
+                "clé",
+            ),
+            ("rtsp://利用者@cam/画像", "rtsp://cam/画像", "利用者", ""),
+            (
+                "rtsp://a@b:clé@[::1]:554/画像",
+                "rtsp://[::1]:554/画像",
+                "a@b",
+                "clé",
+            ),
+        ] {
+            let (address, login) = split_userinfo(url).unwrap();
+            let login = login.unwrap();
+            assert_eq!(address, clean);
+            assert_eq!((login.user.as_str(), login.expose()), (user, password));
+            assert_eq!(strip_userinfo(url), clean);
+            let joined = with_credentials(clean, &login).unwrap();
+            assert_eq!(with_credentials(url, &login).unwrap(), joined);
+            let (address, restored) = split_userinfo(&joined).unwrap();
+            assert_eq!(address, clean);
+            assert_eq!(restored.unwrap(), login);
         }
     }
 
@@ -986,7 +1047,7 @@ mod tests {
         );
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
+            use std::os::unix::fs::PermissionsExt as _;
             let mode = fs::metadata(logins.index_path().unwrap())
                 .unwrap()
                 .permissions()
@@ -1024,24 +1085,20 @@ mod tests {
         // A directory where the index belongs makes the rename fail.
         fs::remove_file(logins.index_path().unwrap()).unwrap();
         fs::create_dir(logins.index_path().unwrap()).unwrap();
-        assert!(
-            logins
-                .save(
-                    address,
-                    &CameraLogin::new("admin", "second-password").unwrap()
-                )
-                .is_err()
-        );
+        logins
+            .save(
+                address,
+                &CameraLogin::new("admin", "second-password").unwrap(),
+            )
+            .unwrap_err();
         assert_eq!(
             store.secrets.lock().unwrap()[&account("admin", address)].as_str(),
             "v1:first-password"
         );
         fs::remove_dir(logins.index_path().unwrap()).unwrap();
-        assert!(
-            logins
-                .save("rtsp://new:554/", &CameraLogin::new("u", "x").unwrap())
-                .is_ok()
-        );
+        logins
+            .save("rtsp://new:554/", &CameraLogin::new("u", "x").unwrap())
+            .unwrap();
     }
 
     #[cfg(not(feature = "keychain"))]
@@ -1059,7 +1116,7 @@ mod tests {
             logins.remembered("rtsp://cam:554/x").unwrap(),
             Remembered::None
         ));
-        assert!(logins.list().unwrap().is_empty());
+        assert_eq!(logins.list().unwrap(), [] as [Entry; 0]);
         assert_eq!(store.reads.load(Ordering::SeqCst), 0);
     }
 
@@ -1081,13 +1138,13 @@ mod tests {
         store.secrets.lock().unwrap().clear();
         assert!(matches!(
             logins.remembered("rtsp://cam:554/x").unwrap(),
-            Remembered::Missing { ref user } if user == "admin"
+            Remembered::Missing { user } if user == "admin"
         ));
         store.secrets.lock().unwrap().insert(
             account("admin", "rtsp://cam:554/x"),
             Zeroizing::new("v2:x".into()),
         );
-        assert!(logins.remembered("rtsp://cam:554/x").is_err());
+        logins.remembered("rtsp://cam:554/x").unwrap_err();
         store.fail.store(true, Ordering::SeqCst);
         let error = logins.remembered("rtsp://cam:554/x").unwrap_err();
         let text = format!("{error:#}");
@@ -1101,8 +1158,8 @@ mod tests {
         crate::dirs::ensure_private_dir(&dir).unwrap();
         let logins = Logins::with(dir.clone(), Arc::new(MemoryStore::default()));
         fs::write(dir.join(INDEX), vec![b' '; MAX_FILE + 1]).unwrap();
-        assert!(logins.list().is_err());
+        logins.list().unwrap_err();
         fs::write(dir.join(INDEX), r#"{"version":2,"logins":[]}"#).unwrap();
-        assert!(logins.list().is_err());
+        logins.list().unwrap_err();
     }
 }

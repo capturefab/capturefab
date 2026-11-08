@@ -1,28 +1,29 @@
-//! Frames delivered in the pixel format FFmpeg decodes them to: gray, YUV
+//! Frames delivered in the pixel format `FFmpeg` decodes them to: gray, YUV
 //! 4:2:0, 4:2:2 or 4:4:4 (planar, semiplanar or packed), or RGB24 for RGB
-//! sources, instead of every frame converted to RGB24 inside FFmpeg.
+//! sources, instead of every frame converted to RGB24 inside `FFmpeg`.
 //!
-//! FFmpeg writes them as raw video, one packet a frame straight to the pipe
-//! (`-avioflags direct`). Raw video has no header, so FFmpeg's own log says
+//! `FFmpeg` writes them as raw video, one packet a frame straight to the pipe
+//! (`-avioflags direct`). Raw video has no header, so `FFmpeg`'s own log says
 //! what it writes: the output stream's pixel format, color range, matrix
 //! and size, on the info line it prints before the first frame. The size
-//! stays the same for the life of the process (FFmpeg scales a source that
+//! stays the same for the life of the process (`FFmpeg` scales a source that
 //! changes size mid-stream to the size it started with), so every frame is
 //! one fixed number of bytes. A format Capturefab cannot carry as decoded
 //! (another matrix, limited-range gray, packed 4:2:2 of odd width), or an
-//! output FFmpeg did not describe, makes the decoder ask for RGB24 instead.
+//! output `FFmpeg` did not describe, makes the decoder ask for RGB24 instead.
+#![forbid(unsafe_code)]
 use crate::frame::{Matrix, ycbcr_planes};
 use crate::types::{Frame, MONO8, RGB8};
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context as _, Result, ensure};
 use std::io::Read;
 
-/// The decoded formats FFmpeg may hand over as they are: it picks the
+/// The decoded formats `FFmpeg` may hand over as they are: it picks the
 /// source's own when it is one of these, else the closest (8 bits for a
 /// deeper source).
 pub(super) const PIX_FMTS: &str =
     "gray|nv12|yuv420p|yuvj420p|yuyv422|uyvy422|yuv422p|yuvj422p|yuv444p|yuvj444p|rgb24";
 
-/// A color range FFmpeg names.
+/// A color range `FFmpeg` names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Range {
     /// `tv`: video levels, 16-235 luma.
@@ -31,7 +32,7 @@ pub(super) enum Range {
     Full,
 }
 
-/// The raw video FFmpeg says it writes.
+/// The raw video `FFmpeg` says it writes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Described {
     pub pix_fmt: String,
@@ -42,24 +43,23 @@ pub(super) struct Described {
     pub colorspace: Option<String>,
 }
 
-/// The output stream an FFmpeg log line describes: `Video: rawvideo (FOURCC
+/// The output stream an `FFmpeg` log line describes: `Video: rawvideo (FOURCC
 /// / 0x…), PIX_FMT(RANGE, COLORSPACE/PRIMARIES/TRANSFER, FIELD), WxH …`,
 /// each parenthesized part optional.
 pub(super) fn describe(line: &str) -> Option<Described> {
-    let rest = &line[line.find("Video: rawvideo")? + "Video: rawvideo".len()..];
+    let (_, rest) = line.split_once("Video: rawvideo")?;
     // The codec tag, if FFmpeg names one.
     let rest = match rest.strip_prefix(" (") {
-        Some(tagged) => &tagged[tagged.find("), ")? + 1..],
-        None => rest,
+        Some(tagged) => tagged.split_once("), ")?.1,
+        None => rest.strip_prefix(", ")?,
     };
-    let rest = rest.strip_prefix(", ")?;
     let end = rest.find(['(', ',', ' ']).unwrap_or(rest.len());
-    let pix_fmt = rest[..end].to_owned();
-    let mut rest = &rest[end..];
+    let (pix_fmt, mut rest) = rest.split_at(end);
+    let pix_fmt = pix_fmt.to_owned();
     let (mut range, mut colorspace) = (None, None);
     if let Some(inner) = rest.strip_prefix('(') {
-        let close = inner.find(')')?;
-        for part in inner[..close].split(", ") {
+        let (attributes, tail) = inner.split_once(')')?;
+        for part in attributes.split(", ") {
             match part {
                 "tv" => range = Some(Range::Limited),
                 "pc" => range = Some(Range::Full),
@@ -71,7 +71,7 @@ pub(super) fn describe(line: &str) -> Option<Described> {
                 }
             }
         }
-        rest = &inner[close + 1..];
+        rest = tail;
     }
     let size = rest.split([',', ' ']).find_map(|word| {
         word.split_once('x')
@@ -90,7 +90,7 @@ fn is_number(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// The color space names FFmpeg prints (`av_color_space_name`).
+/// The color space names `FFmpeg` prints (`av_color_space_name`).
 const MATRICES: [&str; 17] = [
     "gbr",
     "bt709",
@@ -114,14 +114,14 @@ const MATRICES: [&str; 17] = [
 /// The frame format of described raw video: its PFNC (or Capturefab) code
 /// and the bytes of each frame. None for a format, range or matrix
 /// Capturefab does not carry as decoded, and for packed 4:2:2 of odd width,
-/// whose rows FFmpeg pads to whole pixel pairs where PFNC's end on the last
+/// whose rows `FFmpeg` pads to whole pixel pairs where PFNC's end on the last
 /// pixel. An unspecified matrix is BT.601 and an unspecified range video
-/// levels (full for `yuvj` and gray), as FFmpeg's own conversions take them.
+/// levels (full for `yuvj` and gray), as `FFmpeg`'s own conversions take them.
 pub(super) fn frame_format(described: &Described) -> Option<(u32, usize)> {
-    let full = match described.range {
-        Some(range) => range == Range::Full,
-        None => described.pix_fmt.starts_with("yuvj") || described.pix_fmt == "gray",
-    };
+    let full = described.range.map_or_else(
+        || described.pix_fmt.starts_with("yuvj") || described.pix_fmt == "gray",
+        |range| range == Range::Full,
+    );
     let (width, height) = (described.width, described.height);
     let sized = |code| {
         let len = crate::frame::frame_len(code, width, height)?;
@@ -165,7 +165,7 @@ pub(super) fn frame_format(described: &Described) -> Option<(u32, usize)> {
     sized(code)
 }
 
-/// One frame of `len` bytes from FFmpeg's raw video, read straight into a
+/// One frame of `len` bytes from `FFmpeg`'s raw video, read straight into a
 /// pooled buffer (every byte is read, so a recycled one needs no zeroing).
 pub(super) fn read_frame(
     reader: &mut impl Read,
@@ -199,8 +199,8 @@ pub(super) fn read_frame(
     })
 }
 
-/// The video stream FFmpeg reads: its codec, size, whether its samples
-/// are wider than 8 bits, and its average frame rate when FFmpeg knows it.
+/// The video stream `FFmpeg` reads: its codec, size, whether its samples
+/// are wider than 8 bits, and its average frame rate when `FFmpeg` knows it.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Input {
     pub codec: String,
@@ -210,7 +210,7 @@ pub(super) struct Input {
     pub fps: Option<f64>,
 }
 
-/// What a line of FFmpeg's log says.
+/// What a line of `FFmpeg`'s log says.
 #[derive(Debug, PartialEq)]
 pub(super) enum Said {
     /// An error, its level tag dropped, as `-loglevel error` would print it.
@@ -219,10 +219,10 @@ pub(super) enum Said {
     Output(Described),
 }
 
-/// The input stream an FFmpeg log line describes: `Video: CODEC (PROFILE)
+/// The input stream an `FFmpeg` log line describes: `Video: CODEC (PROFILE)
 /// …, PIX_FMT(…), WxH …`.
 fn input(line: &str) -> Option<Input> {
-    let rest = &line[line.find("Video: ")? + "Video: ".len()..];
+    let (_, rest) = line.split_once("Video: ")?;
     let codec = rest.split([' ', ',']).next()?.to_owned();
     let (width, height) = rest.split([',', ' ']).find_map(|word| {
         word.split_once('x')
@@ -248,7 +248,7 @@ fn input(line: &str) -> Option<Input> {
     })
 }
 
-/// FFmpeg's log at `-loglevel level+info`, a line at a time: its errors,
+/// `FFmpeg`'s log at `-loglevel level+info`, a line at a time: its errors,
 /// for the failure a stream ends with, the input video it reads and the
 /// raw video it writes.
 #[derive(Default)]
@@ -287,8 +287,9 @@ impl Lines {
             .find_map(|tag| text.find(tag).map(|at| (tag, at)));
         match tag {
             Some((tag @ ("[panic] " | "[fatal] " | "[error] "), at)) => {
-                let mut kept = text[..at].to_owned();
-                kept.push_str(&text[at + tag.len()..]);
+                let (prefix, tagged) = text.split_at(at);
+                let mut kept = prefix.to_owned();
+                kept.push_str(tagged.split_at(tag.len()).1);
                 kept.push('\n');
                 said(Said::Error(kept.into_bytes()));
             }

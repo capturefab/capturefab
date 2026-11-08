@@ -1,4 +1,4 @@
-//! The FFmpeg built into this executable, extracted on first use to a
+//! The `FFmpeg` built into this executable, extracted on first use to a
 //! private folder that every later process reuses: the cache, else a cache
 //! in the runtime folder, else this user's temporary folder, so read-only
 //! and noexec homes still run it. A copy is checked once against its digest
@@ -6,9 +6,10 @@
 //! file it checked, and later processes compare the file against the marker
 //! instead of hashing it again. A copy the system would not start gets a
 //! marker of its own, so later processes only ask the system again.
+#![deny(clippy::panic_in_result_fn)]
 use super::{Executable, FFMPEG_NAME, nonce};
 use crate::types::{Categorized, ErrorKind};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context as _, Result, bail, ensure};
 use std::{
     fs::{self, OpenOptions},
     io::{Read, Write},
@@ -37,23 +38,25 @@ pub(super) struct Payload<'a> {
     raw: bool,
 }
 impl<'a> Payload<'a> {
+    #[deny(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
     pub(super) fn compressed(bytes: &'a [u8]) -> Result<Self> {
-        let header = PAYLOAD_MAGIC.len() + 8 + 32;
+        let invalid_header = "bundled FFmpeg has an invalid compressed header";
+        let (length, rest) = bytes
+            .strip_prefix(PAYLOAD_MAGIC)
+            .and_then(|rest| rest.split_first_chunk::<8>())
+            .context(invalid_header)?;
+        let (digest, bytes) = rest.split_first_chunk::<32>().context(invalid_header)?;
         ensure!(
-            bytes.len() > header && bytes.starts_with(PAYLOAD_MAGIC),
+            !bytes.is_empty(),
             "bundled FFmpeg has an invalid compressed header"
         );
-        let length = u64::from_le_bytes(
-            bytes[PAYLOAD_MAGIC.len()..PAYLOAD_MAGIC.len() + 8]
-                .try_into()
-                .expect("eight length bytes"),
-        );
+        let length = u64::from_le_bytes(*length);
         let length =
             usize::try_from(length).context("bundled FFmpeg is too large for this host")?;
         ensure!(length > 0, "bundled FFmpeg is empty");
-        let digest = crate::types::hex(&bytes[PAYLOAD_MAGIC.len() + 8..header]);
+        let digest = crate::types::hex(digest);
         Ok(Self {
-            bytes: &bytes[header..],
+            bytes,
             length,
             digest,
             #[cfg(test)]
@@ -77,11 +80,11 @@ impl<'a> Payload<'a> {
             output.write_all(self.bytes)?;
             return Ok(());
         }
-        use sha2::Digest;
+        use sha2::Digest as _;
         let mut decoder = flate2::bufread::ZlibDecoder::new(self.bytes);
         let mut hash = sha2::Sha256::new();
         let mut length = 0usize;
-        let mut buffer = [0u8; 64 * 1024];
+        let mut buffer = vec![0u8; 64 * 1024].into_boxed_slice();
         loop {
             let count = decoder
                 .read(&mut buffer)
@@ -119,11 +122,11 @@ static EXTRACTED: OnceLock<Mutex<Option<Arc<Executable>>>> = OnceLock::new();
 /// the calls until `RETRY` has passed.
 static REFUSED: Mutex<Option<(Instant, String)>> = Mutex::new(None);
 
-/// Why the bundled FFmpeg could not be extracted, when it could not.
+/// Why the bundled `FFmpeg` could not be extracted, when it could not.
 pub(super) fn refused() -> Option<String> {
     REFUSED
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
         .map(|(_, message)| message.clone())
 }
@@ -142,14 +145,14 @@ fn nowhere(why: String) -> anyhow::Error {
         .into()
 }
 
-/// The built-in FFmpeg, extracted once for every process of this user to
+/// The built-in `FFmpeg`, extracted once for every process of this user to
 /// the first of `roots` that allows running programs.
 pub(super) fn extracted(embedded: &[u8]) -> Result<Arc<Executable>> {
     let payload = Payload::compressed(embedded)?;
     let mut extracted = EXTRACTED
         .get_or_init(Default::default)
         .lock()
-        .unwrap_or_else(|e| e.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Another process can remove or replace the copy, so its owner, mode
     // and length are checked again before each use.
     if let Some(copy) = extracted.as_ref()
@@ -157,7 +160,9 @@ pub(super) fn extracted(embedded: &[u8]) -> Result<Arc<Executable>> {
     {
         return Ok(copy.clone());
     }
-    if let Some((when, why)) = &*REFUSED.lock().unwrap_or_else(|e| e.into_inner())
+    if let Some((when, why)) = &*REFUSED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         && when.elapsed() < RETRY
     {
         return Err(nowhere(why.clone()));
@@ -189,11 +194,14 @@ pub(super) fn extracted(embedded: &[u8]) -> Result<Arc<Executable>> {
             refused.join("; ")
         }
     );
-    *REFUSED.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), message.clone()));
+    *REFUSED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((Instant::now(), message.clone()));
     Err(nowhere(message))
 }
 
-/// Where the bundled FFmpeg may be extracted, in order: the cache, a cache
+/// Where the bundled `FFmpeg` may be extracted, in order: the cache, a cache
 /// in the runtime folder, and one in this user's temporary folder.
 fn roots() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
@@ -259,7 +267,10 @@ fn cached_payload(
     let digest = &payload.digest;
     ensure!(digest.len() == 64, "bundled FFmpeg has no digest");
     private_dir(root)?;
-    let dir = root.join(format!("ffmpeg-{}", &digest[..16]));
+    let prefix = digest
+        .get(..16)
+        .context("bundled FFmpeg has an invalid digest")?;
+    let dir = root.join(format!("ffmpeg-{prefix}"));
     let in_use = hold(&dir)?;
     let path = dir.join(FFMPEG_NAME);
     let copy = Executable {
@@ -322,7 +333,7 @@ fn identity(path: &Path) -> Option<String> {
     let meta = fs::symlink_metadata(path).ok()?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::MetadataExt as _;
         Some(format!(
             "{} {} {} {}.{} {}.{}",
             meta.dev(),
@@ -336,7 +347,7 @@ fn identity(path: &Path) -> Option<String> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
+        use std::os::windows::fs::MetadataExt as _;
         Some(format!(
             "{} {} {}",
             meta.len(),
@@ -393,7 +404,7 @@ fn hold(dir: &Path) -> Result<fs::File> {
 }
 #[cfg(unix)]
 fn same_file(file: &fs::File, path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::MetadataExt as _;
     match (file.metadata(), fs::metadata(path)) {
         (Ok(open), Ok(named)) => (open.dev(), open.ino()) == (named.dev(), named.ino()),
         _ => false,
@@ -463,7 +474,7 @@ fn private_dir(dir: &Path) -> Result<()> {
     builder.recursive(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::fs::DirBuilderExt as _;
         builder.mode(0o700);
     }
     builder.create(dir)?;
@@ -471,7 +482,7 @@ fn private_dir(dir: &Path) -> Result<()> {
     ensure!(meta.is_dir(), "{} is not a directory", dir.display());
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         ensure!(
             meta.uid() == crate::dirs::effective_uid(),
             "{} belongs to another user",
@@ -492,7 +503,7 @@ fn trusted(path: &Path, length: usize) -> Result<()> {
     );
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::MetadataExt as _;
         ensure!(
             meta.uid() == crate::dirs::effective_uid() && meta.mode() & 0o022 == 0,
             "extracted FFmpeg is writable by another user"
@@ -505,7 +516,7 @@ fn lock_file(path: &Path) -> Result<fs::File> {
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
     Ok(options.open(path)?)
@@ -516,14 +527,20 @@ thread_local! {
     static HASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 fn sha256_file(path: &Path) -> Result<String> {
-    use sha2::Digest;
     #[cfg(test)]
     HASHED.set(HASHED.get() + 1);
     let mut file = fs::File::open(path)?;
+    sha256_reader(&mut file)
+}
+fn sha256_reader(reader: &mut impl Read) -> Result<String> {
+    use sha2::Digest as _;
     let mut hash = sha2::Sha256::new();
     let mut bytes = vec![0u8; 1 << 20];
     loop {
-        let read = file.read(&mut bytes)?;
+        let read = match reader.read(&mut bytes) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            read => read?,
+        };
         if read == 0 {
             break;
         }
@@ -535,8 +552,28 @@ fn sha256_file(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hashing_retries_interrupted_short_reads_and_preserves_other_errors() {
+        let mut reader = crate::test_io::FaultReader::new(
+            b"a".as_slice().chain(b"bc".as_slice()),
+            std::io::ErrorKind::Interrupted,
+        );
+        assert_eq!(
+            sha256_reader(&mut reader).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let mut reader = crate::test_io::FaultReader::new(
+            b"abc".as_slice(),
+            std::io::ErrorKind::PermissionDenied,
+        );
+        let error = sha256_reader(&mut reader).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
     #[cfg(unix)]
-    use std::{process::Command, thread, time::Duration};
+    use std::{process::Command, thread};
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -553,11 +590,11 @@ mod tests {
     const PAYLOAD: &[u8] = b"#!/bin/sh\necho stand-in for FFmpeg\n";
     #[cfg(unix)]
     fn digest(bytes: &[u8]) -> String {
-        use sha2::Digest;
+        use sha2::Digest as _;
         format!("{:x}", sha2::Sha256::digest(bytes))
     }
     fn compressed_payload(bytes: &[u8]) -> Vec<u8> {
-        use sha2::Digest;
+        use sha2::Digest as _;
         let mut packed = PAYLOAD_MAGIC.to_vec();
         packed.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
         packed.extend_from_slice(&sha2::Sha256::digest(bytes));
@@ -619,7 +656,13 @@ mod tests {
             let root = base.join(index.to_string());
             let payload = Payload::compressed(bad).unwrap();
             assert!(cached_payload(&root, &payload, |_| true).is_err());
-            let dir = root.join(format!("ffmpeg-{}", &payload.digest[..16]));
+            let dir = root.join(format!(
+                "ffmpeg-{}",
+                payload
+                    .digest
+                    .get(..16)
+                    .expect("hexadecimal payload digest")
+            ));
             assert!(!dir.join(FFMPEG_NAME).exists());
             assert!(!dir.join(MARKER).exists());
             assert!(fs::read_dir(dir).unwrap().all(|entry| {
@@ -630,22 +673,28 @@ mod tests {
                     .ends_with(".tmp")
             }));
         }
-        assert!(Payload::compressed(&good[..header]).is_err());
+        for end in 0..=header {
+            assert!(
+                Payload::compressed(&good[..end]).is_err(),
+                "header length {end}"
+            );
+        }
         assert!(Payload::compressed(b"invalid").is_err());
         fs::remove_dir_all(base).unwrap();
     }
     #[test]
     #[cfg(unix)]
     fn bundled_ffmpeg_is_extracted_once_and_shared() {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         let base = temp_dir("cache");
         let root = base.join("capturefab");
         let digest = digest(PAYLOAD);
         // Concurrent first uses produce one complete copy.
         let copies = thread::scope(|scope| {
-            let workers = (0..8)
-                .map(|_| scope.spawn(|| cached_copy(&root, PAYLOAD, &digest).unwrap()))
-                .collect::<Vec<_>>();
+            let mut workers = Vec::with_capacity(8);
+            for _ in 0..8 {
+                workers.push(scope.spawn(|| cached_copy(&root, PAYLOAD, &digest).unwrap()));
+            }
             workers
                 .into_iter()
                 .map(|worker| worker.join().unwrap())
@@ -722,7 +771,8 @@ mod tests {
         let digest = digest(PAYLOAD);
         let refused = cached_payload(&root, &Payload::raw(PAYLOAD, &digest), |_| false);
         assert!(refused.is_err());
-        let dir = root.join(format!("ffmpeg-{}", &digest[..16]));
+        let prefix = digest.get(..16).expect("hexadecimal payload digest");
+        let dir = root.join(format!("ffmpeg-{prefix}"));
         let path = dir.join(FFMPEG_NAME);
         assert!(!dir.join(MARKER).exists());
         assert!(marked(&dir, REFUSED_MARKER, &path, &digest));
@@ -757,18 +807,18 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn tampered_or_loosened_copies_fail_validation_and_are_replaced() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt as _;
         let base = temp_dir("tamper");
         let root = base.join("capturefab");
         let digest = digest(PAYLOAD);
-        let path = cached_copy(&root, PAYLOAD, &digest).unwrap().path.clone();
+        let path = cached_copy(&root, PAYLOAD, &digest).unwrap().path;
         // Same length, different bytes: the write changes the file the
         // marker vouched for, and the digest notices.
         let mut tampered = PAYLOAD.to_vec();
         tampered[16] ^= 1;
         thread::sleep(Duration::from_millis(10));
         fs::write(&path, &tampered).unwrap();
-        assert!(trusted(&path, PAYLOAD.len()).is_ok());
+        trusted(&path, PAYLOAD.len()).unwrap();
         cached_copy(&root, PAYLOAD, &digest).unwrap();
         assert_eq!(fs::read(&path).unwrap(), PAYLOAD);
         // Writable by others, or cut short: the check before each use fails.
@@ -816,7 +866,12 @@ mod tests {
     fn a_copy_removed_while_waiting_for_its_lock_is_extracted_again() {
         let base = temp_dir("prune-race");
         let root = base.join("capturefab");
-        let dir = root.join(format!("ffmpeg-{}", &digest(PAYLOAD)[..16]));
+        let dir = root.join(format!(
+            "ffmpeg-{}",
+            digest(PAYLOAD)
+                .get(..16)
+                .expect("hexadecimal payload digest")
+        ));
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(FFMPEG_NAME), PAYLOAD).unwrap();
         // Another build's cleanup holds the copy's lock.
@@ -830,8 +885,11 @@ mod tests {
         });
         // The copy this process holds is in place, not the one removed.
         assert_eq!(fs::read(&copy.path).unwrap(), PAYLOAD);
+        let Executable {
+            _in_use: in_use, ..
+        } = &copy;
         assert!(same_file(
-            copy._in_use.as_ref().unwrap(),
+            in_use.as_ref().unwrap(),
             &dir.join("in-use.lock")
         ));
         fs::remove_dir_all(base).unwrap();
@@ -839,7 +897,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn copies_the_system_will_not_start_are_detected() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt as _;
         let dir = temp_dir("noexec");
         let path = dir.join(FFMPEG_NAME);
         fs::write(&path, PAYLOAD).unwrap();
@@ -853,7 +911,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn extracted_copy_is_reused_by_another_process() {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::MetadataExt as _;
         if let Some(root) = std::env::var_os("CAPTUREFAB_TEST_EXTRACT_ROOT") {
             let copy = cached_copy(Path::new(&root), PAYLOAD, &digest(PAYLOAD)).unwrap();
             println!("inode {}", fs::metadata(&copy.path).unwrap().ino());

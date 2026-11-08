@@ -4,7 +4,7 @@
 //! its cameras.
 use super::{BUILTINS, escapable, subcommand};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
 /// What completion knows of a feature.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -44,6 +44,25 @@ pub(super) struct Cache {
     /// as completion asks for them.
     pub partial: bool,
     pub letters: BTreeSet<char>,
+}
+impl Cache {
+    /// Keep the first description of each feature, in arrival order.
+    pub(super) fn extend(&mut self, rows: Vec<Feature>) {
+        if rows.is_empty() {
+            return;
+        }
+        let mut names: HashSet<_> = self.features.iter().map(|row| row.name.as_str()).collect();
+        let unique: Vec<_> = rows
+            .iter()
+            .map(|row| names.insert(row.name.as_str()))
+            .collect();
+        drop(names);
+        self.features.extend(
+            rows.into_iter()
+                .zip(unique)
+                .filter_map(|(row, unique)| unique.then_some(row)),
+        );
+    }
 }
 
 /// `text` as one word of the shell: quoted when it has whitespace, quotes,
@@ -152,9 +171,10 @@ fn candidates(tree: &clap::Command, words: &[String], current: &str, hints: &Hin
             return hints
                 .cameras
                 .iter()
-                .chain(std::iter::once(&"none".to_owned()))
+                .map(String::as_str)
+                .chain(std::iter::once("none"))
                 .filter(|camera| starts(camera))
-                .map(|camera| quote(camera))
+                .map(quote)
                 .collect();
         }
         "help" => {
@@ -168,16 +188,14 @@ fn candidates(tree: &clap::Command, words: &[String], current: &str, hints: &Hin
         }
         _ => {}
     }
-    let words = match first.as_str() {
-        "show" => std::iter::once("inspect".to_owned())
-            .chain(words[1..].iter().cloned())
-            .collect(),
-        _ => words.to_vec(),
+    let first = match first.as_str() {
+        "show" => "inspect",
+        first => first,
     };
     let mut command = tree;
     let mut pending: Option<&clap::Arg> = None;
     let mut positionals_only = false;
-    for word in &words {
+    for word in std::iter::once(first).chain(words.iter().skip(1).map(String::as_str)) {
         if pending.take().is_some() {
             continue;
         }
@@ -185,14 +203,17 @@ fn candidates(tree: &clap::Command, words: &[String], current: &str, hints: &Hin
             positionals_only = true;
             continue;
         }
-        if !positionals_only && word.starts_with('-') && word.len() > 1 {
-            let arg = match word.strip_prefix("--") {
+        if !positionals_only
+            && let Some(flag) = word.strip_prefix('-')
+            && !flag.is_empty()
+        {
+            let arg = match flag.strip_prefix('-') {
                 Some(long) if !long.contains('=') => command
                     .get_arguments()
                     .find(|arg| arg.get_long() == Some(long)),
                 Some(_) => None,
                 None => {
-                    let mut letters = word[1..].chars();
+                    let mut letters = flag.chars();
                     match (letters.next(), letters.next()) {
                         (Some(short), None) => command
                             .get_arguments()
@@ -236,8 +257,8 @@ fn candidates(tree: &clap::Command, words: &[String], current: &str, hints: &Hin
         "features" => hints
             .features
             .iter()
+            .filter(|feature| starts_folded(&feature.name, current))
             .map(|feature| feature.name.clone())
-            .filter(|name| starts_folded(name, current))
             .collect(),
         "schema" => commands(tree)
             .into_iter()
@@ -297,7 +318,7 @@ fn values(arg: &clap::Arg, current: &str, hints: &Hints) -> Vec<String> {
 }
 
 /// Whether `name` starts with `prefix`, ignoring case: `expo` finds
-/// ExposureTime.
+/// `ExposureTime`.
 fn starts_folded(name: &str, prefix: &str) -> bool {
     name.len() >= prefix.len()
         && name
@@ -330,9 +351,10 @@ fn names(kind: Names, current: &str, hints: &Hints) -> Vec<String> {
                 }
                 values
             }
-            "auto_exposure" | "auto_wb" => {
-                ["off", "once", "continuous"].map(str::to_owned).to_vec()
-            }
+            "auto_exposure" | "auto_wb" => ["off", "once", "continuous"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
             "roi" => vec!["full".to_owned()],
             "format" => feature("PixelFormat")
                 .map(|format| format.choices.clone())
@@ -386,6 +408,34 @@ fn names(kind: Names, current: &str, hints: &Hints) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::cli::Cli;
+
+    #[test]
+    fn completion_cache_keeps_first_descriptions_in_arrival_order() {
+        let feature = |name: &str, kind: &str| Feature {
+            name: name.into(),
+            kind: kind.into(),
+            ..Feature::default()
+        };
+        let mut cache = Cache::default();
+        cache.extend(vec![feature("Gain", "float"), feature("Width", "int")]);
+        cache.extend(vec![
+            feature("Width", "other"),
+            feature("ExposureTime", "float"),
+            feature("Gain", "other"),
+            feature("ExposureTime", "other"),
+            feature("Height", "int"),
+        ]);
+        cache.extend(Vec::new());
+        assert_eq!(
+            cache.features,
+            [
+                feature("Gain", "float"),
+                feature("Width", "int"),
+                feature("ExposureTime", "float"),
+                feature("Height", "int"),
+            ]
+        );
+    }
 
     #[test]
     fn completion_reads_the_word_under_the_cursor() {
@@ -460,6 +510,7 @@ mod tests {
         assert_eq!(completed("capture -c sim"), ["sim:0", "sim:1"]);
         assert_eq!(completed("info --camera av"), ["'avfoundation:HD Camera'"]);
         assert_eq!(completed("use s"), ["sim:0", "sim:1"]);
+        assert_eq!(completed("use n"), ["none"]);
         assert_eq!(completed("record --codec h"), ["h264", "hevc"]);
         assert_eq!(completed("completions z"), ["zsh"]);
         assert_eq!(completed("list --kind s"), ["screen", "sim"]);
@@ -467,6 +518,8 @@ mod tests {
         assert_eq!(completed("help preset s"), ["save", "show"]);
         // A value already given moves on to the next word.
         assert_eq!(completed("capture -c sim:0 --ev"), ["--every"]);
+        assert_eq!(completed("capture -é --ev"), ["--every"]);
+        assert_eq!(completed("capture -- -c sim"), [] as [String; 0]);
     }
 
     #[test]
@@ -481,7 +534,7 @@ mod tests {
         );
         assert_eq!(completed("set ExposureA"), ["ExposureAuto="]);
         // Read-only features are not offered to set.
-        assert!(completed("set Device").is_empty());
+        assert_eq!(completed("set Device"), [] as [String; 0]);
         assert_eq!(completed("get Device"), ["DeviceModelName"]);
         assert_eq!(
             completed("set ExposureAuto=O"),
@@ -523,6 +576,10 @@ mod tests {
             ["ExposureAuto=", "ExposureTime=", "exposure="]
         );
         assert_eq!(completed("show --set Pixel"), ["PixelFormat="]);
+        assert_eq!(
+            completed("show -c sim:0 --set Pixel"),
+            completed("inspect -c sim:0 --set Pixel")
+        );
         assert_eq!(completed("features Pix"), ["PixelFormat"]);
         assert_eq!(completed("schema ins"), ["inspect"]);
     }

@@ -1,3 +1,4 @@
+#![deny(clippy::missing_const_for_fn)]
 use crate::types::{
     Backend, CameraInfo, Frame, MONO8, RGB8, RegisterIo, Transport, TransportStats, hex,
 };
@@ -7,16 +8,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub mod replay;
+pub(crate) mod replay;
 
 /// A replay selector keeps the path literal, including spaces and colons.
-pub fn replay_source(selector: &str) -> Option<&std::path::Path> {
+pub(crate) fn replay_source(selector: &str) -> Option<&std::path::Path> {
     selector
         .strip_prefix("sim:replay:")
         .map(std::path::Path::new)
 }
 
-pub fn validate_selector_shape(selector: &str) -> Result<()> {
+pub(crate) fn validate_selector_shape(selector: &str) -> Result<()> {
     let name = selector.strip_prefix("sim:").unwrap_or(selector);
     ensure!(
         !name.trim().is_empty(),
@@ -32,22 +33,23 @@ pub fn validate_selector_shape(selector: &str) -> Result<()> {
     Options::parse(selector).map(|_| ())
 }
 
-pub fn open(selector: &str, timeout: Duration) -> Result<Box<dyn Backend>> {
+pub(crate) fn open(selector: &str, timeout: Duration) -> Result<Box<dyn Backend>> {
     validate_selector_shape(selector)?;
-    if let Some(source) = replay_source(selector) {
-        replay::open(source, 640, 480, 30.0, timeout)
-    } else {
-        if let Some(delay) = test_hook(selector, "connect=after:") {
-            std::thread::sleep(Duration::from_millis(delay));
-        }
-        Ok(Box::new(Simulator::for_selector(selector)))
-    }
+    replay_source(selector).map_or_else(
+        || -> Result<Box<dyn Backend>> {
+            if let Some(delay) = test_hook(selector, "connect=after:") {
+                std::thread::sleep(Duration::from_millis(delay));
+            }
+            Ok(Box::new(Simulator::for_selector(selector)))
+        },
+        |source| replay::open(source, 640, 480, 30.0, timeout),
+    )
 }
 
-pub fn info() -> CameraInfo {
+pub(crate) fn info() -> CameraInfo {
     info_named("sim:0")
 }
-pub fn info_named(id: &str) -> CameraInfo {
+pub(crate) fn info_named(id: &str) -> CameraInfo {
     let mut info = CameraInfo {
         id: id.into(),
         transport: Transport::Simulator,
@@ -60,13 +62,13 @@ pub fn info_named(id: &str) -> CameraInfo {
         .into(),
         serial: format!("SIM{}", base(id).trim_start_matches("sim:")),
         address: None,
-        profile: Default::default(),
+        profile: crate::camera_profile::CameraProfile::default(),
     };
     info.profile = crate::camera_profile::detect(&info, &[]);
     info
 }
 /// A simulator selector without its `?options`: the camera they configure.
-pub fn base(selector: &str) -> &str {
+pub(crate) fn base(selector: &str) -> &str {
     if replay_source(selector).is_some() {
         return selector;
     }
@@ -143,7 +145,7 @@ impl SimKind {
             _ => Self::Area,
         }
     }
-    fn model(self) -> &'static str {
+    const fn model(self) -> &'static str {
         match self {
             Self::Area => "Pattern camera",
             Self::Line => "Pattern line scan camera",
@@ -154,7 +156,7 @@ impl SimKind {
     }
     /// Whether it has exposure, gain, triggers and the other controls of an
     /// image sensor; depth and thermal cameras deliver calibrated samples.
-    fn analog(self) -> bool {
+    const fn analog(self) -> bool {
         !matches!(self, Self::Depth | Self::Thermal)
     }
 }
@@ -302,8 +304,8 @@ const FOCUS: usize = 0x140;
 const MAGNIFICATION: usize = 0x148;
 const ILLUMINATION: usize = 0x150;
 const TRIGGER_SELECTOR: usize = 0x160;
-/// TriggerMode, TriggerSource, TriggerActivation and TriggerSoftware hold
-/// one register per TriggerSelector value, four bytes apart.
+/// `TriggerMode`, `TriggerSource`, `TriggerActivation` and `TriggerSoftware` hold
+/// one register per `TriggerSelector` value, four bytes apart.
 const TRIGGER_MODE: usize = 0x168;
 const TRIGGER_SOURCE: usize = 0x170;
 const TRIGGER_SOFTWARE: usize = 0x180;
@@ -337,7 +339,7 @@ const STREAMING: [(usize, usize); 4] = [
 const FRAME_START: usize = 0;
 const ACQUISITION_START: usize = 1;
 /// Trigger sources: Software, Line0, then Line1, which never fires, and
-/// the camera's own timing, Freerun and FixedRate, as Allied Vision
+/// the camera's own timing, Freerun and `FixedRate`, as Allied Vision
 /// cameras have.
 const SOFTWARE: u32 = 0;
 const LINE0: u32 = 1;
@@ -353,19 +355,24 @@ fn scene(width: u32, height: u32) -> Vec<(f32, u8)> {
         .flat_map(|y| (0..width).map(move |x| (x, y)))
         .map(|(x, y)| {
             let d = (x as f32 - width as f32 * 0.5).hypot(y as f32 - height as f32 * 0.5);
-            let ring = (d * 0.11 / std::f32::consts::TAU * 256.0) as u32 as u8;
+            #[expect(
+                clippy::cast_sign_loss,
+            clippy::cast_possible_truncation,
+                reason = "radial distance is nonnegative; the cast truncates the phase before its intentional byte wrap"
+            )]
+            let ring = ((d * 0.11 / std::f32::consts::TAU * 256.0) as u32).to_le_bytes()[0];
             (40.0 + 130.0 * x as f32 / width as f32, ring)
         })
         .collect()
 }
 
-pub struct Simulator {
+pub(crate) struct Simulator {
     kind: SimKind,
     options: Options,
     memory: Vec<u8>,
     /// The factory settings, which the Default user set loads.
     factory: Vec<u8>,
-    /// The registers UserSetSave copied into UserSet1 and UserSet2.
+    /// The registers `UserSetSave` copied into `UserSet1` and `UserSet2`.
     user_sets: [Option<Vec<u8>>; 2],
     running: bool,
     /// When a free-running sensor reads out its next frame.
@@ -374,16 +381,16 @@ pub struct Simulator {
     frame_id: u64,
     scene: (u32, u32, Vec<(f32, u8)>),
     /// Panic after this many frames: `?panic=after:N`, a fault-test hook
-    /// honored only with CAPTUREFAB_TEST_HOOKS=1.
+    /// honored only with `CAPTUREFAB_TEST_HOOKS=1`.
     panic_after: Option<u64>,
-    /// Go on streaming after a capture as a live FFmpeg source does:
-    /// `?linger=1`, a test hook honored only with CAPTUREFAB_TEST_HOOKS=1.
+    /// Go on streaming after a capture as a live `FFmpeg` source does:
+    /// `?linger=1`, a test hook honored only with `CAPTUREFAB_TEST_HOOKS=1`.
     lingers: bool,
     /// When each software frame trigger that no frame answered yet fired.
     triggers: VecDeque<Instant>,
     /// The last Line0 edge taken: only later edges start frames.
     line_edge: Instant,
-    /// An acquisition still waiting for its AcquisitionStart trigger.
+    /// An acquisition still waiting for its `AcquisitionStart` trigger.
     armed: bool,
     random: u64,
     stats: TransportStats,
@@ -393,8 +400,8 @@ fn panic_after(selector: &str) -> Option<u64> {
     test_hook(selector, "panic=after:")
 }
 /// Whether a selector's `?exclusive=1` makes the simulator a device one
-/// process at a time owns, as a GigE camera is, when test hooks are on.
-pub fn exclusive(selector: &str) -> bool {
+/// process at a time owns, as a `GigE` camera is, when test hooks are on.
+pub(crate) fn exclusive(selector: &str) -> bool {
     test_hook(selector, "exclusive=") == Some(1)
 }
 /// The number after `prefix` in a selector's options, when test hooks are
@@ -418,7 +425,7 @@ impl Default for Simulator {
 impl Simulator {
     /// Typed selectors reserve their first component; arbitrary other names
     /// keep the original area-scan simulator behavior.
-    pub fn for_selector(selector: &str) -> Self {
+    pub(crate) fn for_selector(selector: &str) -> Self {
         let kind = SimKind::from_selector(selector);
         let now = Instant::now();
         let mut s = Self {
@@ -479,12 +486,17 @@ impl Simulator {
             SimKind::Thermal => {
                 r#"<EnumEntry Name="Mono16"><Value>0x01100007</Value></EnumEntry>"#.to_owned()
             }
-            _ => SENSOR_FORMATS
-                .iter()
-                .map(|(name, value)| {
-                    format!(r#"<EnumEntry Name="{name}"><Value>{value:#010x}</Value></EnumEntry>"#)
-                })
-                .collect(),
+            _ => {
+                use std::fmt::Write as _;
+                let mut entries = String::new();
+                for (name, value) in SENSOR_FORMATS {
+                    let _ = write!(
+                        entries,
+                        r#"<EnumEntry Name="{name}"><Value>{value:#010x}</Value></EnumEntry>"#
+                    );
+                }
+                entries
+            }
         };
         let (special_category, special_features) = match self.kind {
             SimKind::Depth => ("<pFeature>Scan3dControl</pFeature>", DEPTH_FEATURES),
@@ -540,10 +552,15 @@ impl Simulator {
     fn put_f64(&mut self, p: usize, v: f64) {
         self.memory[p..p + 8].copy_from_slice(&v.to_le_bytes());
     }
+    #[deny(clippy::arithmetic_side_effects)]
     fn refresh_payload(&mut self) {
-        let bytes = crate::frame::row_bytes(self.u32(WIDTH), self.u32(PIXEL_FORMAT))
-            * self.u32(HEIGHT) as usize;
-        self.put_u32(PAYLOAD, u32::try_from(bytes).unwrap_or(u32::MAX));
+        let row = crate::frame::row_bytes(self.u32(WIDTH), self.u32(PIXEL_FORMAT));
+        let bytes = usize::try_from(self.u32(HEIGHT))
+            .ok()
+            .and_then(|height| row.checked_mul(height))
+            .and_then(|bytes| u32::try_from(bytes).ok())
+            .unwrap_or(u32::MAX);
+        self.put_u32(PAYLOAD, bytes);
     }
     /// Check every setting in `memory` before it becomes the camera's.
     fn validate(&self, memory: &[u8]) -> Result<()> {
@@ -651,7 +668,7 @@ impl Simulator {
             proposed[offset..offset + 4].copy_from_slice(&moved.to_le_bytes());
         }
     }
-    /// A TriggerSoftware for trigger `selector`; ignored while the camera
+    /// A `TriggerSoftware` for trigger `selector`; ignored while the camera
     /// is stopped, or when that trigger is off or has another source.
     fn trigger(&mut self, selector: usize) {
         if !self.running || !self.triggered_by(selector, SOFTWARE) {
@@ -837,9 +854,14 @@ fn copy_settings(from: &[u8], to: &mut [u8]) {
 }
 fn unhex(text: &str) -> Result<Vec<u8>> {
     ensure!(text.len().is_multiple_of(2), "odd hex length");
-    (0..text.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).context("invalid hex"))
+    text.as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).context("invalid hex")?;
+            u8::from_str_radix(pair, 16).context("invalid hex")
+        })
         .collect()
 }
 impl RegisterIo for Simulator {
@@ -917,9 +939,11 @@ impl Backend for Simulator {
     }
     fn next_frame(&mut self, timeout: Duration) -> Result<Frame> {
         ensure!(self.running, "camera is not streaming");
-        if self.panic_after.is_some_and(|after| self.frame_id >= after) {
-            panic!("simulated camera fault after {} frames", self.frame_id);
-        }
+        assert!(
+            self.panic_after.is_none_or(|after| self.frame_id < after),
+            "simulated camera fault after {} frames",
+            self.frame_id
+        );
         let deadline = Instant::now() + timeout;
         loop {
             let Some((readout, start)) = self.next_readout().filter(|(at, _)| *at <= deadline)
@@ -942,7 +966,10 @@ impl Backend for Simulator {
                 }
                 Start::Line(edge) => self.line_edge = edge,
             }
-            self.frame_id += 1;
+            self.frame_id = self
+                .frame_id
+                .checked_add(1)
+                .context("simulator frame counter exhausted")?;
             if self.lose().is_some() {
                 continue;
             }
@@ -990,6 +1017,35 @@ impl Backend for Simulator {
         Ok(())
     }
 }
+/// The animation has a 32-bit phase. Keep its wrap independent of the
+/// frame counter's width and of overflow checks in the build profile.
+#[deny(clippy::arithmetic_side_effects, clippy::cast_precision_loss)]
+const fn animation_shift(frame_id: u64) -> u32 {
+    let [a, b, c, d, ..] = frame_id.saturating_sub(1).to_le_bytes();
+    u32::from_le_bytes([a, b, c, d]).wrapping_mul(4)
+}
+
+/// Add low-bit sensor texture while keeping clipped pixels at full scale.
+#[inline]
+fn wide_sample(level: u8, bits: u32, texture: u32) -> u16 {
+    let sample = if level == u8::MAX {
+        (1u32 << bits) - 1
+    } else {
+        (u32::from(level) << (bits - 8)) | (texture & ((1 << (bits - 8)) - 1))
+    };
+    u16::try_from(sample).expect("simulator sample depths are at most 16 bits")
+}
+
+/// One period of the animated intensity variation, without a per-frame allocation.
+#[deny(clippy::cast_precision_loss)]
+fn animation_wave(shift: u32) -> [f32; 256] {
+    let phase = u16::from(shift.to_le_bytes()[0]);
+    std::array::from_fn(|i| {
+        let index = u16::try_from(i).expect("the 256-entry waveform index fits u16");
+        30.0 * (std::f32::consts::TAU * f32::from(index + phase) / 256.0).sin()
+    })
+}
+
 impl Simulator {
     /// The time between frames of a free-running sensor.
     fn period(&self) -> Duration {
@@ -1011,7 +1067,7 @@ impl Simulator {
         if (self.scene.0, self.scene.1) != (width, height) {
             self.scene = (width, height, scene(width, height));
         }
-        let shift = (self.frame_id.saturating_sub(1) * 4) as u32;
+        let shift = animation_shift(self.frame_id);
         let illumination = if self.kind == SimKind::Microscope {
             self.f64(ILLUMINATION) / 100.0
         } else {
@@ -1022,148 +1078,176 @@ impl Simulator {
         } else {
             10_000.0
         };
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the simulator's pixel model deliberately retains its existing f32 rounding"
+        )]
         let gain = (10f64.powf((self.f64(GAIN) + self.f64(DIGITAL_GAIN)) / 20.0)
             * self.f64(EXPOSURE)
             / exposure_reference
             * illumination) as f32;
+        #[expect(
+            clippy::cast_sign_loss,
+            clippy::cast_possible_truncation,
+            reason = "the clamped sensor level uses Rust's saturating float conversion, including zero for NaN"
+        )]
         let level = |v: f32| (v * gain).clamp(0.0, 255.0) as u8;
-        let wave: Vec<f32> = (0..256)
-            .map(|i| 30.0 * (std::f32::consts::TAU * (i + shift % 256) as f32 / 256.0).sin())
-            .collect();
+        let wave = animation_wave(shift);
         let color = matches!(
             pixel_format,
             RGB8 | RGB12 | BAYER_RG8 | BAYER_RG12 | BAYER_RG12P
         );
         // Samples wider than a byte keep a sensor's low-bit texture, and a
         // clipped one is at the top of its range.
-        let wide = |level: u8, bits: u32, texture: u32| -> u16 {
-            if level == 255 {
-                ((1u32 << bits) - 1) as u16
-            } else {
-                ((u32::from(level) << (bits - 8)) | (texture & ((1 << (bits - 8)) - 1))) as u16
-            }
-        };
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the optical pixel model deliberately evaluates magnification and blur in f32"
+        )]
+        let optics = (self.kind == SimKind::Microscope).then(|| {
+            (
+                self.f64(MAGNIFICATION) as f32,
+                (self.f64(FOCUS) - 50.0).abs() as f32,
+            )
+        });
         let mut sum = 0u64;
         // Every byte of every row is written below, so a recycled buffer's
         // old pixels never show.
-        let mut data = crate::framebuf::pool().take_stale(self.u32(PAYLOAD) as usize);
+        let payload =
+            usize::try_from(self.u32(PAYLOAD)).expect("simulator payload fits address space");
+        let mut data = crate::framebuf::pool().take_stale(payload);
         let row_bytes = crate::frame::row_bytes(width, pixel_format);
-        for (i, (base, ring)) in self.scene.2.iter().enumerate() {
-            let (x, y) = (i as u32 % width, i as u32 / width);
-            let p = &mut data[y as usize * row_bytes..];
-            if matches!(self.kind, SimKind::Depth | SimKind::Thermal) {
-                let dx = (x as f32 - width as f32 * (0.3 + (shift as f32 * 0.01).sin() * 0.1))
-                    / width as f32;
-                let dy = (y as f32 - height as f32 * 0.5) / height as f32;
-                let object = dx * dx * 16.0 + dy * dy * 9.0 < 1.0;
-                let sample = if self.kind == SimKind::Depth {
-                    // Millimeters along calibrated C (depth), with zero denoting
-                    // an invalid sample. A foreground object crosses a sloped plane.
-                    if i == 0 {
-                        0
-                    } else if object {
-                        750
+        let columns = usize::try_from(width).expect("simulator width fits address space");
+        for (row, (scene, p)) in self
+            .scene
+            .2
+            .chunks_exact(columns)
+            .zip(data.chunks_exact_mut(row_bytes))
+            .enumerate()
+        {
+            let y = u32::try_from(row).expect("simulator row fits its u32 height");
+            for (column, (base, ring)) in scene.iter().enumerate() {
+                let x = u32::try_from(column).expect("simulator column fits its u32 width");
+                if matches!(self.kind, SimKind::Depth | SimKind::Thermal) {
+                    let dx = (x as f32 - width as f32 * (0.3 + (shift as f32 * 0.01).sin() * 0.1))
+                        / width as f32;
+                    let dy = (y as f32 - height as f32 * 0.5) / height as f32;
+                    let object = dx * dx * 16.0 + dy * dy * 9.0 < 1.0;
+                    let sample = if self.kind == SimKind::Depth {
+                        // Millimeters along calibrated C (depth), with zero denoting
+                        // an invalid sample. A foreground object crosses a sloped plane.
+                        if x == 0 && y == 0 {
+                            0
+                        } else if object {
+                            750
+                        } else {
+                            1_200 + x * 2 + y
+                        }
                     } else {
-                        1_200 + x * 2 + y
+                        // 0.01 Kelvin per unsigned sample, including a warm object.
+                        28_315
+                            + x * 1_000 / width
+                            + y * 500 / height
+                            + if object { 2_000 } else { 0 }
+                    };
+                    let sample = u16::try_from(sample)
+                        .expect("calibrated simulator samples fit their 16-bit format");
+                    let at = column * 2;
+                    p[at..at + 2].copy_from_slice(&sample.to_le_bytes());
+                    continue;
+                }
+                // The checkerboard is fixed on the sensor, so it moves with the
+                // offsets.
+                let grid = (((x + offset_x) / 64 + (y + offset_y) / 64) % 2) as f32 * 25.0;
+                let marker = self.kind != SimKind::Microscope
+                    && (x.abs_diff((shift % width).max(1)) < 2
+                        || (self.kind != SimKind::Line && y == height / 2));
+                let intensity = if let Some((magnification, blur)) = optics {
+                    let sx = width as f32 * 0.5 + (x as f32 - width as f32 * 0.5) / magnification;
+                    let sy = height as f32 * 0.5 + (y as f32 - height as f32 * 0.5) / magnification;
+                    let mut intensity = 0.0;
+                    for (ox, oy) in [
+                        (0.0, 0.0),
+                        (-1.0, 0.0),
+                        (1.0, 0.0),
+                        (0.0, -1.0),
+                        (0.0, 1.0),
+                        (-1.0, -1.0),
+                        (1.0, -1.0),
+                        (-1.0, 1.0),
+                        (1.0, 1.0),
+                    ] {
+                        #[expect(
+                            clippy::cast_sign_loss,
+                            clippy::cast_possible_truncation,
+                            reason = "the image coordinate is clamped nonnegative before Rust's saturating float conversion"
+                        )]
+                        let bx = (sx + ox * blur).clamp(0.0, (width - 1) as f32) as u32;
+                        #[expect(
+                            clippy::cast_sign_loss,
+                            clippy::cast_possible_truncation,
+                            reason = "the image coordinate is clamped nonnegative before Rust's saturating float conversion"
+                        )]
+                        let by = (sy + oy * blur).clamp(0.0, (height - 1) as f32) as u32;
+                        let (base, ring) = self.scene.2[(by * width + bx) as usize];
+                        let grid =
+                            (((bx + offset_x) / 64 + (by + offset_y) / 64) % 2) as f32 * 25.0;
+                        intensity += base + grid + wave[ring as usize];
                     }
+                    intensity / 9.0
                 } else {
-                    // 0.01 Kelvin per unsigned sample, including a warm object.
-                    28_315 + x * 1_000 / width + y * 500 / height + if object { 2_000 } else { 0 }
+                    base + grid + wave[*ring as usize]
                 };
-                let at = x as usize * 2;
-                p[at..at + 2].copy_from_slice(&(sample as u16).to_le_bytes());
-                continue;
-            }
-            // The checkerboard is fixed on the sensor, so it moves with the
-            // offsets.
-            let grid = (((x + offset_x) / 64 + (y + offset_y) / 64) % 2) as f32 * 25.0;
-            let marker = self.kind != SimKind::Microscope
-                && (x.abs_diff((shift % width).max(1)) < 2
-                    || (self.kind != SimKind::Line && y == height / 2));
-            let intensity = if self.kind == SimKind::Microscope {
-                let magnification = self.f64(MAGNIFICATION) as f32;
-                let sx = width as f32 * 0.5 + (x as f32 - width as f32 * 0.5) / magnification;
-                let sy = height as f32 * 0.5 + (y as f32 - height as f32 * 0.5) / magnification;
-                let blur = (self.f64(FOCUS) - 50.0).abs() as f32;
-                let mut intensity = 0.0;
-                for (ox, oy) in [
-                    (0.0, 0.0),
-                    (-1.0, 0.0),
-                    (1.0, 0.0),
-                    (0.0, -1.0),
-                    (0.0, 1.0),
-                    (-1.0, -1.0),
-                    (1.0, -1.0),
-                    (-1.0, 1.0),
-                    (1.0, 1.0),
-                ] {
-                    let bx = (sx + ox * blur).clamp(0.0, (width - 1) as f32) as u32;
-                    let by = (sy + oy * blur).clamp(0.0, (height - 1) as f32) as u32;
-                    let (base, ring) = self.scene.2[(by * width + bx) as usize];
-                    let grid = (((bx + offset_x) / 64 + (by + offset_y) / 64) % 2) as f32 * 25.0;
-                    intensity += base + grid + wave[ring as usize];
-                }
-                intensity / 9.0
-            } else {
-                base + grid + wave[*ring as usize]
-            };
-            let red = level(if marker { 230.0 } else { intensity });
-            sum += u64::from(red);
-            let rgb = if color && self.kind == SimKind::Microscope {
-                [red, level(intensity * 0.9), level(intensity * 0.75)]
-            } else if color {
-                [
-                    red,
-                    level(if marker {
-                        230.0
-                    } else {
-                        ((y * 255 / height + shift % 256) % 256) as f32
-                    }),
-                    level(if marker {
-                        230.0
-                    } else {
-                        ((x + y + shift % 256) % 256) as f32
-                    }),
-                ]
-            } else {
-                [red; 3]
-            };
-            let x = x as usize;
-            let bayer = rgb[[0, 1, 1, 2][((y & 1) * 2 + (x as u32 & 1)) as usize]];
-            match pixel_format {
-                RGB8 => p[x * 3..x * 3 + 3].copy_from_slice(&rgb),
-                MONO12 => {
-                    p[x * 2..x * 2 + 2].copy_from_slice(&wide(red, 12, x as u32).to_le_bytes())
-                }
-                MONO16 => p[x * 2..x * 2 + 2]
-                    .copy_from_slice(&wide(red, 16, x as u32 * 7 + y).to_le_bytes()),
-                BAYER_RG12 => {
-                    p[x * 2..x * 2 + 2].copy_from_slice(&wide(bayer, 12, x as u32).to_le_bytes())
-                }
-                // PFNC lsb packing: two 12-bit samples in three bytes. An
-                // even sample clears the high nibble, which the odd one
-                // after it fills, or which stays zero at an odd width.
-                MONO12P => {
-                    let sample = wide(red, 12, x as u32);
-                    let at = x / 2 * 3;
-                    if x.is_multiple_of(2) {
-                        p[at] = sample as u8;
-                        p[at + 1] = (sample >> 8) as u8;
-                    } else {
-                        p[at + 1] = (p[at + 1] & 0x0f) | ((sample & 0x0f) << 4) as u8;
-                        p[at + 2] = (sample >> 4) as u8;
+                let red = level(if marker { 230.0 } else { intensity });
+                sum += u64::from(red);
+                let rgb = if color && self.kind == SimKind::Microscope {
+                    [red, level(intensity * 0.9), level(intensity * 0.75)]
+                } else if color {
+                    [
+                        red,
+                        level(if marker {
+                            230.0
+                        } else {
+                            ((y * 255 / height + shift % 256) % 256) as f32
+                        }),
+                        level(if marker {
+                            230.0
+                        } else {
+                            ((x + y + shift % 256) % 256) as f32
+                        }),
+                    ]
+                } else {
+                    [red; 3]
+                };
+                let texture = x;
+                let x = column;
+                let bayer = rgb[[0, 1, 1, 2][(row & 1) * 2 + (column & 1)]];
+                match pixel_format {
+                    RGB8 => p[x * 3..x * 3 + 3].copy_from_slice(&rgb),
+                    MONO12 => {
+                        p[x * 2..x * 2 + 2]
+                            .copy_from_slice(&wide_sample(red, 12, texture).to_le_bytes());
                     }
-                }
-                MONO14P => put_lsb(p, x * 14, 14, wide(red, 14, x as u32)),
-                BAYER_RG12P => put_lsb(p, x * 12, 12, wide(bayer, 12, x as u32)),
-                RGB12 => {
-                    for (c, &level) in rgb.iter().enumerate() {
-                        let at = x * 6 + c * 2;
-                        p[at..at + 2].copy_from_slice(&wide(level, 12, x as u32).to_le_bytes());
+                    MONO16 => p[x * 2..x * 2 + 2]
+                        .copy_from_slice(&wide_sample(red, 16, texture * 7 + y).to_le_bytes()),
+                    BAYER_RG12 => {
+                        p[x * 2..x * 2 + 2]
+                            .copy_from_slice(&wide_sample(bayer, 12, texture).to_le_bytes());
                     }
+                    // The common PFNC writer also clears a trailing padding nibble
+                    // when an odd-width 12-bit row ends with an even sample.
+                    MONO12P => put_lsb(p, x * 12, 12, wide_sample(red, 12, texture)),
+                    MONO14P => put_lsb(p, x * 14, 14, wide_sample(red, 14, texture)),
+                    BAYER_RG12P => put_lsb(p, x * 12, 12, wide_sample(bayer, 12, texture)),
+                    RGB12 => {
+                        for (c, &level) in rgb.iter().enumerate() {
+                            let at = x * 6 + c * 2;
+                            p[at..at + 2]
+                                .copy_from_slice(&wide_sample(level, 12, texture).to_le_bytes());
+                        }
+                    }
+                    BAYER_RG8 => p[x] = bayer,
+                    _ => p[x] = red,
                 }
-                BAYER_RG8 => p[x] = bayer,
-                _ => p[x] = red,
             }
         }
         if self.kind.analog() {
@@ -1192,14 +1276,15 @@ impl Simulator {
 /// sample in its last byte cleared: samples written in order then fill a
 /// row whose old contents were anything, with its padding bits zero.
 fn put_lsb(row: &mut [u8], first: usize, bits: usize, sample: u16) {
-    let value = u32::from(sample) << (first % 8);
+    let bytes = (u32::from(sample) << (first % 8)).to_le_bytes();
     let kept = (1u8 << (first % 8)) - 1;
-    for (i, byte) in row[first / 8..(first + bits).div_ceil(8)]
+    for (i, (byte, value)) in row[first / 8..(first + bits).div_ceil(8)]
         .iter_mut()
+        .zip(bytes)
         .enumerate()
     {
         let old = if i == 0 { *byte & kept } else { 0 };
-        *byte = old | (value >> (8 * i)) as u8;
+        *byte = old | value;
     }
 }
 
@@ -1207,6 +1292,104 @@ fn put_lsb(row: &mut [u8], first: usize, bits: usize, sample: u16) {
 mod tests {
     use super::*;
     use crate::{camera::Camera, camera_profile::CameraKind};
+
+    #[test]
+    fn hex_settings_reject_malformed_unicode_without_panicking() {
+        let bytes: Vec<_> = (0..=u8::MAX).collect();
+        assert_eq!(unhex(&hex(&bytes)).unwrap(), bytes);
+        assert_eq!(unhex("aF+1").unwrap(), [175, 1]);
+        for text in ["0", "gg", "é", "aé0", "🚀", "0🚀0", "１２"] {
+            assert!(unhex(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn packed_samples_preserve_prefix_bits_and_clear_padding_at_every_offset() {
+        for bits in [12usize, 14] {
+            for offset in 0..8 {
+                let first = 8 + offset;
+                for sample in 0..(1u16 << bits) {
+                    let mut actual = [u8::MAX; 6];
+                    let mut expected = actual;
+                    for at in first..(first + bits).div_ceil(8) * 8 {
+                        let value =
+                            u8::from(at < first + bits && (sample >> (at - first)) & 1 != 0);
+                        expected[at / 8] =
+                            (expected[at / 8] & !(1 << (at % 8))) | (value << (at % 8));
+                    }
+                    put_lsb(&mut actual, first, bits, sample);
+                    assert_eq!(actual, expected, "{bits} bits at {offset}: {sample}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wide_samples_preserve_levels_texture_and_clipping_at_each_depth() {
+        for bits in [12, 14, 16] {
+            let low_mask = (1u32 << (bits - 8)) - 1;
+            let full = (1u32 << bits) - 1;
+            for level in 0..=u8::MAX {
+                for texture in (0..=low_mask).chain([u32::MAX]) {
+                    let sample = u32::from(wide_sample(level, bits, texture));
+                    if level == u8::MAX {
+                        assert_eq!(sample, full);
+                    } else {
+                        assert_eq!(sample >> (bits - 8), u32::from(level));
+                        assert_eq!(sample & low_mask, texture & low_mask);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_animation_wave_preserves_every_phase_exactly() {
+        for phase in 0..256u32 {
+            for shift in [phase, u32::MAX - 255 + phase] {
+                let old: Vec<f32> = (0..256u32)
+                    .map(|i| {
+                        30.0 * (std::f32::consts::TAU * (i + shift % 256) as f32 / 256.0).sin()
+                    })
+                    .collect();
+                let wave = animation_wave(shift);
+                for (actual, expected) in wave.iter().zip(old) {
+                    assert_eq!(actual.to_bits(), expected.to_bits(), "shift {shift}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn animation_phase_wraps_without_overflow_at_large_frame_ids() {
+        for id in [
+            0,
+            1,
+            2,
+            (1 << 30) - 1,
+            1 << 30,
+            (1 << 32) + 1,
+            1 << 62,
+            u64::MAX,
+        ] {
+            let expected = u128::from(id.saturating_sub(1)) * 4 % (1u128 << 32);
+            assert_eq!(
+                animation_shift(id),
+                u32::try_from(expected).unwrap(),
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_exhausted_frame_counter_does_not_wrap_or_panic() {
+        let mut simulator = Simulator::for_selector("sim:0");
+        simulator.start(0).unwrap();
+        simulator.frame_id = u64::MAX;
+        let error = simulator.next_frame(Duration::from_secs(1)).unwrap_err();
+        assert!(error.to_string().contains("frame counter exhausted"));
+        assert_eq!(simulator.frame_id, u64::MAX);
+    }
 
     #[test]
     fn every_link_of_the_simulators_xml_names_a_node() {
@@ -1296,7 +1479,7 @@ mod tests {
             frame
                 .data
                 .windows(2)
-                .any(|samples| samples[0] != samples[1])
+                .any(|samples| matches!(samples, [first, second] if first != second))
         );
         assert!(camera.set("Height", "2").is_err());
         camera.set("AcquisitionLineRate", "1000").unwrap();
@@ -1426,14 +1609,14 @@ mod tests {
         c.set("ExposureTime", "1000").unwrap();
         c.start().unwrap();
         assert!(c.software_triggered());
-        assert!(c.next_frame(Duration::from_millis(100)).is_err());
+        c.next_frame(Duration::from_millis(100)).unwrap_err();
         c.request_frame().unwrap();
         c.request_frame().unwrap();
         let first = c.next_frame(Duration::from_millis(500)).unwrap();
         let second = c.next_frame(Duration::from_millis(500)).unwrap();
         assert_eq!(second.id, first.id + 1);
         assert!(second.device_ts_ns > first.device_ts_ns);
-        assert!(c.next_frame(Duration::from_millis(100)).is_err());
+        c.next_frame(Duration::from_millis(100)).unwrap_err();
         c.stop().unwrap();
         // Line1 never fires, nor Line0 without its option.
         for source in ["Line0", "Line1"] {
@@ -1464,7 +1647,7 @@ mod tests {
         gated.set("TriggerMode", "On").unwrap();
         gated.set("TriggerSource", "Software").unwrap();
         gated.start().unwrap();
-        assert!(gated.next_frame(Duration::from_millis(100)).is_err());
+        gated.next_frame(Duration::from_millis(100)).unwrap_err();
         gated.request_frame().unwrap();
         gated.next_frame(Duration::from_millis(500)).unwrap();
         gated.next_frame(Duration::from_millis(500)).unwrap();
@@ -1477,15 +1660,15 @@ mod tests {
         lined.set("TriggerMode", "On").unwrap();
         lined.set("TriggerSource", "Line0").unwrap();
         lined.start().unwrap();
-        let times = (0..3)
-            .map(|_| {
-                lined
-                    .next_frame(Duration::from_secs(1))
-                    .unwrap()
-                    .device_ts_ns
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
+        let times = std::iter::repeat_with(|| {
+            lined
+                .next_frame(Duration::from_secs(1))
+                .unwrap()
+                .device_ts_ns
+                .unwrap()
+        })
+        .take(3)
+        .collect::<Vec<_>>();
         let period = 1e9 / 5.0;
         for pair in times.windows(2) {
             let gap = (pair[1] - pair[0]) as f64;
@@ -1532,8 +1715,8 @@ mod tests {
         c.set("AcquisitionFrameRate", "120").unwrap();
         c.set("ExposureTime", "100").unwrap();
         c.start().unwrap();
-        let ids = (0..40)
-            .map(|_| c.next_frame(Duration::from_secs(1)).unwrap().id)
+        let ids = std::iter::repeat_with(|| c.next_frame(Duration::from_secs(1)).unwrap().id)
+            .take(40)
             .collect::<Vec<_>>();
         let stats = c.stats().unwrap();
         let gaps = ids
@@ -1561,8 +1744,8 @@ mod tests {
         c.set("AcquisitionFrameRate", "120").unwrap();
         c.set("ExposureTime", "100").unwrap();
         c.start().unwrap();
-        let last = (0..100)
-            .map(|_| c.next_frame(Duration::from_secs(1)).unwrap().id)
+        let last = std::iter::repeat_with(|| c.next_frame(Duration::from_secs(1)).unwrap().id)
+            .take(100)
             .last()
             .unwrap();
         let stats = c.stats().unwrap();
@@ -1668,7 +1851,7 @@ mod tests {
                 .0
                 .iter()
                 .zip(rgb8.data.iter())
-                .all(|(wide, &narrow)| (u16::from_le_bytes(*wide) >> 4) as u8 == narrow)
+                .all(|(wide, &narrow)| u16::from_le_bytes(*wide) >> 4 == u16::from(narrow))
         );
     }
 

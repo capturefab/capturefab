@@ -1,19 +1,19 @@
 //! Stream copy: a compressed source recorded as it arrives, without
 //! decoding or encoding its video.
 //!
-//! A source's decoder FFmpeg can write the video it reads, as it reads it,
+//! A source's decoder `FFmpeg` can write the video it reads, as it reads it,
 //! to a second output beside the raw frames it decodes for captures,
 //! inspection and status: MPEG-TS on a pipe of its own (`-c:v copy`). A
 //! [`Tap`] reads that pipe and cuts it into the source's frames, keeping
 //! those since the last key frame. A recording that copies the source
 //! attaches a [`Feed`] to the tap, starting at that key frame, and its
-//! writer hands each frame to the recording's FFmpeg, which only remuxes
+//! writer hands each frame to the recording's `FFmpeg`, which only remuxes
 //! them into the file (`-c:v copy`), through the same output thread,
 //! maximum size and free-space floor as an encoded recording.
 //!
-//! The tap belongs to the source, not to one FFmpeg: a network stream
+//! The tap belongs to the source, not to one `FFmpeg`: a network stream
 //! reopened after a drop goes on feeding the recording from its next key
-//! frame, and FFmpeg's MPEG-TS reader turns the new process's timestamps
+//! frame, and `FFmpeg`'s MPEG-TS reader turns the new process's timestamps
 //! into a continuous timeline. Nothing the tap does blocks the decoder: a
 //! recording whose writer falls behind loses frames up to the next key
 //! frame instead.
@@ -22,9 +22,17 @@
 //! just after a reference frame would leave out the frames shown before
 //! it, which come next: it goes on taking those ([`Order`]) and ends
 //! before the next frame shown after everything it wrote.
+#![deny(clippy::missing_const_for_fn)]
 // Windows FFmpeg cannot be handed a pipe of its own, so nothing taps a
 // source there.
-#![cfg_attr(not(unix), allow(dead_code))]
+#![cfg_attr(
+    not(unix),
+    allow(
+        dead_code,
+        reason = "stream-copy interfaces are shared with Windows, where FFmpeg cannot inherit the extra pipe"
+    )
+)]
+#![deny(clippy::cast_precision_loss)]
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
@@ -48,8 +56,8 @@ pub enum StreamCopy {
     Any,
 }
 impl StreamCopy {
-    pub fn is_never(&self) -> bool {
-        *self == Self::Never
+    pub fn is_never(self) -> bool {
+        self == Self::Never
     }
     /// Whether a source in `source` codec is copied for a recording that
     /// asks for `wanted`.
@@ -62,7 +70,7 @@ impl StreamCopy {
     }
 }
 
-/// The codec families a recording copies, by FFmpeg's codec name: what
+/// The codec families a recording copies, by `FFmpeg`'s codec name: what
 /// MPEG-TS carries and every recording container takes.
 pub(crate) fn copyable(codec: &str) -> Option<&'static str> {
     match codec {
@@ -72,7 +80,7 @@ pub(crate) fn copyable(codec: &str) -> Option<&'static str> {
     }
 }
 
-/// The FFmpeg output options that copy the source's video to `pipe`: MPEG-TS,
+/// The `FFmpeg` output options that copy the source's video to `pipe`: MPEG-TS,
 /// written a frame at a time.
 pub(super) fn output_args(pipe: &str) -> Vec<String> {
     [
@@ -89,18 +97,20 @@ pub(super) fn output_args(pipe: &str) -> Vec<String> {
         "mpegts",
         pipe,
     ]
+    .into_iter()
     .map(str::to_owned)
-    .to_vec()
+    .collect::<Vec<_>>()
 }
 
 /// The most bytes of copied video one source keeps for a recording that
 /// starts (the frames since the last key frame) and one recording queues
-/// for its FFmpeg: a share of the memory left, within 4 to 64 MiB, far more
+/// for its `FFmpeg`: a share of the memory left, within 4 to 64 MiB, far more
 /// than seconds of camera video.
 fn limit() -> usize {
     const SHARE: u64 = 32;
     let budget = crate::host::memory_budget().map_or(u64::MAX, |budget| budget / SHARE);
-    budget.clamp(4 << 20, 64 << 20) as usize
+    usize::try_from(budget.clamp(4 << 20, 64 << 20))
+        .expect("stream-copy budget fits the supported address space")
 }
 
 /// MPEG-TS packets are this long.
@@ -124,21 +134,45 @@ pub(crate) struct TsFrame {
     pub(crate) pts: Option<u64>,
 }
 
-/// MPEG-TS from a tap's pipe, cut into frames.
-#[derive(Default)]
-pub(crate) struct Framer {
-    /// The start of a packet that has not arrived whole.
+/// An assembled frame or a discontinuity requiring a fresh key frame.
+enum Framed {
+    Frame(TsFrame),
+    /// An oversized frame was discarded; wait for a fresh key frame.
+    Lost,
+}
+
+/// MPEG-TS from a tap's pipe, cut into bounded frames.
+struct Framer {
+    /// The start of a packet not received whole yet.
     partial: Vec<u8>,
     pmt_pid: Option<u16>,
     video_pid: Option<u16>,
     pat: Option<Vec<u8>>,
     pmt: Option<Vec<u8>>,
-    /// The frame being received.
+    /// The frame being received, discarded if it would exceed the limit.
     frame: Option<TsFrame>,
+    /// The same byte budget as the tap retaining completed frames.
+    limit: usize,
+}
+impl Default for Framer {
+    fn default() -> Self {
+        Self::new(limit())
+    }
 }
 impl Framer {
-    /// Take `bytes`, handing each frame they complete to `out`.
-    pub(crate) fn push(&mut self, mut bytes: &[u8], out: &mut impl FnMut(TsFrame)) {
+    const fn new(limit: usize) -> Self {
+        Self {
+            partial: Vec::new(),
+            pmt_pid: None,
+            video_pid: None,
+            pat: None,
+            pmt: None,
+            frame: None,
+            limit,
+        }
+    }
+    /// Take `bytes`, reporting completed frames and losses in stream order.
+    fn push(&mut self, mut bytes: &[u8], out: &mut impl FnMut(Framed)) {
         if !self.partial.is_empty() {
             let wanted = (PACKET - self.partial.len()).min(bytes.len());
             self.partial.extend_from_slice(&bytes[..wanted]);
@@ -146,8 +180,16 @@ impl Framer {
             if self.partial.len() < PACKET {
                 return;
             }
-            let packet = std::mem::take(&mut self.partial);
-            self.packet(&packet, out);
+            let mut packet = std::mem::take(&mut self.partial);
+            self.packet(
+                packet
+                    .as_slice()
+                    .try_into()
+                    .expect("one complete TS packet"),
+                out,
+            );
+            packet.clear();
+            self.partial = packet;
         }
         while !bytes.is_empty() {
             // FFmpeg writes whole packets; anything else is skipped up to
@@ -157,22 +199,21 @@ impl Framer {
                 bytes = &bytes[skip..];
                 continue;
             }
-            if bytes.len() < PACKET {
+            let Some((packet, rest)) = bytes.split_first_chunk::<PACKET>() else {
                 self.partial.extend_from_slice(bytes);
                 return;
-            }
-            let (packet, rest) = bytes.split_at(PACKET);
+            };
             self.packet(packet, out);
             bytes = rest;
         }
     }
     /// The stream has ended: the frame being received is complete.
-    pub(crate) fn finish(&mut self, out: &mut impl FnMut(TsFrame)) {
+    fn finish(&mut self, out: &mut impl FnMut(Framed)) {
         if let Some(frame) = self.frame.take() {
-            out(frame);
+            out(Framed::Frame(frame));
         }
     }
-    fn packet(&mut self, packet: &[u8], out: &mut impl FnMut(TsFrame)) {
+    fn packet(&mut self, packet: &[u8; PACKET], out: &mut impl FnMut(Framed)) {
         let pid = (u16::from(packet[1] & 0x1f) << 8) | u16::from(packet[2]);
         let start = packet[1] & 0x40 != 0;
         let control = (packet[3] >> 4) & 3;
@@ -200,14 +241,16 @@ impl Framer {
             // A random access indicator marks a key frame's first packet.
             let key = adaptation && packet[4] > 0 && packet[5] & 0x40 != 0;
             let tables = match (&self.pat, &self.pmt) {
-                (Some(pat), Some(pmt)) if key => Some([&pat[..], &pmt[..]].concat().into()),
+                (Some(pat), Some(pmt)) if key => {
+                    Some([pat.as_slice(), pmt.as_slice()].concat().into())
+                }
                 _ => None,
             };
             if let Some(frame) = self.frame.take() {
-                out(frame);
+                out(Framed::Frame(frame));
             }
             self.frame = Some(TsFrame {
-                data: Vec::with_capacity(64 * PACKET),
+                data: Vec::with_capacity((64 * PACKET).min(self.limit)),
                 key,
                 tables,
                 arrived_ms: 0,
@@ -216,6 +259,25 @@ impl Framer {
         }
         // Packets before the first frame are only the tables, kept above.
         if let Some(frame) = &mut self.frame {
+            let Some(length) = frame
+                .data
+                .len()
+                .checked_add(packet.len())
+                .filter(|&length| length <= self.limit)
+            else {
+                self.frame = None;
+                out(Framed::Lost);
+                return;
+            };
+            if frame.data.capacity() < length {
+                let capacity = frame
+                    .data
+                    .capacity()
+                    .saturating_mul(2)
+                    .max(length)
+                    .min(self.limit);
+                frame.data.reserve_exact(capacity - frame.data.len());
+            }
             frame.data.extend_from_slice(packet);
         }
     }
@@ -226,12 +288,12 @@ fn pts(payload: &[u8]) -> Option<u64> {
     if payload.get(..3)? != [0, 0, 1] || payload.get(7)? & 0x80 == 0 {
         return None;
     }
-    let b = payload.get(9..14)?;
+    let b = payload.get(9..)?.first_chunk::<5>()?;
     Some(
-        (u64::from(b[0] >> 1) & 0x07) << 30
-            | u64::from(b[1]) << 22
-            | u64::from(b[2] >> 1) << 15
-            | u64::from(b[3]) << 7
+        ((u64::from(b[0] >> 1) & 0x07) << 30)
+            | (u64::from(b[1]) << 22)
+            | (u64::from(b[2] >> 1) << 15)
+            | (u64::from(b[3]) << 7)
             | u64::from(b[4] >> 1),
     )
 }
@@ -246,7 +308,7 @@ pub(crate) struct Order {
 }
 impl Order {
     /// `frame` was written.
-    pub(crate) fn wrote(&mut self, frame: &TsFrame) {
+    pub(crate) const fn wrote(&mut self, frame: &TsFrame) {
         let Some(pts) = frame.pts else {
             return;
         };
@@ -256,7 +318,7 @@ impl Order {
         }
     }
     /// Frames may yet come that are shown before one written.
-    pub(crate) fn reordered(&self) -> bool {
+    pub(crate) const fn reordered(&self) -> bool {
         self.reordered
     }
     /// `frame` is shown before a frame written: a recording that ends
@@ -270,7 +332,7 @@ impl Order {
     }
 }
 /// Whether 33-bit time `a` comes before `b`, across a wrap.
-fn before(a: u64, b: u64) -> bool {
+const fn before(a: u64, b: u64) -> bool {
     const BITS: u64 = (1 << 33) - 1;
     a != b && b.wrapping_sub(a) & BITS < 1 << 32
 }
@@ -308,21 +370,22 @@ fn video_pid(section: &[u8]) -> Option<u16> {
     let info = usize::from(u16::from_be_bytes([*section.get(10)?, *section.get(11)?]) & 0x0fff);
     let mut streams = section.get(12 + info..)?;
     let mut first = None;
-    while streams.len() >= 5 {
-        let kind = streams[0];
-        let pid = u16::from_be_bytes([streams[1], streams[2]]) & 0x1fff;
-        let skip = usize::from(u16::from_be_bytes([streams[3], streams[4]]) & 0x0fff);
+    while let Some((&[kind, pid_high, pid_low, info_high, info_low], rest)) =
+        streams.split_first_chunk::<5>()
+    {
+        let pid = u16::from_be_bytes([pid_high, pid_low]) & 0x1fff;
+        let skip = usize::from(u16::from_be_bytes([info_high, info_low]) & 0x0fff);
         // H.264 and HEVC.
         if matches!(kind, 0x1b | 0x24) {
             return Some(pid);
         }
         first.get_or_insert(pid);
-        streams = streams.get(5 + skip..)?;
+        streams = rest.get(skip..)?;
     }
     first
 }
 
-/// A source's copied video, kept across its FFmpeg processes, for the
+/// A source's copied video, kept across its `FFmpeg` processes, for the
 /// recording that copies it.
 pub struct Tap {
     codec: &'static str,
@@ -346,11 +409,13 @@ impl Tap {
         })
     }
     /// The codec family the source sends, such as "h264".
-    pub(crate) fn codec(&self) -> &'static str {
+    pub(crate) const fn codec(&self) -> &'static str {
         self.codec
     }
     fn lock(&self) -> std::sync::MutexGuard<'_, TapState> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
     /// Start feeding `feed`, from the last key frame.
     pub(crate) fn attach(&self, feed: Arc<Feed>) {
@@ -375,14 +440,17 @@ impl Tap {
     pub(crate) fn attached(&self) -> bool {
         self.lock().feed.is_some()
     }
-    /// A new FFmpeg process starts writing: what came before it is no
+    /// A new `FFmpeg` process starts writing: what came before it is no
     /// start for a recording, and the one fed goes on from the new
     /// process's first key frame.
     fn restart(&self) {
+        self.resync(false);
+    }
+    fn resync(&self, lost: bool) {
         let mut state = self.lock();
         (state.gop, state.gop_bytes) = (Vec::new(), 0);
         if let Some(feed) = &state.feed {
-            feed.resync();
+            feed.resync(lost);
         }
     }
     fn offer(&self, mut frame: TsFrame) {
@@ -404,20 +472,26 @@ impl Tap {
             feed.offer(&frame);
         }
     }
-    /// Read a decoder's copied video from `pipe` until its FFmpeg exits.
+    fn framed(&self, event: Framed) {
+        match event {
+            Framed::Frame(frame) => self.offer(frame),
+            Framed::Lost => self.resync(true),
+        }
+    }
+    /// Read a decoder's copied video from `pipe` until its `FFmpeg` exits.
     pub(crate) fn read(&self, mut pipe: impl Read) {
         self.restart();
-        let mut framer = Framer::default();
+        let mut framer = Framer::new(self.limit);
         let mut buffer = vec![0; 256 * PACKET];
         loop {
             match pipe.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(count) => framer.push(&buffer[..count], &mut |frame| self.offer(frame)),
+                Ok(count) => framer.push(&buffer[..count], &mut |event| self.framed(event)),
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(_) => break,
             }
         }
-        framer.finish(&mut |frame| self.offer(frame));
+        framer.finish(&mut |event| self.framed(event));
     }
 }
 
@@ -438,7 +512,7 @@ struct FeedState {
     ending: Option<u64>,
     bytes: usize,
     /// It has a key frame to go on from: not until its first, nor after
-    /// frames were dropped or the source's FFmpeg started again.
+    /// frames were dropped or the source's `FFmpeg` started again.
     synced: bool,
     queued: u64,
     /// Frames it could not keep: one that would have outgrown its limit,
@@ -467,7 +541,9 @@ impl Feed {
         })
     }
     fn lock(&self) -> std::sync::MutexGuard<'_, FeedState> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
     fn offer(&self, frame: &Arc<TsFrame>) {
         let mut state = self.lock();
@@ -502,8 +578,13 @@ impl Feed {
         drop(state);
         self.changed.notify_one();
     }
-    fn resync(&self) {
-        self.lock().synced = false;
+    fn resync(&self, lost: bool) {
+        let mut state = self.lock();
+        if state.closed {
+            return;
+        }
+        state.synced = false;
+        state.dropped = state.dropped.saturating_add(u64::from(lost));
     }
     /// The next frame, waiting up to `wait` for one.
     pub(crate) fn take(&self, wait: Duration) -> Taken {
@@ -512,7 +593,7 @@ impl Feed {
             state = self
                 .changed
                 .wait_timeout(state, wait)
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
         }
         match state.queue.pop_front() {
@@ -545,29 +626,27 @@ impl Feed {
 /// A pipe's read end, and its write end for a child.
 pub(super) type Pipe = (std::io::PipeReader, std::io::PipeWriter);
 
-/// Hand FFmpeg a pipe of its own for the copied video, named in the output
+/// Hand `FFmpeg` a pipe of its own for the copied video, named in the output
 /// arguments added to `command`: the end this process reads, and the end
 /// the child writes, which the caller drops once the child is spawned so
 /// the pipe ends with the child.
 #[cfg(unix)]
 pub(super) fn pipe(command: &mut std::process::Command) -> anyhow::Result<Pipe> {
-    use anyhow::Context;
-    use std::os::{fd::AsRawFd, unix::process::CommandExt};
+    use anyhow::Context as _;
+    use std::os::{fd::AsRawFd as _, unix::process::CommandExt as _};
     let (reader, writer) = std::io::pipe().context("cannot create a pipe for stream copy")?;
     let fd = writer.as_raw_fd();
     command.args(output_args(&format!("pipe:{fd}")));
-    // SAFETY: fcntl is async-signal-safe, as pre_exec requires; the
-    // descriptor is the pipe's write end, which the caller keeps open
-    // until the spawn has happened. Only the child loses close-on-exec, so
-    // no other process this one starts inherits it.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    let prepare = move || {
+        // SAFETY: fd names the write end kept open by the caller through spawn.
+        // Only this child loses close-on-exec, preserving other spawn isolation.
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    };
+    // SAFETY: prepare uses only async-signal-safe fcntl and errno reads.
+    unsafe { command.pre_exec(prepare) };
     Ok((reader, writer))
 }
 
@@ -580,8 +659,8 @@ pub(crate) mod tests {
     pub(crate) fn packet(pid: u16, start: bool, key: bool, payload: &[u8]) -> Vec<u8> {
         let mut packet = vec![
             SYNC,
-            (u8::from(start) << 6) | (pid >> 8) as u8,
-            pid as u8,
+            (u8::from(start) << 6) | pid.to_be_bytes()[0],
+            pid.to_be_bytes()[1],
             0x30,
             1,
             if key { 0x40 } else { 0 },
@@ -615,10 +694,65 @@ pub(crate) mod tests {
         let mut framer = Framer::default();
         let mut frames = Vec::new();
         for chunk in bytes.chunks(step) {
-            framer.push(chunk, &mut |frame| frames.push(frame));
+            framer.push(chunk, &mut |event| {
+                if let Framed::Frame(frame) = event {
+                    frames.push(frame);
+                }
+            });
         }
-        framer.finish(&mut |frame| frames.push(frame));
+        framer.finish(&mut |event| {
+            if let Framed::Frame(frame) = event {
+                frames.push(frame);
+            }
+        });
         frames
+    }
+
+    #[test]
+    fn oversized_frames_are_bounded_and_recordings_resume_at_a_key_frame() {
+        let stream = [
+            tables(),
+            frame(1, true, 1),
+            frame(2, false, 128),
+            frame(3, false, 1),
+            frame(4, true, 1),
+            frame(5, false, 1),
+        ]
+        .concat();
+        for limit in [2 * PACKET, 70 * PACKET] {
+            for step in [1, PACKET - 1, PACKET, PACKET + 17, stream.len()] {
+                let tap = Tap {
+                    codec: "h264",
+                    limit,
+                    state: Mutex::default(),
+                };
+                let feed = Feed::new();
+                tap.attach(feed.clone());
+                let mut framer = Framer::new(tap.limit);
+                let mut losses = 0;
+                for chunk in stream.chunks(step) {
+                    framer.push(chunk, &mut |event| {
+                        losses += usize::from(matches!(event, Framed::Lost));
+                        tap.framed(event);
+                    });
+                    assert!(framer.partial.len() < PACKET);
+                    assert!(
+                        framer
+                            .frame
+                            .as_ref()
+                            .is_none_or(|frame| frame.data.len() <= tap.limit
+                                && frame.data.capacity() <= tap.limit)
+                    );
+                }
+                framer.finish(&mut |event| tap.framed(event));
+                assert_eq!(losses, 1, "chunk size {step}");
+                assert_eq!(taken(&feed), [(true, 1), (true, 4), (false, 5)]);
+                assert_eq!(feed.dropped(), 2);
+                let later = Feed::new();
+                tap.attach(later.clone());
+                assert_eq!(taken(&later), [(true, 4), (false, 5)]);
+            }
+        }
     }
 
     #[test]
@@ -640,7 +774,7 @@ pub(crate) mod tests {
                 [true, false, true]
             );
             assert_eq!(frames[0].data, frame(1, true, 3));
-            assert_eq!(frames[0].tables.as_deref(), Some(&tables()[..]));
+            assert_eq!(frames[0].tables.as_deref(), Some(&*tables()));
             assert!(frames[1].tables.is_none());
             // Tables between frames stay with the frame before them.
             assert_eq!(frames[1].data, [frame(2, false, 2), tables()].concat());
@@ -672,6 +806,7 @@ pub(crate) mod tests {
 
     /// A PES header carrying presentation time `pts`.
     fn pes(pts: u64) -> Vec<u8> {
+        let byte = |value: u64| value.to_le_bytes()[0];
         vec![
             0,
             0,
@@ -682,11 +817,11 @@ pub(crate) mod tests {
             0x80,
             0x80,
             5,
-            0x21 | ((pts >> 29) & 0x0e) as u8,
-            (pts >> 22) as u8,
-            0x01 | ((pts >> 14) & 0xfe) as u8,
-            (pts >> 7) as u8,
-            0x01 | ((pts << 1) & 0xfe) as u8,
+            0x21 | byte((pts >> 29) & 0x0e),
+            byte(pts >> 22),
+            0x01 | byte((pts >> 14) & 0xfe),
+            byte(pts >> 7),
+            0x01 | byte((pts << 1) & 0xfe),
         ]
     }
 
@@ -707,7 +842,7 @@ pub(crate) mod tests {
         // Decode order I0 P3 B1 B2 P6 B4 B5, in 90 kHz ticks a frame.
         let at = |frame: u64| TsFrame {
             pts: Some(frame * 3600),
-            ..ts(frame as u8, frame == 0)
+            ..ts(u8::try_from(frame).unwrap(), frame == 0)
         };
         let mut order = Order::default();
         for frame in [0, 3, 1, 2, 6] {
@@ -762,7 +897,7 @@ pub(crate) mod tests {
         tap.detach(&feed);
         tap.offer(ts(7, true));
         assert!(!tap.attached());
-        assert!(taken(&feed).is_empty());
+        assert_eq!(taken(&feed), [] as [(bool, u8); 0]);
         feed.close();
         assert!(matches!(feed.take(Duration::ZERO), Taken::Closed));
     }
@@ -787,6 +922,9 @@ pub(crate) mod tests {
         feed.offer(&Arc::new(ts(8, false)));
         assert_eq!(taken(&feed), [(false, 7)]);
         assert!(matches!(feed.take(Duration::ZERO), Taken::Closed));
+        let dropped = feed.dropped();
+        feed.resync(true);
+        assert_eq!(feed.dropped(), dropped);
     }
 
     #[test]

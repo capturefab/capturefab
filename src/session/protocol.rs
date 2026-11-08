@@ -7,6 +7,8 @@
 //! `started` with its budget when the camera thread takes it, then answered
 //! with `reply`, after every event it caused. Status and ping requests are
 //! answered at once, beside whatever the camera thread is doing.
+#![forbid(unsafe_code)]
+#![deny(clippy::missing_const_for_fn)]
 use super::SessionCommand;
 use crate::engine::saved::SavedFile;
 use serde::{Deserialize, Serialize};
@@ -23,11 +25,17 @@ pub(crate) const MAX_REQUEST: usize = 1024 * 1024;
 
 /// What the camera thread of a worker runs: a public command, or one only a
 /// coordinator sends. One lives per request, so its size does not matter.
-#[allow(clippy::large_enum_variant)]
+#[cfg_attr(
+    target_pointer_width = "64",
+    expect(
+        clippy::large_enum_variant,
+        reason = "one command is held per request; boxing would add allocation at every worker dispatch"
+    )
+)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum WorkerCommand {
-    /// Apply this camera's share of the GigE bandwidth a network scan planned.
+    /// Apply this camera's share of the `GigE` bandwidth a network scan planned.
     OptimizeNetwork { bytes_per_second: u64 },
     #[serde(untagged)]
     Session(SessionCommand),
@@ -39,10 +47,10 @@ impl From<SessionCommand> for WorkerCommand {
 }
 impl WorkerCommand {
     /// The public command, if this is one.
-    pub(crate) fn session(&self) -> Option<&SessionCommand> {
+    pub(crate) const fn session(&self) -> Option<&SessionCommand> {
         match self {
             Self::Session(command) => Some(command),
-            _ => None,
+            Self::OptimizeNetwork { .. } => None,
         }
     }
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
@@ -60,7 +68,7 @@ impl WorkerCommand {
     }
     /// Whether it writes camera settings: a worker ended while it ran may
     /// leave the camera half-configured.
-    pub(crate) fn changes_settings(&self) -> bool {
+    pub(crate) const fn changes_settings(&self) -> bool {
         match self {
             Self::Session(command) => matches!(
                 command,
@@ -71,7 +79,7 @@ impl WorkerCommand {
                     | SessionCommand::Auto { .. }
                     | SessionCommand::Manual
             ),
-            _ => false,
+            Self::OptimizeNetwork { .. } => false,
         }
     }
     /// How long the camera thread may take on this command once it starts,
@@ -90,13 +98,19 @@ impl WorkerCommand {
                 SessionCommand::Connect { timeout_ms, .. } => timeout_ms.saturating_add(30_000),
                 _ => 60_000,
             },
-            _ => 60_000,
+            Self::OptimizeNetwork { .. } => 60_000,
         }
     }
 }
 
 /// One line a coordinator sends a worker.
-#[allow(clippy::large_enum_variant)]
+#[cfg_attr(
+    target_pointer_width = "64",
+    expect(
+        clippy::large_enum_variant,
+        reason = "one protocol message is held per request; boxing would add allocation on the worker channel"
+    )
+)]
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Input {
@@ -242,11 +256,9 @@ mod tests {
             json!({"op": "shutdown"})
         );
         // An internal operation never parses as a public command.
-        assert!(
-            SessionCommand::from_json_slice(br#"{"op":"optimize_network","bytes_per_second":1}"#)
-                .is_err()
-        );
-        assert!(serde_json::from_str::<Input>(r#"{"op":"run","id":1}"#).is_err());
+        SessionCommand::from_json_slice(br#"{"op":"optimize_network","bytes_per_second":1}"#)
+            .unwrap_err();
+        serde_json::from_str::<Input>(r#"{"op":"run","id":1}"#).unwrap_err();
     }
 
     #[test]

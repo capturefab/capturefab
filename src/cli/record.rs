@@ -1,7 +1,8 @@
-//! `capturefab record`: video to a file through FFmpeg, or a stream to a
+//! `capturefab record`: video to a file through `FFmpeg`, or a stream to a
 //! server. It blocks until `--for` ends it, or a signal: an open-ended
 //! recording stopped by a signal ends normally. With `--background` the
 //! recording runs on in a session as a job.
+#![deny(clippy::missing_const_for_fn)]
 use super::{
     Client, Global, Route,
     args::{CameraArg, KeepArg, Wait},
@@ -15,13 +16,13 @@ use crate::{
     session::SessionCommand,
     types::{Categorized, ErrorKind, Usage},
 };
-use anyhow::{Context, Result};
+use anyhow::{Context as _, Result};
 use clap::{Args, ValueEnum};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum Codec {
+pub(crate) enum Codec {
     H264,
     #[value(alias = "h265")]
     Hevc,
@@ -29,7 +30,7 @@ pub enum Codec {
     Ffv1,
 }
 impl Codec {
-    fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Self::H264 => "h264",
             Self::Hevc => "hevc",
@@ -40,7 +41,7 @@ impl Codec {
 }
 
 #[derive(Debug, Args)]
-pub struct RecordArgs {
+pub(crate) struct RecordArgs {
     #[command(flatten)]
     pub camera: CameraArg,
     /// A file (.mkv, .mp4, .mov, .ts, .webm; it must not exist, or use {seq}) or a stream URL (rtsp://, srt://, rtmp://, udp://)
@@ -77,7 +78,7 @@ pub struct RecordArgs {
     #[arg(long)]
     pub background: bool,
     #[command(flatten)]
-    pub progress: super::jobs::ProgressArg,
+    pub progress: jobs::ProgressArg,
     #[command(flatten)]
     pub keep: KeepArg,
 }
@@ -97,7 +98,7 @@ impl RecordArgs {
     /// Whether the source's own video may be recorded as it is: not when
     /// the frames are asked for at another rate or bitrate, nor as FFV1;
     /// in the codec asked for, or any a recording copies.
-    fn copy(&self) -> StreamCopy {
+    const fn copy(&self) -> StreamCopy {
         match self.codec {
             _ if self.fps.is_some() || self.bitrate.is_some() => StreamCopy::Never,
             Some(Codec::Ffv1) => StreamCopy::Never,
@@ -168,8 +169,8 @@ fn camera_fps(info: &Value) -> f64 {
     .map_or(30.0, |fps| fps.min(240.0))
 }
 
-pub fn run(global: &Global, args: RecordArgs) -> Result<Report> {
-    let output = output(&args)?;
+pub(super) fn run(global: &Global, args: &RecordArgs) -> Result<Report> {
+    let output = output(args)?;
     let settings = args
         .settings
         .iter()
@@ -190,8 +191,8 @@ pub fn run(global: &Global, args: RecordArgs) -> Result<Report> {
         bitrate: args.bitrate(),
         max_file_bytes,
         min_free,
-        on_exists: Default::default(),
-        context: Default::default(),
+        on_exists: crate::naming::OnExists::default(),
+        context: std::collections::BTreeMap::new(),
         duration_ms: args.duration.map(millis),
         utc_offset_s: Some(crate::naming::local_offset()),
         warmup_ms: Some(millis(args.warmup)),
@@ -208,7 +209,7 @@ pub fn run(global: &Global, args: RecordArgs) -> Result<Report> {
         .validate()
         .map_err(super::input)?;
     if crate::media::is_recording(&output) {
-        crate::engine::preflight_recording_output(&output, Default::default()).map_err(|error| {
+        crate::engine::preflight_recording_output(&output, crate::naming::OnExists::default()).map_err(|error| {
             if crate::types::classify(&error).kind == ErrorKind::Exists {
                 let mut taken = Categorized::new(ErrorKind::Exists, format!("{error:#}"))
                     .hint("Capturefab never overwrites files: add {seq} to -o for a new name each time");
@@ -261,7 +262,11 @@ pub fn run(global: &Global, args: RecordArgs) -> Result<Report> {
         })?;
     }
     if args.auto {
-        super::auto::settle(&client, Duration::from_secs(5), &Default::default())?;
+        super::auto::settle(
+            &client,
+            Duration::from_secs(5),
+            &crate::cli::auto::Limits::default(),
+        )?;
     }
     let info = client.call(SessionCommand::Info)?;
     let fps = args.fps.unwrap_or_else(|| camera_fps(&info));
@@ -279,12 +284,11 @@ pub fn run(global: &Global, args: RecordArgs) -> Result<Report> {
             .as_str()
             .context("recording without a job")?
             .to_owned(),
-        args: &args,
+        args,
         info: &info,
         output: reply["path"]
             .as_str()
-            .map(str::to_owned)
-            .unwrap_or_else(|| crate::media::redact_url(&output)),
+            .map_or_else(|| crate::media::redact_url(&output), str::to_owned),
         started,
         fps,
     };
@@ -323,7 +327,7 @@ enum Ended {
     Source,
 }
 impl Ended {
-    fn name(self) -> &'static str {
+    const fn name(self) -> &'static str {
         match self {
             Self::Duration => "duration",
             Self::Signal => "signal",
@@ -352,7 +356,7 @@ impl Recording<'_> {
         ))
     }
     /// The first frame's wait.
-    fn first_frame_wait(&self) -> Option<Duration> {
+    const fn first_frame_wait(&self) -> Option<Duration> {
         match self.args.timeout {
             Wait::For(wait) => Some(wait),
             Wait::Forever => None,
@@ -377,7 +381,7 @@ impl Recording<'_> {
         loop {
             let (now, job, detail) = self.next(seq, self.first_frame_left())?;
             seq = now;
-            if super::jobs::ended(&job) {
+            if jobs::ended(&job) {
                 if job["state"] == "failed" {
                     return Err(self.failure(&job, &detail));
                 }
@@ -426,7 +430,7 @@ impl Recording<'_> {
         let duration = self.args.duration;
         self.client.stop_on_signal(&self.job);
         let mut shown =
-            super::jobs::Progress::new(format!("recording {}…", self.output), self.args.progress);
+            jobs::Progress::new(format!("recording {}…", self.output), self.args.progress);
         let mut seq = 0;
         let mut stopping: Option<Instant> = None;
         let mut armed = true;
@@ -444,7 +448,7 @@ impl Recording<'_> {
             }
             armed = job["state"] == "armed";
             let signal = signals::interrupted();
-            if super::jobs::ended(&job) {
+            if jobs::ended(&job) {
                 let ended = match detail["ended"].as_str() {
                     _ if job["state"] == "failed" => return Err(self.failure(&job, &detail)),
                     Some("duration") => Ended::Duration,
@@ -539,15 +543,15 @@ impl Recording<'_> {
         let frames = detail["written"].as_u64().filter(|_| !truncated);
         let encoder = file["encoder"]
             .as_str()
-            .or(detail["encoder"].as_str())
+            .or_else(|| detail["encoder"].as_str())
             .unwrap_or_default();
         let mut value = json!({
             "camera": self.info["camera"],
             "output": file["path"]
                 .as_str()
-                .or(job["last_file"].as_str())
+                .or_else(|| job["last_file"].as_str())
                 .map_or_else(|| self.output.clone(), str::to_owned),
-            "bytes": file["bytes"].as_u64().or(job["bytes"].as_u64()),
+            "bytes": file["bytes"].as_u64().or_else(|| job["bytes"].as_u64()),
             "duration_s": (duration_s * 1000.0).round() / 1000.0,
             "frames": frames,
             "dropped": detail["dropped"],
@@ -557,8 +561,8 @@ impl Recording<'_> {
             "height": self.info["height"],
             "codec": file["codec"]
                 .as_str()
-                .or(detail["codec"].as_str())
-                .unwrap_or(self.args.codec().name()),
+                .or_else(|| detail["codec"].as_str())
+                .unwrap_or_else(|| self.args.codec().name()),
             "encoder": encoder,
             "ended": ended.name(),
             "finalized": detail["finalized"].as_bool().unwrap_or(false),
@@ -611,7 +615,7 @@ fn text(value: &Value) -> String {
 }
 
 /// Result fields, for `schema`.
-pub const FIELDS: &[(&str, &str)] = &[
+pub(super) const FIELDS: &[(&str, &str)] = &[
     ("camera", "string — camera ID"),
     (
         "output",

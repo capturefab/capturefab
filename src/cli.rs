@@ -1,5 +1,10 @@
 //! The command line: global flags, dispatch, and how a camera command
 //! reaches its camera (a session that holds it, or a worker of its own).
+#![deny(clippy::missing_const_for_fn)]
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+#![cfg_attr(not(test), deny(clippy::panic, clippy::unreachable))]
+// Command output must not depend on randomized hash-table iteration.
+#![deny(clippy::iter_over_hash_type)]
 mod args;
 mod auto;
 mod camera;
@@ -8,7 +13,7 @@ mod debug;
 mod doctor;
 mod inspect;
 mod jobs;
-pub mod login;
+pub(crate) mod login;
 mod network;
 mod onvif;
 pub(crate) mod output;
@@ -35,7 +40,7 @@ use crate::{
     types::{Categorized, ErrorKind, Usage},
 };
 use anyhow::Result;
-use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{Args, CommandFactory as _, FromArgMatches as _, Parser, Subcommand};
 use output::{Output, Report};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -62,7 +67,7 @@ More: capturefab --help, capturefab COMMAND --help";
     after_help = "Examples:\n  capturefab list --kind sim\n  capturefab info -c sim:0\n  capturefab set -c sim:0 exposure=5ms gain=3\n  capturefab --json get -c sim:0 ExposureTime 'TriggerMode[FrameStart]'",
     disable_help_subcommand = true
 )]
-pub struct Cli {
+pub(crate) struct Cli {
     #[command(flatten)]
     pub global: Global,
     #[command(subcommand)]
@@ -71,7 +76,7 @@ pub struct Cli {
 
 /// Flags every command takes, before or after its name.
 #[derive(Debug, Clone, Default, Args)]
-pub struct Global {
+pub(crate) struct Global {
     /// One JSON document on stdout: the result, or {"error":{...}} with a non-zero exit
     #[arg(
         long,
@@ -93,19 +98,19 @@ pub struct Global {
     /// Never use a running session: open the camera in a worker of this command
     #[arg(long, global = true)]
     pub no_session: bool,
-    /// The session came from CAPTUREFAB_SESSION, not --session: a default
+    /// The session came from `CAPTUREFAB_SESSION`, not --session: a default
     /// that --no-session and binary stdout override.
     #[arg(skip)]
     pub session_from_env: bool,
-    /// The command's --keep came from CAPTUREFAB_KEEP: a default that
+    /// The command's --keep came from `CAPTUREFAB_KEEP`: a default that
     /// --no-session and binary stdout override.
     #[arg(skip)]
     pub keep_from_env: bool,
 }
 impl Global {
-    /// Let `--no-session` override a CAPTUREFAB_SESSION default; both typed
+    /// Let `--no-session` override a `CAPTUREFAB_SESSION` default; both typed
     /// is a mistake.
-    pub fn settle_session(&mut self, typed: bool) -> Result<()> {
+    pub(crate) fn settle_session(&mut self, typed: bool) -> Result<()> {
         if self.session.is_some() && self.no_session {
             if typed {
                 return Err(Usage(
@@ -118,7 +123,7 @@ impl Global {
         self.session_from_env = self.session.is_some() && !typed;
         Ok(())
     }
-    pub fn output(&self) -> Output {
+    pub(crate) const fn output(&self) -> Output {
         Output {
             json: self.json,
             quiet: self.quiet,
@@ -127,12 +132,11 @@ impl Global {
     }
 }
 
-// Parsed once per process; boxing would only obscure the clap tree.
-#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
-pub enum Command {
-    /// List cameras: GigE Vision, USB3 Vision, webcams, ONVIF
+pub(crate) enum Command {
+    /// List cameras: `GigE` Vision, USB3 Vision, webcams, ONVIF
     #[command(
+        about = "List cameras: GigE Vision, USB3 Vision, webcams, ONVIF",
         visible_alias = "ls",
         after_help = "Examples:\n  capturefab list\n  capturefab list --kind gige,u3v --timeout 3s\n  capturefab list --kind sim\n  capturefab --json list"
     )]
@@ -157,8 +161,9 @@ pub enum Command {
         after_help = "Examples:\n  capturefab set -c sim:0 exposure=5ms gain=3\n  capturefab set -c sim:0 ExposureTime=10ms Width=640\n  capturefab set -c sim:0 'TriggerMode[FrameStart]=On' 'TriggerSource[FrameStart]=Line0'\n  capturefab set -c sim:0 roi=0,0,320,240 --dry-run"
     )]
     Set(camera::SetArgs),
-    /// Run a command feature, such as UserSetSave[UserSet1]
+    /// Run a command feature, such as `UserSetSave[UserSet1]`.
     #[command(
+        about = "Run a command feature, such as UserSetSave[UserSet1]",
         after_help = "Examples:\n  capturefab exec -c sim:0 'TriggerSoftware[FrameStart]'\n  capturefab exec -c gige:00c0df123456 'UserSetSave[UserSet1]'"
     )]
     Exec(camera::ExecArgs),
@@ -223,13 +228,17 @@ pub enum Command {
         after_help = "Examples:\n  capturefab onvif resolve cam.local\n  capturefab onvif resolve cam.local --profile Profile_1"
     )]
     Onvif(onvif::OnvifCommand),
-    /// Check GigE network paths; --tune applies bandwidth sharing to cameras
+    /// Check `GigE` network paths; --tune applies bandwidth sharing to cameras
     #[command(
+        about = "Check GigE network paths; --tune applies bandwidth sharing to cameras",
         after_help = "Examples:\n  capturefab network\n  capturefab network --tune -c gige:00c0df123456 -c gige:00c0df654321"
     )]
     Network(network::NetworkArgs),
-    /// Check this computer: FFmpeg, folders, USB and GigE limits, with a fix for each warning
-    #[command(after_help = "Examples:\n  capturefab doctor\n  capturefab --json doctor")]
+    /// Check this computer: `FFmpeg`, folders, USB and `GigE` limits, with a fix for each warning
+    #[command(
+        about = "Check this computer: FFmpeg, folders, USB and GigE limits, with a fix for each warning",
+        after_help = "Examples:\n  capturefab doctor\n  capturefab --json doctor"
+    )]
     Doctor,
     /// Describe commands, arguments, results and error codes as JSON
     #[command(
@@ -249,19 +258,23 @@ pub enum Command {
         after_help = "Examples:\n  capturefab completions zsh > ~/.zfunc/_capturefab\n  capturefab completions bash > ~/.local/share/bash-completion/completions/capturefab"
     )]
     Completions { shell: clap_complete::Shell },
-    /// Protocol tools: GenICam XML, raw registers, one session request
+    /// Protocol tools: `GenICam` XML, raw registers, one session request
     #[command(
+        about = "Protocol tools: GenICam XML, raw registers, one session request",
         subcommand,
         after_help = "Examples:\n  capturefab debug xml -c sim:0 > camera.xml\n  capturefab debug read -c sim:0 0x100 4\n  echo '{\"op\":\"status\"}' | capturefab --session bench debug rpc"
     )]
     Debug(debug::DebugCommand),
-    /// Print Capturefab's license and the bundled FFmpeg's license notice
-    #[command(after_help = "Examples:\n  capturefab licenses\n  capturefab --json licenses")]
+    /// Print Capturefab's license and the bundled `FFmpeg`'s license notice
+    #[command(
+        about = "Print Capturefab's license and the bundled FFmpeg's license notice",
+        after_help = "Examples:\n  capturefab licenses\n  capturefab --json licenses"
+    )]
     Licenses,
 }
 
 /// Run the command line; the process exit code.
-pub fn main() -> i32 {
+pub(crate) fn main() -> i32 {
     let args = std::env::args_os().collect::<Vec<_>>();
     let json = output::json_requested(&args);
     let args = help_words(args, json);
@@ -362,7 +375,7 @@ fn command_path(matches: &clap::ArgMatches) -> String {
     path.join(" ")
 }
 
-/// Whether the command's `--keep` came from CAPTUREFAB_KEEP.
+/// Whether the command's `--keep` came from `CAPTUREFAB_KEEP`.
 fn keep_from_env(matches: &clap::ArgMatches) -> bool {
     let mut matches = matches;
     while let Some((_, sub)) = matches.subcommand() {
@@ -416,7 +429,7 @@ fn missing_subcommand(mut args: impl Iterator<Item = String>) -> Option<(String,
 }
 
 /// Run a parsed command. `None` when it printed its own output.
-pub fn run(mut cli: Cli) -> Result<Option<Report>> {
+pub(crate) fn run(mut cli: Cli) -> Result<Option<Report>> {
     if let Some(session) = &cli.global.session {
         ipc::validate_name(session).map_err(|error| Usage(format!("{error:#}")))?;
     }
@@ -426,29 +439,30 @@ pub fn run(mut cli: Cli) -> Result<Option<Report>> {
                 .hint("`capturefab schema` lists the commands")
                 .into());
         }
-        println!("{OVERVIEW}");
-        return Ok(None);
+        return Ok(Some(
+            Report::json(Value::Null).text(format!("{OVERVIEW}\n")),
+        ));
     };
     let global = &cli.global;
     Ok(Some(match command {
-        Command::List(args) => camera::list(global, args)?,
-        Command::Info(args) => camera::info(global, args)?,
+        Command::List(args) => camera::list(global, &args)?,
+        Command::Info(args) => camera::info(global, &args)?,
         Command::Features(args) => camera::features(global, args)?,
-        Command::Get(args) => camera::get(global, args)?,
-        Command::Set(args) => camera::set(global, args)?,
-        Command::Exec(args) => camera::exec(global, args)?,
-        Command::Capture(args) => return capture::run(global, args),
-        Command::Record(args) => record::run(global, args)?,
-        Command::Inspect(args) => inspect::run(global, args)?,
-        Command::Watch(args) => return watch::run(global, args),
-        Command::Auto(args) => auto::run(global, args)?,
+        Command::Get(args) => camera::get(global, &args)?,
+        Command::Set(args) => camera::set(global, &args)?,
+        Command::Exec(args) => camera::exec(global, &args)?,
+        Command::Capture(args) => return capture::run(global, &args),
+        Command::Record(args) => record::run(global, &args)?,
+        Command::Inspect(args) => inspect::run(global, &args)?,
+        Command::Watch(args) => return watch::run(global, &args),
+        Command::Auto(args) => auto::run(global, &args)?,
         Command::Preset(command) => preset::run(global, command)?,
         Command::Jobs(args) => jobs::run(global, args)?,
         Command::Session(command) => session::run(global, command)?,
-        Command::Serve(args) => return serve::run(global, args),
+        Command::Serve(args) => return serve::run(global, &args),
         Command::Login(command) => login::run(global, &command)?,
         Command::Onvif(command) => onvif::run(global, command)?,
-        Command::Network(args) => network::run(global, args)?,
+        Command::Network(args) => network::run(global, &args)?,
         Command::Doctor => doctor::doctor(global),
         Command::Schema { command } => schema::run(global, &command)?,
         Command::Completions { shell } => {
@@ -512,7 +526,7 @@ pub(crate) struct Route {
     pub stdout: bool,
 }
 impl Route {
-    pub fn keep(keep: Option<Duration>) -> Self {
+    pub(crate) fn keep(keep: Option<Duration>) -> Self {
         Self {
             keep,
             ..Self::default()
@@ -520,7 +534,7 @@ impl Route {
     }
     /// The default of a camera command: keep the camera warm in the `auto`
     /// session for `WARM`.
-    pub fn warm() -> Self {
+    pub(crate) fn warm() -> Self {
         Self {
             keep: Some(WARM),
             warm: true,
@@ -528,7 +542,7 @@ impl Route {
         }
     }
     /// The same route without a session to keep.
-    fn cold(self) -> Self {
+    const fn cold(self) -> Self {
         Self {
             keep: None,
             warm: false,
@@ -536,7 +550,7 @@ impl Route {
         }
     }
     /// A route whose camera may take up to `wait` (none: a minute) to open.
-    pub fn waiting(mut self, wait: args::Wait) -> Self {
+    pub(crate) fn waiting(mut self, wait: args::Wait) -> Self {
         let wait = match wait {
             args::Wait::For(wait) => wait,
             args::Wait::Forever => Duration::from_secs(60),
@@ -548,7 +562,7 @@ impl Route {
         millis(self.connect.unwrap_or(CONNECT_TIMEOUT))
     }
     /// A session must hold the camera.
-    fn needs_session(self) -> bool {
+    const fn needs_session(self) -> bool {
         self.keep.is_some() || self.background
     }
     /// How long a session started for this command waits unused.
@@ -566,13 +580,12 @@ impl Route {
 /// holds) the camera, or a worker of this command.
 pub(crate) struct Client {
     pub out: Output,
-    session: Option<String>,
+    host: JobHost,
     /// The camera as the session is asked for it: the selector typed, which
     /// the session resolves, or none for the session's only camera. For the
     /// workers a shell holds, the camera's ID there.
     target: Option<String>,
-    local: Option<SessionHandle>,
-    /// `local` holds a shell's cameras, which outlive this command.
+    /// The direct host holds a shell's cameras, which outlive this command.
     shared: bool,
     /// `--keep`: sent with each request that uses the session.
     keep: Option<Duration>,
@@ -584,7 +597,7 @@ pub(crate) struct Client {
 }
 impl Drop for Client {
     fn drop(&mut self) {
-        if let Some(local) = &self.local {
+        if let JobHost::Direct(local) = &self.host {
             if self.shared {
                 if self.out.verbose
                     && let Ok(state) = self.call(SessionCommand::Status)
@@ -600,7 +613,7 @@ impl Drop for Client {
             }
             local.shutdown();
         } else if self.out.verbose
-            && let Some(session) = &self.session
+            && let JobHost::Session(session) = &self.host
         {
             self.print_session_log(session);
         }
@@ -626,7 +639,7 @@ enum Found {
     Routed,
 }
 impl Found {
-    fn of(started: bool) -> Self {
+    const fn of(started: bool) -> Self {
         if started { Self::Started } else { Self::Named }
     }
 }
@@ -646,20 +659,20 @@ impl Unusable {
 impl Client {
     /// Open `selector`, or the default camera, through the route the global
     /// flags choose.
-    pub fn open(global: &Global, selector: Option<&str>) -> Result<Self> {
+    pub(crate) fn open(global: &Global, selector: Option<&str>) -> Result<Self> {
         Self::open_with(global, selector, Route::default())
     }
     /// Open `selector` as `route` asks: through `--session`, a running
     /// session that holds the camera, or for `--keep`/`--background` one
     /// started for it; else a worker of this command.
-    pub fn open_with(global: &Global, selector: Option<&str>, route: Route) -> Result<Self> {
+    pub(crate) fn open_with(global: &Global, selector: Option<&str>, route: Route) -> Result<Self> {
         let since_ms = crate::scheduling::now_ms();
         let selector = selector.map(caller_selector).transpose()?;
         let out = global.output();
-        let _activity = term::activity(match &selector {
-            Some(selector) => format!("connecting to {}…", crate::media::redact_url(selector)),
-            None => "connecting…".to_owned(),
-        });
+        let _activity = term::activity(selector.as_ref().map_or_else(
+            || "connecting…".to_owned(),
+            |selector| format!("connecting to {}…", crate::media::redact_url(selector)),
+        ));
         // CAPTUREFAB_KEEP and the warm default are defaults, which
         // --no-session overrides.
         let mut route = if global.no_session && (route.warm || global.keep_from_env) {
@@ -681,13 +694,27 @@ impl Client {
             }
             let started = route.needs_session()
                 && session::ensure(name, selector.as_deref(), route.idle(), global)?;
-            return Self::in_session(out, name, selector, route, since_ms, Found::of(started))
-                .map_err(Unusable::error);
+            return Self::in_session(
+                out,
+                name,
+                selector.as_deref(),
+                route,
+                since_ms,
+                Found::of(started),
+            )
+            .map_err(Unusable::error);
         }
         if !global.no_session
             && let Some(name) = route_to(&ipc::sessions(), selector.as_deref())
         {
-            match Self::in_session(out, &name, selector.clone(), route, since_ms, Found::Routed) {
+            match Self::in_session(
+                out,
+                &name,
+                selector.as_deref(),
+                route,
+                since_ms,
+                Found::Routed,
+            ) {
                 Ok(client) => return Ok(client),
                 // A session that is stopping, or gone, leaves the camera to
                 // this command; one that holds it and failed says why.
@@ -726,8 +753,14 @@ impl Client {
                 Err(error) => return Err(error),
             };
             if let Some(found) = found {
-                let selector = Some(selector.clone());
-                match Self::in_session(out, AUTO_SESSION, selector, route, since_ms, found) {
+                match Self::in_session(
+                    out,
+                    AUTO_SESSION,
+                    Some(selector.as_str()),
+                    route,
+                    since_ms,
+                    found,
+                ) {
                     Ok(client) => return Ok(client),
                     Err(Unusable::Gone(_)) if route.warm => {}
                     Err(unusable) => return Err(unusable.error()),
@@ -744,9 +777,8 @@ impl Client {
         let stdout = route.stdout.then(|| local.stdout_pipe()).transpose()?;
         let client = Self {
             out,
-            session: None,
+            host: JobHost::Direct(local),
             target: None,
-            local: Some(local.clone()),
             shared: false,
             keep: None,
             stdout,
@@ -769,21 +801,19 @@ impl Client {
             .into_iter()
             .filter_map(|camera| Some((camera.named_by(&selector)?, camera.id)))
             .min();
-        let id = match held {
-            Some((_, id)) => id,
-            None => {
-                let reply = handle.request(SessionCommand::connect(selector, route.connect()))?;
-                reply["connected"]["id"]
-                    .as_str()
-                    .map(str::to_owned)
-                    .ok_or_else(|| anyhow::anyhow!("camera connected without an ID"))?
-            }
+        let id = if let Some((_, id)) = held {
+            id
+        } else {
+            let reply = handle.request(SessionCommand::connect(selector, route.connect()))?;
+            reply["connected"]["id"]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow::anyhow!("camera connected without an ID"))?
         };
         Ok(Self {
             out,
-            session: None,
+            host: JobHost::Direct(handle.clone()),
             target: Some(id),
-            local: Some(handle.clone()),
             shared: true,
             keep: None,
             stdout: None,
@@ -797,7 +827,7 @@ impl Client {
     fn in_session(
         out: Output,
         name: &str,
-        selector: Option<String>,
+        selector: Option<&str>,
         route: Route,
         since_ms: u64,
         found: Found,
@@ -811,7 +841,7 @@ impl Client {
             }
         };
         let descriptor = ipc::read_descriptor(name).map_err(unusable)?;
-        let held = selector.as_deref().is_none_or(|selector| {
+        let held = selector.is_none_or(|selector| {
             descriptor
                 .cameras
                 .iter()
@@ -819,9 +849,8 @@ impl Client {
         });
         let mut client = Self {
             out,
-            session: Some(name.to_owned()),
-            target: selector.clone(),
-            local: None,
+            host: JobHost::Session(name.to_owned()),
+            target: selector.map(str::to_owned),
             shared: false,
             keep,
             stdout: None,
@@ -829,11 +858,12 @@ impl Client {
         };
         let connect = |selector: &str| {
             let connect = SessionCommand::connect(selector.to_owned(), route.connect());
-            ipc::call_keeping(name, None, connect.clone(), default_timeout(&connect), keep)
+            let timeout = default_timeout(&connect);
+            ipc::call_keeping(name, None, connect, timeout, keep)
                 .map(drop)
                 .map_err(unusable)
         };
-        match (&selector, held) {
+        match (selector, held) {
             (Some(selector), false) => connect(selector)?,
             // Started for it just now, as this command asked.
             (Some(_), true) if found == Found::Started => {}
@@ -863,37 +893,34 @@ impl Client {
                     keep,
                 )
                 .map_err(unusable)?;
-                let cameras = reply["cameras"].as_array().cloned().unwrap_or_default();
-                client.target = Some(only_camera(name, &cameras).map_err(Unusable::Failed)?);
+                let cameras = reply["cameras"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                client.target = Some(only_camera(name, cameras).map_err(Unusable::Failed)?);
             }
         }
         Ok(client)
     }
-    pub fn call(&self, command: SessionCommand) -> Result<Value> {
+    pub(crate) fn call(&self, command: SessionCommand) -> Result<Value> {
         command.validate()?;
-        match (&self.session, &self.local) {
-            (Some(session), _) => {
+        match &self.host {
+            JobHost::Session(session) => {
                 // Looking does not keep a session; using it does.
                 let keep = self
                     .keep
                     .filter(|_| !matches!(command, SessionCommand::Status));
-                ipc::call_keeping(
-                    session,
-                    self.target.as_deref(),
-                    command.clone(),
-                    default_timeout(&command),
-                    keep,
-                )
+                let timeout = default_timeout(&command);
+                ipc::call_keeping(session, self.target.as_deref(), command, timeout, keep)
             }
             // A shell's command that a signal interrupted stops waiting,
             // and what only it waited for, such as an inspection, stops.
-            (None, Some(local)) => match &self.target {
+            JobHost::Direct(local) => match &self.target {
                 Some(target) if self.shared => {
                     local.request_for(Some(target), command, &signals::interrupted)
                 }
                 _ => local.request(command),
             },
-            (None, None) => unreachable!("a client has a session or a worker"),
         }
     }
     /// What session `session` logged for this command's camera since the
@@ -931,11 +958,14 @@ impl Client {
         }
     }
     /// The camera's entry in a session status, as `Status` reports it.
-    pub fn status(&self) -> Result<Value> {
-        let state = self.call(SessionCommand::Status)?;
-        let cameras = state["cameras"].as_array().cloned().unwrap_or_default();
-        match cameras.as_slice() {
-            [camera] => Ok(camera.clone()),
+    pub(crate) fn status(&self) -> Result<Value> {
+        let mut state = self.call(SessionCommand::Status)?;
+        match state
+            .get_mut("cameras")
+            .and_then(Value::as_array_mut)
+            .map(Vec::as_mut_slice)
+        {
+            Some([camera]) => Ok(camera.take()),
             _ => Err(Categorized::new(
                 ErrorKind::Disconnected,
                 "the camera is no longer connected",
@@ -944,24 +974,23 @@ impl Client {
         }
     }
     /// The session this client uses, if any.
-    pub fn session(&self) -> Option<&str> {
-        self.session.as_deref()
+    pub(crate) const fn session(&self) -> Option<&str> {
+        match &self.host {
+            JobHost::Session(session) => Some(session.as_str()),
+            JobHost::Direct(_) => None,
+        }
     }
     /// Where this client's jobs run.
-    pub fn host(&self) -> JobHost {
-        match (&self.session, &self.local) {
-            (Some(session), _) => JobHost::Session(session.clone()),
-            (None, Some(local)) => JobHost::Direct(local.clone()),
-            (None, None) => unreachable!("a client has a session or a worker"),
-        }
+    pub(crate) fn host(&self) -> JobHost {
+        self.host.clone()
     }
     /// Job `id` once it changed after `seq` or ended, waiting at most
     /// `wait`: `{seq, job, detail}`.
-    pub fn wait_job(&self, id: &str, seq: u64, wait: Duration) -> Result<Value> {
+    pub(crate) fn wait_job(&self, id: &str, seq: u64, wait: Duration) -> Result<Value> {
         self.host().wait(id, seq, wait)
     }
     /// Stop job `id` when a signal arrives, as one that came already does.
-    pub fn stop_on_signal(&self, id: &str) {
+    pub(crate) fn stop_on_signal(&self, id: &str) {
         let host = self.host();
         let id = id.to_owned();
         let stop = move || {
@@ -981,17 +1010,20 @@ impl Client {
         }
     }
     /// The worker of this command, without a session.
-    pub fn local(&self) -> Option<&SessionHandle> {
-        self.local.as_ref()
+    pub(crate) const fn local(&self) -> Option<&SessionHandle> {
+        match &self.host {
+            JobHost::Direct(local) => Some(local),
+            JobHost::Session(_) => None,
+        }
     }
     /// Whether the camera stays open once this command ends: in a session,
     /// or in the workers a shell holds.
-    pub fn outlives(&self) -> bool {
-        self.session.is_some() || self.shared
+    pub(crate) const fn outlives(&self) -> bool {
+        matches!(&self.host, JobHost::Session(_)) || self.shared
     }
     /// The pipe this command's worker writes an image captured to stdout
     /// to, once.
-    pub fn take_stdout(&mut self) -> Option<std::io::PipeReader> {
+    pub(crate) const fn take_stdout(&mut self) -> Option<std::io::PipeReader> {
         self.stdout.take()
     }
 }
@@ -1005,7 +1037,7 @@ pub(crate) enum JobHost {
 impl JobHost {
     /// Job `id` once it changed after `seq` or ended, waiting at most
     /// `wait`: `{seq, job, detail}`.
-    pub fn wait(&self, id: &str, seq: u64, wait: Duration) -> Result<Value> {
+    pub(crate) fn wait(&self, id: &str, seq: u64, wait: Duration) -> Result<Value> {
         let wait = wait.min(Duration::from_millis(crate::session::jobs::MAX_WAIT_MS));
         match self {
             Self::Session(name) => {
@@ -1014,18 +1046,20 @@ impl JobHost {
                     after_seq: seq,
                     timeout_ms: millis(wait),
                 };
-                ipc::call(name, command.clone(), default_timeout(&command))
+                let timeout = default_timeout(&command);
+                ipc::call(name, command, timeout)
             }
             Self::Direct(local) => local.wait_job(id, seq, wait),
         }
     }
     /// Stop job `id` and wait for it to end: `{job, detail}`. A session is
     /// asked on a connection of its own.
-    pub fn stop(&self, id: &str) -> Result<Value> {
+    pub(crate) fn stop(&self, id: &str) -> Result<Value> {
         match self {
             Self::Session(name) => {
                 let command = SessionCommand::StopJob { job: id.into() };
-                ipc::call(name, command.clone(), default_timeout(&command))
+                let timeout = default_timeout(&command);
+                ipc::call(name, command, timeout)
             }
             Self::Direct(local) => local.stop_job(id),
         }
@@ -1117,13 +1151,17 @@ pub(crate) fn input(error: anyhow::Error) -> anyhow::Error {
 /// any.
 fn route_to(sessions: &[ipc::Descriptor], selector: Option<&str>) -> Option<String> {
     // A camera's own ID outranks another camera's serial or alias.
-    let rank = |session: &ipc::Descriptor| match selector {
-        Some(selector) => session
-            .cameras
-            .iter()
-            .filter_map(|camera| camera.named_by(selector))
-            .min(),
-        None => (session.cameras.len() == 1 && session.name != AUTO_SESSION).then_some(0),
+    let rank = |session: &ipc::Descriptor| {
+        selector.map_or_else(
+            || (session.cameras.len() == 1 && session.name != AUTO_SESSION).then_some(0),
+            |selector| {
+                session
+                    .cameras
+                    .iter()
+                    .filter_map(|camera| camera.named_by(selector))
+                    .min()
+            },
+        )
     };
     let ranked = sessions
         .iter()
@@ -1323,7 +1361,7 @@ mod tests {
             model: String::new(),
             serial: serial.into(),
             address: None,
-            profile: Default::default(),
+            profile: crate::camera_profile::CameraProfile::default(),
         };
         let session = |name: &str, cameras: Vec<ipc::HeldCamera>| ipc::Descriptor {
             version: ipc::VERSION,

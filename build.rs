@@ -1,6 +1,7 @@
+#![deny(clippy::doc_markdown, clippy::cast_possible_truncation)]
 use std::{
     env, fs,
-    io::Write,
+    io::Write as _,
     path::{Path, PathBuf},
 };
 
@@ -59,29 +60,31 @@ fn main() {
         }
         None => None,
     };
-    let packed = match &bundled {
-        Some(path) => {
-            println!("cargo:rerun-if-changed={}", path.display());
-            let bytes = fs::read(path).unwrap_or_else(|e| {
-                panic!(
-                    "cannot read FFmpeg {} to embed: {e}; build it with scripts/build-ffmpeg.sh, or unset CAPTUREFAB_FFMPEG_BINARY",
-                    path.display()
-                )
-            });
-            pack(&bytes)
-        }
-        None => Vec::new(),
-    };
-    write_if_changed(&out.join("capturefab-ffmpeg.bin"), &packed);
-    let license = if let Some(path) = env::var_os("CAPTUREFAB_FFMPEG_LICENSE") {
-        let path = PathBuf::from(path);
+    let packed = bundled.as_ref().map_or_else(Vec::new, |path| {
         println!("cargo:rerun-if-changed={}", path.display());
-        fs::read_to_string(&path).expect("read FFmpeg license notice")
-    } else if bundled.is_some() {
-        "Capturefab is MIT-licensed. Bundled FFmpeg runs as a separate executable and is GPLv3 with static x264 (GPLv2-or-later), SRT (MPLv2), OpenSSL (Apache-2.0) and zlib (zlib License). Source archives, licenses and build configuration accompany releases. See `capturefab licenses` and https://ffmpeg.org/.".to_string()
-    } else {
-        "Capturefab is MIT-licensed. This build has no FFmpeg built in: it runs the FFmpeg that CAPTUREFAB_FFMPEG names, or one next to capturefab or on PATH, as a separate executable under that FFmpeg's own license. See https://ffmpeg.org/.".to_string()
-    };
+        let bytes = fs::read(path).unwrap_or_else(|e| {
+            panic!(
+                "cannot read FFmpeg {} to embed: {e}; build it with scripts/build-ffmpeg.sh, or unset CAPTUREFAB_FFMPEG_BINARY",
+                path.display()
+            )
+        });
+        pack(&bytes)
+    });
+    write_if_changed(&out.join("capturefab-ffmpeg.bin"), &packed);
+    let license = env::var_os("CAPTUREFAB_FFMPEG_LICENSE").map_or_else(
+        || {
+            if bundled.is_some() {
+                "Capturefab is MIT-licensed. Bundled FFmpeg runs as a separate executable and is GPLv3 with static x264 (GPLv2-or-later), SRT (MPLv2), OpenSSL (Apache-2.0) and zlib (zlib License). Source archives, licenses and build configuration accompany releases. See `capturefab licenses` and https://ffmpeg.org/.".to_owned()
+            } else {
+                "Capturefab is MIT-licensed. This build has no FFmpeg built in: it runs the FFmpeg that CAPTUREFAB_FFMPEG names, or one next to capturefab or on PATH, as a separate executable under that FFmpeg's own license. See https://ffmpeg.org/.".to_owned()
+            }
+        },
+        |path| {
+            let path = PathBuf::from(path);
+            println!("cargo:rerun-if-changed={}", path.display());
+            fs::read_to_string(&path).expect("read FFmpeg license notice")
+        },
+    );
     write_if_changed(
         &out.join("capturefab-ffmpeg-license.txt"),
         license.as_bytes(),
@@ -90,14 +93,18 @@ fn main() {
 
 /// `bytes` in a versioned envelope that lets release packaging verify the
 /// original executable, independently of the compressor's implementation.
-/// Its digest also names the extracted copy, so builds of the same FFmpeg
+/// Its digest also names the extracted copy, so builds of the same `FFmpeg`
 /// share one cache file.
 fn pack(bytes: &[u8]) -> Vec<u8> {
-    use sha2::Digest;
+    use sha2::Digest as _;
     let digest = sha2::Sha256::digest(bytes);
     let mut packed = Vec::new();
     packed.extend_from_slice(b"CAPTUREFAB-FFMPEG-ZLIB\0");
-    packed.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    packed.extend_from_slice(
+        &u64::try_from(bytes.len())
+            .expect("embedded FFmpeg length fits its envelope")
+            .to_le_bytes(),
+    );
     packed.extend_from_slice(&digest);
     let mut encoder = flate2::write::ZlibEncoder::new(packed, flate2::Compression::best());
     encoder.write_all(bytes).expect("compress bundled FFmpeg");

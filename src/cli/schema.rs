@@ -7,10 +7,10 @@ use serde_json::{Map, Value, json};
 
 /// The contract's version; it changes when a result or argument changes
 /// incompatibly.
-pub const CONTRACT_VERSION: u32 = 1;
+pub(super) const CONTRACT_VERSION: u32 = 1;
 
 /// What a command can change: read (nothing but ephemeral previews),
-/// camera_write, file_write (outside the camera), or disruptive (may stop
+/// `camera_write`, `file_write` (outside the camera), or disruptive (may stop
 /// streams, hold cameras or run arbitrary camera commands).
 const EFFECTS: &[(&str, &str)] = &[
     ("list", "read"),
@@ -383,14 +383,7 @@ fn errors(command: &str) -> &'static [&'static str] {
         "session stop" | "session status" | "session list" => {
             &["session_not_found", "unavailable", "timeout"]
         }
-        "login add" => &[
-            "auth_required",
-            "auth_rejected",
-            "unavailable",
-            "unsupported",
-            "timeout",
-        ],
-        "onvif resolve" => &[
+        "login add" | "onvif resolve" => &[
             "auth_required",
             "auth_rejected",
             "unavailable",
@@ -469,7 +462,7 @@ fn arg_type(arg: &clap::Arg) -> &'static str {
     match arg
         .get_value_names()
         .and_then(|names| names.first())
-        .map(|name| name.as_str())
+        .map(clap::builder::Str::as_str)
     {
         Some("DUR") => "duration",
         Some("CAM") => "camera",
@@ -500,7 +493,7 @@ pub(crate) fn arguments(command: &clap::Command) -> Vec<Value> {
                 value["value_name"] = json!(
                     names
                         .iter()
-                        .map(|n| n.as_str())
+                        .map(clap::builder::Str::as_str)
                         .collect::<Vec<_>>()
                         .join(" ")
                 );
@@ -634,10 +627,11 @@ fn command(name: &str) -> Result<Value> {
     Ok(value)
 }
 
-pub fn run(_global: &Global, words: &[String]) -> Result<Report> {
+pub(super) fn run(_global: &Global, words: &[String]) -> Result<Report> {
     if words.is_empty() {
         let value = overview();
-        let text = brief(&value, 0) + "\n";
+        let mut text = brief(&value, 0);
+        text.push('\n');
         return Ok(Report::json(value).text(text));
     }
     let name = words.join(" ");
@@ -645,36 +639,58 @@ pub fn run(_global: &Global, words: &[String]) -> Result<Report> {
         return Err(Usage("name a command, such as schema set".into()).into());
     }
     let value = command(&name)?;
-    let text = serde_json::to_string_pretty(&value)? + "\n";
+    let mut text = serde_json::to_string_pretty(&value)?;
+    text.push('\n');
     Ok(Report::json(value).text(text))
 }
 
 /// JSON with each entry of the outer two maps on a line of its own: the
 /// overview as people read it, little larger than the line `--json` prints.
 fn brief(value: &Value, depth: usize) -> String {
-    let Value::Object(map) = value else {
-        return value.to_string();
-    };
-    if depth == 2 || map.is_empty() {
-        return value.to_string();
+    fn append(text: &mut String, value: &Value, depth: usize) {
+        use std::fmt::Write as _;
+        let Value::Object(map) = value else {
+            write!(text, "{value}").expect("writing to a String cannot fail");
+            return;
+        };
+        if depth == 2 || map.is_empty() {
+            write!(text, "{value}").expect("writing to a String cannot fail");
+            return;
+        }
+        text.push_str("{\n");
+        for (index, (key, value)) in map.iter().enumerate() {
+            if index > 0 {
+                text.push_str(",\n");
+            }
+            text.extend(std::iter::repeat_n(' ', 2 * (depth + 1)));
+            write!(text, "{}: ", Value::from(key.as_str()))
+                .expect("writing to a String cannot fail");
+            append(text, value, depth + 1);
+        }
+        text.push('\n');
+        text.extend(std::iter::repeat_n(' ', 2 * depth));
+        text.push('}');
     }
-    let pad = "  ".repeat(depth + 1);
-    let entries = map
-        .iter()
-        .map(|(key, value)| {
-            format!(
-                "{pad}{}: {}",
-                Value::from(key.as_str()),
-                brief(value, depth + 1)
-            )
-        })
-        .collect::<Vec<_>>();
-    format!("{{\n{}\n{}}}", entries.join(",\n"), "  ".repeat(depth))
+    let mut text = String::new();
+    append(&mut text, value, depth);
+    text
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overview_format_keeps_json_escaping_and_two_expanded_levels() {
+        let value = json!({"a": {"b": {"c": [1, 2]}}, "k\n": "quoted\n\"é"});
+        assert_eq!(
+            brief(&value, 0),
+            "{\n  \"a\": {\n    \"b\": {\"c\":[1,2]}\n  },\n  \"k\\n\": \"quoted\\n\\\"é\"\n}"
+        );
+        for value in [json!({}), json!([]), json!(null), json!("é\n")] {
+            assert_eq!(brief(&value, 0), value.to_string());
+        }
+    }
 
     #[test]
     fn every_command_has_an_effect_and_every_effect_a_command() {
@@ -717,14 +733,14 @@ mod tests {
             }
         }
         assert_eq!(
-            super::command("capture").unwrap()["effect_with"]["--set"],
+            command("capture").unwrap()["effect_with"]["--set"],
             "camera_write"
         );
         // A read command's flag that names a file or path writes there: it
         // widens the command to a file write, which a harness that allows
         // reads must be told.
         for (name, command) in commands() {
-            if super::effect(&name) != "read" {
+            if effect(&name) != "read" {
                 continue;
             }
             for arg in command.get_arguments() {
@@ -732,7 +748,7 @@ mod tests {
                     .get_value_names()
                     .is_some_and(|names| names.iter().any(|n| n == "FILE" || n == "PATH"));
                 if let (true, Some(long)) = (names_file, arg.get_long()) {
-                    let widened = super::effect_with(&name).unwrap_or_default();
+                    let widened = effect_with(&name).unwrap_or_default();
                     assert_eq!(
                         widened[format!("--{long}")],
                         "file_write",
@@ -742,7 +758,7 @@ mod tests {
             }
         }
         assert_eq!(
-            super::command("debug xml").unwrap()["effect_with"]["--output"],
+            command("debug xml").unwrap()["effect_with"]["--output"],
             "file_write"
         );
     }
@@ -764,7 +780,7 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(documented, parsed, "{name}");
         }
-        let set = super::command("set").unwrap();
+        let set = command("set").unwrap();
         let dry_run = set["args"]
             .as_array()
             .unwrap()
@@ -780,7 +796,7 @@ mod tests {
         // Output drops null values (`output::document`), so a key a result
         // leaves out is absent, and the schema must not promise a null.
         for (name, _) in commands() {
-            let documented = super::command(&name).unwrap();
+            let documented = command(&name).unwrap();
             for (field, meaning) in documented["result"].as_object().into_iter().flatten() {
                 let meaning = meaning.as_str().unwrap();
                 assert!(
@@ -792,7 +808,7 @@ mod tests {
             }
         }
         assert!(
-            super::command("doctor").unwrap()["result"]["read_only_root"]
+            command("doctor").unwrap()["result"]["read_only_root"]
                 .as_str()
                 .unwrap()
                 .contains("absent")
@@ -816,7 +832,7 @@ mod tests {
             overview["commands"].as_object().unwrap().len(),
             commands().len()
         );
-        assert!(super::command("no such").is_err());
+        command("no such").unwrap_err();
         // What people read is the same JSON, an entry a line.
         let shown = brief(&overview, 0);
         assert_eq!(serde_json::from_str::<Value>(&shown).unwrap(), overview);

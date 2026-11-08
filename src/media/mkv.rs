@@ -1,25 +1,29 @@
-//! A Matroska recording finished as FFmpeg would finish a file it could
+//! A Matroska recording finished as `FFmpeg` would finish a file it could
 //! seek in: its length (Info's Duration) and its index (Cues).
 //!
 //! A local recording reaches its file through a pipe (the storage writer
-//! bounds and watches every byte), so FFmpeg cannot go back to write what
+//! bounds and watches every byte), so `FFmpeg` cannot go back to write what
 //! it learns only at the end. Two steps make up for it:
 //!
-//! - FFmpeg is asked to stop after a century (`-t`), which makes it write a
+//! - `FFmpeg` is asked to stop after a century (`-t`), which makes it write a
 //!   Duration into Info at the start. As the start passes through the
 //!   recording's output thread, [`Rewriter`] turns that Duration into a
 //!   Void of the same size, so a file left behind by a crash has no false
 //!   length, and notes where the parts of the start are ([`Head`]).
-//! - Once FFmpeg has finished, [`finish`] reads the clusters' starts and
+//! - Once `FFmpeg` has finished, [`finish`] reads the clusters' starts and
 //!   appends Cues, one entry a cluster that starts with a key frame, names
-//!   them in the SeekHead in the space FFmpeg left after it, gives the
+//!   them in the `SeekHead` in the space `FFmpeg` left after it, gives the
 //!   Segment its size, and writes the Duration back in place of the Void.
 //!
-//! Each element FFmpeg protects with a CRC-32 gets a new one. Whatever this
-//! cannot read as expected it leaves as FFmpeg wrote it.
+//! Each element `FFmpeg` protects with a CRC-32 gets a new one. Whatever this
+//! cannot read as expected it leaves as `FFmpeg` wrote it.
+#![forbid(unsafe_code)]
+#![deny(clippy::missing_const_for_fn)]
+
 use std::{
+    cmp::Ordering,
     fs::File,
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write as _},
 };
 
 const EBML: u32 = 0x1A45_DFA3;
@@ -29,13 +33,13 @@ const SEEK: u32 = 0x4DBB;
 const SEEK_ID: u32 = 0x53AB;
 const SEEK_POSITION: u32 = 0x53AC;
 const INFO: u32 = 0x1549_A966;
-const TIMESTAMP_SCALE: u32 = 0x2AD7B1;
+const TIMESTAMP_SCALE: u32 = 0x002A_D7B1;
 const DURATION: u32 = 0x4489;
 const TRACKS: u32 = 0x1654_AE6B;
 const TRACK_ENTRY: u32 = 0xAE;
 const TRACK_NUMBER: u32 = 0xD7;
 const TRACK_TYPE: u32 = 0x83;
-const DEFAULT_DURATION: u32 = 0x23E383;
+const DEFAULT_DURATION: u32 = 0x0023_E383;
 const CLUSTER: u32 = 0x1F43_B675;
 const TIMESTAMP: u32 = 0xE7;
 const SIMPLE_BLOCK: u32 = 0xA3;
@@ -54,40 +58,43 @@ const VOID: u32 = 0xEC;
 /// The longest start of a file looked through for its first cluster.
 const MOST_HEAD: usize = 1 << 20;
 
-/// FFmpeg's output options that make it write a Duration to take the place
+/// `FFmpeg`'s output options that make it write a Duration to take the place
 /// of: a stop after a century, which no recording reaches.
-pub(super) fn output_args() -> [&'static str; 2] {
+pub(super) const fn output_args() -> [&'static str; 2] {
     ["-t", "3155760000"]
 }
 
 /// An element's ID, its size (None when unknown) and its header's length.
+#[deny(clippy::arithmetic_side_effects)]
 fn element(bytes: &[u8]) -> Option<(u32, Option<u64>, usize)> {
     let first = *bytes.first()?;
-    let id_len = first.leading_zeros() as usize + 1;
+    let id_len = usize::try_from(first.leading_zeros().checked_add(1)?).ok()?;
     if id_len > 4 {
         return None;
     }
     let id = bytes
         .get(..id_len)?
         .iter()
-        .fold(0u32, |id, &byte| id << 8 | u32::from(byte));
+        .fold(0u32, |id, &byte| (id << 8) | u32::from(byte));
     let (size, size_len) = vint(bytes.get(id_len..)?)?;
-    Some((id, size, id_len + size_len))
+    Some((id, size, id_len.checked_add(size_len)?))
 }
 
 /// A size: its value (None when every value bit is set, unknown) and its
 /// length.
+#[deny(clippy::arithmetic_side_effects)]
 fn vint(bytes: &[u8]) -> Option<(Option<u64>, usize)> {
     let first = *bytes.first()?;
-    let len = first.leading_zeros() as usize + 1;
-    if len > 8 {
+    let width = first.leading_zeros().checked_add(1)?;
+    if width > 8 {
         return None;
     }
-    let mut value = u64::from(first & 0xFFu8.checked_shr(len as u32).unwrap_or(0));
+    let len = usize::try_from(width).ok()?;
+    let mut value = u64::from(first & 0xFFu8.checked_shr(width).unwrap_or(0));
     for &byte in bytes.get(1..len)? {
-        value = value << 8 | u64::from(byte);
+        value = (value << 8) | u64::from(byte);
     }
-    let unknown = value == (1u64 << (7 * len)) - 1;
+    let unknown = value == 1u64.checked_shl(width.checked_mul(7)?)?.checked_sub(1)?;
     Some(((!unknown).then_some(value), len))
 }
 
@@ -95,18 +102,26 @@ fn uint(bytes: &[u8]) -> u64 {
     bytes
         .iter()
         .take(8)
-        .fold(0, |value, &byte| value << 8 | u64::from(byte))
+        .fold(0, |value, &byte| (value << 8) | u64::from(byte))
+}
+
+fn id_length(id: u32) -> usize {
+    usize::try_from((32 - id.leading_zeros()).div_ceil(8).max(1))
+        .expect("an element ID uses at most four bytes")
 }
 
 fn id_bytes(id: u32) -> Vec<u8> {
-    let len = (32 - id.leading_zeros() as usize).div_ceil(8).max(1);
-    id.to_be_bytes()[4 - len..].to_vec()
+    id.to_be_bytes()[4 - id_length(id)..].to_vec()
 }
 
 /// `value` as a size of `len` bytes.
 fn size_bytes(value: u64, len: usize) -> Vec<u8> {
-    let mut bytes = value.to_be_bytes()[8 - len..].to_vec();
-    bytes[0] |= 0x80 >> (len - 1);
+    size_array(value, len)[8 - len..].to_vec()
+}
+
+const fn size_array(value: u64, len: usize) -> [u8; 8] {
+    let mut bytes = value.to_be_bytes();
+    bytes[8 - len] |= 0x80 >> (len - 1);
     bytes
 }
 
@@ -118,8 +133,17 @@ fn size_len(value: u64) -> usize {
 }
 
 fn master(id: u32, data: &[u8]) -> Vec<u8> {
-    let mut bytes = id_bytes(id);
-    bytes.extend(size_bytes(data.len() as u64, size_len(data.len() as u64)));
+    let id_len = id_length(id);
+    let length = u64::try_from(data.len()).expect("element data length fits its 64-bit size");
+    let size_len = size_len(length);
+    let capacity = data
+        .len()
+        .checked_add(id_len)
+        .and_then(|length| length.checked_add(size_len))
+        .expect("element and header fit the address space");
+    let mut bytes = Vec::with_capacity(capacity);
+    bytes.extend_from_slice(&id.to_be_bytes()[4 - id_len..]);
+    bytes.extend_from_slice(&size_array(length, size_len)[8 - size_len..]);
     bytes.extend_from_slice(data);
     bytes
 }
@@ -136,7 +160,7 @@ fn void(len: usize) -> Option<Vec<u8>> {
         2..=128 => size_bytes(len as u64 - 2, 1),
         _ => size_bytes(len as u64 - 9, 8),
     };
-    let mut bytes = vec![VOID as u8];
+    let mut bytes = vec![u8::try_from(VOID).expect("Void has a one-byte ID")];
     bytes.extend(size);
     bytes.resize(len, 0);
     Some(bytes)
@@ -170,15 +194,15 @@ fn children(data: &[u8]) -> Vec<(u32, std::ops::Range<usize>, usize)> {
 
 /// Where the parts of a Matroska file's start are, in bytes from its
 /// start, as [`Rewriter`] found them.
+#[deny(clippy::struct_field_names)]
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Head {
     /// Where the Segment's data starts: positions in it count from here.
     segment_data: u64,
-    /// The Segment's size field, when FFmpeg left it unknown in 8 bytes.
+    /// The Segment's size field, when `FFmpeg` left it unknown in 8 bytes.
     segment_size_at: Option<u64>,
-    /// The SeekHead, with the Void after it: where, how long, its Seek
-    /// elements and whether it has a CRC-32.
-    seek_head: Option<(u64, usize, Vec<u8>, bool)>,
+    /// The `SeekHead`, with the Void after it.
+    seek: Option<SeekHead>,
     /// Where Info's data ends, and its CRC-32 element's start when it has
     /// one.
     info: (u64, Option<u64>),
@@ -192,53 +216,67 @@ pub(super) struct Head {
     first_cluster: u64,
 }
 
-/// FFmpeg's output on its way to the file: its start is held until its
+#[deny(clippy::struct_field_names)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SeekHead {
+    offset: u64,
+    /// Space occupied by the element and any following Void.
+    space: usize,
+    /// Encoded Seek elements, preserved when adding the Cues entry.
+    entries: Vec<u8>,
+    crc: bool,
+}
+
+/// `FFmpeg`'s output on its way to the file: its start is held until its
 /// first cluster, its Duration made a Void and the start's parts noted.
 pub(super) struct Rewriter {
     held: Vec<u8>,
     /// Once the start has gone on: what it says, if it could be read.
-    done: Option<Option<Head>>,
+    start: Start,
 }
 impl Rewriter {
-    pub(super) fn new() -> Self {
+    pub(super) const fn new() -> Self {
         Self {
             held: Vec::new(),
-            done: None,
+            start: Start::More,
         }
     }
     /// What to write of `bytes` now: none while the start is held.
     pub(super) fn push<'a>(&mut self, bytes: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
-        if self.done.is_some() {
+        if !matches!(self.start, Start::More) {
             return bytes.into();
         }
         self.held.extend_from_slice(bytes);
         let (start, info) = read_head(&self.held);
-        let head = match start {
+        let start = match start {
             Start::More if self.held.len() < MOST_HEAD => return Vec::new().into(),
-            Start::More | Start::Unknown => None,
-            Start::Head(head) => Some(head),
+            Start::More | Start::Unknown => Start::Unknown,
+            Start::Head(head) => Start::Head(head),
         };
         // A file whose start cannot be read further still loses its false
         // Duration.
         if let Some(info) = info {
             info.patch(&mut self.held);
         }
-        self.done = Some(head);
+        self.start = start;
         std::mem::take(&mut self.held).into()
     }
     /// What is still held, at the output's end.
     pub(super) fn flush(&mut self) -> Vec<u8> {
-        if self.done.is_none() {
+        if matches!(self.start, Start::More) {
             if let (_, Some(info)) = read_head(&self.held) {
                 info.patch(&mut self.held);
             }
-            self.done = Some(None);
+            self.start = Start::Unknown;
         }
         std::mem::take(&mut self.held)
     }
     /// What the start said, once it has gone on.
     pub(super) fn head(&self) -> Option<Head> {
-        self.done.clone().flatten()
+        match &self.start {
+            Start::Head(head) => Some(head.clone()),
+            Start::More | Start::Unknown => None,
+        }
     }
 }
 
@@ -297,7 +335,7 @@ fn read_start(bytes: &[u8], patch: &mut Option<Patch>) -> Start {
     if more(0, header, size) {
         return Start::More;
     }
-    let mut at = header + size as usize;
+    let mut at = header + usize::try_from(size).expect("element fits the available header buffer");
     let Some((id, _, header)) = element(&bytes[at..]) else {
         return Start::More;
     };
@@ -308,7 +346,7 @@ fn read_start(bytes: &[u8], patch: &mut Option<Patch>) -> Start {
     let segment_size_at = (header - id_bytes(id).len() == 8).then_some(size_at as u64);
     let segment_data = at + header;
     at = segment_data;
-    let mut seek_head: Option<(u64, usize, Vec<u8>, bool)> = None;
+    let mut seek: Option<SeekHead> = None;
     let mut info = None;
     let (mut track, mut frame_ns) = (None, None);
     loop {
@@ -322,7 +360,7 @@ fn read_start(bytes: &[u8], patch: &mut Option<Patch>) -> Start {
             return Start::Head(Head {
                 segment_data: segment_data as u64,
                 segment_size_at,
-                seek_head,
+                seek,
                 info,
                 duration_at,
                 scale,
@@ -337,7 +375,9 @@ fn read_start(bytes: &[u8], patch: &mut Option<Patch>) -> Start {
         if more(at, header, size) {
             return Start::More;
         }
-        let data = at + header..at + header + size as usize;
+        let data = at + header
+            ..at + header
+                + usize::try_from(size).expect("element fits the available header buffer");
         match id {
             SEEK_HEAD => {
                 let found = children(&bytes[data.clone()]);
@@ -346,18 +386,28 @@ fn read_start(bytes: &[u8], patch: &mut Option<Patch>) -> Start {
                     .iter()
                     .filter(|(id, ..)| *id == SEEK)
                     .flat_map(|(_, range, start)| {
-                        bytes[data.start + start..data.start + range.end].to_vec()
+                        bytes[data.start + start..data.start + range.end]
+                            .iter()
+                            .copied()
                     })
                     .collect();
-                seek_head = Some((at as u64, data.end - at, seeks, crc));
+                seek = Some(SeekHead {
+                    offset: at as u64,
+                    space: data.end - at,
+                    entries: seeks,
+                    crc,
+                });
             }
             // The space FFmpeg keeps after its SeekHead.
-            VOID if seek_head
-                .as_ref()
-                .is_some_and(|(start, len, ..)| *start as usize + len == at) =>
+            VOID if seek.as_ref().is_some_and(|seek| {
+                usize::try_from(seek.offset)
+                    .ok()
+                    .and_then(|start| start.checked_add(seek.space))
+                    == Some(at)
+            }) =>
             {
-                if let Some((_, len, ..)) = &mut seek_head {
-                    *len += data.end - at;
+                if let Some(seek) = &mut seek {
+                    seek.space += data.end - at;
                 }
             }
             INFO if info.is_none() => {
@@ -419,13 +469,16 @@ fn read_start(bytes: &[u8], patch: &mut Option<Patch>) -> Start {
     }
 }
 
-fn read_at(file: &mut File, at: u64, buffer: &mut [u8]) -> io::Result<usize> {
+#[deny(clippy::panic_in_result_fn)]
+fn read_at(file: &mut (impl Read + Seek), at: u64, buffer: &mut [u8]) -> io::Result<usize> {
     file.seek(SeekFrom::Start(at))?;
     let mut filled = 0;
     while filled < buffer.len() {
-        match file.read(&mut buffer[filled..])? {
-            0 => break,
-            count => filled += count,
+        match file.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(count) => filled += count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
         }
     }
     Ok(filled)
@@ -437,7 +490,7 @@ fn write_at(file: &mut File, at: u64, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// A block's track, timestamp relative to its cluster, and whether it is
-/// a key frame, from the start of its data (a SimpleBlock's, or a Block's
+/// a key frame, from the start of its data (a `SimpleBlock`'s, or a Block's
 /// in a group, which `group` holds whole when it is one).
 fn block(data: &[u8], group: Option<&[u8]>) -> Option<Block> {
     let (track, len) = vint(data)?;
@@ -454,6 +507,12 @@ fn block(data: &[u8], group: Option<&[u8]>) -> Option<Block> {
 /// A block's track, time relative to its cluster, and whether it is a key
 /// frame.
 type Block = (u64, i64, bool);
+
+/// A file length capped to a host buffer, including lengths beyond usize.
+fn bounded_len(length: u64, capacity: usize) -> usize {
+    usize::try_from(length).unwrap_or(capacity).min(capacity)
+}
+
 /// The cluster whose data starts `at` and lasts `size` bytes: its own
 /// time, and its blocks (only the first unless `every`), read a child at a
 /// time.
@@ -463,29 +522,41 @@ fn cluster(
     size: u64,
     every: bool,
 ) -> io::Result<(Option<u64>, Vec<Block>)> {
-    let end = at + size;
+    let end = at.checked_add(size).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Matroska cluster range overflow",
+        )
+    })?;
     let (mut time, mut blocks) = (None, Vec::new());
     let mut child = at;
     let mut header = [0u8; 24];
     while child < end {
-        let read = read_at(file, child, &mut header[..(end - child).min(24) as usize])?;
+        let count = bounded_len(end - child, header.len());
+        let read = read_at(file, child, &mut header[..count])?;
         let Some((id, Some(size), len)) = element(&header[..read]) else {
             break;
         };
-        let data = child + len as u64;
+        let Some(data) = child.checked_add(len as u64) else {
+            break;
+        };
+        let Some(next) = data.checked_add(size).filter(|next| *next <= end) else {
+            break;
+        };
         match id {
             TIMESTAMP => {
                 let mut value = [0u8; 8];
-                let count = size.min(8) as usize;
+                let count = bounded_len(size, value.len());
                 read_at(file, data, &mut value[..count])?;
                 time = Some(uint(&value[..count]));
             }
             SIMPLE_BLOCK => {
-                let start = &header[len.min(read)..read];
+                let count = bounded_len(size, read - len);
+                let start = &header[len..len + count];
                 blocks.extend(block(start, None));
             }
             BLOCK_GROUP if size <= 4096 => {
-                let mut group = vec![0; size as usize];
+                let mut group = vec![0; bounded_len(size, 4096)];
                 read_at(file, data, &mut group)?;
                 if let Some((_, range, _)) =
                     children(&group).into_iter().find(|(id, ..)| *id == BLOCK)
@@ -498,12 +569,29 @@ fn cluster(
         if !every && !blocks.is_empty() {
             break;
         }
-        child = data + size;
+        child = next;
     }
     Ok((time, blocks))
 }
 
-/// Finish the Matroska file `file` FFmpeg wrote through a pipe, whose
+/// The latest timestamp and the preceding distinct one, regardless of order.
+fn latest_times(times: impl IntoIterator<Item = u64>) -> Option<(u64, Option<u64>)> {
+    let mut times = times.into_iter();
+    let last = times.next()?;
+    Some(times.fold(
+        (last, None),
+        |(last, previous), time| match time.cmp(&last) {
+            Ordering::Greater => (time, Some(last)),
+            Ordering::Less => (
+                last,
+                Some(previous.map_or(time, |value: u64| value.max(time))),
+            ),
+            Ordering::Equal => (last, previous),
+        },
+    ))
+}
+
+/// Finish the Matroska file `file` `FFmpeg` wrote through a pipe, whose
 /// start [`Rewriter`] read as `head`: add its index, where it may grow by
 /// `room` bytes, and its length. Nothing is changed when its clusters
 /// cannot be read as expected.
@@ -514,14 +602,17 @@ pub(super) fn finish(file: &mut File, head: &Head, room: u64) -> io::Result<()> 
     let mut at = head.first_cluster;
     let mut header = [0u8; 12];
     while at < len {
-        let read = read_at(file, at, &mut header[..(len - at).min(12) as usize])?;
+        let count = bounded_len(len - at, header.len());
+        let read = read_at(file, at, &mut header[..count])?;
         let Some((id, Some(size), header_len)) = element(&header[..read]) else {
             break;
         };
-        let data = at + header_len as u64;
-        if data + size > len {
+        let Some(data) = at.checked_add(header_len as u64) else {
             break;
-        }
+        };
+        let Some(next) = data.checked_add(size).filter(|next| *next <= len) else {
+            break;
+        };
         if id == CLUSTER {
             let (time, blocks) = cluster(file, data, size, false)?;
             let time = time.unwrap_or(0);
@@ -537,7 +628,7 @@ pub(super) fn finish(file: &mut File, head: &Head, room: u64) -> io::Result<()> 
             }
             last = Some((data, size, time));
         }
-        at = data + size;
+        at = next;
     }
     // A file that ends inside an element, as one whose FFmpeg failed may,
     // takes nothing after it: it would be read as part of that element.
@@ -547,28 +638,32 @@ pub(super) fn finish(file: &mut File, head: &Head, room: u64) -> io::Result<()> 
     };
     // The length: to the end of the frame shown last.
     let (_, blocks) = cluster(file, data, size, true)?;
-    let mut times: Vec<u64> = blocks
-        .iter()
-        .filter(|(track, ..)| head.track.is_none_or(|video| video == *track))
-        .map(|(_, relative, _)| time.saturating_add_signed(*relative))
-        .collect();
-    times.sort_unstable();
-    times.dedup();
-    let Some(&shown_last) = times.last() else {
+    let Some((shown_last, previous)) = latest_times(
+        blocks
+            .iter()
+            .filter(|(track, ..)| head.track.is_none_or(|video| video == *track))
+            .map(|(_, relative, _)| time.saturating_add_signed(*relative)),
+    ) else {
         return Ok(());
     };
     let frame = head
         .frame_ns
         .map(|ns| ns / head.scale)
-        .or_else(|| {
-            let mut gaps = times.windows(2).map(|pair| pair[1] - pair[0]);
-            gaps.next_back()
-        })
+        .or_else(|| previous.map(|previous| shown_last - previous))
         .unwrap_or(0);
-    let duration = (shown_last + frame) as f64;
+    #[deny(clippy::arithmetic_side_effects)]
+    let Some(duration) = shown_last.checked_add(frame) else {
+        return Ok(());
+    };
+    let duration = duration as f64;
     // The index, at the end, named in the SeekHead.
     let mut end = len;
-    if let Some((seek_at, space, seeks, has_crc)) = &head.seek_head
+    if let Some(SeekHead {
+        offset: seek_at,
+        space,
+        entries: seeks,
+        crc: has_crc,
+    }) = &head.seek
         && !cues.is_empty()
         && whole
     {
@@ -599,9 +694,22 @@ pub(super) fn finish(file: &mut File, head: &Head, room: u64) -> io::Result<()> 
             ]
             .concat(),
         );
-        let entries = [&seeks[..], &seek[..]].concat();
+        let entries = [seeks.as_slice(), seek.as_slice()].concat();
         let body = if *has_crc {
-            [&[CRC32 as u8, 0x84][..], &crc(&entries), &entries].concat()
+            [
+                &[
+                    u8::try_from(CRC32).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "CRC-32 identifier exceeds one byte",
+                        )
+                    })?,
+                    0x84,
+                ][..],
+                &crc(&entries),
+                &entries,
+            ]
+            .concat()
         } else {
             entries
         };
@@ -632,7 +740,13 @@ pub(super) fn finish(file: &mut File, head: &Head, room: u64) -> io::Result<()> 
     write_at(file, head.duration_at, &length)?;
     let (info_end, crc_at) = head.info;
     if let Some(crc_at) = crc_at {
-        let mut info = vec![0; (info_end - crc_at - 6) as usize];
+        let mut info = vec![
+            0;
+            usize::try_from(info_end - crc_at - 6).map_err(|_| io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Matroska Info exceeds host address size"
+            ))?
+        ];
         read_at(file, crc_at + 6, &mut info)?;
         write_at(file, crc_at + 2, &crc(&info))?;
     }
@@ -641,8 +755,104 @@ pub(super) fn finish(file: &mut File, head: &Head, room: u64) -> io::Result<()> 
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_reads_retry_interruptions_and_preserve_short_eof() {
+        for (offset, expected) in [
+            (2, b"2345".as_slice()),
+            (4, b"45".as_slice()),
+            (8, b"".as_slice()),
+        ] {
+            let mut reader = crate::test_io::FaultReader::new(
+                io::Cursor::new(b"012345"),
+                io::ErrorKind::Interrupted,
+            );
+            let mut bytes = [0; 4];
+            let count = read_at(&mut reader, offset, &mut bytes).unwrap();
+            assert_eq!(&bytes[..count], expected);
+            assert!(bytes[count..].iter().all(|byte| *byte == 0));
+        }
+        let mut reader = crate::test_io::FaultReader::new(
+            io::Cursor::new(b"012345"),
+            io::ErrorKind::PermissionDenied,
+        );
+        assert_eq!(
+            read_at(&mut reader, 0, &mut [0; 4]).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn latest_distinct_times_match_sorting_for_reordered_and_duplicate_blocks() {
+        let domain = [0, 1, 2, u64::MAX];
+        for a in domain {
+            for b in domain {
+                for c in domain {
+                    let values = [a, b, c];
+                    for count in 0..=values.len() {
+                        let values = &values[..count];
+                        let mut sorted = values.to_vec();
+                        sorted.sort_unstable();
+                        sorted.dedup();
+                        let expected = sorted.pop().map(|last| (last, sorted.pop()));
+                        assert_eq!(latest_times(values.iter().copied()), expected, "{values:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_elements_match_fixed_wire_bytes_at_reserved_size_boundaries() {
+        for (length, header) in [
+            (0, &[0xa3, 0x80][..]),
+            (126, &[0xa3, 0xfe][..]),
+            (127, &[0xa3, 0x40, 0x7f][..]),
+            (16_382, &[0xa3, 0x7f, 0xfe][..]),
+            (16_383, &[0xa3, 0x20, 0x3f, 0xff][..]),
+        ] {
+            let payload = vec![0x5a; length];
+            let encoded = master(SIMPLE_BLOCK, &payload);
+            assert_eq!(&encoded[..header.len()], header, "payload length {length}");
+            assert_eq!(&encoded[header.len()..], payload);
+        }
+        assert_eq!(master(0x4286, &[]), [0x42, 0x86, 0x80]);
+        assert_eq!(master(TIMESTAMP_SCALE, &[]), [0x2a, 0xd7, 0xb1, 0x80]);
+        assert_eq!(master(EBML, &[]), [0x1a, 0x45, 0xdf, 0xa3, 0x80]);
+        assert_eq!(unsigned(TIMESTAMP, 0), [0xe7, 0x81, 0]);
+        assert_eq!(unsigned(TIMESTAMP, 255), [0xe7, 0x81, 255]);
+        assert_eq!(unsigned(TIMESTAMP, 256), [0xe7, 0x82, 1, 0]);
+        assert_eq!(
+            unsigned(TIMESTAMP, u64::MAX),
+            [0xe7, 0x88, 255, 255, 255, 255, 255, 255, 255, 255]
+        );
+    }
+
+    #[test]
+    fn ebml_headers_check_every_supported_width_and_truncation() {
+        assert_eq!(vint(&[]), None);
+        assert_eq!(vint(&[0; 9]), None);
+        for len in 1..=8 {
+            let unknown = (1u64 << (7 * len)) - 1;
+            let encoded = size_bytes(unknown - 1, len);
+            assert_eq!(vint(&encoded), Some((Some(unknown - 1), len)));
+            assert_eq!(vint(&size_bytes(unknown, len)), Some((None, len)));
+            for end in 0..len {
+                assert_eq!(vint(&encoded[..end]), None);
+            }
+        }
+        for id in [0xa3, 0x4286, 0x002a_d7b1, EBML] {
+            let mut encoded = id_bytes(id);
+            encoded.push(0x80);
+            assert_eq!(element(&encoded), Some((id, Some(0), encoded.len())));
+            for end in 0..encoded.len() {
+                assert_eq!(element(&encoded[..end]), None);
+            }
+        }
+        assert_eq!(element(&[0x08, 0, 0, 0, 0, 0x80]), None);
+    }
 
     fn binary(id: u32, data: &[u8]) -> Vec<u8> {
         master(id, data)
@@ -650,7 +860,12 @@ mod tests {
     fn with_crc(id: u32, children: &[u8]) -> Vec<u8> {
         master(
             id,
-            &[&[CRC32 as u8, 0x84][..], &crc(children), children].concat(),
+            &[
+                &[u8::try_from(CRC32).expect("CRC-32 has a one-byte ID"), 0x84][..],
+                &crc(children),
+                children,
+            ]
+            .concat(),
         )
     }
     fn simple(track: u8, relative: i16, key: bool, payload: usize) -> Vec<u8> {
@@ -660,10 +875,10 @@ mod tests {
         data.resize(4 + payload, 0x55);
         binary(SIMPLE_BLOCK, &data)
     }
-    /// A file as FFmpeg writes one to a pipe, with its early Duration:
+    /// A file as `FFmpeg` writes one to a pipe, with its early Duration:
     /// clusters of three frames 40 ms apart, each starting with a key
     /// frame but the second.
-    fn piped() -> Vec<u8> {
+    pub(in crate::media) fn piped() -> Vec<u8> {
         let header = master(EBML, &unsigned(0x4286, 1));
         let seeks = [
             binary(
@@ -721,20 +936,24 @@ mod tests {
         let (_, Some(size), header) = element(file)? else {
             return None;
         };
-        let mut at = header + size as usize;
-        let (_, _, header) = element(&file[at..])?;
-        at += header;
-        while let Some((id, Some(size), header)) = element(&file[at..]) {
-            let data = file.get(at + header..at + header + size as usize)?;
+        let mut at = header.checked_add(usize::try_from(size).ok()?)?;
+        let (_, _, header) = element(file.get(at..)?)?;
+        at = at.checked_add(header)?;
+        while let Some((id, Some(size), header)) = element(file.get(at..)?) {
+            let start = at.checked_add(header)?;
+            let end = start.checked_add(usize::try_from(size).ok()?)?;
+            let data = file.get(start..end)?;
             if id == wanted {
                 return Some((at, data.to_vec()));
             }
-            at += header + size as usize;
+            at = end;
         }
         None
     }
     fn crc_holds(data: &[u8]) -> bool {
-        data[..2] == [CRC32 as u8, 0x84] && data[2..6] == crc(&data[6..])
+        let (header, body) = data.split_first_chunk::<6>().expect("CRC-32 header");
+        header[..2] == [u8::try_from(CRC32).expect("CRC-32 has a one-byte ID"), 0x84]
+            && header[2..] == crc(body)
     }
 
     #[test]
@@ -824,7 +1043,8 @@ mod tests {
         assert!(seek_at < void_at && void_at < info_at);
         let (before, _) = top(&written, INFO).unwrap();
         assert_eq!(info_at, before);
-        let (_, size, _) = element(&finished[segment_data as usize - 12..]).unwrap();
+        let (_, size, _) =
+            element(&finished[usize::try_from(segment_data).unwrap() - 12..]).unwrap();
         assert_eq!(size, Some(finished.len() as u64 - segment_data));
         // A file with no room left for an index still gets its length.
         std::fs::write(&path, &written).unwrap();
@@ -857,9 +1077,10 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert_eq!(finished.len(), cut.len());
         assert!(!finished.windows(4).any(|bytes| bytes == id_bytes(CUES)));
-        let (_, size, _) = element(&finished[segment_data as usize - 12..]).unwrap();
+        let (_, size, _) =
+            element(&finished[usize::try_from(segment_data).unwrap() - 12..]).unwrap();
         assert_eq!(size, None);
-        let duration_at = head.duration_at as usize;
+        let duration_at = usize::try_from(head.duration_at).unwrap();
         assert_eq!(finished[duration_at..duration_at + 3], [0x44, 0x89, 0x88]);
         let length = f64::from_be_bytes(
             finished[duration_at + 3..duration_at + 11]
@@ -867,6 +1088,75 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(length, 360.0);
+    }
+
+    #[test]
+    fn overflowing_frame_end_leaves_the_recording_unchanged() {
+        let mut rewriter = Rewriter::new();
+        let mut written = rewriter.push(&piped()).into_owned();
+        written.extend(rewriter.flush());
+        let head = rewriter.head().unwrap();
+        written.truncate(usize::try_from(head.first_cluster).unwrap());
+        written.extend(with_crc(
+            CLUSTER,
+            &[
+                unsigned(TIMESTAMP, u64::MAX - 1),
+                simple(1, 0, true, 1),
+                simple(1, 1, false, 1),
+            ]
+            .concat(),
+        ));
+        let path = std::env::temp_dir().join(format!(
+            "capturefab-mkv-overflow-{}-{}.mkv",
+            std::process::id(),
+            crate::types::random_hex(4).unwrap()
+        ));
+        std::fs::write(&path, &written).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let result = finish(&mut file, &head, u64::MAX);
+        drop(file);
+        let finished = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        result.unwrap();
+        assert_eq!(finished, written);
+    }
+
+    #[test]
+    fn cluster_children_cannot_read_past_their_declared_ranges() {
+        let prefix = [master(SIMPLE_BLOCK, &[0x81]), void(6).unwrap()].concat();
+        let timestamp = unsigned(TIMESTAMP, 0x0102_0304_0506_0708);
+        let bytes = [(&*prefix), &timestamp].concat();
+        let path = std::env::temp_dir().join(format!(
+            "capturefab-mkv-bounds-{}-{}.mkv",
+            std::process::id(),
+            crate::types::random_hex(4).unwrap()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let mut file = File::open(&path).unwrap();
+        // A one-byte block cannot borrow its timestamp and flags from Void.
+        let (time, blocks) = cluster(&mut file, 0, prefix.len() as u64, true).unwrap();
+        assert!(time.is_none() && blocks.is_empty());
+        // The timestamp's final byte exists in the file, outside the cluster.
+        let (time, blocks) = cluster(
+            &mut file,
+            prefix.len() as u64,
+            timestamp.len() as u64 - 1,
+            true,
+        )
+        .unwrap();
+        assert!(time.is_none() && blocks.is_empty());
+        assert_eq!(
+            cluster(&mut file, u64::MAX - 1, 8, true)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        drop(file);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -896,7 +1186,10 @@ mod tests {
             let void = void(len).unwrap();
             assert_eq!(void.len(), len);
             let (id, size, header) = element(&void).unwrap();
-            assert_eq!((id, size.unwrap() as usize + header), (VOID, len));
+            assert_eq!(
+                (id, usize::try_from(size.unwrap()).unwrap() + header),
+                (VOID, len)
+            );
         }
         assert!(void(1).is_none());
     }

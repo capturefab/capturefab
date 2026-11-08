@@ -211,7 +211,7 @@ ffmpeg_flags=(--prefix="$OUTPUT_DIR" --arch="$TARGET_ARCH" --target-os="$TARGET_
     # Retain the exact conversion/probe graph used by src/media.rs, including
     # automatic pixel-format conversion and hardware frame transfers.
     --disable-filters
-    "--enable-filter=scale,pad,fps,format,null"
+    "--enable-filter=scale,pad,fps,format,null,settb,setpts"
     "--enable-filter=hwupload,hwdownload,hwmap,color,testsrc,testsrc2"
     # Camera capture only; no audio capture, screen grabbers or device playback.
     --disable-indevs --disable-outdevs --enable-indev=lavfi)
@@ -384,6 +384,11 @@ if [[ $run_checks == 1 ]]; then
     "$binary" -hide_banner -encoders > "$OUTPUT_DIR/logs/encoders.txt" 2>&1
     grep -q 'libx264' "$OUTPUT_DIR/logs/encoders.txt" || die 'libx264 encoder missing'
     "$binary" -hide_banner -loglevel error -f lavfi -i testsrc2=size=64x64:rate=2 -frames:v 2 -c:v libx264 -f null -
+    "$binary" -hide_banner -loglevel error -f lavfi -i testsrc2=size=64x48:rate=2 \
+        -vf 'settb=AVTB,setpts=(RTCTIME-RTCSTART)/(TB*1000000)' \
+        -enc_time_base 1:1000000 -fps_mode vfr -frames:v 2 -c:v libx264 \
+        -progress pipe:1 -f null - > "$OUTPUT_DIR/logs/recording-clock.txt"
+    grep -Eq '^frame=2$' "$OUTPUT_DIR/logs/recording-clock.txt" || die 'recording clock dropped a frame'
     # Check actual capabilities rather than trusting configure arguments: FFmpeg
     # can silently disable a requested component when a dependency is missing.
     for category in decoders demuxers muxers filters devices; do
@@ -405,7 +410,7 @@ if [[ $run_checks == 1 ]]; then
     for component in rawvideo ppm ffv1 libx264; do
         require_component encoders "$component"
     done
-    for component in scale pad fps format hwupload color testsrc2; do
+    for component in scale pad fps format settb setpts hwupload color testsrc2; do
         require_component filters "$component"
     done
     case $TARGET_OS in

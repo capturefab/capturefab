@@ -1,8 +1,12 @@
-//! A small, uncached GenApi interpreter. Unsupported nodes and expressions fail closed.
+//! A small, uncached `GenApi` interpreter. Unsupported nodes and expressions fail closed.
 //! Every feature operation resolves its links again, so selector-dependent addresses and
 //! access conditions are evaluated against the camera's current state.
-use crate::types::{Categorized, ErrorKind, RegisterIo, Usage};
-use anyhow::{Context, Result, anyhow, bail, ensure};
+#![forbid(unsafe_code)]
+#![deny(clippy::panic_in_result_fn)]
+#![cfg_attr(not(test), deny(clippy::panic, clippy::unreachable))]
+#![deny(clippy::missing_const_for_fn)]
+use crate::types::{Categorized, ErrorKind, RegisterIo, Usage, integral_float};
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -13,6 +17,8 @@ use std::{
 const MAX_XML: usize = 32 * 1024 * 1024;
 const MAX_DEPTH: usize = 64;
 const MAX_FORMULA_DEPTH: usize = 128;
+/// 2^53: the inclusive limit of f64's consecutive integer range.
+const EXACT_INTEGER_LIMIT: f64 = 9_007_199_254_740_992.0;
 
 /// Node kinds that are features a person reads, writes or executes.
 const FEATURE_KINDS: [&str; 14] = [
@@ -34,7 +40,7 @@ const FEATURE_KINDS: [&str; 14] = [
 
 /// Features a camera cannot change while it streams: the image's geometry
 /// and format.
-pub fn stream_locked(name: &str) -> bool {
+pub(crate) fn stream_locked(name: &str) -> bool {
     matches!(
         name,
         "Width"
@@ -94,8 +100,8 @@ struct Element {
 struct Node {
     kind: String,
     props: Vec<Element>,
-    /// Host-side values written to floating Value, ValueIndexed and
-    /// ValueDefault elements, by element position.
+    /// Host-side values written to floating Value, `ValueIndexed` and
+    /// `ValueDefault` elements, by element position.
     stored: RefCell<BTreeMap<usize, Value>>,
 }
 impl Node {
@@ -134,12 +140,12 @@ impl Node {
 }
 
 #[derive(Debug, Clone)]
-pub struct NodeMap {
+pub(crate) struct NodeMap {
     nodes: BTreeMap<String, Node>,
 }
 
 impl NodeMap {
-    pub fn parse(xml: &str) -> Result<Self> {
+    pub(crate) fn parse(xml: &str) -> Result<Self> {
         ensure!(xml.len() <= MAX_XML, "GenICam XML exceeds 32 MiB limit");
         let doc =
             roxmltree::Document::parse(xml.trim_matches('\0')).context("invalid GenICam XML")?;
@@ -168,7 +174,7 @@ impl NodeMap {
         };
         let props = |n: roxmltree::Node<'_, '_>| {
             n.children()
-                .filter(|p| p.is_element())
+                .filter(roxmltree::Node::is_element)
                 .map(|p| Element {
                     tag: p.tag_name().name().into(),
                     text: embedded(p).unwrap_or_else(|| p.text().unwrap_or("").trim().into()),
@@ -219,7 +225,7 @@ impl NodeMap {
                         .filter(|p| !fields_has(&fields, &p.tag) && p.tag != "StructEntry")
                         .collect::<Vec<_>>();
                     fields.extend(inherited);
-                    ("MaskedIntReg", entry_name.to_string())
+                    ("MaskedIntReg", entry_name.to_owned())
                 } else {
                     let parent = parent_name.context("nested EnumEntry has no named parent")?;
                     if !fields_has(&fields, "Symbolic") {
@@ -264,7 +270,7 @@ impl NodeMap {
         ensure!(!nodes.is_empty(), "GenICam XML has no named nodes");
         Ok(Self { nodes })
     }
-    pub fn has(&self, name: &str) -> bool {
+    pub(crate) fn has(&self, name: &str) -> bool {
         self.nodes.contains_key(name)
     }
     /// The first link to a node the map does not have, as `(node, link)`:
@@ -311,8 +317,8 @@ impl NodeMap {
         false
     }
 
-    /// The feature a `pIsLocked` on `name` waits for, such as ExposureAuto
-    /// for ExposureTime: an exposed value feature whose stored value the
+    /// The feature a `pIsLocked` on `name` waits for, such as `ExposureAuto`
+    /// for `ExposureTime`: an exposed value feature whose stored value the
     /// lock condition reads. Auto switches first, then other switches.
     pub(crate) fn lock_owner(&self, name: &str) -> Option<String> {
         let inputs = self.lock_inputs(name);
@@ -320,8 +326,7 @@ impl NodeMap {
             return None;
         }
         let exposed = self.exposed_features();
-        let mut owners = self
-            .nodes
+        self.nodes
             .iter()
             .filter(|(candidate, node)| {
                 candidate.as_str() != name
@@ -338,18 +343,16 @@ impl NodeMap {
                         .iter()
                         .any(|link| inputs.contains(link))
             })
-            .map(|(candidate, node)| (candidate.clone(), node.kind.clone()))
-            .collect::<Vec<_>>();
-        owners.sort_by_key(|(candidate, kind)| {
-            (
-                !candidate.ends_with("Auto"),
-                !matches!(kind.as_str(), "Enumeration" | "Boolean"),
-                candidate.clone(),
-            )
-        });
-        owners.into_iter().next().map(|(owner, _)| owner)
+            .min_by_key(|&(candidate, node)| {
+                (
+                    !candidate.ends_with("Auto"),
+                    !matches!(node.kind.as_str(), "Enumeration" | "Boolean"),
+                    candidate.as_str(),
+                )
+            })
+            .map(|(owner, _)| owner.clone())
     }
-    /// The XML Visibility of a feature; GenICam's default is Beginner.
+    /// The XML Visibility of a feature; `GenICam`'s default is Beginner.
     pub(crate) fn visibility(&self, name: &str) -> &str {
         self.nodes
             .get(name)
@@ -405,7 +408,7 @@ impl NodeMap {
     pub(crate) fn static_max(&self, name: &str) -> Option<f64> {
         literal(self.nodes.get(name)?.prop("Max")?).ok()?.as_f64()
     }
-    /// The node's GenICam kind, such as `Float` or `IntReg`.
+    /// The node's `GenICam` kind, such as `Float` or `IntReg`.
     pub(crate) fn kind(&self, name: &str) -> Option<&str> {
         self.nodes.get(name).map(|node| node.kind.as_str())
     }
@@ -415,7 +418,7 @@ impl NodeMap {
     /// Selectors that address a feature's value, including selectors hidden
     /// behind register address expressions. A rollback must read and write
     /// the same selected bank even when another has since been selected.
-    pub fn selectors(&self, name: &str) -> Vec<String> {
+    pub(crate) fn selectors(&self, name: &str) -> Vec<String> {
         let mut dependencies = BTreeSet::new();
         let mut pending = vec![name.to_owned()];
         let mut selectors = BTreeSet::new();
@@ -445,7 +448,7 @@ impl NodeMap {
         selectors.remove(name);
         selectors.into_iter().collect()
     }
-    pub fn is_writable(&self, io: &mut dyn RegisterIo, name: &str) -> bool {
+    pub(crate) fn is_writable(&self, io: &mut dyn RegisterIo, name: &str) -> bool {
         self.writable(io, name, 0).is_ok()
     }
     /// A configuration value may be temporarily locked by another setting.
@@ -521,7 +524,7 @@ impl NodeMap {
         let Ok(node) = self.node(name, 0) else {
             return Availability::Absent;
         };
-        let entry = self.enum_entries(node).into_iter().find_map(|entry| {
+        let entry = Self::enum_entries(node).into_iter().find_map(|entry| {
             self.nodes.get(entry).filter(|en| {
                 symbol == entry
                     || symbol
@@ -530,10 +533,7 @@ impl NodeMap {
                         })
             })
         });
-        match entry {
-            Some(entry) => self.gate(io, entry, 1),
-            None => Availability::Absent,
-        }
+        entry.map_or(Availability::Absent, |entry| self.gate(io, entry, 1))
     }
     /// One node's `pIsImplemented` and `pIsAvailable`. A condition that
     /// cannot be evaluated counts as available, so the read reports it.
@@ -632,12 +632,12 @@ impl NodeMap {
         }
         inputs
     }
-    pub fn choices(&self, io: &mut dyn RegisterIo, name: &str) -> Result<Vec<String>> {
+    pub(crate) fn choices(&self, io: &mut dyn RegisterIo, name: &str) -> Result<Vec<String>> {
         let node = self.node(name, 0)?;
         Ok(self.entry_names(io, name, node))
     }
     fn entry_names(&self, io: &mut dyn RegisterIo, name: &str, node: &Node) -> Vec<String> {
-        self.enum_entries(node)
+        Self::enum_entries(node)
             .into_iter()
             .filter_map(|e| {
                 self.nodes
@@ -646,14 +646,51 @@ impl NodeMap {
                     .map(|en| {
                         en.prop("Symbolic")
                             .unwrap_or_else(|| e.strip_prefix(&format!("{name}_")).unwrap_or(e))
-                            .to_string()
+                            .to_owned()
                     })
             })
             .collect()
     }
-    pub fn bounds(&self, io: &mut dyn RegisterIo, name: &str) -> Result<Bounds> {
+    pub(crate) fn bounds(&self, io: &mut dyn RegisterIo, name: &str) -> Result<Bounds> {
         let node = self.node(name, 0)?;
         Ok(self.range(io, node, 0))
+    }
+    /// The increment base of an integer alias, without rounding a target's
+    /// minimum through the floating-point bounds used for display.
+    #[deny(clippy::cast_precision_loss)]
+    fn integer_minimum(
+        &self,
+        io: &mut dyn RegisterIo,
+        n: &Node,
+        depth: usize,
+    ) -> Result<Option<i128>> {
+        if integer_kind(&n.kind) {
+            if let Some(link) = n.prop("pMin") {
+                return exact_integer(&self.numeric_value(io, link, depth + 1)?).map(Some);
+            }
+            if let Some(text) = n.prop("Min") {
+                return exact_integer(&integer_literal(text)?).map(Some);
+            }
+        }
+        if n.kind != "Integer" {
+            // Converters may derive their bounds by evaluating a float
+            // formula. Keep their existing conservative conversion policy.
+            return Ok(self
+                .range(io, n, depth)
+                .min
+                .filter(|value| value.abs() < EXACT_INTEGER_LIMIT)
+                .and_then(integral_float));
+        }
+        let link = self.resolve_value_link(io, n, depth)?;
+        let copies = n.props.iter().filter(|p| p.tag == "pValueCopy");
+        let mut minimum = None;
+        for target in link.into_iter().chain(copies.map(|p| p.text.as_str())) {
+            let node = self.node(target, depth + 1)?;
+            if let Some(value) = self.integer_minimum(io, node, depth + 1)? {
+                minimum = Some(minimum.map_or(value, |old: i128| old.max(value)));
+            }
+        }
+        Ok(minimum)
     }
     fn range(&self, io: &mut dyn RegisterIo, n: &Node, depth: usize) -> Bounds {
         let specified = |key: &str| n.prop(key).is_some() || n.prop(&format!("p{key}")).is_some();
@@ -840,7 +877,7 @@ impl NodeMap {
             .map(|(name, _)| name.as_str())
             .collect()
     }
-    pub fn features(&self, io: &mut dyn RegisterIo) -> Vec<FeatureInfo> {
+    pub(crate) fn features(&self, io: &mut dyn RegisterIo) -> Vec<FeatureInfo> {
         self.feature_names()
             .into_iter()
             .filter_map(|name| self.feature(io, name))
@@ -872,7 +909,7 @@ impl NodeMap {
                 .or_else(|| node.prop("ToolTip"))
                 .unwrap_or("")
                 .into(),
-            unit: node.prop("Unit").map(str::to_string),
+            unit: node.prop("Unit").map(str::to_owned),
             min: bounds.min,
             max: bounds.max,
             inc: bounds.inc,
@@ -931,7 +968,7 @@ impl NodeMap {
                     value,
                     writable: false,
                     description: String::new(),
-                    unit: node.prop("Unit").map(str::to_string),
+                    unit: node.prop("Unit").map(str::to_owned),
                     min: None,
                     max: None,
                     inc: None,
@@ -942,15 +979,15 @@ impl NodeMap {
             .collect()
     }
     fn exposed_features(&self) -> Option<BTreeSet<String>> {
-        if !self
+        if self
             .nodes
             .get("Root")
-            .is_some_and(|node| node.kind == "Category")
+            .is_none_or(|node| node.kind != "Category")
         {
             return None;
         }
         let mut features = BTreeSet::new();
-        let mut pending = vec!["Root".to_string()];
+        let mut pending = vec!["Root".to_owned()];
         while let Some(name) = pending.pop() {
             if !features.insert(name.clone()) {
                 continue;
@@ -1003,7 +1040,7 @@ impl NodeMap {
         );
         Ok(())
     }
-    pub fn get(&self, io: &mut dyn RegisterIo, name: &str) -> Result<Value> {
+    pub(crate) fn get(&self, io: &mut dyn RegisterIo, name: &str) -> Result<Value> {
         self.get_inner(io, name, 0)
     }
     fn get_inner(&self, io: &mut dyn RegisterIo, name: &str, depth: usize) -> Result<Value> {
@@ -1020,7 +1057,7 @@ impl NodeMap {
                 ensure!(bytes.len() == len, "short register read");
                 let mut raw = decode_integer(&bytes, n.big_endian());
                 let bits = if n.kind == "MaskedIntReg" {
-                    let (shift, bits) = self.mask(n, len)?;
+                    let (shift, bits) = Self::mask(n, len)?;
                     raw = (raw >> shift) & bit_mask(bits);
                     bits
                 } else {
@@ -1028,9 +1065,9 @@ impl NodeMap {
                 };
                 if n.prop("Sign") == Some("Signed") {
                     let signed = if bits == 64 {
-                        raw as i64
+                        raw.cast_signed()
                     } else {
-                        ((raw << (64 - bits)) as i64) >> (64 - bits)
+                        (raw << (64 - bits)).cast_signed() >> (64 - bits)
                     };
                     Ok(json!(signed))
                 } else {
@@ -1042,8 +1079,28 @@ impl NodeMap {
                 let b = io.read_memory(addr, len)?;
                 ensure!(b.len() == len, "short float register read");
                 let v = match len {
-                    4 => f32::from_bits(decode_integer(&b, n.big_endian()) as u32) as f64,
-                    8 => f64::from_bits(decode_integer(&b, n.big_endian())),
+                    4 => {
+                        let bytes = b
+                            .as_slice()
+                            .try_into()
+                            .context("short float register read")?;
+                        f64::from(if n.big_endian() {
+                            f32::from_be_bytes(bytes)
+                        } else {
+                            f32::from_le_bytes(bytes)
+                        })
+                    }
+                    8 => {
+                        let bytes = b
+                            .as_slice()
+                            .try_into()
+                            .context("short float register read")?;
+                        if n.big_endian() {
+                            f64::from_be_bytes(bytes)
+                        } else {
+                            f64::from_le_bytes(bytes)
+                        }
+                    }
                     _ => bail!("float register length {len} is unsupported"),
                 };
                 ensure!(
@@ -1101,7 +1158,7 @@ impl NodeMap {
                 // Availability limits the choices, not the reading: a value
                 // set before its entry became unavailable still decodes.
                 let mut matched = None;
-                for entry in self.enum_entries(n) {
+                for entry in Self::enum_entries(n) {
                     let en = self.node(entry, depth + 1)?;
                     if numeric_equal(&self.raw_value(io, en, depth + 1)?, &value)? {
                         if self.available(io, en, depth + 1).is_ok() {
@@ -1190,7 +1247,7 @@ impl NodeMap {
         Ok(branch.tag.starts_with('p').then_some(branch.text.as_str()))
     }
     /// The position of the element holding a node's host value now: its
-    /// Value, or the ValueIndexed or ValueDefault its pIndex selects.
+    /// Value, or the `ValueIndexed` or `ValueDefault` its pIndex selects.
     fn host_entry(&self, io: &mut dyn RegisterIo, n: &Node, depth: usize) -> Result<Option<usize>> {
         if let Some(index) = self.indexed_branch(io, n, depth)? {
             return Ok((!n.props[index].tag.starts_with('p')).then_some(index));
@@ -1199,6 +1256,7 @@ impl NodeMap {
     }
     /// For a value table, the position of the (p)ValueIndexed entry matching
     /// the pIndex value, else of the (p)ValueDefault. The forms may be mixed.
+    #[deny(clippy::cast_precision_loss)]
     fn indexed_branch(
         &self,
         io: &mut dyn RegisterIo,
@@ -1212,21 +1270,27 @@ impl NodeMap {
         let selector = n
             .prop("pIndex")
             .context("indexed value node has no pIndex")?;
-        let index = self.number(io, selector, depth + 1)?;
+        // Preserve integer values until after the range check: converting
+        // 2^53 + 1 to f64 first would round it down to the accepted limit.
+        const LIMIT: i128 = 1 << f64::MANTISSA_DIGITS;
+        let index = exact_integer(&self.numeric_value(io, selector, depth + 1)?)
+            .context("indexed value selector is not an exact integer")?;
         ensure!(
-            index.fract() == 0.0 && index.abs() <= (1u64 << 53) as f64,
+            (-LIMIT..=LIMIT).contains(&index),
             "indexed value selector is not an exact integer"
         );
         let mut selected = None;
         for (position, entry) in n.props.iter().enumerate().filter(|(_, p)| indexed(p)) {
-            let candidate = number(&literal(
+            let candidate = integer_literal(
                 entry
                     .attrs
                     .get("Index")
                     .with_context(|| format!("{} has no Index", entry.tag))?,
-            )?)?;
+            )
+            .and_then(|value| exact_integer(&value))
+            .with_context(|| format!("{} Index is not an exact integer", entry.tag))?;
             ensure!(
-                candidate.fract() == 0.0 && candidate.abs() <= (1u64 << 53) as f64,
+                (-LIMIT..=LIMIT).contains(&candidate),
                 "{} Index is not an exact integer",
                 entry.tag
             );
@@ -1337,16 +1401,20 @@ impl NodeMap {
         ensure!(supplied, "register has no address");
         let address = u64::try_from(address).context("register address is out of range")?;
         address
-            .checked_add(length as u64)
+            .checked_add(u64::try_from(length).context("register length exceeds u64")?)
             .context("register range overflow")?;
-        Ok((address, length as usize))
+        Ok((
+            address,
+            usize::try_from(length).context("register length exceeds host address size")?,
+        ))
     }
-    fn mask(&self, n: &Node, len: usize) -> Result<(usize, usize)> {
+    fn mask(n: &Node, len: usize) -> Result<(usize, usize)> {
         let parse = |key| -> Result<usize> {
-            Ok(unsigned(&literal(
+            usize::try_from(unsigned(&literal(
                 n.prop(key)
                     .ok_or_else(|| anyhow!("masked register missing {key}"))?,
-            )?)? as usize)
+            )?)?)
+            .context("register bit index exceeds host address size")
         };
         let (lsb, msb) = if n.prop("Bit").is_some() {
             let bit = parse("Bit")?;
@@ -1364,7 +1432,7 @@ impl NodeMap {
         ensure!(low <= high, "invalid masked register bit order");
         Ok((low, high - low + 1))
     }
-    fn enum_entries<'a>(&'a self, n: &'a Node) -> Vec<&'a str> {
+    fn enum_entries(n: &Node) -> Vec<&str> {
         n.props
             .iter()
             .filter_map(|p| {
@@ -1378,7 +1446,7 @@ impl NodeMap {
             })
             .collect()
     }
-    pub fn set(&self, io: &mut dyn RegisterIo, name: &str, value: &str) -> Result<()> {
+    pub(crate) fn set(&self, io: &mut dyn RegisterIo, name: &str, value: &str) -> Result<()> {
         let n = self.node(name, 0)?;
         let kind = if n.kind == "Float" && self.direct_integer_target(io, name, 0)? {
             "Integer"
@@ -1393,7 +1461,12 @@ impl NodeMap {
     /// Validate without changing host values or camera registers. Temporary
     /// locks are checked by the actual write, allowing auto-to-manual takeover
     /// to validate the value before disabling camera auto settings.
-    pub fn validate_set(&self, io: &mut dyn RegisterIo, name: &str, value: &str) -> Result<()> {
+    pub(crate) fn validate_set(
+        &self,
+        io: &mut dyn RegisterIo,
+        name: &str,
+        value: &str,
+    ) -> Result<()> {
         let n = self.node(name, 0)?;
         let kind = if n.kind == "Float" && self.direct_integer_target(io, name, 0)? {
             "Integer"
@@ -1430,7 +1503,7 @@ impl NodeMap {
             return Ok(());
         }
         let node = self.node(link, depth + 1)?;
-        for entry in self.enum_entries(node) {
+        for entry in Self::enum_entries(node) {
             let en = self.node(entry, depth + 2)?;
             if numeric_equal(&self.entry_value(io, en, depth + 2)?, &code)? {
                 let label = en
@@ -1445,6 +1518,7 @@ impl NodeMap {
         }
         bail!("camera reported error {code} in {link}")
     }
+    #[deny(clippy::cast_precision_loss)]
     fn write_value(
         &self,
         io: &mut dyn RegisterIo,
@@ -1501,11 +1575,11 @@ impl NodeMap {
                         )
                         .details(json!({"feature": name, "value": symbol, "choices": choices}))
                     })?;
-                    (self.node(entry, depth + 1)?, symbol.to_string())
+                    (self.node(entry, depth + 1)?, symbol.to_owned())
                 } else {
                     // An integer link writes an entry's value.
                     let mut found = None;
-                    for entry in self.enum_entries(n) {
+                    for entry in Self::enum_entries(n) {
                         let en = self.node(entry, depth + 1)?;
                         if numeric_equal(&self.entry_value(io, en, depth + 1)?, value)? {
                             found = Some(en);
@@ -1536,48 +1610,55 @@ impl NodeMap {
             "String" | "StringReg" | "Boolean" | "Enumeration"
         ) {
             let mut constraint = |key| -> Result<Option<Value>> {
-                if let Some(link) = n.prop(&format!("p{key}")) {
-                    self.numeric_value(io, link, depth + 1).map(Some)
-                } else {
-                    n.prop(key)
-                        .map(|text| {
-                            if integer_kind(&n.kind) {
-                                integer_literal(text)
-                            } else {
-                                literal(text)
-                            }
-                        })
-                        .transpose()
-                }
+                n.prop(&format!("p{key}")).map_or_else(
+                    || {
+                        n.prop(key)
+                            .map(|text| {
+                                if integer_kind(&n.kind) {
+                                    integer_literal(text)
+                                } else {
+                                    literal(text)
+                                }
+                            })
+                            .transpose()
+                    },
+                    |link| self.numeric_value(io, link, depth + 1).map(Some),
+                )
             };
             let (mut min, max, inc) = (constraint("Min")?, constraint("Max")?, constraint("Inc")?);
             // An increment steps from the effective minimum, which may be
             // the pValue target's.
             if min.is_none() && inc.is_some() && matches!(n.kind.as_str(), "Integer" | "Float") {
-                min = self
-                    .range(io, n, depth)
-                    .min
-                    .filter(|v| {
-                        n.kind == "Float" || (v.fract() == 0.0 && v.abs() < (1u64 << 53) as f64)
-                    })
-                    .map(|v| {
-                        if n.kind == "Float" {
-                            json!(v)
-                        } else {
-                            json!(v as i64)
-                        }
-                    });
+                min = if n.kind == "Integer" {
+                    self.integer_minimum(io, n, depth)?
+                        .map(|value| json!(value))
+                } else {
+                    self.range(io, n, depth).min.map(|value| json!(value))
+                };
             }
-            validate_numeric(name, &n.kind, value, min, max, inc)?;
+            validate_numeric(
+                name,
+                &n.kind,
+                value,
+                min.as_ref(),
+                max.as_ref(),
+                inc.as_ref(),
+            )?;
         }
         if let Some(link) = self.resolve_value_link(io, n, depth)? {
             let translated = if n.kind == "Converter" && self.integer_target(link, depth + 1)? {
                 let numeric = number(&translated)?;
                 ensure!(
-                    numeric.abs() <= (1u64 << 53) as f64,
+                    numeric.abs() <= EXACT_INTEGER_LIMIT,
                     "converter output exceeds exact integer conversion range"
                 );
-                json!(numeric.trunc() as i64)
+                json!(
+                    i64::try_from(
+                        integral_float(numeric.trunc())
+                            .context("converter output is not an integer")?
+                    )
+                    .context("converter output exceeds signed integer range")?
+                )
             } else {
                 translated
             };
@@ -1617,7 +1698,7 @@ impl NodeMap {
                     "unsupported integer register size"
                 );
                 let (shift, bits) = if n.kind == "MaskedIntReg" {
-                    self.mask(n, len)?
+                    Self::mask(n, len)?
                 } else {
                     (0, len * 8)
                 };
@@ -1631,7 +1712,7 @@ impl NodeMap {
                             (1i64 << (bits - 1)) - 1
                         );
                     }
-                    (i as u64) & bit_mask(bits)
+                    i.cast_unsigned() & bit_mask(bits)
                 } else {
                     let u = unsigned_integer(&translated)?;
                     ensure!(
@@ -1665,17 +1746,22 @@ impl NodeMap {
                 let v = number(&translated)?;
                 match len {
                     4 => {
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "float32 registers round to binary32; overflow and nonzero underflow are rejected below"
+                        )]
+                        let stored = v as f32;
                         ensure!(
-                            (v as f32).is_finite(),
+                            stored.is_finite(),
                             "{name} exceeds the float32 range (maximum magnitude {})",
                             f32::MAX
                         );
                         ensure!(
-                            v == 0.0 || v as f32 != 0.0,
+                            v == 0.0 || stored != 0.0,
                             "{name} is too small for a nonzero float32 value; use 0 or a representable value (smallest magnitude {})",
                             f32::from_bits(1)
                         );
-                        encode_integer((v as f32).to_bits() as u64, 4, n.big_endian())
+                        encode_integer(u64::from(stored.to_bits()), 4, n.big_endian())
                     }
                     8 => encode_integer(v.to_bits(), 8, n.big_endian()),
                     _ => bail!("unsupported float register size"),
@@ -1706,13 +1792,9 @@ impl NodeMap {
         let node = self.node(name, depth)?;
         match node.kind.as_str() {
             "Integer" | "IntReg" | "MaskedIntReg" | "IntConverter" => Ok(true),
-            "Float" | "Converter" => {
-                if let Some(link) = node.prop("pValue") {
-                    self.integer_target(link, depth + 1)
-                } else {
-                    Ok(false)
-                }
-            }
+            "Float" | "Converter" => node
+                .prop("pValue")
+                .map_or_else(|| Ok(false), |link| self.integer_target(link, depth + 1)),
             _ => Ok(false),
         }
     }
@@ -1733,7 +1815,7 @@ impl NodeMap {
         }
         Ok(false)
     }
-    pub fn execute(&self, io: &mut dyn RegisterIo, name: &str) -> Result<()> {
+    pub(crate) fn execute(&self, io: &mut dyn RegisterIo, name: &str) -> Result<()> {
         self.access(io, name, true, 0)?;
         let n = self.node(name, 0)?;
         ensure!(n.kind == "Command", "{name} is not a command");
@@ -1749,11 +1831,11 @@ impl NodeMap {
         n.stored.borrow_mut().insert(index, v);
         Ok(())
     }
-    /// Poll a command's IsDone after `execute`: its target reads back
+    /// Poll a command's `IsDone` after `execute`: its target reads back
     /// something other than the command value. A write-only or floating
     /// command, or a target that cannot be read, counts as done. Returns
     /// false if the command is still running at `timeout`.
-    pub fn wait_done(
+    pub(crate) fn wait_done(
         &self,
         io: &mut dyn RegisterIo,
         name: &str,
@@ -1840,7 +1922,7 @@ impl NodeMap {
         }
     }
     fn find_entry<'a>(&'a self, name: &str, n: &'a Node, symbol: &str) -> Option<&'a str> {
-        self.enum_entries(n).into_iter().find(|entry| {
+        Self::enum_entries(n).into_iter().find(|entry| {
             self.nodes.get(*entry).is_some_and(|en| {
                 symbol == *entry
                     || symbol
@@ -1857,8 +1939,8 @@ impl NodeMap {
             literal(en.prop("Value").context("enumeration entry has no value")?)
         }
     }
-    /// Evaluate one of the node's formulas: as `f64` for SwissKnife and
-    /// Converter nodes, as `i64` for IntSwissKnife and IntConverter nodes.
+    /// Evaluate one of the node's formulas: as `f64` for `SwissKnife` and
+    /// Converter nodes, as `i64` for `IntSwissKnife` and `IntConverter` nodes.
     fn formula<T: Operand>(
         &self,
         io: &mut dyn RegisterIo,
@@ -1900,14 +1982,14 @@ impl NodeMap {
     }
 }
 /// Whether an element names another node: a `p` link, or a register's
-/// embedded address IntSwissKnife.
+/// embedded address `IntSwissKnife`.
 fn node_link(tag: &str) -> bool {
     tag.starts_with('p') || tag == "IntSwissKnife"
 }
 fn fields_has(fields: &[Element], tag: &str) -> bool {
     fields.iter().any(|p| p.tag == tag)
 }
-fn bit_mask(bits: usize) -> u64 {
+const fn bit_mask(bits: usize) -> u64 {
     if bits == 64 {
         u64::MAX
     } else {
@@ -1916,11 +1998,11 @@ fn bit_mask(bits: usize) -> u64 {
 }
 fn decode_integer(b: &[u8], big: bool) -> u64 {
     if big {
-        b.iter().fold(0, |v, b| (v << 8) | *b as u64)
+        b.iter().fold(0, |v, b| (v << 8) | u64::from(*b))
     } else {
         b.iter()
             .enumerate()
-            .fold(0, |v, (i, b)| v | ((*b as u64) << (i * 8)))
+            .fold(0, |v, (i, b)| v | (u64::from(*b) << (i * 8)))
     }
 }
 fn encode_integer(v: u64, len: usize, big: bool) -> Vec<u8> {
@@ -1941,6 +2023,7 @@ fn number(v: &Value) -> Result<f64> {
 fn integer_kind(kind: &str) -> bool {
     matches!(kind, "Integer" | "IntReg" | "MaskedIntReg" | "IntConverter")
 }
+
 fn numeric_equal(a: &Value, b: &Value) -> Result<bool> {
     let integer = |value: &Value| {
         value
@@ -1952,7 +2035,7 @@ fn numeric_equal(a: &Value, b: &Value) -> Result<bool> {
         (Some(a), Some(b)) => Ok(a == b),
         (Some(integer), None) | (None, Some(integer)) => {
             let value = number(if a.is_i64() || a.is_u64() { b } else { a })?;
-            Ok(value.fract() == 0.0 && value.abs() <= u64::MAX as f64 && value as i128 == integer)
+            Ok(integral_float(value).is_some_and(|value| value == integer))
         }
         (None, None) => Ok(number(a)? == number(b)?),
     }
@@ -1960,14 +2043,25 @@ fn numeric_equal(a: &Value, b: &Value) -> Result<bool> {
 fn input_value(name: &str, kind: &str, text: &str) -> Result<Value> {
     match kind {
         "String" | "StringReg" | "Enumeration" => Ok(json!(text)),
-        "Boolean" => match text.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "on" => Ok(json!(true)),
-            "false" | "0" | "off" => Ok(json!(false)),
-            _ => Err(Usage(format!(
-                "{name} must be true or false (also accepts 1/0 and on/off)"
-            ))
-            .into()),
-        },
+        "Boolean" => {
+            let text = text.trim();
+            [
+                ("true", true),
+                ("1", true),
+                ("on", true),
+                ("false", false),
+                ("0", false),
+                ("off", false),
+            ]
+            .into_iter()
+            .find_map(|(word, value)| text.eq_ignore_ascii_case(word).then_some(json!(value)))
+            .ok_or_else(|| {
+                Usage(format!(
+                    "{name} must be true or false (also accepts 1/0 and on/off)"
+                ))
+                .into()
+            })
+        }
         "Command" => Err(Usage(format!("use exec for command {name}")).into()),
         _ if integer_kind(kind) => integer_literal(text)
             .map_err(|error| Usage(format!("{name} requires an exact integer: {error:#}")).into()),
@@ -1979,11 +2073,10 @@ fn input_value(name: &str, kind: &str, text: &str) -> Result<Value> {
 /// rounding through f64. The allowed range covers signed and unsigned registers.
 fn integer_literal(text: &str) -> Result<Value> {
     let text = text.trim();
-    let (negative, body) = if let Some(body) = text.strip_prefix('-') {
-        (true, body)
-    } else {
-        (false, text.strip_prefix('+').unwrap_or(text))
-    };
+    let (negative, body) = text.strip_prefix('-').map_or_else(
+        || (false, text.strip_prefix('+').unwrap_or(text)),
+        |body| (true, body),
+    );
     let magnitude = if let Some(hex) = body.strip_prefix("0x").or_else(|| body.strip_prefix("0X")) {
         u64::from_str_radix(hex, 16).context("invalid hexadecimal integer or integer overflow")?
     } else {
@@ -1991,7 +2084,7 @@ fn integer_literal(text: &str) -> Result<Value> {
         let mantissa = parts.next().unwrap_or("");
         let exponent = parts
             .next()
-            .map(|s| s.parse::<i32>())
+            .map(str::parse::<i32>)
             .transpose()
             .context("invalid integer exponent")?
             .unwrap_or(0);
@@ -2008,38 +2101,52 @@ fn integer_literal(text: &str) -> Result<Value> {
                     .all(|b| b.is_ascii_digit()),
             "expected a decimal or hexadecimal integer"
         );
-        let mut digits = format!("{whole}{fraction}")
-            .trim_start_matches('0')
-            .to_owned();
+        let significant_whole = whole.trim_start_matches('0');
+        let significant_fraction = if significant_whole.is_empty() {
+            fraction.trim_start_matches('0')
+        } else {
+            fraction
+        };
+        let mut digits =
+            String::with_capacity(significant_whole.len() + significant_fraction.len());
+        digits.push_str(significant_whole);
+        digits.push_str(significant_fraction);
         if digits.is_empty() {
             return Ok(json!(0));
         }
-        let shift = i64::from(exponent) - fraction.len() as i64;
+        let fractional_digits =
+            i64::try_from(fraction.len()).context("integer exponent overflow")?;
+        let shift = i64::from(exponent)
+            .checked_sub(fractional_digits)
+            .context("integer exponent overflow")?;
         if shift < 0 {
-            let remove = usize::try_from(-shift).context("integer exponent overflow")?;
+            let remove =
+                usize::try_from(shift.unsigned_abs()).context("integer exponent overflow")?;
             ensure!(
-                remove <= digits.len()
-                    && digits[digits.len() - remove..].bytes().all(|b| b == b'0'),
+                remove <= digits.len() && digits.bytes().rev().take(remove).all(|b| b == b'0'),
                 "fractional values are not allowed"
             );
             digits.truncate(digits.len() - remove);
         } else {
+            let shift = usize::try_from(shift).context("integer overflow")?;
             ensure!(
-                shift <= 20 && digits.len() + shift as usize <= 20,
+                shift <= 20 && digits.len() <= 20 - shift,
                 "integer overflow"
             );
-            digits.extend(std::iter::repeat_n('0', shift as usize));
+            digits.extend(std::iter::repeat_n('0', shift));
         }
         digits.parse::<u64>().context("integer overflow")?
     };
     if negative {
         let value = -i128::from(magnitude);
-        ensure!(value >= i128::from(i64::MIN), "signed integer overflow");
-        Ok(json!(value as i64))
+        Ok(json!(
+            i64::try_from(value).context("signed integer overflow")?
+        ))
     } else {
         Ok(json!(magnitude))
     }
 }
+#[deny(clippy::cast_precision_loss)]
 fn exact_integer(value: &Value) -> Result<i128> {
     if let Some(value) = value.as_i64() {
         return Ok(i128::from(value));
@@ -2049,18 +2156,18 @@ fn exact_integer(value: &Value) -> Result<i128> {
     }
     let value = value.as_f64().context("expected an integer")?;
     ensure!(
-        value.is_finite() && value.fract() == 0.0 && value.abs() <= (1u64 << 53) as f64,
+        value.abs() <= EXACT_INTEGER_LIMIT,
         "expected an exactly representable integer"
     );
-    Ok(value as i128)
+    integral_float(value).context("expected an exactly representable integer")
 }
 fn validate_numeric(
     name: &str,
     kind: &str,
     value: &Value,
-    min: Option<Value>,
-    max: Option<Value>,
-    inc: Option<Value>,
+    min: Option<&Value>,
+    max: Option<&Value>,
+    inc: Option<&Value>,
 ) -> Result<()> {
     let out_of_range = |message: String, nearest: Value| -> anyhow::Error {
         Categorized::new(ErrorKind::OutOfRange, message)
@@ -2076,10 +2183,10 @@ fn validate_numeric(
     };
     if integer_kind(kind) {
         let value = exact_integer(value).with_context(|| format!("{name} requires an integer"))?;
-        let min = min.as_ref().map(exact_integer).transpose()?;
-        let max = max.as_ref().map(exact_integer).transpose()?;
+        let min = min.map(exact_integer).transpose()?;
+        let max = max.map(exact_integer).transpose()?;
         ensure!(
-            !min.zip(max).is_some_and(|(low, high)| low > high),
+            min.zip(max).is_none_or(|(low, high)| low <= high),
             "{name} has invalid camera bounds"
         );
         if let Some(min) = min
@@ -2098,7 +2205,7 @@ fn validate_numeric(
                 json!(max),
             ));
         }
-        if let Some(inc) = inc.as_ref().map(exact_integer).transpose()? {
+        if let Some(inc) = inc.map(exact_integer).transpose()? {
             ensure!(inc > 0, "{name} has invalid camera increment {inc}");
             let base = min.unwrap_or(0);
             if (value - base) % inc != 0 {
@@ -2117,10 +2224,10 @@ fn validate_numeric(
         }
     } else {
         let value = number(value)?;
-        let min = min.as_ref().map(number).transpose()?;
-        let max = max.as_ref().map(number).transpose()?;
+        let min = min.map(number).transpose()?;
+        let max = max.map(number).transpose()?;
         ensure!(
-            !min.zip(max).is_some_and(|(low, high)| low > high),
+            min.zip(max).is_none_or(|(low, high)| low <= high),
             "{name} has invalid camera bounds"
         );
         if let Some(min) = min
@@ -2144,27 +2251,31 @@ fn validate_numeric(
     }
     Ok(())
 }
+#[deny(clippy::cast_precision_loss)]
 fn signed_integer(v: &Value) -> Result<i64> {
     if let Some(value) = v.as_i64() {
         return Ok(value);
     }
     let n = number(v)?;
     ensure!(
-        n.fract() == 0.0 && n.abs() <= (1u64 << 53) as f64,
+        n.abs() <= EXACT_INTEGER_LIMIT,
         "expected exact signed integer"
     );
-    Ok(n as i64)
+    i64::try_from(integral_float(n).context("expected exact signed integer")?)
+        .context("expected exact signed integer")
 }
+#[deny(clippy::cast_precision_loss)]
 fn unsigned_integer(v: &Value) -> Result<u64> {
     if let Some(value) = v.as_u64() {
         return Ok(value);
     }
     let n = number(v)?;
     ensure!(
-        n.fract() == 0.0 && n >= 0.0 && n <= (1u64 << 53) as f64,
+        (0.0..=EXACT_INTEGER_LIMIT).contains(&n),
         "expected exact unsigned integer"
     );
-    Ok(n as u64)
+    u64::try_from(integral_float(n).context("expected exact unsigned integer")?)
+        .context("expected exact unsigned integer")
 }
 fn unsigned(v: &Value) -> Result<u64> {
     v.as_u64()
@@ -2201,25 +2312,32 @@ fn literal(s: &str) -> Result<Value> {
 }
 /// Decode a raw XML file or an in-memory ZIP, without writing device-provided paths.
 #[cfg(any(feature = "usb", test))]
-pub fn decode_xml(data: &[u8]) -> Result<String> {
-    use std::io::{Cursor, Read};
+pub(crate) fn decode_xml(data: &[u8]) -> Result<String> {
+    use std::io::{Cursor, Read as _};
     ensure!(data.len() <= MAX_XML, "GenICam file exceeds 32 MiB limit");
     let bytes = if data.starts_with(b"PK\x03\x04") {
         let mut archive = zip::ZipArchive::new(Cursor::new(data)).context("invalid GenICam ZIP")?;
         // Like the reference implementation, take the first file, preferring
         // one named *.xml when the archive also holds other files.
-        let files = (0..archive.len())
-            .filter_map(|i| {
-                let file = archive.by_index(i).ok()?;
-                (!file.is_dir()).then(|| (i, file.name().to_ascii_lowercase().ends_with(".xml")))
-            })
-            .collect::<Vec<_>>();
-        let (index, _) = files
-            .iter()
-            .find(|(_, xml)| *xml)
-            .or(files.first())
-            .copied()
-            .context("GenICam ZIP contains no file")?;
+        let mut selected = None;
+        for index in 0..archive.len() {
+            let Ok(file) = archive.by_index(index) else {
+                continue;
+            };
+            if file.is_dir() {
+                continue;
+            }
+            selected.get_or_insert(index);
+            if file
+                .name()
+                .rsplit_once('.')
+                .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("xml"))
+            {
+                selected = Some(index);
+                break;
+            }
+        }
+        let index = selected.context("GenICam ZIP contains no file")?;
         let file = archive.by_index(index)?;
         ensure!(
             file.size() <= MAX_XML as u64,
@@ -2235,18 +2353,20 @@ pub fn decode_xml(data: &[u8]) -> Result<String> {
     } else {
         data.to_vec()
     };
-    let xml = String::from_utf8(bytes).context("GenICam XML is not UTF-8")?;
-    Ok(xml
-        .trim_start_matches('\u{feff}')
-        .trim_end_matches('\0')
-        .to_string())
+    let mut xml = String::from_utf8(bytes).context("GenICam XML is not UTF-8")?;
+    let prefix = xml.len() - xml.trim_start_matches('\u{feff}').len();
+    if prefix != 0 {
+        xml.replace_range(..prefix, "");
+    }
+    xml.truncate(xml.trim_end_matches('\0').len());
+    Ok(xml)
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum Token {
+enum Token<'a> {
     Num(Value),
-    Name(String),
-    Op(String),
+    Name(&'a str),
+    Op(&'static str),
     L,
     R,
     Q,
@@ -2254,8 +2374,8 @@ enum Token {
     Comma,
     End,
 }
-/// Formula arithmetic. GenApi evaluates SwissKnife and Converter formulas in
-/// `f64`, and IntSwissKnife and IntConverter formulas in 64-bit integers.
+/// Formula arithmetic. `GenApi` evaluates `SwissKnife` and Converter formulas in
+/// `f64`, and `IntSwissKnife` and `IntConverter` formulas in 64-bit integers.
 trait Operand: Copy + Default {
     const INTEGER: bool;
     fn literal(value: &Value) -> Result<Self>;
@@ -2270,10 +2390,10 @@ trait Operand: Copy + Default {
 }
 impl Operand for f64 {
     const INTEGER: bool = false;
-    fn literal(value: &Value) -> Result<f64> {
+    fn literal(value: &Value) -> Result<Self> {
         number(value)
     }
-    fn variable(value: &Value) -> Result<f64> {
+    fn variable(value: &Value) -> Result<Self> {
         number(value)
     }
     fn truth(self) -> bool {
@@ -2282,25 +2402,26 @@ impl Operand for f64 {
     fn finite(self) -> bool {
         self.is_finite()
     }
-    fn boolean(value: bool) -> f64 {
-        value as u8 as f64
+    fn boolean(value: bool) -> Self {
+        Self::from(u8::from(value))
     }
-    fn constant(name: &str) -> Option<f64> {
+    fn constant(name: &str) -> Option<Self> {
         match name {
             "PI" => Some(std::f64::consts::PI),
             "E" => Some(std::f64::consts::E),
             _ => None,
         }
     }
-    fn unary(op: &str, value: f64) -> Result<f64> {
+    fn unary(op: &str, value: Self) -> Result<Self> {
         Ok(match op {
             "+" => value,
             "-" => -value,
-            "!" => f64::boolean(value == 0.0),
-            _ => (!bits(value)?) as f64,
+            "!" => Self::boolean(value == 0.0),
+            "~" => (!bits(value)?) as Self,
+            _ => bail!("unsupported formula unary operator {op}"),
         })
     }
-    fn binary(op: &str, lhs: f64, rhs: f64) -> Result<f64> {
+    fn binary(op: &str, lhs: Self, rhs: Self) -> Result<Self> {
         let value = match op {
             "+" => lhs + rhs,
             "-" => lhs - rhs,
@@ -2314,16 +2435,16 @@ impl Operand for f64 {
                 lhs % rhs
             }
             "**" => lhs.powf(rhs),
-            "&" | "|" | "^" | "<<" | ">>" => i64::binary(op, bits(lhs)?, bits(rhs)?)? as f64,
-            _ => f64::boolean(comparison(op, lhs, rhs)),
+            "&" | "|" | "^" | "<<" | ">>" => i64::binary(op, bits(lhs)?, bits(rhs)?)? as Self,
+            _ => Self::boolean(comparison(op, lhs, rhs)?),
         };
         ensure!(value.is_finite(), "non-finite formula result");
         Ok(value)
     }
-    fn call(name: &str, args: &[f64]) -> Result<f64> {
+    fn call(name: &str, args: &[Self]) -> Result<Self> {
         let x = args[0];
         Ok(match name {
-            "SGN" => f64::boolean(x > 0.0) - f64::boolean(x < 0.0),
+            "SGN" => Self::boolean(x > 0.0) - Self::boolean(x < 0.0),
             "NEG" => -x,
             "ABS" => x.abs(),
             "EXP" => x.exp(),
@@ -2353,33 +2474,32 @@ impl Operand for f64 {
     }
 }
 /// Integer formulas wrap on overflow like the C `int64_t` arithmetic of
-/// GenApi implementations, and divide with truncation toward zero.
+/// `GenApi` implementations, and divide with truncation toward zero.
 impl Operand for i64 {
     const INTEGER: bool = true;
-    fn literal(value: &Value) -> Result<i64> {
+    fn literal(value: &Value) -> Result<Self> {
         if value.is_f64() {
             ensure!(
                 number(value)?.fract() == 0.0,
                 "integer formula cannot use fractional literal {value}"
             );
         }
-        i64::variable(value)
+        Self::variable(value)
     }
     /// Unsigned 64-bit registers keep their bit pattern, and Float values round
-    /// to the nearest integer, as GenApi's integer references do.
-    fn variable(value: &Value) -> Result<i64> {
+    /// to the nearest integer, as `GenApi`'s integer references do.
+    #[deny(clippy::cast_precision_loss)]
+    fn variable(value: &Value) -> Result<Self> {
         if let Some(v) = value.as_i64() {
             return Ok(v);
         }
         if let Some(v) = value.as_u64() {
-            return Ok(v as i64);
+            return Ok(v.cast_signed());
         }
         let v = number(value)?.round();
-        ensure!(
-            v >= i64::MIN as f64 && v < i64::MAX as f64,
-            "integer formula value {v} exceeds the 64-bit range"
-        );
-        Ok(v as i64)
+        integral_float(v)
+            .and_then(|integer| Self::try_from(integer).ok())
+            .with_context(|| format!("integer formula value {v} exceeds the 64-bit range"))
     }
     fn truth(self) -> bool {
         self != 0
@@ -2387,21 +2507,22 @@ impl Operand for i64 {
     fn finite(self) -> bool {
         true
     }
-    fn boolean(value: bool) -> i64 {
+    fn boolean(value: bool) -> Self {
         value.into()
     }
-    fn constant(_: &str) -> Option<i64> {
+    fn constant(_: &str) -> Option<Self> {
         None
     }
-    fn unary(op: &str, value: i64) -> Result<i64> {
+    fn unary(op: &str, value: Self) -> Result<Self> {
         Ok(match op {
             "+" => value,
             "-" => value.wrapping_neg(),
-            "!" => i64::boolean(value == 0),
-            _ => !value,
+            "!" => Self::boolean(value == 0),
+            "~" => !value,
+            _ => bail!("unsupported formula unary operator {op}"),
         })
     }
-    fn binary(op: &str, lhs: i64, rhs: i64) -> Result<i64> {
+    fn binary(op: &str, lhs: Self, rhs: Self) -> Result<Self> {
         Ok(match op {
             "+" => lhs.wrapping_add(rhs),
             "-" => lhs.wrapping_sub(rhs),
@@ -2425,10 +2546,10 @@ impl Operand for i64 {
                 ensure!((0..64).contains(&rhs), "invalid formula shift");
                 if op == "<<" { lhs << rhs } else { lhs >> rhs }
             }
-            _ => i64::boolean(comparison(op, lhs, rhs)),
+            _ => Self::boolean(comparison(op, lhs, rhs)?),
         })
     }
-    fn call(name: &str, args: &[i64]) -> Result<i64> {
+    fn call(name: &str, args: &[Self]) -> Result<Self> {
         let x = args[0];
         Ok(match name {
             "SGN" => x.signum(),
@@ -2440,7 +2561,7 @@ impl Operand for i64 {
 }
 /// The standard formula functions and how many arguments each takes. Only SGN
 /// and NEG are standard in integer formulas; ABS is also accepted there
-/// because vendor XMLs use it in IntSwissKnife nodes.
+/// because vendor XMLs use it in `IntSwissKnife` nodes.
 fn function(name: &str, integer: bool) -> Result<std::ops::RangeInclusive<usize>> {
     let arity = match name {
         "SGN" | "NEG" | "ABS" => return Ok(1..=1),
@@ -2455,16 +2576,16 @@ fn function(name: &str, integer: bool) -> Result<std::ops::RangeInclusive<usize>
     );
     Ok(arity)
 }
-fn comparison<T: PartialOrd>(op: &str, lhs: T, rhs: T) -> bool {
-    match op {
+fn comparison<T: PartialOrd + Copy>(op: &str, lhs: T, rhs: T) -> Result<bool> {
+    Ok(match op {
         "==" | "=" => lhs == rhs,
         "!=" | "<>" => lhs != rhs,
         "<" => lhs < rhs,
         ">" => lhs > rhs,
         "<=" => lhs <= rhs,
         ">=" => lhs >= rhs,
-        _ => unreachable!(),
-    }
+        _ => bail!("unsupported formula binary operator {op}"),
+    })
 }
 fn evaluate<T: Operand>(expression: &str, vars: &BTreeMap<String, T>) -> Result<T> {
     evaluate_with(expression, vars, &BTreeMap::new())
@@ -2512,7 +2633,11 @@ fn evaluate_with<T: Operand>(
                     }
                 }
             }
-            tokens.push(Token::Num(literal(&expression[start..i])?));
+            tokens.push(Token::Num(literal(
+                expression
+                    .get(start..i)
+                    .context("invalid formula literal boundary")?,
+            )?));
             continue;
         }
         if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
@@ -2524,16 +2649,28 @@ fn evaluate_with<T: Operand>(
             {
                 i += 1;
             }
-            tokens.push(Token::Name(expression[start..i].into()));
+            tokens.push(Token::Name(
+                expression
+                    .get(start..i)
+                    .context("invalid formula name boundary")?,
+            ));
             continue;
         }
-        if i + 1 < bytes.len()
-            && matches!(
-                &expression[i..i + 2],
-                "<<" | ">>" | "<=" | ">=" | "==" | "!=" | "<>" | "&&" | "||" | "**"
-            )
-        {
-            tokens.push(Token::Op(expression[i..i + 2].into()));
+        let double = match (bytes[i], bytes.get(i + 1).copied()) {
+            (b'<', Some(b'<')) => Some("<<"),
+            (b'>', Some(b'>')) => Some(">>"),
+            (b'<', Some(b'=')) => Some("<="),
+            (b'>', Some(b'=')) => Some(">="),
+            (b'=', Some(b'=')) => Some("=="),
+            (b'!', Some(b'=')) => Some("!="),
+            (b'<', Some(b'>')) => Some("<>"),
+            (b'&', Some(b'&')) => Some("&&"),
+            (b'|', Some(b'|')) => Some("||"),
+            (b'*', Some(b'*')) => Some("**"),
+            _ => None,
+        };
+        if let Some(op) = double {
+            tokens.push(Token::Op(op));
             i += 2;
             continue;
         }
@@ -2543,8 +2680,19 @@ fn evaluate_with<T: Operand>(
             b'?' => Token::Q,
             b':' => Token::Colon,
             b',' => Token::Comma,
-            b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' | b'~' | b'!' | b'<' | b'>'
-            | b'=' => Token::Op((bytes[i] as char).to_string()),
+            b'+' => Token::Op("+"),
+            b'-' => Token::Op("-"),
+            b'*' => Token::Op("*"),
+            b'/' => Token::Op("/"),
+            b'%' => Token::Op("%"),
+            b'&' => Token::Op("&"),
+            b'|' => Token::Op("|"),
+            b'^' => Token::Op("^"),
+            b'~' => Token::Op("~"),
+            b'!' => Token::Op("!"),
+            b'<' => Token::Op("<"),
+            b'>' => Token::Op(">"),
+            b'=' => Token::Op("="),
             _ => bail!("unsupported formula syntax at byte {i}"),
         });
         i += 1;
@@ -2567,7 +2715,7 @@ fn evaluate_with<T: Operand>(
     Ok(value)
 }
 struct Expr<'a, T> {
-    tokens: Vec<Token>,
+    tokens: Vec<Token<'a>>,
     pos: usize,
     vars: &'a BTreeMap<String, T>,
     expressions: &'a BTreeMap<String, String>,
@@ -2601,10 +2749,16 @@ impl<T: Operand> Expr<'_, T> {
                     self.pos += 1;
                     let name = n.to_ascii_uppercase();
                     let arity = function(&name, T::INTEGER)?;
-                    let mut args = vec![self.expr(0)?];
+                    let mut args = [T::default(); 2];
+                    args[0] = self.expr(0)?;
+                    let mut count = 1;
                     while self.tokens[self.pos] == Token::Comma {
                         self.pos += 1;
-                        args.push(self.expr(0)?);
+                        let value = self.expr(0)?;
+                        if let Some(argument) = args.get_mut(count) {
+                            *argument = value;
+                        }
+                        count += 1;
                     }
                     ensure!(
                         self.tokens[self.pos] == Token::R,
@@ -2612,18 +2766,18 @@ impl<T: Operand> Expr<'_, T> {
                     );
                     self.pos += 1;
                     ensure!(
-                        arity.contains(&args.len()),
+                        count <= args.len() && arity.contains(&count),
                         "wrong number of arguments for formula function {name}"
                     );
-                    self.compute(|| T::call(&name, &args))?
-                } else if let Some(&value) = self.vars.get(&n) {
+                    self.compute(|| T::call(&name, &args[..count]))?
+                } else if let Some(&value) = self.vars.get(n) {
                     value
-                } else if let Some(text) = self.expressions.get(&n) {
+                } else if let Some(text) = self.expressions.get(n) {
                     self.compute(|| {
                         evaluate(text, self.vars).with_context(|| format!("formula expression {n}"))
                     })?
                 } else {
-                    T::constant(&n).ok_or_else(|| anyhow!("unknown formula variable {n}"))?
+                    T::constant(n).ok_or_else(|| anyhow!("unknown formula variable {n}"))?
                 }
             }
             Token::L => {
@@ -2635,9 +2789,9 @@ impl<T: Operand> Expr<'_, T> {
                 self.pos += 1;
                 v
             }
-            Token::Op(op) if matches!(op.as_str(), "+" | "-" | "!" | "~") => {
+            Token::Op(op) if matches!(op, "+" | "-" | "!" | "~") => {
                 let v = self.expr(12)?;
-                self.compute(|| T::unary(&op, v))?
+                self.compute(|| T::unary(op, v))?
             }
             _ => bail!("expected formula operand"),
         })
@@ -2674,7 +2828,7 @@ impl<T: Operand> Expr<'_, T> {
             let Token::Op(op) = &self.tokens[self.pos] else {
                 break;
             };
-            let prec = match op.as_str() {
+            let prec = match *op {
                 "||" => 1,
                 "&&" => 2,
                 "|" => 3,
@@ -2691,17 +2845,17 @@ impl<T: Operand> Expr<'_, T> {
             if prec < min {
                 break;
             }
-            let op = op.clone();
+            let op = *op;
             self.pos += 1;
-            let decided = match op.as_str() {
+            let decided = match op {
                 "&&" => !lhs.truth(),
                 "||" => lhs.truth(),
                 _ => false,
             };
             let rhs = self.discard(decided, if op == "**" { prec } else { prec + 1 })?;
-            lhs = match op.as_str() {
+            lhs = match op {
                 "&&" | "||" => T::boolean(if decided { op == "||" } else { rhs.truth() }),
-                _ => self.compute(|| T::binary(&op, lhs, rhs))?,
+                _ => self.compute(|| T::binary(op, lhs, rhs))?,
             };
         }
         self.skip = skip;
@@ -2710,18 +2864,42 @@ impl<T: Operand> Expr<'_, T> {
     }
 }
 /// Bitwise operators truncate a floating-point operand toward zero, like the
-/// C conversion to `int64_t` in GenApi implementations.
+/// C conversion to `int64_t` in `GenApi` implementations.
+#[deny(clippy::cast_precision_loss)]
 fn bits(v: f64) -> Result<i64> {
-    ensure!(
-        v >= i64::MIN as f64 && v < i64::MAX as f64,
-        "bitwise formula operand outside the 64-bit integer range"
-    );
-    Ok(v.trunc() as i64)
+    integral_float(v.trunc())
+        .and_then(|integer| i64::try_from(integer).ok())
+        .context("bitwise formula operand outside the 64-bit integer range")
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unsupported_formula_operators_fail_closed_for_both_numeric_types() {
+        for operator in ["?", "//", "==="] {
+            for error in [
+                i64::unary(operator, 3).unwrap_err(),
+                f64::unary(operator, 3.0).unwrap_err(),
+            ] {
+                assert_eq!(
+                    error.to_string(),
+                    format!("unsupported formula unary operator {operator}")
+                );
+            }
+            for error in [
+                i64::binary(operator, 3, 2).unwrap_err(),
+                f64::binary(operator, 3.0, 2.0).unwrap_err(),
+            ] {
+                assert_eq!(
+                    error.to_string(),
+                    format!("unsupported formula binary operator {operator}")
+                );
+            }
+        }
+    }
+
     use super::*;
+    use std::fmt::Write as _;
     use std::io::Cursor;
     #[test]
     fn image_geometry_and_format_are_locked_while_streaming() {
@@ -2818,11 +2996,11 @@ mod tests {
         let mut io = Memory::default();
         m.set(&mut io, "LineSelector", "Line1").unwrap();
         m.set(&mut io, "LineMode", "Output").unwrap();
-        assert_eq!(io.read_memory(0x10380024, 4).unwrap(), [1, 0, 0, 0]);
-        assert_eq!(io.read_memory(0x10380020, 4).unwrap(), [0; 4]);
+        assert_eq!(io.read_memory(0x1038_0024, 4).unwrap(), [1, 0, 0, 0]);
+        assert_eq!(io.read_memory(0x1038_0020, 4).unwrap(), [0; 4]);
         assert_eq!(m.selectors("LineMode"), ["LineSelector"]);
         assert_eq!(m.get(&mut io, "RegLineMode_Offset").unwrap(), 4);
-        io.write_memory(0x00800004, &[2, 0, 0, 0]).unwrap();
+        io.write_memory(0x0080_0004, &[2, 0, 0, 0]).unwrap();
         assert_eq!(m.get(&mut io, "RegDeviceVendorNameImpl").unwrap(), 0);
         assert_eq!(m.get(&mut io, "RegDeviceVendorNameAvail").unwrap(), 1);
         io.write_memory(0x2010, &[9, 0, 0, 0]).unwrap();
@@ -2936,6 +3114,40 @@ mod tests {
         assert!(m.is_writable(&mut io, "Table"));
     }
     #[test]
+    fn indexed_values_validate_integers_before_float_rounding() {
+        for selector in ["9007199254740993", "-9007199254740993"] {
+            let m = map(&format!(
+                "<Integer Name='Selector'><Value>{selector}</Value></Integer><Integer Name='Table'><pIndex>Selector</pIndex><ValueIndexed Index='9007199254740992'>1</ValueIndexed><ValueDefault>2</ValueDefault></Integer>"
+            ));
+            let error = m.get(&mut Memory::default(), "Table").unwrap_err();
+            assert!(format!("{error:#}").contains("selector is not an exact integer"));
+        }
+        for index in [
+            "9007199254740993",
+            "-9007199254740993",
+            "9007199254740992.1",
+            "-9007199254740992.1",
+            "9007199254740993e0",
+        ] {
+            let m = map(&format!(
+                "<Integer Name='Selector'><Value>0</Value></Integer><Integer Name='Table'><pIndex>Selector</pIndex><ValueIndexed Index='{index}'>1</ValueIndexed><ValueDefault>2</ValueDefault></Integer>"
+            ));
+            let error = m.get(&mut Memory::default(), "Table").unwrap_err();
+            assert!(format!("{error:#}").contains("Index is not an exact integer"));
+        }
+        for index in [
+            "9007199254740992",
+            "-9007199254740992",
+            "9.007199254740992e15",
+            "0x20000000000000",
+        ] {
+            let m = map(&format!(
+                "<Integer Name='Selector'><Value>{index}</Value></Integer><Integer Name='Table'><pIndex>Selector</pIndex><ValueIndexed Index='{index}'>1</ValueIndexed><ValueDefault>2</ValueDefault></Integer>"
+            ));
+            assert_eq!(m.get(&mut Memory::default(), "Table").unwrap(), 1);
+        }
+    }
+    #[test]
     fn indexed_value_routes_read_write_and_default_without_changing_register_indexing() {
         let m = map(
             "<Integer Name='Selector'><pValue>S</pValue></Integer><IntReg Name='S'><Address>0</Address><Length>4</Length></IntReg><Integer Name='Mux'><pIndex>Selector</pIndex><pValueIndexed Index='1'>A</pValueIndexed><pValueIndexed Index='2'>B</pValueIndexed><pValueDefault>Default</pValueDefault></Integer><IntReg Name='A'><Address>16</Address><Length>4</Length></IntReg><IntReg Name='B'><Address>20</Address><Length>4</Length><AccessMode>RO</AccessMode></IntReg><IntReg Name='Default'><Address>32</Address><pIndex Offset='4'>Selector</pIndex><Length>4</Length></IntReg>",
@@ -2955,8 +3167,98 @@ mod tests {
         let missing = map(
             "<Integer Name='S'><Value>3</Value></Integer><Integer Name='Mux'><pIndex>S</pIndex><pValueIndexed Index='1'>S</pValueIndexed></Integer>",
         );
-        assert!(missing.get(&mut io, "Mux").is_err());
+        missing.get(&mut io, "Mux").unwrap_err();
     }
+    #[test]
+    fn float_register_reads_preserve_width_and_byte_order() {
+        for (endian, big) in [("LittleEndian", false), ("BigEndian", true)] {
+            for (length, bytes, expected) in [
+                (
+                    4,
+                    if big {
+                        (-2.5f32).to_be_bytes()
+                    } else {
+                        (-2.5f32).to_le_bytes()
+                    }
+                    .to_vec(),
+                    -2.5,
+                ),
+                (
+                    8,
+                    if big {
+                        f64::MIN_POSITIVE.to_be_bytes()
+                    } else {
+                        f64::MIN_POSITIVE.to_le_bytes()
+                    }
+                    .to_vec(),
+                    f64::MIN_POSITIVE,
+                ),
+            ] {
+                let m = map(&format!(
+                    "<FloatReg Name='R'><Address>0</Address><Length>{length}</Length><Endianess>{endian}</Endianess></FloatReg>"
+                ));
+                let mut io = Memory::default();
+                io.write_memory(0, &bytes).unwrap();
+                assert_eq!(m.get(&mut io, "R").unwrap().as_f64(), Some(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_mask_indices_cannot_wrap_into_the_register() {
+        for bit in [32, 1u64 << 32, (1u64 << 32) + 3, u64::MAX] {
+            for mask in [
+                format!("<Bit>{bit}</Bit>"),
+                format!("<LSB>0</LSB><MSB>{bit}</MSB>"),
+                format!("<LSB>{bit}</LSB><MSB>31</MSB>"),
+            ] {
+                let m = map(&format!(
+                    "<MaskedIntReg Name='R'><Address>0</Address><Length>4</Length>{mask}</MaskedIntReg>"
+                ));
+                let mut io = Memory::default();
+                io.write_memory(0, &[0xa5; 4]).unwrap();
+                assert!(m.get(&mut io, "R").is_err(), "accepted {mask}");
+                assert!(m.set(&mut io, "R", "1").is_err(), "accepted {mask}");
+                assert_eq!(io.read_memory(0, 4).unwrap(), [0xa5; 4]);
+            }
+        }
+    }
+
+    #[test]
+    fn exact_integer_literals_keep_their_signed_and_exponent_bounds() {
+        for (text, expected) in [
+            ("-9223372036854775808", json!(i64::MIN)),
+            ("-9.223372036854775808e18", json!(i64::MIN)),
+            ("1.8446744073709551615e19", json!(u64::MAX)),
+            ("100e-2", json!(1)),
+            ("1e19", json!(10_000_000_000_000_000_000u64)),
+            ("000001.0200e2", json!(102)),
+            ("000.0001200e5", json!(12)),
+            ("0001.000e0", json!(1)),
+            (".000010e5", json!(1)),
+            ("000.000e-2147483648", json!(0)),
+        ] {
+            assert_eq!(integer_literal(text).unwrap(), expected, "{text}");
+        }
+        for text in [
+            "-9223372036854775809",
+            "1e20",
+            "1e2147483647",
+            "1e-2147483648",
+            "000.0001200e4",
+            "0001.001e0",
+        ] {
+            assert!(integer_literal(text).is_err(), "accepted {text}");
+        }
+        let zeros = "0".repeat(65_536);
+        for text in [
+            format!("{zeros}1.00"),
+            format!("0.{zeros}1e{}", zeros.len() + 1),
+        ] {
+            assert_eq!(integer_literal(&text).unwrap(), 1);
+        }
+    }
+
     #[test]
     fn masked_boolean_preserves_other_bits() {
         let m = map(
@@ -3002,8 +3304,30 @@ mod tests {
         assert_eq!(io.read_memory(0, 4).unwrap(), [1, 2, 170, 4]);
     }
     #[test]
+    fn xml_decoding_preserves_text_while_removing_padding() {
+        use std::io::Write as _;
+
+        for prefix in ["", "\u{feff}", "\u{feff}\u{feff}"] {
+            for body in ["", "<XML/>", " <相机/>\n", "<XML>\0</XML>"] {
+                for suffix in ["", "\0", "\0\0"] {
+                    let padded = format!("{prefix}{body}{suffix}");
+                    assert_eq!(decode_xml(padded.as_bytes()).unwrap(), body);
+                    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+                    zip.start_file("Camera.xml", zip::write::SimpleFileOptions::default())
+                        .unwrap();
+                    zip.write_all(padded.as_bytes()).unwrap();
+                    assert_eq!(
+                        decode_xml(&zip.finish().unwrap().into_inner()).unwrap(),
+                        body
+                    );
+                }
+            }
+        }
+        decode_xml(b"\xef\xbb\xbf<XML>\xff</XML>\0").unwrap_err();
+    }
+    #[test]
     fn zip_xml_selects_the_first_xml_file() {
-        use std::io::Write;
+        use std::io::Write as _;
         let archive = |names: &[&str]| {
             let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
             for name in names {
@@ -3035,6 +3359,32 @@ mod tests {
             "<C/>"
         );
         assert_eq!(first(&[("Camera_1_0", "<D/>")]).unwrap(), "<D/>");
+        assert_eq!(
+            first(&[("first.data", "<First/>"), ("second.data", "<Second/>")]).unwrap(),
+            "<First/>"
+        );
+        for name in [
+            "Camera.xml",
+            "Camera.Xml",
+            "Camera.xMl",
+            "Camera.XML",
+            "相机.XML",
+        ] {
+            assert_eq!(
+                first(&[
+                    ("readme.txt", "notes"),
+                    (name, "<Selected/>"),
+                    ("later.xml", "<Later/>")
+                ])
+                .unwrap(),
+                "<Selected/>",
+                "{name}"
+            );
+        }
+        assert_eq!(
+            first(&[("Camera.xml.backup", "backup"), ("Camera.xml", "<XML/>")]).unwrap(),
+            "<XML/>"
+        );
         let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
         zip.add_directory("xml/", zip::write::SimpleFileOptions::default())
             .unwrap();
@@ -3050,9 +3400,9 @@ mod tests {
             "<Integer Name='Feature'><pValue>R</pValue><pIsAvailable>Available</pIsAvailable><pIsLocked>Locked</pIsLocked></Integer><Integer Name='Available'><Value>1</Value></Integer><Integer Name='Locked'><Value>1</Value></Integer><IntReg Name='R'><Address>0</Address><Length>4</Length></IntReg><Integer Name='Unavailable'><pValue>R</pValue><pIsAvailable>No</pIsAvailable></Integer><Integer Name='No'><Value>0</Value></Integer>",
         );
         let mut io = Memory::default();
-        assert!(m.get(&mut io, "Feature").is_ok());
+        m.get(&mut io, "Feature").unwrap();
         assert!(m.set(&mut io, "Feature", "3").is_err());
-        assert!(m.get(&mut io, "Unavailable").is_err());
+        m.get(&mut io, "Unavailable").unwrap_err();
     }
     #[test]
     fn features_omit_what_the_model_does_not_implement() {
@@ -3074,9 +3424,9 @@ mod tests {
             names(&m, &mut io),
             ["GainImpl", "GainReg", "Shutter", "ShutterReg"]
         );
-        assert!(m.get(&mut io, "Gain").is_err());
+        m.get(&mut io, "Gain").unwrap_err();
         io.write_memory(4, &[1, 0, 0, 0]).unwrap();
-        assert!(names(&m, &mut io).contains(&"Gain".to_string()));
+        assert!(names(&m, &mut io).contains(&"Gain".to_owned()));
     }
     #[test]
     fn availability_and_locks_are_told_apart_and_traced_to_their_inputs() {
@@ -3184,9 +3534,70 @@ mod tests {
         let mut io = Memory::default();
         m.set(&mut io, "Exposure", "100").unwrap();
         assert_eq!(m.get(&mut io, "Exposure").unwrap(), 100.0);
-        assert!(m.get(&mut io, "Loop").is_err());
+        m.get(&mut io, "Loop").unwrap_err();
         assert_eq!(m.bounds(&mut io, "Loop").unwrap(), Bounds::default());
     }
+    #[test]
+    fn excess_function_arguments_are_still_parsed_before_the_count_is_rejected() {
+        let vars = BTreeMap::new();
+        for (expression, message) in [
+            ("ROUND(1,2,3)", "wrong number of arguments"),
+            ("ROUND(1,2,1/0)", "formula division by zero"),
+            ("ROUND(1,2,3", "unclosed formula function"),
+            ("0 && ROUND(1,2,1/0)", "wrong number of arguments"),
+        ] {
+            let error = evaluate::<f64>(expression, &vars).unwrap_err();
+            assert!(
+                error.to_string().contains(message),
+                "{expression}: {error:#}"
+            );
+        }
+        let long = format!("ROUND(1{})", ",1".repeat(2_000));
+        let error = evaluate::<f64>(&long, &vars).unwrap_err();
+        assert!(
+            error.to_string().contains("wrong number of arguments"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn formula_operator_spellings_keep_their_meanings() {
+        let vars = BTreeMap::new();
+        for (expression, expected) in [
+            ("5+2", 7),
+            ("5-2", 3),
+            ("5*2", 10),
+            ("5/2", 2),
+            ("5%2", 1),
+            ("5&2", 0),
+            ("5|2", 7),
+            ("5^2", 7),
+            ("~5", -6),
+            ("!5", 0),
+            ("+5", 5),
+            ("-5", -5),
+            ("5<2", 0),
+            ("5>2", 1),
+            ("5=2", 0),
+            ("5<<2", 20),
+            ("5>>2", 1),
+            ("5<=5", 1),
+            ("5>=5", 1),
+            ("5==5", 1),
+            ("5!=2", 1),
+            ("5<>2", 1),
+            ("5&&2", 1),
+            ("0||2", 1),
+            ("5**2", 25),
+        ] {
+            assert_eq!(
+                evaluate::<i64>(expression, &vars).unwrap(),
+                expected,
+                "{expression}"
+            );
+        }
+    }
+
     #[test]
     fn formula_expressions_are_evaluated_where_they_are_used() {
         let m = map(concat!(
@@ -3236,10 +3647,17 @@ mod tests {
             evaluate("(X & 3) == 3 ? 0x10 + 2 * 4 : 0", &vars).unwrap(),
             24.0
         );
-        assert!(evaluate("UNKNOWN(X)", &vars).is_err());
+        evaluate("UNKNOWN(X)", &vars).unwrap_err();
         assert_eq!(evaluate("X=7 ? EXP(LN(1)) : 0", &vars).unwrap(), 1.0);
-        assert!(evaluate("X / 0", &vars).is_err());
-        assert!(evaluate("X + ", &vars).is_err());
+        evaluate("X / 0", &vars).unwrap_err();
+        evaluate("X + ", &vars).unwrap_err();
+        for expression in ["€", "X + €", "+é", "🚀", "Xé", "1 ** 🚀"] {
+            let error = evaluate(expression, &vars).unwrap_err();
+            assert!(
+                error.to_string().contains("non-ASCII formula syntax"),
+                "{expression}: {error}"
+            );
+        }
     }
     #[test]
     fn standard_formula_functions_and_constants() {
@@ -3284,8 +3702,8 @@ mod tests {
         }
         let integers = BTreeMap::from([("X".into(), -7i64)]);
         assert_eq!(evaluate::<i64>("SGN(X) * NEG(X)", &integers).unwrap(), -7);
-        assert!(evaluate::<i64>("PI", &integers).is_err());
-        assert!(evaluate::<i64>("X > 0 ? LG(X) : 0", &integers).is_err());
+        evaluate::<i64>("PI", &integers).unwrap_err();
+        evaluate::<i64>("X > 0 ? LG(X) : 0", &integers).unwrap_err();
 
         let m = map(concat!(
             "<Float Name='ShutterTemperature'><pValue>ShutterTemperatureValConv</pValue><Unit>K</Unit></Float>",
@@ -3321,22 +3739,23 @@ mod tests {
         assert_eq!(io.read_memory(0x30024, 4).unwrap(), 43u32.to_be_bytes());
 
         let chain = |levels: usize| {
-            let mut formula = "(0)".to_string();
+            let mut formula = "(0)".to_owned();
             for level in (1..=levels).rev() {
                 formula = format!("(TO={level})?({level}):({formula})");
             }
             formula
         };
-        let vars = BTreeMap::from([("TO".to_string(), 90i64)]);
+        let vars = BTreeMap::from([("TO".to_owned(), 90i64)]);
         assert_eq!(evaluate(&chain(100), &vars).unwrap(), 90);
         assert_eq!(
             evaluate(&chain(100).replace(['(', ')'], ""), &vars).unwrap(),
             90
         );
-        let flat = (1..=1000)
-            .map(|level| format!("TO={level}?{level}:"))
-            .collect::<String>()
-            + "0";
+        let mut flat = String::new();
+        for level in 1..=1000 {
+            let _ = write!(flat, "TO={level}?{level}:");
+        }
+        flat.push('0');
         assert_eq!(evaluate(&flat, &vars).unwrap(), 90);
         for deep in [
             format!("{}1{}", "(".repeat(200), ")".repeat(200)),
@@ -3374,16 +3793,77 @@ mod tests {
         assert_eq!(int("(X = 0) || (10 / X > 1)", &[("X", 0)]).unwrap(), 1);
         let none = BTreeMap::new();
         assert_eq!(evaluate::<f64>("0 ? LN(-1) * 2 : 3", &none).unwrap(), 3.0);
-        assert!(int("1 ? 1 / 0 : 0", &[]).is_err());
-        assert!(int("0 ? UNKNOWN : 0", &[]).is_err());
-        assert!(int("0 ? (1 : 0", &[]).is_err());
+        int("1 ? 1 / 0 : 0", &[]).unwrap_err();
+        int("0 ? UNKNOWN : 0", &[]).unwrap_err();
+        int("0 ? (1 : 0", &[]).unwrap_err();
     }
+    #[test]
+    fn mixed_integer_float_comparisons_keep_integer_boundaries() {
+        for (integer, float, equal) in [
+            (json!(u64::MAX), 18_446_744_073_709_551_616.0, false),
+            (json!(i64::MIN), -9_223_372_036_854_775_808.0, true),
+            (
+                json!(9_007_199_254_740_993u64),
+                9_007_199_254_740_992.0,
+                false,
+            ),
+            (json!(0), -0.0, true),
+            (json!(1), 1.5, false),
+        ] {
+            let float = json!(float);
+            assert_eq!(numeric_equal(&integer, &float).unwrap(), equal);
+            assert_eq!(numeric_equal(&float, &integer).unwrap(), equal);
+        }
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX, 0.5] {
+            assert!(integral_float(value).is_none());
+        }
+        signed_integer(&json!(1.5)).unwrap_err();
+        unsigned_integer(&json!(-1.0)).unwrap_err();
+    }
+
+    #[test]
+    fn float_integer_conversions_keep_signed_64_bit_boundaries() {
+        let upper = 9_223_372_036_854_775_808.0f64;
+        let largest = 9_223_372_036_854_774_784;
+        for (value, truncated, rounded) in [
+            (upper.next_down(), largest, largest),
+            (-upper, i64::MIN, i64::MIN),
+            (0.0, 0, 0),
+            (-0.0, 0, 0),
+            (2.7, 2, 3),
+            (-2.7, -2, -3),
+        ] {
+            assert_eq!(bits(value).unwrap(), truncated, "{value}");
+            assert_eq!(i64::variable(&json!(value)).unwrap(), rounded, "{value}");
+        }
+        for value in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            upper,
+            (-upper).next_down(),
+            f64::MAX,
+            -f64::MAX,
+        ] {
+            assert_eq!(
+                bits(value).unwrap_err().to_string(),
+                "bitwise formula operand outside the 64-bit integer range"
+            );
+            if value.is_finite() {
+                assert_eq!(
+                    i64::variable(&json!(value)).unwrap_err().to_string(),
+                    format!("integer formula value {value} exceeds the 64-bit range")
+                );
+            }
+        }
+    }
+
     #[test]
     fn float_bitwise_operands_truncate_toward_zero() {
         let none = BTreeMap::new();
         assert_eq!(evaluate::<f64>("~2.7", &none).unwrap(), -3.0);
         assert_eq!(evaluate::<f64>("-2.5 & 0xFF", &none).unwrap(), 254.0);
-        assert!(evaluate::<f64>("1e19 & 1", &none).is_err());
+        evaluate::<f64>("1e19 & 1", &none).unwrap_err();
         let m = map(concat!(
             "<Float Name='StrobeDelay'><pValue>StrobeDelayVal_Float</pValue><Unit>us</Unit></Float>",
             "<Converter Name='StrobeDelayVal_Float'><pVariable Name='OLD'>StrobeLineDelay_Reg</pVariable><FormulaTo>( FROM * 1.024 ) &amp; 0x0000FFFF</FormulaTo><FormulaFrom>( TO / 1.024 + 0.5 ) &amp; 0x0000FFFF</FormulaFrom><pValue>StrobeLineDelay_Reg</pValue><Slope>Increasing</Slope></Converter>",
@@ -3468,6 +3948,47 @@ mod tests {
         m.set(&mut io, "S", "-2").unwrap();
         assert_eq!(m.get(&mut io, "S").unwrap(), -2);
         assert_eq!(io.read_memory(8, 2).unwrap(), [255, 254]);
+    }
+    #[test]
+    fn inherited_integer_minima_keep_wide_increment_bases() {
+        for base in [
+            9_007_199_254_740_993i128,
+            -9_007_199_254_740_995,
+            9_223_372_036_854_775_809,
+        ] {
+            for minimum in [format!("<Min>{base}</Min>"), "<pMin>Minimum</pMin>".into()] {
+                let sign = if base < 0 { "Signed" } else { "Unsigned" };
+                let m = map(&format!(
+                    "<Integer Name='Count'><pValue>Inner</pValue><Inc>2</Inc></Integer><Integer Name='Inner'><pValue>R</pValue>{minimum}</Integer><Integer Name='Minimum'><Value>{base}</Value></Integer><IntReg Name='R'><Address>0</Address><Length>8</Length><Sign>{sign}</Sign></IntReg>"
+                ));
+                let mut io = Memory::default();
+                m.set(&mut io, "Count", &(base + 2).to_string()).unwrap();
+                assert_eq!(m.get(&mut io, "Count").unwrap(), json!(base + 2));
+                let before = io.bytes.clone();
+                assert!(m.set(&mut io, "Count", &(base + 1).to_string()).is_err());
+                assert_eq!(io.bytes, before);
+            }
+        }
+        let copied = map(concat!(
+            "<Integer Name='Count'><pValue>A</pValue><pValueCopy>B</pValueCopy><Inc>3</Inc></Integer>",
+            "<Integer Name='A'><Value>9007199254740993</Value><Min>9007199254740993</Min></Integer>",
+            "<Integer Name='B'><Value>9007199254740994</Value><Min>9007199254740994</Min></Integer>",
+        ));
+        let mut io = Memory::default();
+        copied.set(&mut io, "Count", "9007199254740997").unwrap();
+        for feature in ["A", "B"] {
+            assert_eq!(
+                copied.get(&mut io, feature).unwrap(),
+                json!(9_007_199_254_740_997u64)
+            );
+        }
+        assert!(copied.set(&mut io, "Count", "9007199254740996").is_err());
+        for feature in ["A", "B"] {
+            assert_eq!(
+                copied.get(&mut io, feature).unwrap(),
+                json!(9_007_199_254_740_997u64)
+            );
+        }
     }
     #[test]
     fn integer_inputs_and_limits_do_not_round_through_floating_point() {
@@ -3564,10 +4085,10 @@ mod tests {
         ));
         let mut io = Memory::default();
         m.set(&mut io, "Unsigned", "255").unwrap();
-        io.write_memory(4, &0xa5a5a5a5u32.to_le_bytes()).unwrap();
+        io.write_memory(4, &0xa5a5_a5a5_u32.to_le_bytes()).unwrap();
         m.set(&mut io, "Signed", "-8").unwrap();
         assert_eq!(m.get(&mut io, "Signed").unwrap(), -8);
-        assert_eq!(io.read_memory(4, 4).unwrap(), 0xa5a5a585u32.to_le_bytes());
+        assert_eq!(io.read_memory(4, 4).unwrap(), 0xa5a5_a585_u32.to_le_bytes());
         m.set(&mut io, "F32", "0.1").unwrap();
         let before = io.bytes.clone();
         for (feature, value) in [
@@ -3610,10 +4131,24 @@ mod tests {
             "<Boolean Name='Enabled'><Value>0</Value></Boolean><Enumeration Name='Mode'><Value>0</Value><EnumEntry Name='Slow'><Value>0</Value></EnumEntry><EnumEntry Name='Fast'><Value>1</Value></EnumEntry></Enumeration>",
         );
         let mut io = Memory::default();
-        m.set(&mut io, "Enabled", " ON ").unwrap();
-        assert_eq!(m.get(&mut io, "Enabled").unwrap(), true);
-        let error = format!("{:#}", m.set(&mut io, "Enabled", "yes").unwrap_err());
-        assert!(error.contains("true or false"), "{error}");
+        for (text, expected) in [
+            ("true", true),
+            ("TrUe", true),
+            ("1", true),
+            (" ON ", true),
+            ("false", false),
+            ("FaLsE", false),
+            ("0", false),
+            ("\u{a0}oFf\u{2003}", false),
+        ] {
+            m.set(&mut io, "Enabled", text).unwrap();
+            assert_eq!(m.get(&mut io, "Enabled").unwrap(), expected, "{text}");
+        }
+        for invalid in ["yes", "no", "2", "", "trué", "ｔｒｕｅ", "true false"] {
+            let error = format!("{:#}", m.set(&mut io, "Enabled", invalid).unwrap_err());
+            assert!(error.contains("true or false"), "{error}");
+            assert_eq!(m.get(&mut io, "Enabled").unwrap(), false);
+        }
         let error = format!("{:#}", m.set(&mut io, "Mode", "unknown").unwrap_err());
         assert!(error.contains("Slow, Fast"), "{error}");
         assert_eq!(m.get(&mut io, "Mode").unwrap(), "Slow");
@@ -3635,7 +4170,7 @@ mod tests {
                 .unwrap();
             assert_eq!(m.get(&mut io, "Mode").unwrap(), symbol);
         }
-        assert!(m.get(&mut io, "Invalid").is_err());
+        m.get(&mut io, "Invalid").unwrap_err();
         assert!(m.set(&mut io, "Invalid", "false").is_err());
     }
     fn basler() -> NodeMap {
@@ -3670,8 +4205,7 @@ mod tests {
             "<Integer Name='GevSCPSPacketSize'><pIsLocked>d_1000</pIsLocked><pValue>d_1073</pValue></Integer>",
             "<Integer Name='d_1073'><pValue>d_175</pValue><Min>500</Min><Max>8192</Max><Inc>1</Inc></Integer>",
             "<Enumeration Name='DeviceTLType'><ImposedAccessMode>RO</ImposedAccessMode><EnumEntry Name='GigEVision'><Value>0</Value></EnumEntry><Value>0</Value></Enumeration>",
-        )
-        .to_string();
+        ).to_owned();
         for (name, address) in [
             ("d_155", 0x1000_10d0),
             ("d_1238", 0x1000_10c4),
@@ -3687,7 +4221,8 @@ mod tests {
             ("d_1000", 0x1000_8a68),
             ("d_175", 0x1000_1954),
         ] {
-            xml += &format!(
+            let _ = write!(
+                xml,
                 "<IntReg Name='{name}'><Address>{address:#x}</Address><Length>4</Length><Endianess>BigEndian</Endianess></IntReg>"
             );
         }
@@ -3713,7 +4248,7 @@ mod tests {
         );
         let gain = m.bounds(&mut io, "Gain").unwrap();
         assert_eq!((gain.min, gain.inc), (Some(0.0), None));
-        assert!((gain.max.unwrap() - 48.00000004350822).abs() < 1e-9);
+        assert!((gain.max.unwrap() - 48.000_000_043_508_22).abs() < 1e-9);
         assert_eq!(
             m.bounds(&mut io, "AcquisitionFrameRate").unwrap(),
             bounds(0.1, 1e6, None)
@@ -3793,7 +4328,7 @@ mod tests {
             io.write_memory(0x1000_37a8, &mirrored).unwrap();
             assert_eq!(
                 m.bounds(&mut io, "AutoExposureTimeUpperLimit").unwrap(),
-                bounds(lower as f64, 1e7, Some(1.0))
+                bounds(f64::from(lower), 1e7, Some(1.0))
             );
         }
         assert!(
@@ -3833,7 +4368,7 @@ mod tests {
         assert_eq!(m.get(&mut io, "BalanceRatio").unwrap(), 6321.0 / 4096.0);
         assert_eq!(
             m.bounds(&mut io, "BalanceRatio").unwrap(),
-            bounds(0.25, 15.999755859375, None)
+            bounds(0.25, 15.999_755_859_375, None)
         );
         m.set(&mut io, "d_1502", "1.0").unwrap();
         assert_eq!(m.get(&mut io, "d_1502").unwrap(), json!(1));

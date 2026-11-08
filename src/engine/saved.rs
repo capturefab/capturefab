@@ -7,13 +7,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     fs::{File, OpenOptions},
-    io::Write,
+    io::Write as _,
     path::{Path, PathBuf},
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SavedItem {
+pub(crate) enum SavedItem {
     Capture {
         frame_id: u64,
         /// The camera's clock when it took the frame; see `Frame`.
@@ -32,8 +32,8 @@ pub enum SavedItem {
 }
 
 /// One finished file, reported by a camera worker to the coordinator.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SavedFile {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SavedFile {
     /// UTC Unix milliseconds, taken when the frame was received.
     pub wall_ms: u64,
     pub path: String,
@@ -48,15 +48,15 @@ pub struct SavedFile {
 
 /// A finished local recording, reported by the forwarder when it stops,
 /// as its job's summary shows it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct RecordedFile {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RecordedFile {
     pub path: String,
     pub bytes: u64,
     pub started_ms: u64,
     pub ended_ms: u64,
     pub codec: String,
     pub encoder: String,
-    /// The file reached its maximum size before FFmpeg finished it, and was
+    /// The file reached its maximum size before `FFmpeg` finished it, and was
     /// cut there: it plays up to its last whole part, and holds fewer
     /// frames than were encoded.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -67,7 +67,7 @@ impl SavedFile {
     /// A capture's `--manifest` line: `{file, camera, time, device_ts_ns?,
     /// frame_id?, width, height, pixel_format, bytes, sha256, settings,
     /// tags}`. `features` are the camera's values when the frame came.
-    pub fn manifest_line(&self, camera: &str, features: &Value) -> Value {
+    pub(crate) fn manifest_line(&self, camera: &str, features: &Value) -> Value {
         let SavedItem::Capture {
             frame_id,
             device_ts_ns,
@@ -96,10 +96,10 @@ impl SavedFile {
     }
 }
 
-/// The camera's settings, from the GenICam values a worker read, under the
+/// The camera's settings, from the `GenICam` values a worker read, under the
 /// names `inspect` and `info` use, with units in the names: SFNC gives
-/// ExposureTime in microseconds and Gain in dB.
-pub fn settings(features: &Value) -> Value {
+/// `ExposureTime` in microseconds and Gain in dB.
+pub(crate) fn settings(features: &Value) -> Value {
     let number = |names: &[&str]| names.iter().find_map(|name| features[*name].as_f64());
     let mode = |name: &str| features[name].as_str().map(str::to_ascii_lowercase);
     let trigger = match features["TriggerMode"].as_str() {
@@ -139,7 +139,7 @@ pub fn settings(features: &Value) -> Value {
 /// cameras' workers never interleave. The job that writes it syncs it when
 /// it ends.
 #[derive(Debug)]
-pub struct Manifest {
+pub(crate) struct Manifest {
     file: File,
     path: PathBuf,
 }
@@ -148,7 +148,7 @@ impl Manifest {
     /// An existing file must be empty or JSON Lines, such as an earlier
     /// manifest: lines are never appended to an image or another file named
     /// by mistake.
-    pub fn open(path: &Path) -> Result<Self> {
+    pub(crate) fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -180,14 +180,14 @@ impl Manifest {
             path: path.to_path_buf(),
         })
     }
-    pub fn append(&self, line: &Value) -> Result<()> {
+    pub(crate) fn append(&self, line: &Value) -> Result<()> {
         let mut text = serde_json::to_vec(line)?;
         text.push(b'\n');
         (&self.file)
             .write_all(&text)
             .with_context(|| format!("cannot append to manifest {}", self.path.display()))
     }
-    pub fn sync(&self) -> Result<()> {
+    pub(crate) fn sync(&self) -> Result<()> {
         self.file
             .sync_data()
             .with_context(|| format!("cannot sync manifest {}", self.path.display()))
@@ -267,7 +267,7 @@ mod tests {
             })
         );
         // A frame without the camera's clock has no device time.
-        let mut hosted = file.clone();
+        let mut hosted = file;
         if let SavedItem::Capture { device_ts_ns, .. } = &mut hosted.item {
             *device_ts_ns = None;
         }

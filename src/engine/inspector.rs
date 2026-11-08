@@ -3,7 +3,14 @@
 //! and hands it, shared and uncopied, to an inspector thread that measures
 //! it, writes its preview to a file and replies: acquisition never waits for
 //! that work.
-use super::*;
+#![deny(clippy::missing_const_for_fn)]
+use super::{
+    Answer, Arc, AtomicBool, AtomicU64, AutoController, Baseline, Camera, Context as _, Duration,
+    Envelope, Frame, Instant, JobStream, NO_FRAME_HINT, Ordering, Path, PathBuf, Result,
+    SessionCommand, Value, Warmup, WorkerCommand, WorkerHandle, camera_mut, deadline_after,
+    frame_wait, frame_wait_error, interrupted, json, linger, mpsc, next_frame, refresh,
+    settle_auto, unsettled_warning, used, warm_up,
+};
 use crate::inspect::PreviewFormat;
 use std::{
     fs::{self, OpenOptions},
@@ -83,7 +90,7 @@ impl Request {
 }
 
 /// A frame request waiting for its frame from a streaming camera.
-pub(super) struct Waiting {
+struct Waiting {
     id: Option<u64>,
     cancel: Arc<AtomicBool>,
     request: Request,
@@ -123,9 +130,10 @@ impl Job {
     }
 }
 
-/// The inspector thread, started with its first inspection.
+/// Pending frame requests and the lazily started inspector thread.
 #[derive(Default)]
 pub(super) struct Inspector {
+    waiting: Vec<Waiting>,
     jobs: Option<SyncSender<Job>>,
     held: Arc<AtomicUsize>,
     /// Bytes of the frames held, which with their conversions must fit
@@ -133,6 +141,9 @@ pub(super) struct Inspector {
     bytes: Arc<AtomicUsize>,
 }
 impl Inspector {
+    pub(super) const fn has_waiting(&self) -> bool {
+        !self.waiting.is_empty()
+    }
     /// Hand `job` to the inspector thread, or refuse it at once when it
     /// holds as many as it may: `MAX_INSPECTIONS`, and frames of at most a
     /// quarter of the memory left. One is always taken.
@@ -183,94 +194,96 @@ impl Inspector {
     }
 }
 
-/// Take up frame request `envelope`. A streaming camera's next frames serve
-/// it as they arrive; a stopped camera acquires them now, as many as it
-/// asks to let pass and one more, and stops again unless it lingers.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn begin(
-    h: &WorkerHandle,
-    camera: &mut Option<Camera>,
-    auto: &mut Option<AutoController>,
-    envelope: Envelope,
-    mut request: Request,
-    inspector: &mut Inspector,
-    waiting: &mut Vec<Waiting>,
-    stream: &mut super::JobStream,
-) {
-    let Some(c) = camera.as_mut() else {
-        (envelope.reply)(Err(no_camera()));
-        return;
-    };
-    request.timeout = frame_wait(c, request.timeout_ms);
-    let deadline = deadline_after(request.timeout);
-    if c.is_streaming() {
-        let cancel = h
-            .running
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .map(|running| running.cancel.clone())
-            .unwrap_or_default();
-        if let Some(id) = envelope.id {
-            h.deferred
+impl Inspector {
+    /// Take up frame request `envelope`. A streaming camera's next frames serve
+    /// it as they arrive; a stopped camera acquires them now, as many as it
+    /// asks to let pass and one more, and stops again unless it lingers.
+    pub(super) fn begin(
+        &mut self,
+        h: &WorkerHandle,
+        camera: &mut Option<Camera>,
+        auto: &mut Option<AutoController>,
+        envelope: Envelope,
+        mut request: Request,
+        stream: &mut JobStream,
+    ) {
+        let Some(c) = camera.as_mut() else {
+            (envelope.reply)(Err(no_camera()));
+            return;
+        };
+        request.timeout = frame_wait(c, request.timeout_ms);
+        let deadline = deadline_after(request.timeout);
+        if c.is_streaming() {
+            let cancel = h
+                .running
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(id, cancel.clone());
-        }
-        // A camera sending frames only when triggered sends one now.
-        if let Err(error) = c.request_frame() {
-            finish(h, envelope.id, envelope.reply, Err(error));
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map(|running| running.cancel.clone())
+                .unwrap_or_default();
+            if let Some(id) = envelope.id {
+                h.deferred
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(id, cancel.clone());
+            }
+            // A camera sending frames only when triggered sends one now.
+            if let Err(error) = c.request_frame() {
+                finish(h, envelope.id, envelope.reply, Err(error));
+                return;
+            }
+            // A camera that lingers goes on streaming until this is served.
+            used(stream, c);
+            self.waiting.push(Waiting {
+                id: envelope.id,
+                cancel,
+                left: request.fresh.saturating_sub(1),
+                waited: 0,
+                after_change: false,
+                baseline: Baseline::now(h),
+                deadline,
+                request,
+                reply: envelope.reply,
+            });
             return;
         }
-        // A camera that lingers goes on streaming until this is served.
-        super::used(stream, c);
-        waiting.push(Waiting {
-            id: envelope.id,
-            cancel,
-            left: request.fresh.saturating_sub(1),
-            waited: 0,
-            after_change: false,
-            baseline: Baseline::now(h),
-            deadline,
-            request,
-            reply: envelope.reply,
-        });
-        return;
-    }
-    let info = c.info.clone();
-    let count = request.fresh.max(1);
-    let baseline = Baseline::now(h);
-    match acquire(
-        h,
-        camera,
-        auto,
-        count,
-        deadline,
-        request.timeout,
-        request.warmup_ms,
-        Some(stream),
-    ) {
-        Ok((frame, received, settled, warmup)) => inspector.inspect(Job {
-            frame: Arc::new(frame),
-            received,
-            camera: info,
-            source: "grab",
-            waited: count,
-            after_change: false,
-            warmup,
-            lost: losses(&baseline, h),
-            notes: if settled {
-                Vec::new()
-            } else {
-                vec!["auto exposure had not settled when this frame was taken".into()]
+        let info = c.info.clone();
+        let count = request.fresh.max(1);
+        let baseline = Baseline::now(h);
+        match acquire(
+            h,
+            camera,
+            auto,
+            Acquisition {
+                count,
+                deadline,
+                wait: request.timeout,
+                warmup_ms: request.warmup_ms,
             },
-            request,
-            reply: envelope.reply,
-        }),
-        Err(error) if no_frame_in_time(&error) => {
-            (envelope.reply)(Err(counted(h, error, &baseline)))
+            Some(stream),
+        ) {
+            Ok((frame, received, settled, warmup)) => self.inspect(Job {
+                frame: Arc::new(frame),
+                received,
+                camera: info,
+                source: "grab",
+                waited: count,
+                after_change: false,
+                warmup,
+                lost: losses(&baseline, h),
+                notes: if settled {
+                    Vec::new()
+                } else {
+                    vec!["auto exposure had not settled when this frame was taken".into()]
+                },
+                request,
+                reply: envelope.reply,
+            }),
+            Err(error) if no_frame_in_time(&error) => {
+                (envelope.reply)(Err(counted(h, error, &baseline)));
+            }
+            Err(error) => (envelope.reply)(Err(error)),
         }
-        Err(error) => (envelope.reply)(Err(error)),
     }
 }
 
@@ -282,22 +295,33 @@ fn no_frame_in_time(error: &anyhow::Error) -> bool {
     )
 }
 
+/// Frame count, wait budget and warm-up for one acquisition.
+#[derive(Clone, Copy)]
+pub(super) struct Acquisition {
+    pub count: u32,
+    pub deadline: Instant,
+    pub wait: Duration,
+    pub warmup_ms: Option<u64>,
+}
+
 /// Acquire `count` frames from a stopped camera, warming up one that sets
 /// its own exposure and settling Capturefab's auto exposure first, and stop
 /// it again, or with `stream` leave a camera that lingers streaming for a
 /// moment: the last frame, when it came, whether auto exposure had settled,
 /// and the warm-up.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn acquire(
     h: &WorkerHandle,
     camera: &mut Option<Camera>,
     auto: &mut Option<AutoController>,
-    count: u32,
-    deadline: Instant,
-    wait: Duration,
-    warmup_ms: Option<u64>,
-    stream: Option<&mut super::JobStream>,
+    acquisition: Acquisition,
+    stream: Option<&mut JobStream>,
 ) -> Result<(Frame, Instant, bool, Option<Warmup>)> {
+    let Acquisition {
+        count,
+        deadline,
+        wait,
+        warmup_ms,
+    } = acquisition;
     let c = camera_mut(camera)?;
     let was_streaming = c.is_streaming();
     c.start()?;
@@ -334,7 +358,7 @@ pub(super) fn acquire(
         let (frame, received) = last.context("no frame was asked for")?;
         Ok((frame, received, settled, warmup))
     })();
-    let lingers = match (stream, super::linger(c)) {
+    let lingers = match (stream, linger(c)) {
         (Some(stream), Some(linger)) if !was_streaming && result.is_ok() => {
             stream.started = true;
             stream.linger_until = Some(Instant::now() + linger);
@@ -347,114 +371,121 @@ pub(super) fn acquire(
     } else {
         Ok(())
     };
-    refresh(h, camera);
+    refresh(h, camera.as_ref());
     let acquired = result?;
     stopped?;
     Ok(acquired)
 }
 
-/// Serve the waiting requests a streaming camera's new `frame` is due for:
-/// each takes it, shared, once it has let its frames pass. The frame is
-/// handed back for the recording when `keep`, sharing its buffer with the
-/// inspections.
-pub(super) fn serve(
-    c: &mut Camera,
-    frame: Frame,
-    keep: bool,
-    waiting: &mut Vec<Waiting>,
-    inspector: &mut Inspector,
-    h: &WorkerHandle,
-) -> Option<Frame> {
-    if waiting.is_empty() {
-        return keep.then_some(frame);
-    }
-    let received = Instant::now();
-    // A frame exposed before the camera's last settings change counts for
-    // none of them.
-    let stale = c.frame_predates_change();
-    let mut due = Vec::new();
-    for item in std::mem::take(waiting) {
-        if item.left == 0 && !stale {
-            due.push(item);
-            continue;
+impl Inspector {
+    /// Serve the waiting requests a streaming camera's new `frame` is due for:
+    /// each takes it, shared, once it has let its frames pass. The frame is
+    /// handed back for the recording when `keep`, sharing its buffer with the
+    /// inspections.
+    pub(super) fn serve(
+        &mut self,
+        c: &mut Camera,
+        frame: Frame,
+        keep: bool,
+        h: &WorkerHandle,
+    ) -> Option<Frame> {
+        let waiting = &mut self.waiting;
+        if waiting.is_empty() {
+            return keep.then_some(frame);
         }
-        let mut item = item;
-        if stale {
-            item.after_change = true;
-        } else {
-            item.left -= 1;
-        }
-        item.waited += 1;
-        let _ = c.request_frame();
-        waiting.push(item);
-    }
-    if due.is_empty() {
-        return keep.then_some(frame);
-    }
-    let shared = Arc::new(frame);
-    for item in due {
-        forget(h, item.id);
-        inspector.inspect(Job {
-            frame: shared.clone(),
-            received,
-            camera: c.info.clone(),
-            request: item.request,
-            source: "live",
-            waited: item.waited + 1,
-            after_change: item.after_change,
-            warmup: None,
-            lost: losses(&item.baseline, h),
-            notes: Vec::new(),
-            reply: item.reply,
-        });
-    }
-    keep.then(|| Arc::try_unwrap(shared).unwrap_or_else(|shared| (*shared).clone()))
-}
-
-/// End the waiting requests that were cancelled, whose deadline passed, or
-/// whose camera stopped streaming; with `gone`, every one, for that reason.
-pub(super) fn expire(
-    h: &WorkerHandle,
-    camera: &mut Option<Camera>,
-    waiting: &mut Vec<Waiting>,
-    gone: Option<&dyn Fn() -> anyhow::Error>,
-) {
-    if waiting.is_empty() {
-        return;
-    }
-    let now = Instant::now();
-    let streaming = camera.as_ref().is_some_and(Camera::is_streaming);
-    for item in std::mem::take(waiting) {
-        let error = if let Some(gone) = gone {
-            gone()
-        } else if item.cancel.load(Ordering::Acquire) {
-            interrupted("inspection cancelled")
-        } else if now >= item.deadline {
-            match camera.as_mut() {
-                Some(c) => counted(h, missing_frame(c, item.request.timeout), &item.baseline),
-                None => no_camera(),
+        let received = Instant::now();
+        // A frame exposed before the camera's last settings change counts for
+        // none of them.
+        let stale = c.frame_predates_change();
+        let mut due = Vec::new();
+        for item in std::mem::take(waiting) {
+            if item.left == 0 && !stale {
+                due.push(item);
+                continue;
             }
-        } else if !streaming {
-            match camera.as_ref() {
-                Some(c) => anyhow::anyhow!(
-                    "{} stopped streaming{}",
-                    crate::media::redact_url(&c.info.id),
-                    h.snapshot()
-                        .last_error
-                        .map(|error| format!(": {error}"))
-                        .unwrap_or_default()
-                ),
-                None => crate::types::Categorized::error(
-                    crate::types::ErrorKind::Disconnected,
-                    "the camera was disconnected",
-                ),
+            let mut item = item;
+            if stale {
+                item.after_change = true;
+            } else {
+                item.left -= 1;
             }
-        } else {
+            item.waited += 1;
+            let _ = c.request_frame();
             waiting.push(item);
-            continue;
-        };
-        forget(h, item.id);
-        (item.reply)(Err(error));
+        }
+        if due.is_empty() {
+            return keep.then_some(frame);
+        }
+        let shared = Arc::new(frame);
+        for item in due {
+            forget(h, item.id);
+            self.inspect(Job {
+                frame: shared.clone(),
+                received,
+                camera: c.info.clone(),
+                request: item.request,
+                source: "live",
+                waited: item.waited + 1,
+                after_change: item.after_change,
+                warmup: None,
+                lost: losses(&item.baseline, h),
+                notes: Vec::new(),
+                reply: item.reply,
+            });
+        }
+        keep.then(|| Arc::try_unwrap(shared).unwrap_or_else(|shared| (*shared).clone()))
+    }
+
+    /// End the waiting requests that were cancelled, whose deadline passed, or
+    /// whose camera stopped streaming; with `gone`, every one, for that reason.
+    pub(super) fn expire(
+        &mut self,
+        h: &WorkerHandle,
+        camera: &mut Option<Camera>,
+        gone: Option<&dyn Fn() -> anyhow::Error>,
+    ) {
+        let waiting = &mut self.waiting;
+        if waiting.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let streaming = camera.as_ref().is_some_and(Camera::is_streaming);
+        for item in std::mem::take(waiting) {
+            let error = if let Some(gone) = gone {
+                gone()
+            } else if item.cancel.load(Ordering::Acquire) {
+                interrupted("inspection cancelled")
+            } else if now >= item.deadline {
+                match camera.as_mut() {
+                    Some(c) => counted(h, missing_frame(c, item.request.timeout), &item.baseline),
+                    None => no_camera(),
+                }
+            } else if !streaming {
+                camera.as_ref().map_or_else(
+                    || {
+                        crate::types::Categorized::error(
+                            crate::types::ErrorKind::Disconnected,
+                            "the camera was disconnected",
+                        )
+                    },
+                    |c| {
+                        anyhow::anyhow!(
+                            "{} stopped streaming{}",
+                            crate::media::redact_url(&c.info.id),
+                            h.snapshot()
+                                .last_error
+                                .map(|error| format!(": {error}"))
+                                .unwrap_or_default()
+                        )
+                    },
+                )
+            } else {
+                waiting.push(item);
+                continue;
+            };
+            forget(h, item.id);
+            (item.reply)(Err(error));
+        }
     }
 }
 
@@ -470,7 +501,7 @@ fn forget(h: &WorkerHandle, id: Option<u64>) {
     if let Some(id) = id {
         h.deferred
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&id);
     }
 }
@@ -658,7 +689,7 @@ fn private_image(dir: &Path, label: &str, bytes: &[u8], extension: &str) -> Resu
         options.create_new(true).write(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
         }
         match options.open(&path) {
@@ -671,7 +702,7 @@ fn private_image(dir: &Path, label: &str, bytes: &[u8], extension: &str) -> Resu
                 prune_images(dir, Some(&path))?;
                 return Ok(path);
             }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
     }
@@ -749,7 +780,7 @@ mod tests {
         assert!(size <= MAX_IMAGE_BYTES);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::{PermissionsExt, symlink};
+            use std::os::unix::fs::{PermissionsExt as _, symlink};
             assert_eq!(
                 fs::metadata(&root).unwrap().permissions().mode() & 0o777,
                 0o700
@@ -762,7 +793,7 @@ mod tests {
             }
             let link = root.with_extension("link");
             symlink(&root, &link).unwrap();
-            assert!(private_image(&link, "camera", b"jpeg", "jpg").is_err());
+            private_image(&link, "camera", b"jpeg", "jpg").unwrap_err();
             fs::remove_file(link).unwrap();
         }
         fs::remove_dir_all(root).unwrap();

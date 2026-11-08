@@ -1,15 +1,17 @@
-//! A native Rust GigE Vision control and image transport.
+//! A native Rust `GigE` Vision control and image transport.
 //!
-//! Wire constants and layouts follow the GigE Vision bootstrap/GVCP/GVSP
+//! Wire constants and layouts follow the `GigE` Vision bootstrap/GVCP/GVSP
 //! protocols (also documented in Aravis' protocol headers). This implementation
 //! does not link to, embed, or translate Aravis code.
+#![deny(clippy::missing_const_for_fn)]
 use crate::copies::Site;
 use crate::framebuf::{PoolVec, pool};
 use crate::types::{
     Backend, CameraInfo, Categorized, Frame, RegisterIo, Transport, TransportStats,
 };
 use crate::xml_cache;
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::{Cursor, ErrorKind, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
@@ -17,6 +19,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[cfg(any(test, target_os = "linux"))]
 mod batch;
 
 const GVCP_PORT: u16 = 3956;
@@ -76,7 +79,7 @@ fn scatter(setting: Option<&std::ffi::OsStr>) -> bool {
     setting.is_none_or(|value| value != "0")
 }
 
-fn be16(bytes: &[u8], offset: usize) -> u16 {
+const fn be16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_be_bytes([bytes[offset], bytes[offset + 1]])
 }
 fn be32(bytes: &[u8], offset: usize) -> u32 {
@@ -95,35 +98,34 @@ fn be64(bytes: &[u8], offset: usize) -> u64 {
 }
 /// A tick count of the camera's clock in nanoseconds.
 fn ticks_ns(ticks: u64, frequency: u64) -> u64 {
-    ((u128::from(ticks) * 1_000_000_000) / u128::from(frequency.max(1))).min(u128::from(u64::MAX))
-        as u64
+    u64::try_from((u128::from(ticks) * 1_000_000_000) / u128::from(frequency.max(1)))
+        .unwrap_or(u64::MAX)
 }
 fn bounded_timeout(timeout: Duration) -> Duration {
     timeout.clamp(Duration::from_millis(1), Duration::from_secs(30))
 }
 fn is_receive_timeout(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-    )
+    matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
-fn command_packet(command: u16, id: u16, flags: u8, payload: &[u8]) -> Vec<u8> {
+fn command_packet(command: u16, id: u16, flags: u8, payload: &[u8]) -> Result<Vec<u8>> {
+    let length = u16::try_from(payload.len()).context("GVCP command payload exceeds u16 length")?;
     let mut packet = Vec::with_capacity(8 + payload.len());
     packet.extend([0x42, flags]);
     packet.extend(command.to_be_bytes());
-    packet.extend((payload.len() as u16).to_be_bytes());
+    packet.extend(length.to_be_bytes());
     packet.extend(id.to_be_bytes());
     packet.extend(payload);
-    packet
+    Ok(packet)
 }
 fn resend_packet(id: u16, block: u64, extended: bool, first: u32, last: u32) -> Vec<u8> {
     let range = [first.to_be_bytes(), last.to_be_bytes()].concat();
     let payload = if extended {
         [&[0; 4][..], &range, &block.to_be_bytes()].concat()
     } else {
-        [&[0, 0][..], &(block as u16).to_be_bytes(), &range].concat()
+        [&[0, 0][..], &block.to_be_bytes()[6..], &range].concat()
     };
     command_packet(PACKET_RESEND, id, if extended { 0x10 } else { 0 }, &payload)
+        .expect("resend commands have a fixed payload of at most 20 bytes")
 }
 
 struct Ack<'a> {
@@ -209,7 +211,7 @@ fn discovery_info(payload: &[u8], source: Ipv4Addr) -> Result<CameraInfo> {
         source
     };
     let serial = fixed_text(&payload[0xd8..0xe8]);
-    let mac = ((be32(payload, 8) as u64 & 0xffff) << 32) | be32(payload, 12) as u64;
+    let mac = ((u64::from(be32(payload, 8)) & 0xffff) << 32) | u64::from(be32(payload, 12));
     Ok(CameraInfo {
         id: if mac == 0 {
             format!("gige:{address}")
@@ -221,7 +223,7 @@ fn discovery_info(payload: &[u8], source: Ipv4Addr) -> Result<CameraInfo> {
         model: fixed_text(&payload[0x68..0x88]),
         serial,
         address: Some(address.to_string()),
-        profile: Default::default(),
+        profile: crate::camera_profile::CameraProfile::default(),
     })
 }
 
@@ -229,14 +231,18 @@ fn discovery_info(payload: &[u8], source: Ipv4Addr) -> Result<CameraInfo> {
 /// its limited broadcast leaves on that interface and broadcast
 /// acknowledgements from cameras on foreign subnets still reach it.
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-fn interface_pinned_socket(index: u32, _name: &str) -> Option<UdpSocket> {
+fn interface_pinned_socket(
+    index: u32,
+    #[cfg(any(target_os = "linux", target_os = "android"))] name: &str,
+    #[cfg(target_os = "macos")] _name: &str,
+) -> Option<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).ok()?;
     let pinned = socket.bind_device_by_index_v4(Some(std::num::NonZeroU32::new(index)?));
     // Kernels before 5.0 lack SO_BINDTOIFINDEX; SO_BINDTODEVICE needs no
     // privilege from 5.7.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    let pinned = pinned.or_else(|_| socket.bind_device(Some(_name.as_bytes())));
+    let pinned = pinned.or_else(|_| socket.bind_device(Some(name.as_bytes())));
     pinned.ok()?;
     socket
         .bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into())
@@ -244,7 +250,7 @@ fn interface_pinned_socket(index: u32, _name: &str) -> Option<UdpSocket> {
     Some(socket.into())
 }
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-fn interface_pinned_socket(_index: u32, _name: &str) -> Option<UdpSocket> {
+const fn interface_pinned_socket(_index: u32, _name: &str) -> Option<UdpSocket> {
     None
 }
 
@@ -253,17 +259,17 @@ fn interface_pinned_socket(_index: u32, _name: &str) -> Option<UdpSocket> {
 /// interface so that multi-NIC hosts do not silently discover only the
 /// default-route network, and cameras whose address does not match the
 /// interface's subnet (which ignore directed broadcasts) are still listed.
-pub fn discover(timeout: Duration) -> Result<Vec<CameraInfo>> {
+pub(crate) fn discover(timeout: Duration) -> Result<Vec<CameraInfo>> {
     discover_until(timeout, &mut |_| false)
 }
 /// `discover`, telling `found` of each camera as it answers; it returns at
 /// once, with what answered so far, when `found` says that was the one.
-pub fn discover_until(
+pub(crate) fn discover_until(
     timeout: Duration,
     found: &mut dyn FnMut(&CameraInfo) -> bool,
 ) -> Result<Vec<CameraInfo>> {
     let deadline = Instant::now() + bounded_timeout(timeout);
-    let request = command_packet(DISCOVERY, 0xffff, 0x11, &[]);
+    let request = command_packet(DISCOVERY, 0xffff, 0x11, &[])?;
     let mut sockets = Vec::new();
     let mut local_addresses = HashSet::new();
     let mut pinned_interfaces = HashSet::new();
@@ -281,7 +287,7 @@ pub fn discover_until(
         {
             Ok(_) => true,
             Err(error) => {
-                hint = hint.or(crate::network::local_network_hint(&error, Some(to.into())));
+                hint = hint.or_else(|| crate::network::local_network_hint(&error, Some(to.into())));
                 false
             }
         };
@@ -327,10 +333,9 @@ pub fn discover_until(
         match socket.send_to(&request, (Ipv4Addr::BROADCAST, GVCP_PORT)) {
             Ok(_) => sockets.push(socket),
             Err(error) => {
-                hint = hint.or(crate::network::local_network_hint(
-                    &error,
-                    Some(Ipv4Addr::BROADCAST.into()),
-                ));
+                hint = hint.or_else(|| {
+                    crate::network::local_network_hint(&error, Some(Ipv4Addr::BROADCAST.into()))
+                });
             }
         }
     }
@@ -399,13 +404,13 @@ struct Control {
     write_memory: bool,
     /// The device's maximum command response time (Pending Timeout register).
     response: Duration,
-    /// How long PENDING_ACKs may extend a command past its deadline; `None`
+    /// How long `PENDING_ACKs` may extend a command past its deadline; `None`
     /// keeps every command within its deadline.
     pending_limit: Option<Duration>,
-    /// The GVCP configuration to restore after enabling PENDING_ACK.
+    /// The GVCP configuration to restore after enabling `PENDING_ACK`.
     restore_configuration: Option<u32>,
     /// Four-byte accesses use READREG/WRITEREG with network-order data, as
-    /// GenICam schema 1.0 devices expect; otherwise memory accesses pass
+    /// `GenICam` schema 1.0 devices expect; otherwise memory accesses pass
     /// camera-order data as-is.
     legacy_registers: bool,
     little_endian: bool,
@@ -435,14 +440,14 @@ impl Control {
             .max(self.response + self.response.min(Duration::from_millis(100)))
             .max(Duration::from_millis(1))
     }
-    /// The time for three attempts, before any PENDING_ACK extension.
+    /// The time for three attempts, before any `PENDING_ACK` extension.
     fn command_time(&self) -> Duration {
         self.timeout.max(self.retry_wait() * 3)
     }
     fn transact(&mut self, command: u16, payload: &[u8]) -> Result<Vec<u8>> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
-        let packet = command_packet(command, id, 1, payload);
+        let packet = command_packet(command, id, 1, payload)?;
         let retry_wait = self.retry_wait();
         let start = Instant::now();
         let mut deadline = start + self.command_time();
@@ -486,7 +491,7 @@ impl Control {
                         if ack.command == PENDING_ACK {
                             // Reserved(16), then the time to completion in ms.
                             ensure!(ack.payload.len() == 4, "invalid pending acknowledgement");
-                            let completion = Duration::from_millis(be16(ack.payload, 2) as u64);
+                            let completion = Duration::from_millis(u64::from(be16(ack.payload, 2)));
                             attempt_deadline =
                                 (Instant::now() + completion + retry_wait).min(limit);
                             deadline = deadline.max(attempt_deadline);
@@ -495,7 +500,7 @@ impl Control {
                         return Ok(ack.payload.to_vec());
                     }
                     Err(error) if is_receive_timeout(&error) => break,
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
                     Err(error) => {
                         let context = crate::network::with_local_network_hint(
                             "receiving GVCP acknowledgement",
@@ -542,6 +547,7 @@ impl Control {
         let _ = self.write_register(HEARTBEAT_TIMEOUT, heartbeat_timeout);
         let _ = self.write_register(CONTROL_PRIVILEGE, 0);
     }
+
     fn read_aligned(&mut self, address: u32, length: usize) -> Result<Vec<u8>> {
         ensure!(
             address.is_multiple_of(4) && length.is_multiple_of(4),
@@ -554,10 +560,15 @@ impl Control {
         for offset in (0..length).step_by(MEMORY_CHUNK) {
             let size = (length - offset).min(MEMORY_CHUNK);
             let current = address
-                .checked_add(offset as u32)
+                .checked_add(u32::try_from(offset).context("GVCP read offset exceeds u32")?)
                 .context("GVCP address overflow")?;
-            let mut request = current.to_be_bytes().to_vec();
-            request.extend((size as u32).to_be_bytes());
+            let mut request = [0u8; 8];
+            request[..4].copy_from_slice(&current.to_be_bytes());
+            request[4..].copy_from_slice(
+                &u32::try_from(size)
+                    .context("GVCP memory chunk exceeds u32")?
+                    .to_be_bytes(),
+            );
             let ack = self.transact(READ_MEMORY, &request)?;
             ensure!(
                 ack.len() == 4 + size,
@@ -571,14 +582,18 @@ impl Control {
         }
         Ok(result)
     }
+
     fn write_aligned(&mut self, address: u32, data: &[u8]) -> Result<()> {
         ensure!(
             address.is_multiple_of(4) && data.len().is_multiple_of(4),
             "unaligned GVCP memory write"
         );
+        let mut payload = Vec::new();
         for (index, bytes) in data.chunks(MEMORY_CHUNK).enumerate() {
             let current = address
-                .checked_add((index * MEMORY_CHUNK) as u32)
+                .checked_add(
+                    u32::try_from(index * MEMORY_CHUNK).context("GVCP write offset exceeds u32")?,
+                )
                 .context("GVCP address overflow")?;
             // Register writes carry values, so camera-order data from a
             // little-endian device is flipped back.
@@ -590,7 +605,12 @@ impl Control {
                     } else {
                         u32::from_be_bytes(*value)
                     };
-                    control.write_register(current + word as u32 * 4, value)?;
+                    let offset = u32::try_from(word * 4)
+                        .context("GVCP register write offset exceeds u32")?;
+                    let address = current
+                        .checked_add(offset)
+                        .context("GVCP address overflow")?;
+                    control.write_register(address, value)?;
                 }
                 Ok(())
             };
@@ -598,8 +618,10 @@ impl Control {
                 words(self)?;
                 continue;
             }
-            let mut payload = current.to_be_bytes().to_vec();
-            payload.extend(bytes);
+            payload.clear();
+            payload.reserve(4 + bytes.len());
+            payload.extend_from_slice(&current.to_be_bytes());
+            payload.extend_from_slice(bytes);
             match self.transact(WRITE_MEMORY, &payload) {
                 // The acknowledgement carries a reserved half and a data index
                 // whose unit varies between devices (simulators echo the
@@ -611,7 +633,7 @@ impl Control {
                         .downcast_ref::<GvcpStatus>()
                         .is_some_and(|s| s.0 == 0x8001) =>
                 {
-                    words(self)?
+                    words(self)?;
                 }
                 Err(error) => return Err(error),
             }
@@ -648,13 +670,12 @@ fn memory_range(address: u64, length: usize) -> Result<(u32, usize, usize)> {
         length <= MAX_PAYLOAD,
         "memory request exceeds 128 MiB safety limit"
     );
-    ensure!(
-        address <= u32::MAX as u64,
-        "GigE Vision 1.x memory addresses are limited to 32 bits"
-    );
+    let address = u32::try_from(address)
+        .context("GigE Vision 1.x memory addresses are limited to 32 bits")?;
     if length == 0 {
-        return Ok((address as u32, 0, 0));
+        return Ok((address, 0, 0));
     }
+    let address = u64::from(address);
     let end = address
         .checked_add(length as u64)
         .context("memory range overflow")?;
@@ -665,14 +686,16 @@ fn memory_range(address: u64, length: usize) -> Result<(u32, usize, usize)> {
     let base = address & !3;
     let aligned_end = (end + 3) & !3;
     Ok((
-        base as u32,
-        (aligned_end - base) as usize,
-        (address - base) as usize,
+        u32::try_from(base).context("aligned GVCP address exceeds u32")?,
+        usize::try_from(aligned_end - base)
+            .context("GVCP memory range exceeds host address size")?,
+        usize::try_from(address - base)
+            .context("GVCP alignment offset exceeds host address size")?,
     ))
 }
 
 /// Probe a known IPv4 camera without waiting for LAN-wide discovery.
-pub fn probe(ip: Ipv4Addr, timeout: Duration) -> Result<CameraInfo> {
+pub(crate) fn probe(ip: Ipv4Addr, timeout: Duration) -> Result<CameraInfo> {
     ensure!(
         !ip.is_unspecified() && !ip.is_multicast() && ip != Ipv4Addr::BROADCAST,
         "expected a unicast camera IPv4 address"
@@ -696,14 +719,14 @@ fn probe_identity(ip: Ipv4Addr, timeout: Duration) -> Result<CameraInfo> {
         info.id = format!("gige:{ip}");
     }
     if info.model.is_empty() {
-        info.model = "GigE Vision camera".to_owned();
+        "GigE Vision camera".clone_into(&mut info.model);
     }
     Ok(info)
 }
 
 /// How long the camera at `info` keeps the control privilege of a
 /// controller that went silent: its heartbeat timeout, which anyone may read.
-pub fn heartbeat_timeout(info: &CameraInfo, timeout: Duration) -> Result<Duration> {
+pub(crate) fn heartbeat_timeout(info: &CameraInfo, timeout: Duration) -> Result<Duration> {
     let ip: Ipv4Addr = info
         .address
         .as_deref()
@@ -718,7 +741,7 @@ pub fn heartbeat_timeout(info: &CameraInfo, timeout: Duration) -> Result<Duratio
 /// Confirm a camera's unicast control path, without acquiring control or
 /// changing any register. Broadcast discovery alone does not prove reachability.
 /// All three reads share one deadline, including retries and pending ACKs.
-pub fn probe_network(ip: Ipv4Addr, timeout: Duration) -> Result<Ipv4Addr> {
+pub(crate) fn probe_network(ip: Ipv4Addr, timeout: Duration) -> Result<Ipv4Addr> {
     ensure!(
         !ip.is_unspecified() && !ip.is_multicast() && ip != Ipv4Addr::BROADCAST,
         "expected a unicast camera IPv4 address"
@@ -742,7 +765,7 @@ fn probe_network_at(address: SocketAddrV4, timeout: Duration) -> Result<Ipv4Addr
     }
     match control.socket.local_addr()? {
         SocketAddr::V4(local) => Ok(*local.ip()),
-        _ => bail!("camera control route is not IPv4"),
+        SocketAddr::V6(_) => bail!("camera control route is not IPv4"),
     }
 }
 
@@ -774,17 +797,19 @@ impl Heartbeat {
                 let mut answered = Instant::now();
                 let mut wait = period;
                 loop {
-                    let stop = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    let stop = lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let (stop, _) = wake
                         .wait_timeout_while(stop, wait, |stop| !*stop)
-                        .unwrap_or_else(|e| e.into_inner());
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if *stop {
                         break;
                     }
                     drop(stop);
                     let result = control
                         .lock()
-                        .unwrap_or_else(|e| e.into_inner())
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .read_register(CONTROL_PRIVILEGE);
                     wait = period;
                     let error = match result {
@@ -799,7 +824,9 @@ impl Heartbeat {
                         }
                         Err(error) => Some(format!("camera heartbeat failed: {error:#}")),
                     };
-                    *worker_failure.lock().unwrap_or_else(|e| e.into_inner()) = error;
+                    *worker_failure
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = error;
                 }
             })
             .context("starting GigE heartbeat thread")?;
@@ -821,7 +848,9 @@ impl Heartbeat {
     }
     fn shutdown(&mut self) {
         let (lock, wake) = &*self.shutdown;
-        *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        *lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
         wake.notify_all();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -834,6 +863,16 @@ impl Drop for Heartbeat {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PacketSize {
+    /// No probe yet, or an explicit optimization requested a fresh probe.
+    Untested,
+    /// Probes failed; stream startup uses the conservative default.
+    Unverified,
+    /// Recheck this size on startup before searching for another one.
+    Verified(u32),
+}
+
 struct GigE {
     control: Arc<Mutex<Control>>,
     heartbeat: Heartbeat,
@@ -843,8 +882,8 @@ struct GigE {
     heartbeat_timeout: u32,
     resend: bool,
     big_endian_mono16: bool,
-    stream_source: Option<Option<SocketAddr>>,
-    packet_size: Option<Option<u32>>,
+    stream_source: OnceCell<Option<SocketAddr>>,
+    packet_size: PacketSize,
     stats: TransportStats,
     stream: Option<Stream>,
     xml_cache: Option<String>,
@@ -855,7 +894,7 @@ struct GigE {
 
 /// Acquire camera control. An independent heartbeat keeps the connection alive
 /// even while the camera is idle or waiting for an external trigger.
-pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
+pub(crate) fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
     let ip: Ipv4Addr = info
         .address
         .as_deref()
@@ -866,8 +905,8 @@ pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
     camera.big_endian_mono16 = big_endian_mono16(&info.vendor, &info.model);
     Ok(Box::new(camera))
 }
-/// First-generation Point Grey Blackfly GigE models send Mono16 big-endian
-/// even with GevSCPSBigEndian clear (Aravis keeps the same list).
+/// First-generation Point Grey Blackfly `GigE` models send Mono16 big-endian
+/// even with `GevSCPSBigEndian` clear (Aravis keeps the same list).
 fn big_endian_mono16(vendor: &str, model: &str) -> bool {
     vendor == "Point Grey Research"
         && ["Blackfly BFLY-PGE-31S4M", "Blackfly BFLY-PGE-14S2C"].contains(&model)
@@ -876,10 +915,10 @@ fn connect(address: SocketAddrV4, timeout: Duration) -> Result<GigE> {
     let mut control = Control::connect(address, timeout)?;
     let host_ip = match control.socket.local_addr()? {
         SocketAddr::V4(address) => *address.ip(),
-        _ => unreachable!(),
+        SocketAddr::V6(_) => bail!("camera control route is not IPv4"),
     };
     if control.read_register(CONTROL_PRIVILEGE)? & 3 != 0 {
-        return Err(crate::types::Categorized::new(
+        return Err(Categorized::new(
             crate::types::ErrorKind::CameraBusy,
             "camera is controlled by another application; disconnect it first",
         )
@@ -901,7 +940,7 @@ fn connect(address: SocketAddrV4, timeout: Duration) -> Result<GigE> {
         let resend = capability.is_some_and(|bits| bits & 0x4 != 0);
         control.write_memory = capability.is_none_or(|bits| bits & 0x2 != 0);
         let response = match control.read_register(PENDING_TIMEOUT) {
-            Ok(ms @ 1..=5000) => Duration::from_millis(ms as u64),
+            Ok(ms @ 1..=5000) => Duration::from_millis(u64::from(ms)),
             _ => Duration::ZERO,
         };
         if capability.is_some_and(|bits| bits & 0x20 != 0)
@@ -915,22 +954,25 @@ fn connect(address: SocketAddrV4, timeout: Duration) -> Result<GigE> {
         }
         let heartbeat_timeout = control.read_register(HEARTBEAT_TIMEOUT)?;
         control.response = response;
-        let command_ms = control.command_time().as_millis() as u32;
-        let heartbeat_ms = heartbeat_timeout.max(3000).max(command_ms * 2 + 1000);
+        let command_ms = u32::try_from(control.command_time().as_millis())
+            .context("GVCP command timeout exceeds the heartbeat register range")?;
+        let heartbeat_ms = heartbeat_timeout
+            .max(3000)
+            .max(command_ms.saturating_mul(2).saturating_add(1000));
         control.write_register(HEARTBEAT_TIMEOUT, heartbeat_ms)?;
         // The command in flight holds the heartbeat back, so pending commands
         // must finish well within the heartbeat timeout.
-        control.pending_limit = Some(Duration::from_millis(heartbeat_ms as u64 * 2 / 3));
+        control.pending_limit = Some(Duration::from_millis(u64::from(heartbeat_ms) * 2 / 3));
         let timestamp_frequency = match (
             control.read_register(TIMESTAMP_HIGH),
             control.read_register(TIMESTAMP_LOW),
         ) {
-            (Ok(high), Ok(low)) => ((high as u64) << 32) | low as u64,
+            (Ok(high), Ok(low)) => (u64::from(high) << 32) | u64::from(low),
             _ => 0,
         };
         Ok((
             heartbeat_timeout,
-            Duration::from_millis(heartbeat_ms as u64),
+            Duration::from_millis(u64::from(heartbeat_ms)),
             timestamp_frequency,
             resend,
         ))
@@ -965,8 +1007,8 @@ fn connect(address: SocketAddrV4, timeout: Duration) -> Result<GigE> {
         heartbeat_timeout,
         resend,
         big_endian_mono16: false,
-        stream_source: None,
-        packet_size: None,
+        stream_source: OnceCell::new(),
+        packet_size: PacketSize::Untested,
         stats: TransportStats::default(),
         stream: None,
         xml_cache: None,
@@ -1037,6 +1079,7 @@ impl Backend for GigE {
             .inspect(|key| xml_cache::forget(key))
             .is_some()
     }
+    #[deny(clippy::significant_drop_tightening)]
     fn start(&mut self, payload_size: usize) -> Result<()> {
         self.heartbeat.check()?;
         ensure!(self.stream.is_none(), "GigE receiving is already started");
@@ -1061,26 +1104,26 @@ impl Backend for GigE {
         let mut source = None;
         let result = (|| -> Result<(u32, bool, bool)> {
             control.write_register(STREAM_ADDRESS, u32::from(self.host_ip))?;
-            control.write_register(STREAM_PORT, port as u32)?;
+            control.write_register(STREAM_PORT, u32::from(port))?;
             source = *self
                 .stream_source
-                .get_or_insert_with(|| stream_source(&mut control, self.camera_ip));
+                .get_or_init(|| stream_source(&mut control, self.camera_ip));
             traverse(&socket, source);
             let original = control.read_register(STREAM_PACKET_SIZE)?;
             let mut test =
                 |size| probe_packet_size(&mut control, &socket, &mut buffer, camera, size);
             let negotiated = match self.packet_size {
-                Some(None) => None,
-                cached => cached
-                    .flatten()
-                    .and_then(&mut test)
-                    .or_else(|| ladder(&mut test, cap, mtu.is_some())),
+                PacketSize::Unverified => None,
+                PacketSize::Verified(size) => {
+                    test(size).or_else(|| ladder(&mut test, cap, mtu.is_some()))
+                }
+                PacketSize::Untested => ladder(&mut test, cap, mtu.is_some()),
             };
-            self.packet_size = Some(negotiated);
+            self.packet_size = negotiated.map_or(PacketSize::Unverified, PacketSize::Verified);
             // Pixels are decoded little-endian, the GigE Vision default.
             control.write_register(
                 STREAM_PACKET_SIZE,
-                (original & SCPS_NO_FRAGMENT) | negotiated.unwrap_or(cap.min(1500)),
+                (original & SCPS_NO_FRAGMENT) | negotiated.unwrap_or_else(|| cap.min(1500)),
             )?;
             let scps = control.read_register(STREAM_PACKET_SIZE)?;
             let packet_size = scps & 0xffff;
@@ -1096,60 +1139,64 @@ impl Backend for GigE {
                 scps & SCPS_BIG_ENDIAN != 0,
             ))
         })();
-        match result {
-            Ok((packet_size, negotiated, big_endian)) => {
-                let mut notes: Vec<String> = receive_buffer
-                    .and_then(|bytes| receive_buffer_note(bytes, payload_size))
-                    .into_iter()
-                    .collect();
-                if !negotiated {
-                    notes.push(format!(
-                        "camera did not pass repeated stream packet tests; if frames time out, allow inbound UDP from {}",
-                        self.camera_ip
-                    ));
-                }
-                if big_endian {
-                    notes.push(
-                        "camera kept GevSCPSBigEndian set; 16- and 32-bit samples are swapped to little-endian"
-                            .into(),
-                    );
-                }
-                let mut assembler =
-                    Assembler::new(payload_size, packet_size as usize, self.timestamp_frequency);
-                assembler.resend = self.resend;
-                assembler.big_endian = big_endian;
-                assembler.big_endian_mono16 = self.big_endian_mono16;
-                assembler.stats = TransportStats {
-                    packet_size: Some(packet_size),
-                    receive_buffer_bytes: receive_buffer.map(|bytes| bytes as u64),
-                    notes,
-                    ..std::mem::take(&mut self.stats)
-                };
-                self.stream = Some(Stream {
-                    socket,
-                    gvcp,
-                    source,
-                    buffer,
-                    header: [0; 20],
-                    overflow: vec![0; 64 * 1024],
-                    scratch: Vec::new(),
-                    scatter: scatter(std::env::var_os(SCATTER_ENV).as_deref()),
-                    batch: cfg!(target_os = "linux")
-                        .then(|| batch::Batch::new((packet_size as usize).clamp(576, 65_536))),
-                    timeout: POLL,
-                    next_poll: Instant::now(),
-                    next_traversal: Instant::now() + TRAVERSAL,
-                    request_id: 0,
-                    assembler,
-                });
-                Ok(())
-            }
+        let (packet_size, negotiated, big_endian) = match result {
+            Ok(settings) => settings,
             Err(error) => {
                 let _ = control.write_register(STREAM_PORT, 0);
-                Err(error)
+                return Err(error);
             }
+        };
+        drop(control);
+        let mut notes: Vec<String> = receive_buffer
+            .and_then(|bytes| receive_buffer_note(bytes, payload_size))
+            .into_iter()
+            .collect();
+        if !negotiated {
+            notes.push(format!(
+                "camera did not pass repeated stream packet tests; if frames time out, allow inbound UDP from {}",
+                self.camera_ip
+            ));
         }
+        if big_endian {
+            notes.push(
+                "camera kept GevSCPSBigEndian set; 16- and 32-bit samples are swapped to little-endian"
+                    .into(),
+            );
+        }
+        let mut assembler =
+            Assembler::new(payload_size, packet_size as usize, self.timestamp_frequency);
+        assembler.resend = self.resend;
+        assembler.big_endian = big_endian;
+        assembler.big_endian_mono16 = self.big_endian_mono16;
+        assembler.stats = TransportStats {
+            packet_size: Some(packet_size),
+            receive_buffer_bytes: receive_buffer.map(|bytes| bytes as u64),
+            notes,
+            ..std::mem::take(&mut self.stats)
+        };
+        self.stream = Some(Stream {
+            socket,
+            gvcp,
+            source,
+            buffer,
+            header: [0; 20],
+            overflow: vec![0; 64 * 1024],
+            scratch: Vec::new(),
+            scatter: scatter(std::env::var_os(SCATTER_ENV).as_deref()),
+            #[cfg(any(test, target_os = "linux"))]
+            batch: cfg!(target_os = "linux")
+                .then(|| batch::Batch::new((packet_size as usize).clamp(576, 65_536))),
+            #[cfg(target_os = "linux")]
+            predicted: Vec::new(),
+            timeout: POLL,
+            next_poll: Instant::now(),
+            next_traversal: Instant::now() + TRAVERSAL,
+            request_id: 0,
+            assembler,
+        });
+        Ok(())
     }
+    #[deny(clippy::significant_drop_tightening)]
     fn optimize_network(&mut self, payload_size: usize) -> Result<crate::network::NetworkTuning> {
         ensure!(
             self.stream.is_none(),
@@ -1162,7 +1209,7 @@ impl Backend for GigE {
         self.heartbeat.check()?;
         // Both successful and unsuccessful prior negotiations must be retried
         // after the user changes the cable, interface or firewall configuration.
-        self.packet_size = None;
+        self.packet_size = PacketSize::Untested;
         let socket =
             UdpSocket::bind((self.host_ip, 0)).context("opening GVSP network test socket")?;
         let receive = socket2::SockRef::from(&socket);
@@ -1190,10 +1237,10 @@ impl Backend for GigE {
             let original = control.read_register(STREAM_PACKET_SIZE)?;
             let tuned = (|| -> Result<(u32, Option<u32>)> {
                 control.write_register(STREAM_ADDRESS, u32::from(self.host_ip))?;
-                control.write_register(STREAM_PORT, port as u32)?;
+                control.write_register(STREAM_PORT, u32::from(port))?;
                 let source = self
                     .stream_source
-                    .get_or_insert_with(|| stream_source(&mut control, self.camera_ip));
+                    .get_or_init(|| stream_source(&mut control, self.camera_ip));
                 traverse(&socket, *source);
                 let negotiated = ladder(
                     |size| {
@@ -1208,7 +1255,7 @@ impl Backend for GigE {
                     cap,
                     mtu.is_some(),
                 );
-                let selected = negotiated.unwrap_or(cap.min(1500));
+                let selected = negotiated.unwrap_or_else(|| cap.min(1500));
                 control
                     .write_register(STREAM_PACKET_SIZE, (original & SCPS_NO_FRAGMENT) | selected)?;
                 let actual = control.read_register(STREAM_PACKET_SIZE)? & 0xffff;
@@ -1233,8 +1280,9 @@ impl Backend for GigE {
             tuned
         })();
         control.timeout = saved_timeout;
+        drop(control);
         let (packet_size, negotiated) = result?;
-        self.packet_size = Some(negotiated);
+        self.packet_size = negotiated.map_or(PacketSize::Unverified, PacketSize::Verified);
         let mut warnings = Vec::new();
         if negotiated.is_none() {
             warnings.push(format!("Stream delivery is unverified: the camera did not deliver three consecutive test packets. Applied a conservative {packet_size}-byte packet size; check inbound UDP, the cable and the camera's network path."));
@@ -1246,7 +1294,7 @@ impl Backend for GigE {
         }
         self.stats.packet_size = Some(packet_size);
         self.stats.receive_buffer_bytes = receive_buffer.map(|bytes| bytes as u64);
-        self.stats.notes = warnings.clone();
+        self.stats.notes.clone_from(&warnings);
         let packet_change = if negotiated.is_some() {
             format!(
                 "Stream packet size: {packet_size} bytes, verified with three consecutive test packets"
@@ -1365,6 +1413,7 @@ impl Backend for GigE {
             .as_mut()
             .map_or(0, |stream| stream.take_in(camera))
     }
+    #[deny(clippy::significant_drop_tightening)]
     fn device_time_ns(&mut self) -> Option<u64> {
         if self.timestamp_frequency == 0 || self.stream.is_none() {
             return None;
@@ -1375,6 +1424,7 @@ impl Backend for GigE {
             .ok()?;
         let high = control.read_register(TIMESTAMP_VALUE_HIGH).ok()?;
         let low = control.read_register(TIMESTAMP_VALUE_LOW).ok()?;
+        drop(control);
         Some(ticks_ns(
             (u64::from(high) << 32) | u64::from(low),
             self.timestamp_frequency,
@@ -1399,19 +1449,21 @@ impl Drop for GigE {
 fn set_receive_buffer(socket: &UdpSocket, size: usize) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        use std::os::fd::AsRawFd;
+        use std::os::fd::AsRawFd as _;
         let most = crate::host::memory_budget().map_or(usize::MAX, |budget| {
             usize::try_from(budget / 16).unwrap_or(usize::MAX)
         });
         let forced = libc::c_int::try_from(size.min(most)).unwrap_or(libc::c_int::MAX);
+        let length =
+            libc::socklen_t::try_from(size_of::<libc::c_int>()).map_err(std::io::Error::other)?;
         // SAFETY: setsockopt reads the int it is given, for this socket.
         let set = unsafe {
             libc::setsockopt(
                 socket.as_raw_fd(),
                 libc::SOL_SOCKET,
                 libc::SO_RCVBUFFORCE,
-                (&forced as *const libc::c_int).cast(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                (&raw const forced).cast(),
+                length,
             )
         };
         if set == 0 {
@@ -1452,7 +1504,11 @@ fn stream_source(control: &mut Control, camera: Ipv4Addr) -> Option<SocketAddr> 
     if control.read_register(STREAM_CAPABILITY).ok()? & 0x8000_0000 == 0 {
         return None;
     }
-    let port = control.read_register(STREAM_SOURCE_PORT).ok()? as u16;
+    let [_, _, high, low] = control
+        .read_register(STREAM_SOURCE_PORT)
+        .ok()?
+        .to_be_bytes();
+    let port = u16::from_be_bytes([high, low]);
     (port != 0).then(|| SocketAddr::from((camera, port)))
 }
 /// A datagram from the receive socket to the camera's stream source port
@@ -1533,7 +1589,7 @@ fn ladder(mut test: impl FnMut(u32) -> Option<u32>, cap: u32, mtu_known: bool) -
         None => (test(576)?, standard),
     };
     for _ in 0..6 {
-        let middle = ((low + high) / 2) & !3;
+        let middle = low.midpoint(high) & !3;
         if middle <= low {
             break;
         }
@@ -1546,7 +1602,7 @@ fn ladder(mut test: impl FnMut(u32) -> Option<u32>, cap: u32, mtu_known: bool) -
 }
 
 /// Devices whose XML claims schema 1.1 or newer while their registers follow
-/// the schema 1.0 GigE Vision convention (the list Aravis keeps).
+/// the schema 1.0 `GigE` Vision convention (the list Aravis keeps).
 const LEGACY_REGISTER_DEVICES: [(&str, &str); 19] = [
     ("AT_Automation_Technology_GmbH", "C6_X_GigE"),
     ("DO3THINK", "MGV518"),
@@ -1570,13 +1626,13 @@ const LEGACY_REGISTER_DEVICES: [(&str, &str); 19] = [
 ];
 
 /// Whether four-byte accesses must use READREG/WRITEREG with network-order
-/// data. GenICam asks for this only for schema 1.0 XML; newer schemas read
+/// data. `GenICam` asks for this only for schema 1.0 XML; newer schemas read
 /// registers in camera order, which differs on little-endian devices. An
 /// unreadable root element keeps the legacy convention.
 fn legacy_registers(xml: &str) -> bool {
     let root = (|| {
         let start = xml.find("<RegisterDescription")?;
-        let tag = &xml[start..start + xml[start..].find('>')?];
+        let tag = xml.get(start..)?.split_once('>')?.0;
         let tag = format!("{}/>", tag.trim_end_matches('/'));
         let document = roxmltree::Document::parse(&tag).ok()?;
         let root = document.root_element();
@@ -1632,7 +1688,10 @@ fn parse_local_url(url: &str) -> Result<LocalUrl> {
     })
 }
 fn decode_xml(name: &str, data: Vec<u8>) -> Result<String> {
-    let bytes = if name.to_ascii_lowercase().ends_with(".zip") || data.starts_with(b"PK\x03\x04") {
+    let zip_name = name
+        .rsplit_once('.')
+        .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("zip"));
+    let bytes = if zip_name || data.starts_with(b"PK\x03\x04") {
         let mut archive =
             zip::ZipArchive::new(Cursor::new(data)).context("opening camera XML ZIP")?;
         ensure!(
@@ -1642,7 +1701,12 @@ fn decode_xml(name: &str, data: Vec<u8>) -> Result<String> {
         let mut selected = None;
         for index in 0..archive.len() {
             let mut entry = archive.by_index(index)?;
-            if entry.is_dir() || !entry.name().to_ascii_lowercase().ends_with(".xml") {
+            if entry.is_dir()
+                || !entry
+                    .name()
+                    .rsplit_once('.')
+                    .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("xml"))
+            {
                 continue;
             }
             ensure!(
@@ -1667,15 +1731,16 @@ fn decode_xml(name: &str, data: Vec<u8>) -> Result<String> {
     } else {
         data
     };
-    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&bytes);
-    let text = std::str::from_utf8(bytes)
-        .context("camera XML is not UTF-8")?
-        .trim_end_matches('\0');
+    let mut text = String::from_utf8(bytes).context("camera XML is not UTF-8")?;
+    if text.starts_with('\u{feff}') {
+        text.replace_range(..'\u{feff}'.len_utf8(), "");
+    }
+    text.truncate(text.trim_end_matches('\0').len());
     ensure!(
         text.trim_start().starts_with('<'),
         "camera XML does not contain an XML document"
     );
-    Ok(text.to_owned())
+    Ok(text)
 }
 
 struct Stream {
@@ -1693,8 +1758,10 @@ struct Stream {
     /// Payload packets are received straight into their frames.
     scatter: bool,
     /// Several datagrams are received a system call (Linux).
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg(any(test, target_os = "linux"))]
     batch: Option<batch::Batch>,
+    #[cfg(target_os = "linux")]
+    predicted: Vec<Slot>,
     timeout: Duration,
     next_poll: Instant,
     next_traversal: Instant,
@@ -1713,19 +1780,17 @@ impl Stream {
             Some(_) => remaining.min(self.next_traversal.saturating_duration_since(now).max(POLL)),
             None => remaining,
         };
-        if !self.assembler.in_flight() {
-            if self.timeout.abs_diff(remaining) <= POLL {
-                self.timeout
-            } else {
-                remaining
-            }
-        } else {
+        if self.assembler.in_flight() {
             let wait = remaining.min(POLL);
             if self.timeout > POLL || (wait < POLL) != (self.timeout < POLL) {
                 wait
             } else {
                 self.timeout
             }
+        } else if self.timeout.abs_diff(remaining) <= POLL {
+            self.timeout
+        } else {
+            remaining
         }
     }
     /// Take in every packet that already arrived from `camera`, keeping the
@@ -1777,7 +1842,7 @@ impl Stream {
                 site,
             )));
         };
-        let Stream {
+        let Self {
             socket,
             header,
             overflow,
@@ -1789,7 +1854,7 @@ impl Stream {
             .slot_mut(&slot)
             .expect("a predicted slot lies in its frame's buffer");
         let (received, flags, source) = {
-            let parts = [&mut header[..slot.header], place, &mut overflow[..]];
+            let parts = [&mut header[..slot.header], place, overflow.as_mut_slice()];
             // SAFETY: the socket only writes the bytes it receives into
             // these buffers, which are initialized already, and never
             // reads them or writes uninitialized bytes into them.
@@ -1818,34 +1883,49 @@ impl Stream {
     /// `receive`, several datagrams at a time (`batch`).
     #[cfg(target_os = "linux")]
     fn receive_batch(&mut self, camera: IpAddr) -> std::io::Result<Option<Result<Option<Frame>>>> {
-        let Stream {
+        let Self {
             socket,
             gvcp,
             assembler,
             batch,
             scatter,
+            predicted: slots,
             ..
         } = self;
         let batch = batch.as_mut().expect("a stream that receives in batches");
-        let slots = if *scatter {
-            assembler.predict_run(batch::BATCH)
+        slots.clear();
+        if *scatter {
+            slots.extend(assembler.predict_run(batch::BATCH));
+        }
+        let slots = slots.as_slice();
+        let base = if slots.is_empty() {
+            std::ptr::null_mut()
         } else {
-            Vec::new()
-        };
-        let base = match slots.is_empty() {
-            true => std::ptr::null_mut(),
-            false => assembler
+            assembler
                 .newest_buffer()
-                .expect("predicted slots lie in a buffer"),
+                .expect("predicted slots lie in a buffer")
         };
-        let count = batch::wanted(*scatter, &slots);
-        let received = batch::receive(socket, batch, (&slots, base, count), (camera, *gvcp))?;
+        let count = batch::wanted(*scatter, slots);
+        let mut received = [batch::Received::default(); batch::BATCH];
+        let received_count = batch::receive(
+            socket,
+            batch,
+            (slots, base, count),
+            (camera, *gvcp),
+            &mut received,
+        )?;
         let site = if *scatter {
             Site::GvspFallback
         } else {
             Site::GvspAssemble
         };
-        Ok(batch.take(assembler, (&slots, base), &received, site, Instant::now()))
+        Ok(batch.take(
+            assembler,
+            (slots, base),
+            &received[..received_count],
+            site,
+            Instant::now(),
+        ))
     }
     fn flush(&mut self) {
         for (block, extended, first, last) in self.assembler.requests.drain(..) {
@@ -1866,7 +1946,7 @@ struct ImageLeader {
     x_padding: usize,
     y_padding: usize,
     wire_bytes: usize,
-    /// Chunk data follows the image (GigE Vision 2 extended chunk mode).
+    /// Chunk data follows the image (`GigE` Vision 2 extended chunk mode).
     chunks: bool,
 }
 impl ImageLeader {
@@ -1884,19 +1964,22 @@ impl ImageLeader {
             width > 0 && height > 0 && bits_per_pixel > 0 && bits_per_pixel <= 64,
             "invalid GVSP image dimensions or pixel format"
         );
-        let row_bits = width as u64 * bits_per_pixel as u64;
+        let row_bits = u64::from(width) * u64::from(bits_per_pixel);
         let row_bytes = row_bits.div_ceil(8);
-        let x_padding = be16(data, 32) as usize;
-        let y_padding = be16(data, 34) as usize;
-        let wire_bytes = (row_bytes + x_padding as u64)
-            .checked_mul(height as u64)
-            .and_then(|v| v.checked_add(y_padding as u64))
+        let x_padding = be16(data, 32);
+        let y_padding = be16(data, 34);
+        let wire_bytes = (row_bytes + u64::from(x_padding))
+            .checked_mul(u64::from(height))
+            .and_then(|v| v.checked_add(u64::from(y_padding)))
             .context("GVSP image size overflow")?;
         // PFNC leaves it to the transport whether a packed row ending inside
         // a byte is padded or runs on into the next line; with no x padding
         // either layout is accepted.
         let smallest = if x_padding == 0 {
-            (row_bits as u128 * height as u128).div_ceil(8) as u64 + y_padding as u64
+            u64::try_from(
+                (u128::from(row_bits) * u128::from(height)).div_ceil(8) + u128::from(y_padding),
+            )
+            .context("GVSP packed image size overflow")?
         } else {
             wire_bytes
         };
@@ -1909,15 +1992,16 @@ impl ImageLeader {
             height,
             pixel_format,
             timestamp: be64(data, 4),
-            row_bytes: row_bytes as usize,
-            x_padding,
-            y_padding,
-            wire_bytes: wire_bytes.min(payload_limit as u64) as usize,
+            row_bytes: usize::try_from(row_bytes).context("GVSP row exceeds host address size")?,
+            x_padding: usize::from(x_padding),
+            y_padding: usize::from(y_padding),
+            wire_bytes: usize::try_from(wire_bytes.min(payload_limit as u64))
+                .context("GVSP payload exceeds host address size")?,
             chunks: payload_type & 0x4000 != 0,
         })
     }
     /// The fewest bytes that hold `height` lines.
-    fn image_bytes(&self, height: u32) -> usize {
+    const fn image_bytes(&self, height: u32) -> usize {
         if self.x_padding == 0 {
             let bits_per_pixel = (self.pixel_format >> 16) & 0xff;
             (self.width as usize * bits_per_pixel as usize * height as usize).div_ceil(8)
@@ -1945,6 +2029,7 @@ fn unsupported_payload(payload_type: u16) -> anyhow::Error {
     )
 }
 
+#[derive(Clone, Copy)]
 struct GvspPacket<'a> {
     status: u16,
     frame: u64,
@@ -1964,14 +2049,14 @@ enum Data<'a> {
     Landed(usize),
 }
 impl<'a> Data<'a> {
-    fn len(self) -> usize {
+    const fn len(self) -> usize {
         match self {
             Data::Bytes(bytes, _) => bytes.len(),
             Data::Landed(length) => length,
         }
     }
     /// The bytes of a leader or trailer, which never land in a frame.
-    fn bytes(self) -> &'a [u8] {
+    const fn bytes(self) -> &'a [u8] {
         match self {
             Data::Bytes(bytes, _) => bytes,
             Data::Landed(_) => &[],
@@ -1987,7 +2072,7 @@ fn parse_header(packet: &[u8]) -> Result<(usize, GvspPacket<'static>)> {
         ensure!(packet.len() >= 20, "truncated extended GVSP header");
         (be64(packet, 8), be32(packet, 16), 20)
     } else {
-        (be16(packet, 2) as u64, info & 0x00ff_ffff, 8)
+        (u64::from(be16(packet, 2)), info & 0x00ff_ffff, 8)
     };
     let packet = GvspPacket {
         status: be16(packet, 0),
@@ -2054,21 +2139,20 @@ impl PartialFrame {
     }
     /// Some cameras send a leader at acquisition start or as soon as they are
     /// armed for a trigger, long before the image data.
-    fn awaits_data(&self) -> bool {
+    const fn awaits_data(&self) -> bool {
         self.leader.is_some() && self.count == 0 && self.trailer.is_none()
     }
 }
 /// Bytes per sample of the formats made only of 16- or 32-bit samples, which
 /// a big-endian stream sends most significant byte first.
-fn sample_bytes(pixel_format: u32) -> Option<usize> {
+const fn sample_bytes(pixel_format: u32) -> Option<usize> {
     match (pixel_format >> 16, pixel_format) {
         // RGBa12p and BGRa12p pack 12-bit samples.
         (_, 0x0230_0062 | 0x0230_004f) => None,
-        // Coord3D_AC16 and Coord3D_AC32f, also planar.
-        (_, 0x0220_00bb | 0x0220_00bc) => Some(2),
-        (_, 0x0240_00c2 | 0x0240_00c3) => Some(4),
-        (0x0110 | 0x0230 | 0x0240, _) => Some(2),
-        (0x0120 | 0x0260, _) => Some(4),
+        // Coord3D_AC32f (also planar) overrides the ordinary 16-bit layout.
+        (_, 0x0240_00c2 | 0x0240_00c3) | (0x0120 | 0x0260, _) => Some(4),
+        // Coord3D_AC16, also planar, and ordinary 16-bit layouts.
+        (_, 0x0220_00bb | 0x0220_00bc) | (0x0110 | 0x0230 | 0x0240, _) => Some(2),
         _ => None,
     }
 }
@@ -2076,11 +2160,12 @@ fn bit(bits: &[u64], id: u32) -> bool {
     bits.get(id as usize / 64)
         .is_some_and(|word| (word >> (id % 64)) & 1 != 0)
 }
-fn set_bit(bits: &mut [u64], id: u32) {
+const fn set_bit(bits: &mut [u64], id: u32) {
     bits[id as usize / 64] |= 1 << (id % 64);
 }
 fn missing(received: &[u64], packets: Option<usize>) -> Vec<(u32, u32)> {
-    let end = packets.map_or(received.len() * 64, |packets| packets + 2) as u32;
+    let end = u32::try_from(packets.map_or(received.len() * 64, |packets| packets + 2))
+        .expect("received packet maps are bounded by MAX_FRAME_PACKETS");
     let mut runs: Vec<(u32, u32)> = Vec::new();
     for id in (0..end).filter(|id| !bit(received, *id)) {
         match runs.last_mut() {
@@ -2120,14 +2205,14 @@ impl Budget {
         let refill = now.saturating_duration_since(self.at).as_secs_f64() * RESEND_BUDGET;
         self.tokens = (self.tokens + refill).min(RESEND_BUDGET);
         self.at = self.at.max(now);
-        let granted = self.tokens >= packets as f64;
+        let granted = self.tokens >= f64::from(packets);
         if granted {
-            self.tokens -= packets as f64;
+            self.tokens -= f64::from(packets);
         }
         granted
     }
 }
-fn block_distance(from: u64, to: u64, extended: bool) -> u64 {
+const fn block_distance(from: u64, to: u64, extended: bool) -> u64 {
     let distance = to.wrapping_sub(from);
     if extended {
         distance
@@ -2158,14 +2243,13 @@ impl Blocks {
             return 0;
         }
         let finished = offset.saturating_sub(16);
-        let window = if finished >= 128 {
-            u128::MAX
+        let (window, retained) = if finished >= 128 {
+            (u128::MAX, 0)
         } else {
-            (1 << finished) - 1
+            ((1 << finished) - 1, self.seen >> finished)
         };
         let lost = finished - u64::from((self.seen & window).count_ones());
-        self.seen =
-            self.seen.checked_shr(finished as u32).unwrap_or(0) | (1 << (offset - finished));
+        self.seen = retained | (1 << (offset - finished));
         self.next = Some(if extended {
             next.wrapping_add(finished)
         } else {
@@ -2183,7 +2267,7 @@ struct Assembler {
     limits: [Option<(usize, usize)>; 2],
     timestamp_frequency: u64,
     resend: bool,
-    /// The camera kept GevSCPSBigEndian set: 16-bit samples arrive swapped.
+    /// The camera kept `GevSCPSBigEndian` set: 16-bit samples arrive swapped.
     big_endian: bool,
     big_endian_mono16: bool,
     budget: Budget,
@@ -2225,45 +2309,50 @@ impl Assembler {
     /// its buffer, if that packet's place is still empty and inside the
     /// frame.
     fn predict(&self) -> Option<Slot> {
-        self.predict_run(1).pop()
+        self.predict_run(1).next()
     }
     /// Where the next `count` packets are expected to land, as `predict`
     /// says of the first: the newest frame's payload packets that follow,
     /// up to its end or the first one already received.
-    fn predict_run(&self, count: usize) -> Vec<Slot> {
-        let Some(frame) = self.frames.last().filter(|frame| frame.data.is_some()) else {
-            return Vec::new();
-        };
-        let Some((block_size, max_packets)) = self.limits[frame.extended as usize] else {
-            return Vec::new();
-        };
-        let first = frame.end.div_ceil(block_size) + 1;
-        (first..first + count)
-            .map_while(|id| {
-                let offset = (id - 1) * block_size;
-                let outside = id > max_packets
-                    || frame.packets.is_some_and(|packets| id > packets)
-                    || offset >= self.payload_limit
-                    || bit(&frame.received, id as u32);
-                (!outside).then(|| Slot {
-                    block: frame.block,
-                    extended: frame.extended,
-                    id: id as u32,
-                    header: if frame.extended { 20 } else { 8 },
-                    offset,
-                    len: block_size.min(self.payload_limit - offset),
+    fn predict_run(&self, count: usize) -> impl Iterator<Item = Slot> + '_ {
+        let predicted = self
+            .frames
+            .last()
+            .filter(|frame| frame.data.is_some())
+            .and_then(|frame| {
+                self.limits[usize::from(frame.extended)].map(|limits| (frame, limits))
+            });
+        predicted
+            .into_iter()
+            .flat_map(move |(frame, (block_size, max_packets))| {
+                let first = frame.end.div_ceil(block_size) + 1;
+                (first..=max_packets).take(count).map_while(move |id| {
+                    let offset = (id - 1) * block_size;
+                    let wire_id =
+                        u32::try_from(id).expect("predicted IDs are bounded by MAX_FRAME_PACKETS");
+                    let outside = frame.packets.is_some_and(|packets| id > packets)
+                        || offset >= self.payload_limit
+                        || bit(&frame.received, wire_id);
+                    (!outside).then(|| Slot {
+                        block: frame.block,
+                        extended: frame.extended,
+                        id: wire_id,
+                        header: if frame.extended { 20 } else { 8 },
+                        offset,
+                        len: block_size.min(self.payload_limit - offset),
+                    })
                 })
             })
-            .collect()
     }
     /// The newest frame's buffer, where a batch's predicted slots lie.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg(any(test, target_os = "linux"))]
     fn newest_buffer(&mut self) -> Option<*mut u8> {
         Some(self.frames.last_mut()?.data.as_mut()?.as_mut_ptr())
     }
     /// Whether `slot`'s frame still has the buffer starting at `base` and
     /// its place is still empty, so a packet that landed there can be taken
     /// in.
+    #[cfg(any(test, target_os = "linux"))]
     fn still_empty(&self, slot: &Slot, base: *const u8) -> bool {
         self.frames.iter().rev().any(|frame| {
             frame.block == slot.block
@@ -2287,7 +2376,6 @@ impl Assembler {
     /// in `slot` as predicted: its header, in `header`, names the slot's
     /// frame and packet.
     fn lands(
-        &self,
         slot: &Slot,
         (header, received, truncated): (&[u8], usize, bool),
     ) -> Option<GvspPacket<'static>> {
@@ -2316,7 +2404,7 @@ impl Assembler {
         scratch: &mut Vec<u8>,
         now: Instant,
     ) -> Result<Option<Frame>> {
-        if let Some(packet) = self.lands(slot, (header, received, truncated)) {
+        if let Some(packet) = Self::lands(slot, (header, received, truncated)) {
             return self.take(packet, now);
         }
         // At most one packet: a resend, a reorder, a leader or a trailer.
@@ -2383,6 +2471,7 @@ impl Assembler {
         }
         Ok(self.ready.pop_front())
     }
+
     fn insert(&mut self, index: Option<usize>, packet: GvspPacket<'_>, now: Instant) -> Result<()> {
         ensure!(
             packet.status == 0 || packet.status == 0x0100,
@@ -2395,15 +2484,13 @@ impl Assembler {
             packet.kind
         );
         let (block_size, max_packets) =
-            self.limits[packet.extended as usize].context("invalid GVSP packet size")?;
+            self.limits[usize::from(packet.extended)].context("invalid GVSP packet size")?;
         ensure!(
             packet.id as usize <= max_packets + 1,
             "GVSP packet ID exceeds payload bounds"
         );
-        let index = match index {
-            Some(index) => index,
-            None => self.create(packet.frame, packet.extended, max_packets, now),
-        };
+        let index =
+            index.unwrap_or_else(|| self.create(packet.frame, packet.extended, max_packets, now));
         let frame = &mut self.frames[index];
         ensure!(
             frame.extended == packet.extended,
@@ -2534,7 +2621,10 @@ impl Assembler {
         }
         if let (Some(leader), Some((_, height)), Some(packets)) =
             (&frame.leader, frame.trailer, frame.packets)
-            && bit(&frame.received, packets as u32)
+            && bit(
+                &frame.received,
+                u32::try_from(packets).context("frame packet count exceeds wire ID range")?,
+            )
         {
             ensure!(
                 frame.end >= leader.image_bytes(height),
@@ -2577,7 +2667,7 @@ impl Assembler {
         self.frames.len() - 1
     }
     /// Whether a frame needs `poll` for resends and expiry.
-    fn in_flight(&self) -> bool {
+    const fn in_flight(&self) -> bool {
         match self.frames.as_slice() {
             [] => false,
             [frame] => !frame.awaits_data(),
@@ -2691,7 +2781,7 @@ impl Assembler {
         let stride = leader.row_bytes + leader.x_padding;
         if leader.x_padding > 0 {
             crate::copies::record(
-                crate::copies::Site::GigeRowCompact,
+                Site::GigeRowCompact,
                 leader.row_bytes * (height as usize).saturating_sub(1),
             );
             for row in 1..height as usize {
@@ -2728,7 +2818,7 @@ impl Assembler {
                     } else {
                         u16::from(data.get(source + 1).copied().unwrap_or(0)) << 8
                     };
-                    data[row * leader.row_bytes + byte] = ((low | high) >> shift) as u8;
+                    data[row * leader.row_bytes + byte] = ((low | high) >> shift).to_le_bytes()[0];
                 }
                 if !row_bits.is_multiple_of(8) {
                     data[(row + 1) * leader.row_bytes - 1] &= (1 << (row_bits % 8)) - 1;
@@ -2775,7 +2865,7 @@ mod tests {
     fn ack(command: u16, id: u16, status: u16, data: &[u8]) -> Vec<u8> {
         let mut result = status.to_be_bytes().to_vec();
         result.extend(command.to_be_bytes());
-        result.extend((data.len() as u16).to_be_bytes());
+        result.extend(u16::try_from(data.len()).unwrap().to_be_bytes());
         result.extend(id.to_be_bytes());
         result.extend(data);
         result
@@ -2784,12 +2874,12 @@ mod tests {
         let mut result = vec![0, 0];
         if extended {
             result.extend([0, 0]);
-            result.extend((0x8000_0000 | ((kind as u32) << 24)).to_be_bytes());
+            result.extend((0x8000_0000 | (u32::from(kind) << 24)).to_be_bytes());
             result.extend(frame.to_be_bytes());
             result.extend(id.to_be_bytes());
         } else {
-            result.extend((frame as u16).to_be_bytes());
-            result.extend((((kind as u32) << 24) | id).to_be_bytes());
+            result.extend_from_slice(&frame.to_be_bytes()[6..]);
+            result.extend(((u32::from(kind) << 24) | id).to_be_bytes());
         }
         result.extend(data);
         result
@@ -2807,7 +2897,9 @@ mod tests {
         [1u32.to_be_bytes(), height.to_be_bytes()].concat()
     }
     fn image(width: u32, height: u32) -> Vec<u8> {
-        (0..width * height).map(|i| (i * 7) as u8).collect()
+        (0..width * height)
+            .map(|i| (i * 7).to_le_bytes()[0])
+            .collect()
     }
     fn frame_packets(
         block: u64,
@@ -2818,11 +2910,17 @@ mod tests {
     ) -> Vec<Vec<u8>> {
         let mut packets = vec![gvsp(block, 0, 1, extended, &leader(width, height, MONO8))];
         for chunk in image(width, height).chunks(block_size) {
-            packets.push(gvsp(block, packets.len() as u32, 3, extended, chunk));
+            packets.push(gvsp(
+                block,
+                u32::try_from(packets.len()).unwrap(),
+                3,
+                extended,
+                chunk,
+            ));
         }
         packets.push(gvsp(
             block,
-            packets.len() as u32,
+            u32::try_from(packets.len()).unwrap(),
             2,
             extended,
             &trailer(height),
@@ -2869,7 +2967,7 @@ mod tests {
         fn destination(&self) -> SocketAddrV4 {
             SocketAddrV4::new(
                 Ipv4Addr::from(self.register(STREAM_ADDRESS)),
-                self.register(STREAM_PORT) as u16,
+                u16::try_from(self.register(STREAM_PORT)).unwrap(),
             )
         }
         fn write(
@@ -2932,7 +3030,7 @@ mod tests {
             let block = if extended {
                 be64(packet, 20)
             } else {
-                be16(packet, 10) as u64
+                u64::from(be16(packet, 10))
             };
             let Some(packets) = self.frames.get(&block) else {
                 return;
@@ -2965,7 +3063,7 @@ mod tests {
         fn new(setup: impl FnOnce(&mut FakeCamera)) -> Self {
             let fixture = FAKE_CAMERA
                 .lock()
-                .unwrap_or_else(|error| error.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut camera = FakeCamera::default();
             setup(&mut camera);
             let camera = Arc::new(Mutex::new(camera));
@@ -3034,7 +3132,7 @@ mod tests {
                             camera.memory_writes.push((address, data.len()));
                             let little_endian = camera.little_endian;
                             let status = data.chunks(4).enumerate().find_map(|(word, value)| {
-                                let address = address + word as u32 * 4;
+                                let address = address + u32::try_from(word).unwrap() * 4;
                                 let value = if little_endian {
                                     u32::from_le_bytes(value.try_into().unwrap())
                                 } else {
@@ -3046,7 +3144,8 @@ mod tests {
                                 }
                             });
                             // Real devices answer with reserved(16) + index(16).
-                            let index = [0, 0, 0, data.len() as u8];
+                            let [high, low] = u16::try_from(data.len()).unwrap().to_be_bytes();
+                            let index = [0, 0, high, low];
                             Some(ack(command + 1, id, status.unwrap_or(0), &index))
                         }
                         PACKET_RESEND => {
@@ -3118,7 +3217,7 @@ mod tests {
                 (packets, camera.destination())
             };
             for (id, packet) in packets.iter().enumerate() {
-                if !drops.contains(&(id as u32)) {
+                if !drops.contains(&(u32::try_from(id).unwrap())) {
                     send(packet, destination);
                 }
             }
@@ -3139,7 +3238,7 @@ mod tests {
             setup(camera);
         });
         let mut gige = connect(fake.address, Duration::from_secs(1)).unwrap();
-        gige.packet_size = Some(Some(1500));
+        gige.packet_size = PacketSize::Verified(1500);
         gige.start((WIDTH * HEIGHT) as usize).unwrap();
         (fake, gige)
     }
@@ -3154,7 +3253,9 @@ mod tests {
         control
             .write_register(STREAM_ADDRESS, u32::from(Ipv4Addr::LOCALHOST))
             .unwrap();
-        control.write_register(STREAM_PORT, port as u32).unwrap();
+        control
+            .write_register(STREAM_PORT, u32::from(port))
+            .unwrap();
         let mut buffer = vec![0; 65_536];
         let camera = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let size = ladder(
@@ -3170,7 +3271,7 @@ mod tests {
     #[test]
     fn discovery_identity_and_truncated_packets() {
         let mut identity = vec![0u8; 0xf8];
-        identity[12..16].copy_from_slice(&0x12345678u32.to_be_bytes());
+        identity[12..16].copy_from_slice(&0x1234_5678_u32.to_be_bytes());
         identity[0x48..0x4c].copy_from_slice(b"Acme");
         identity[0x68..0x6c].copy_from_slice(b"C123");
         identity[0xd8..0xdc].copy_from_slice(b"5678");
@@ -3179,13 +3280,13 @@ mod tests {
         assert_eq!(camera.address.as_deref(), Some("10.1.2.3"));
         assert_eq!(camera.vendor, "Acme");
         identity[12..16].fill(0);
-        let first = discovery_info(&identity, Ipv4Addr::new(127, 0, 0, 1)).unwrap();
+        let first = discovery_info(&identity, Ipv4Addr::LOCALHOST).unwrap();
         let second = discovery_info(&identity, Ipv4Addr::new(192, 168, 2, 1)).unwrap();
         assert_ne!(
             first.id, second.id,
             "software cameras with no MAC must stay distinct"
         );
-        assert!(discovery_info(&identity[..240], Ipv4Addr::LOCALHOST).is_err());
+        discovery_info(&identity[..240], Ipv4Addr::LOCALHOST).unwrap_err();
         // Anything on the network can answer discovery: its names cannot
         // carry terminal escapes to whoever lists cameras.
         let vendor = b"Vend\x1b]0;PWNED\x07or";
@@ -3241,9 +3342,8 @@ mod tests {
         server
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        let address = match server.local_addr().unwrap() {
-            SocketAddr::V4(a) => a,
-            _ => unreachable!(),
+        let SocketAddr::V4(address) = server.local_addr().unwrap() else {
+            unreachable!()
         };
         let worker = thread::spawn(move || {
             let mut buffer = [0u8; 100];
@@ -3276,7 +3376,7 @@ mod tests {
         worker.join().unwrap();
     }
     /// A camera that answers each command once, after `reply`, optionally
-    /// preceded by a PENDING_ACK; returns how many command packets it saw.
+    /// preceded by a `PENDING_ACK`; returns how many command packets it saw.
     fn slow_camera(pending: Option<u16>, reply: Duration) -> (SocketAddrV4, JoinHandle<usize>) {
         let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let SocketAddr::V4(address) = server.local_addr().unwrap() else {
@@ -3329,7 +3429,7 @@ mod tests {
         let mut control = Control::connect(address, Duration::from_millis(150)).unwrap();
         control.pending_limit = Some(Duration::from_millis(500));
         let started = Instant::now();
-        assert!(control.read_register(0x100).is_err());
+        control.read_register(0x100).unwrap_err();
         assert!(started.elapsed() < Duration::from_millis(800));
         camera.join().unwrap();
     }
@@ -3373,9 +3473,8 @@ mod tests {
     fn udp_status_and_address_validation() {
         for invalid_address in [false, true] {
             let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-            let address = match server.local_addr().unwrap() {
-                SocketAddr::V4(a) => a,
-                _ => unreachable!(),
+            let SocketAddr::V4(address) = server.local_addr().unwrap() else {
+                unreachable!()
             };
             let worker = thread::spawn(move || {
                 let mut buffer = [0u8; 100];
@@ -3402,6 +3501,33 @@ mod tests {
             worker.join().unwrap();
         }
     }
+    #[test]
+    fn memory_write_chunks_keep_addresses_and_short_final_payloads() {
+        let fake = Fake::new(|_| {});
+        let mut control = Control::connect(fake.address, Duration::from_secs(1)).unwrap();
+        let base = 0x1000_0000;
+        let data: Vec<_> = (0..MEMORY_CHUNK * 2 + 8)
+            .map(|i| i.to_le_bytes()[0])
+            .collect();
+        control.write_bytes(base.into(), &data).unwrap();
+        let camera = fake.camera.lock().unwrap();
+        let chunk = u32::try_from(MEMORY_CHUNK).unwrap();
+        assert_eq!(
+            camera.memory_writes,
+            [
+                (base, MEMORY_CHUNK),
+                (base + chunk, MEMORY_CHUNK),
+                (base + chunk * 2, 8)
+            ]
+        );
+        for (index, word) in data.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(
+                camera.register(base + u32::try_from(index * 4).unwrap()),
+                u32::from_be_bytes(*word)
+            );
+        }
+    }
+
     #[test]
     fn memory_writes_accept_index_acknowledgements_and_fall_back_to_registers() {
         let name = *b"Line 3\0\0\0\0\0\0\0\0\0\0";
@@ -3432,7 +3558,7 @@ mod tests {
         control.write_memory = false;
         control.write_bytes(0xe8, &name).unwrap();
         let camera = fake.camera.lock().unwrap();
-        assert!(camera.memory_writes.is_empty());
+        assert_eq!(camera.memory_writes, [] as [(u32, usize); 0]);
         assert_eq!(camera.register_writes.len(), 4);
     }
     #[test]
@@ -3537,27 +3663,61 @@ mod tests {
         assert!(parse_local_url("http://camera.example/xml").is_err());
         assert!(parse_local_url("Local:a.xml;0;2000000").is_err());
         assert_eq!(memory_range(0x101, 5).unwrap(), (0x100, 8, 1));
-        assert!(memory_range(u32::MAX as u64, 2).is_err());
         assert_eq!(
-            memory_range(u32::MAX as u64, 1).unwrap(),
+            memory_range(u64::from(u32::MAX), 0).unwrap(),
+            (u32::MAX, 0, 0)
+        );
+        memory_range(u64::from(u32::MAX) + 1, 0).unwrap_err();
+        memory_range(u64::from(u32::MAX), 2).unwrap_err();
+        assert_eq!(
+            memory_range(u64::from(u32::MAX), 1).unwrap(),
             (0xffff_fffc, 4, 3)
         );
     }
     #[test]
+    fn xml_padding_is_removed_without_changing_the_document() {
+        for prefix in ["", "\u{feff}"] {
+            for body in ["<XML/>", " <相机/>\n", "<XML>\0</XML>"] {
+                for suffix in ["", "\0", "\0\0"] {
+                    assert_eq!(
+                        decode_xml("Camera.xml", format!("{prefix}{body}{suffix}").into_bytes())
+                            .unwrap(),
+                        body
+                    );
+                }
+            }
+        }
+        for invalid in [
+            b"\xef\xbb\xbf<XML>\xff</XML>\0".as_slice(),
+            b"\xef\xbb\xbf\xef\xbb\xbf<XML/>",
+            b"\xef\xbb\xbf\0",
+        ] {
+            decode_xml("Camera.xml", invalid.to_vec()).unwrap_err();
+        }
+    }
+    #[test]
     fn zip_xml_load_and_ambiguous_entries() {
-        use std::io::Write;
+        use std::io::Write as _;
         use zip::write::SimpleFileOptions;
-        for count in [1, 2] {
+        for (count, extension) in [(1, "xml"), (1, "XML"), (1, "xMl"), (2, "XML")] {
             let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
             for index in 0..count {
                 writer
-                    .start_file(format!("Camera{index}.xml"), SimpleFileOptions::default())
+                    .start_file(
+                        format!("相机{index}.{extension}"),
+                        SimpleFileOptions::default(),
+                    )
                     .unwrap();
-                writer.write_all(b"<RegisterDescription/>").unwrap();
+                writer
+                    .write_all(b"\xef\xbb\xbf<RegisterDescription/>\0\0")
+                    .unwrap();
             }
             let data = writer.finish().unwrap().into_inner();
             let result = decode_xml("Camera.zip", data);
             assert_eq!(result.is_ok(), count == 1);
+            if let Ok(xml) = result {
+                assert_eq!(xml, "<RegisterDescription/>");
+            }
         }
     }
     #[test]
@@ -3625,18 +3785,16 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(assembler.push(&gvsp(1, 1, 3, false, &[2; 7])).is_err());
+        assembler.push(&gvsp(1, 1, 3, false, &[2; 7])).unwrap_err();
         assert!(assembler.frames.is_empty());
-        assert!(
-            assembler
-                .push(&gvsp(2, u32::MAX, 3, true, &[0; 8]))
-                .is_err()
-        );
+        assembler
+            .push(&gvsp(2, u32::MAX, 3, true, &[0; 8]))
+            .unwrap_err();
         for length in 0..8 {
             assert!(parse_header(&[0; 8][..length]).is_err());
         }
         let huge = leader(u32::MAX, u32::MAX, RGB8);
-        assert!(ImageLeader::parse(&huge, MAX_PAYLOAD).is_err());
+        ImageLeader::parse(&huge, MAX_PAYLOAD).unwrap_err();
     }
     #[test]
     fn incomplete_frames_have_bounded_storage() {
@@ -3650,6 +3808,25 @@ mod tests {
             100 - MAX_INCOMPLETE_FRAMES as u64
         );
     }
+    #[test]
+    fn command_payload_lengths_cannot_wrap() {
+        let mut payload = vec![0; usize::from(u16::MAX)];
+        let packet = command_packet(READ_MEMORY, 7, 1, &payload).unwrap();
+        assert_eq!(be16(&packet, 4), u16::MAX);
+        assert_eq!(&packet[8..], payload);
+        payload.push(0);
+        command_packet(READ_MEMORY, 7, 1, &payload).unwrap_err();
+    }
+
+    #[test]
+    fn camera_tick_conversion_saturates_without_wrapping() {
+        assert_eq!(ticks_ns(3, 2), 1_500_000_000);
+        assert_eq!(ticks_ns(u64::MAX, 1_000_000_000), u64::MAX);
+        assert_eq!(ticks_ns(u64::MAX, 1), u64::MAX);
+        assert_eq!(ticks_ns(1, 0), 1_000_000_000);
+        assert_eq!(ticks_ns(1, u64::MAX), 0);
+    }
+
     #[test]
     fn packet_resend_commands_match_aravis_captures() {
         use crate::types::hex;
@@ -3667,14 +3844,19 @@ mod tests {
     fn missing_runs_cover_leader_payload_and_trailer() {
         let bits = |ids: &[u32]| {
             let mut bits = vec![0; 2];
-            ids.iter().for_each(|id| set_bit(&mut bits, *id));
+            for &id in ids {
+                set_bit(&mut bits, id);
+            }
             bits
         };
         assert_eq!(
             missing(&bits(&[1, 2, 5, 6]), Some(6)),
             [(0, 0), (3, 4), (7, 7)]
         );
-        assert!(missing(&bits(&[0, 1, 2, 3, 4, 5, 6, 7]), Some(6)).is_empty());
+        assert_eq!(
+            missing(&bits(&[0, 1, 2, 3, 4, 5, 6, 7]), Some(6)),
+            [] as [(u32, u32); 0]
+        );
         assert_eq!(missing(&bits(&[2, 4]), None), [(0, 1), (3, 3)]);
     }
     #[test]
@@ -3737,7 +3919,7 @@ mod tests {
         assert!(assembler.frames.is_empty());
         let mut unknown = gvsp(2, 1, 3, false, &[1; 8]);
         unknown[..2].copy_from_slice(&0x0001u16.to_be_bytes());
-        assert!(assembler.push(&unknown).is_err());
+        assembler.push(&unknown).unwrap_err();
 
         for status in [0x8010u16, 0x8014] {
             let mut assembler = Assembler::new(16, 44, 0);
@@ -3809,13 +3991,13 @@ mod tests {
             assembler.push_at(&packets[id], at(0)).unwrap();
         }
         assembler.poll(at(9));
-        assert!(assembler.requests.is_empty());
+        assert_eq!(assembler.requests, [] as [(u64, bool, u32, u32); 0]);
         assembler.poll(at(10));
         assert_eq!(assembler.requests, [(1, false, 3, 3), (1, false, 7, 7)]);
         for retry in [30, 50] {
             assembler.requests.clear();
             assembler.poll(at(retry - 1));
-            assert!(assembler.requests.is_empty());
+            assert_eq!(assembler.requests, [] as [(u64, bool, u32, u32); 0]);
             assembler.poll(at(retry));
             assert_eq!(assembler.requests.len(), 2);
         }
@@ -3839,7 +4021,7 @@ mod tests {
         for id in [0, 1, 2, 4, 5, 6] {
             assembler.push_at(&packets[id], at(200)).unwrap();
         }
-        assert!(assembler.requests.is_empty());
+        assert_eq!(assembler.requests, [] as [(u64, bool, u32, u32); 0]);
         assembler
             .push_at(&frame_packets(4, false, 8, 6, 8)[0], at(201))
             .unwrap();
@@ -3854,7 +4036,7 @@ mod tests {
         for id in [0, 1, 2, 4, 5, 6, 7] {
             assembler.push_at(&packets[id], at(300)).unwrap();
         }
-        assert!(assembler.requests.is_empty());
+        assert_eq!(assembler.requests, [] as [(u64, bool, u32, u32); 0]);
         assembler.poll(at(320));
         assert_eq!(assembler.requests, [(5, false, 3, 3)]);
     }
@@ -3896,11 +4078,11 @@ mod tests {
             (400, spread(32), false),
         ] {
             let mut assembler = resending(8 * packets);
-            for (id, packet) in frame_packets(1, false, 8, packets as u32, 8)
+            for (id, packet) in frame_packets(1, false, 8, u32::try_from(packets).unwrap(), 8)
                 .iter()
                 .enumerate()
             {
-                if !drops.contains(&(id as u32)) {
+                if !drops.contains(&(u32::try_from(id).unwrap())) {
                     assembler.push(packet).unwrap();
                 }
             }
@@ -3925,9 +4107,15 @@ mod tests {
         assert_eq!(lost((65_530..=65_534).chain(1..=17).collect(), false), 1);
         let extended = (0..40)
             .filter(|i| ![5, 6, 7].contains(i))
-            .map(|i| u32::MAX as u64 + i)
+            .map(|i| u64::from(u32::MAX) + i)
             .collect();
         assert_eq!(lost(extended, true), 3);
+        // Gaps that cross the 128-frame bitmap still count every absent
+        // block once the 16-frame reordering window has passed it.
+        for next in [128, 129, 144, 145, 32_768] {
+            let blocks = std::iter::once(1).chain(next..=next + 16).collect();
+            assert_eq!(lost(blocks, true), next - 2, "next block {next}");
+        }
         let mut reordered: Vec<u64> = (1..=40).collect();
         reordered.swap(4, 9);
         assert_eq!(lost(reordered, false), 0);
@@ -3946,6 +4134,21 @@ mod tests {
         assert_eq!(assembler.stats.lost_frames, 1);
     }
     #[test]
+    fn packet_prediction_bounds_even_an_unlimited_request() {
+        let mut assembler = Assembler::new(24, 44, 0);
+        let packets = frame_packets(1, false, 8, 3, 8);
+        assembler.push(&packets[0]).unwrap();
+        assembler.push(&packets[1]).unwrap();
+        assert_eq!(assembler.predict_run(0).count(), 0);
+        let slots: Vec<_> = assembler.predict_run(usize::MAX).collect();
+        assert_eq!(slots.iter().map(|slot| slot.id).collect::<Vec<_>>(), [2, 3]);
+        assert_eq!(slots[0].offset, 8);
+        assert_eq!(slots[1].offset, 16);
+        assert!(slots.iter().all(|slot| slot.len == 8));
+        assert_eq!(assembler.predict_run(1).count(), 1);
+    }
+
+    #[test]
     fn direct_placement_handles_reordering_duplicates_padding_and_late_leaders() {
         let mut assembler = Assembler::new(32, 44, 0);
         let mut metadata = leader(5, 3, MONO8);
@@ -3955,7 +4158,7 @@ mod tests {
         let payload = |id: usize| {
             gvsp(
                 1,
-                id as u32,
+                u32::try_from(id).unwrap(),
                 3,
                 false,
                 &wire[(id - 1) * 8..(id * 8).min(20)],
@@ -3983,19 +4186,17 @@ mod tests {
 
         let mut assembler = Assembler::new(32, 44, 0);
         assembler.push(&gvsp(3, 2, 2, false, &trailer(1))).unwrap();
-        assert!(assembler.push(&gvsp(3, 2, 3, false, &[1; 8])).is_err());
+        assembler.push(&gvsp(3, 2, 3, false, &[1; 8])).unwrap_err();
         assembler.push(&gvsp(1, 1, 3, false, &[1; 8])).unwrap();
-        assert!(assembler.push(&gvsp(1, 1, 3, false, &[2; 8])).is_err());
+        assembler.push(&gvsp(1, 1, 3, false, &[2; 8])).unwrap_err();
         assembler.push(&gvsp(2, 2, 3, false, &[1; 8])).unwrap();
-        assert!(assembler.push(&gvsp(2, 1, 3, false, &[1; 4])).is_err());
+        assembler.push(&gvsp(2, 1, 3, false, &[1; 4])).unwrap_err();
         assembler.push(&gvsp(4, 1, 3, false, &[1; 4])).unwrap();
-        assert!(assembler.push(&gvsp(4, 2, 3, false, &[1; 8])).is_err());
+        assembler.push(&gvsp(4, 2, 3, false, &[1; 8])).unwrap_err();
         assembler.push(&gvsp(5, 2, 3, false, &[1; 4])).unwrap();
-        assert!(
-            assembler
-                .push(&gvsp(5, 0, 1, false, &leader(4, 1, MONO8)))
-                .is_err()
-        );
+        assembler
+            .push(&gvsp(5, 0, 1, false, &leader(4, 1, MONO8)))
+            .unwrap_err();
         assert!(assembler.frames.is_empty());
     }
     #[test]
@@ -4009,7 +4210,13 @@ mod tests {
         for chunk in pixels.chunks(block) {
             let mut data = chunk.to_vec();
             data.resize(block, 0);
-            packets.push(gvsp(1, packets.len() as u32, 3, false, &data));
+            packets.push(gvsp(
+                1,
+                u32::try_from(packets.len()).unwrap(),
+                3,
+                false,
+                &data,
+            ));
         }
         assert_eq!(packets.len() - 1, 271);
         packets.push(gvsp(1, 272, 2, false, &trailer(height)));
@@ -4029,9 +4236,9 @@ mod tests {
             }
             // A resend of the last packet may drop or add the padding.
             let unpadded = gvsp(1, 271, 3, false, &pixels[270 * block..]);
-            for (first, again) in [(&packets[271], &unpadded), (&unpadded, &packets[271])] {
+            for sequence in [[&packets[271], &unpadded], [&unpadded, &packets[271]]] {
                 let mut assembler = Assembler::new(payload, 1500, 0);
-                for packet in packets[..271].iter().chain([first, again]) {
+                for packet in packets[..271].iter().chain(sequence) {
                     assert!(assembler.push(packet).unwrap().is_none());
                 }
                 let frame = assembler.push(&packets[272]).unwrap().unwrap();
@@ -4042,16 +4249,14 @@ mod tests {
         for packet in &packets[..=271] {
             assembler.push(packet).unwrap();
         }
-        assert!(
-            assembler
-                .push(&gvsp(1, 270, 3, false, &pixels[269 * block..][..752]))
-                .is_err()
-        );
+        assembler
+            .push(&gvsp(1, 270, 3, false, &pixels[269 * block..][..752]))
+            .unwrap_err();
         let mut assembler = Assembler::new(396_744, 1500, 0);
         assembler.push(&packets[0]).unwrap();
         let short = gvsp(1, 271, 3, false, &pixels[270 * block..][..700]);
         assembler.push(&short).unwrap();
-        assert!(assembler.push(&packets[272]).is_err());
+        assembler.push(&packets[272]).unwrap_err();
     }
     #[test]
     fn short_frames_end_at_the_trailer_height() {
@@ -4063,7 +4268,13 @@ mod tests {
         let lines = image(width, 300);
         let mut packets = vec![gvsp(7, 0, 1, false, &leader(width, 1000, MONO8))];
         for chunk in lines.chunks(block) {
-            packets.push(gvsp(7, packets.len() as u32, 3, false, chunk));
+            packets.push(gvsp(
+                7,
+                u32::try_from(packets.len()).unwrap(),
+                3,
+                false,
+                chunk,
+            ));
         }
         assert_eq!((packets.len(), packets[138].len()), (139, 8 + 732));
         packets.push(gvsp(7, 139, 2, false, &trailer(300)));
@@ -4099,7 +4310,7 @@ mod tests {
         let rows: Vec<u8> = (1..=24).collect();
         for (id, chunk) in rows.chunks(8).enumerate() {
             assembler
-                .push(&gvsp(1, id as u32 + 1, 3, false, chunk))
+                .push(&gvsp(1, u32::try_from(id).unwrap() + 1, 3, false, chunk))
                 .unwrap();
         }
         assembler.push(&gvsp(1, 0, 1, false, &metadata)).unwrap();
@@ -4143,10 +4354,22 @@ mod tests {
             let pixels = image(width, lines);
             let mut packets = vec![gvsp(7, 0, 1, false, &leader(width, 1000, MONO8))];
             for chunk in pixels.chunks(block) {
-                packets.push(gvsp(7, packets.len() as u32, 3, false, chunk));
+                packets.push(gvsp(
+                    7,
+                    u32::try_from(packets.len()).unwrap(),
+                    3,
+                    false,
+                    chunk,
+                ));
             }
             assert_eq!(packets.len(), full + 2);
-            packets.push(gvsp(7, full as u32 + 2, 2, false, &trailer(lines)));
+            packets.push(gvsp(
+                7,
+                u32::try_from(full).unwrap() + 2,
+                2,
+                false,
+                &trailer(lines),
+            ));
             let mut assembler = resending();
             for packet in &packets[..=full] {
                 assembler.push_at(packet, at(0)).unwrap();
@@ -4187,9 +4410,21 @@ mod tests {
             metadata[34..36].copy_from_slice(&y_padding.to_be_bytes());
             let mut packets = vec![gvsp(1, 0, 1, false, &metadata)];
             for chunk in wire.chunks(12) {
-                packets.push(gvsp(1, packets.len() as u32, 3, false, chunk));
+                packets.push(gvsp(
+                    1,
+                    u32::try_from(packets.len()).unwrap(),
+                    3,
+                    false,
+                    chunk,
+                ));
             }
-            packets.push(gvsp(1, packets.len() as u32, 2, false, &trailer(8)));
+            packets.push(gvsp(
+                1,
+                u32::try_from(packets.len()).unwrap(),
+                2,
+                false,
+                &trailer(8),
+            ));
             packets
                 .iter()
                 .find_map(|packet| assembler.push(packet).transpose())
@@ -4200,14 +4435,14 @@ mod tests {
             for (i, &sample) in samples.iter().enumerate() {
                 for bit in 0..bits {
                     data[(i * bits + bit) / 8] |=
-                        ((sample >> bit) as u8 & 1) << ((i * bits + bit) % 8);
+                        (u8::from((sample >> bit) & 1 != 0)) << ((i * bits + bit) % 8);
                 }
             }
             data
         };
         for (pixel, width, bits) in [(0x010c_0047, 5, 12), (0x010a_0046, 6, 10)] {
             let samples: Vec<u16> = (0..width * 8)
-                .map(|i| ((i * 317 + 179) & ((1 << bits) - 1)) as u16)
+                .map(|i| u16::try_from((i * 317 + 179) & ((1 << bits) - 1)).unwrap())
                 .collect();
             let continuous = pack(&samples, bits);
             let rows: Vec<u8> = samples
@@ -4234,7 +4469,7 @@ mod tests {
                 .flat_map(|row| row.iter().copied().chain([0xa5]))
                 .collect();
             assert_eq!(send(pixel, width, 72, &x_padded, 1, 0).unwrap().data, rows);
-            assert!(send(pixel, width, 64, &continuous[..59], 0, 0).is_err());
+            send(pixel, width, 64, &continuous[..59], 0, 0).unwrap_err();
         }
         for (pixel, width, channels, bits) in [
             (0x0104_0039, 3, 1, 4),
@@ -4242,7 +4477,7 @@ mod tests {
             (0x0224_0049, 3, 3, 12),
         ] {
             let samples: Vec<u16> = (0..width * channels * 8)
-                .map(|i| ((i * 317 + 179) & ((1 << bits) - 1)) as u16)
+                .map(|i| u16::try_from((i * 317 + 179) & ((1 << bits) - 1)).unwrap())
                 .collect();
             let continuous = pack(&samples, bits);
             let rows: Vec<u8> = samples
@@ -4251,9 +4486,9 @@ mod tests {
                 .collect();
             let frame = send(pixel, width, rows.len(), &continuous, 0, 0).unwrap();
             assert_eq!(frame.data, rows, "{pixel:08x}");
-            assert!(crate::frame::rgb(&frame).is_ok());
+            crate::frame::rgb(&frame).unwrap();
         }
-        assert!(ImageLeader::parse(&leader(5, 8, 0x010c_0047), 59).is_err());
+        ImageLeader::parse(&leader(5, 8, 0x010c_0047), 59).unwrap_err();
     }
     #[test]
     fn image_payloads_with_chunks_deliver_the_image() {
@@ -4273,7 +4508,13 @@ mod tests {
         tail.extend(1u32.to_be_bytes());
         let mut packets = vec![gvsp(3, 0, 1, false, &metadata)];
         for chunk in payload.chunks(8) {
-            packets.push(gvsp(3, packets.len() as u32, 3, false, chunk));
+            packets.push(gvsp(
+                3,
+                u32::try_from(packets.len()).unwrap(),
+                3,
+                false,
+                chunk,
+            ));
         }
         packets.push(gvsp(3, 5, 2, false, &tail));
         for late_leader in [false, true] {
@@ -4305,7 +4546,7 @@ mod tests {
             (0x000b, "GenDC"),
             (0x8001, "device-specific"),
         ] {
-            metadata[2..4].copy_from_slice(&(payload_type as u16).to_be_bytes());
+            metadata[2..4].copy_from_slice(&u16::try_from(payload_type).unwrap().to_be_bytes());
             let error = ImageLeader::parse(&metadata, 32).unwrap_err();
             assert!(error.to_string().contains(name), "{error}");
             assert_eq!(
@@ -4337,7 +4578,7 @@ mod tests {
         );
     }
     /// A receive buffer past `net.core.rmem_max` where the process may ask
-    /// for one (root, or CAP_NET_ADMIN), else as large as the limit allows.
+    /// for one (root, or `CAP_NET_ADMIN`), else as large as the limit allows.
     #[test]
     fn receive_buffers_are_forced_past_the_limit_where_allowed() {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -4375,6 +4616,9 @@ mod tests {
         assert!(size.is_some_and(|size| (1350..=1400).contains(&size)) && probes.len() <= 9);
         let (size, probes) = run(4000, 9000, true);
         assert!(size.is_some_and(|size| (3900..=4000).contains(&size)) && probes.len() <= 8);
+        let (size, probes) = run(u32::MAX - 4, u32::MAX, true);
+        assert!(size.is_some_and(|size| size > u32::MAX / 2 && size <= u32::MAX - 4));
+        assert!(probes.len() <= 8);
     }
     #[test]
     fn packet_size_probes_against_fake_camera() {
@@ -4438,14 +4682,17 @@ mod tests {
     #[test]
     fn network_probe_rejects_unreadable_and_silent_cameras_within_deadline() {
         let fake = Fake::new(|camera| camera.unreadable.push(GVCP_CAPABILITY));
-        assert!(probe_network_at(fake.address, Duration::from_millis(100)).is_err());
-        assert!(fake.camera.lock().unwrap().register_writes.is_empty());
+        probe_network_at(fake.address, Duration::from_millis(100)).unwrap_err();
+        assert_eq!(
+            fake.camera.lock().unwrap().register_writes,
+            [] as [(u32, u32); 0]
+        );
         let silent = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let SocketAddr::V4(address) = silent.local_addr().unwrap() else {
             unreachable!()
         };
         let started = Instant::now();
-        assert!(probe_network_at(address, Duration::from_millis(40)).is_err());
+        probe_network_at(address, Duration::from_millis(40)).unwrap_err();
         assert!(started.elapsed() < Duration::from_millis(500));
     }
     #[test]
@@ -4474,10 +4721,10 @@ mod tests {
             camera.registers.insert(STREAM_PACKET_SIZE, flags | 576);
         });
         let mut gige = connect(fake.address, Duration::from_millis(200)).unwrap();
-        gige.packet_size = Some(None);
+        gige.packet_size = PacketSize::Unverified;
         let tuning = gige.optimize_network(8000).unwrap();
         assert_eq!(tuning.packet_size, Some(1500));
-        assert_eq!(gige.packet_size, Some(Some(1500)));
+        assert_eq!(gige.packet_size, PacketSize::Verified(1500));
         assert!(
             tuning
                 .changes
@@ -4512,7 +4759,7 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("unverified"))
         );
-        assert_eq!(gige.packet_size, Some(None));
+        assert_eq!(gige.packet_size, PacketSize::Unverified);
     }
     #[test]
     fn rejected_network_settings_restore_packet_size_and_destination() {
@@ -4526,14 +4773,14 @@ mod tests {
             camera.registers.insert(STREAM_PACKET_SIZE, flags | 1400);
         });
         let mut gige = connect(fake.address, Duration::from_millis(200)).unwrap();
-        assert!(gige.optimize_network(8000).is_err());
+        gige.optimize_network(8000).unwrap_err();
         assert_eq!(
             fake.register(STREAM_ADDRESS),
             u32::from(Ipv4Addr::LOCALHOST)
         );
         assert_eq!(fake.register(STREAM_PORT), 8123);
         assert_eq!(fake.register(STREAM_PACKET_SIZE), flags | 1400);
-        assert_eq!(gige.packet_size, None);
+        assert_eq!(gige.packet_size, PacketSize::Untested);
     }
     #[test]
     fn start_clears_only_big_endian_drains_test_packets_and_caches_the_size() {
@@ -4561,7 +4808,7 @@ mod tests {
         assert!(!gige.stream.as_ref().unwrap().assembler.big_endian);
         let socket = &gige.stream.as_ref().unwrap().socket;
         socket.set_nonblocking(true).unwrap();
-        assert!(socket.recv(&mut vec![0; 65_536]).is_err());
+        socket.recv(&mut vec![0; 65_536]).unwrap_err();
         socket.set_nonblocking(false).unwrap();
         assert_eq!(gige.stats().unwrap().packet_size, Some(9000));
         gige.stop().unwrap();
@@ -4604,7 +4851,7 @@ mod tests {
                     camera.registers.insert(STREAM_CAPABILITY, 0x8000_0000);
                 }
             });
-            let source = fake.stream.local_addr().unwrap().port() as u32;
+            let source = u32::from(fake.stream.local_addr().unwrap().port());
             fake.camera
                 .lock()
                 .unwrap()
@@ -4614,12 +4861,12 @@ mod tests {
                 .set_read_timeout(Some(Duration::from_millis(200)))
                 .unwrap();
             let mut gige = connect(fake.address, Duration::from_secs(1)).unwrap();
-            gige.packet_size = Some(Some(1500));
+            gige.packet_size = PacketSize::Verified(1500);
             gige.start(8000).unwrap();
             let stream = gige.stream.as_mut().unwrap();
             let port = stream.socket.local_addr().unwrap().port();
             stream.next_traversal = Instant::now();
-            assert!(gige.next_frame(Duration::from_millis(20)).is_err());
+            gige.next_frame(Duration::from_millis(20)).unwrap_err();
             let mut buffer = [0; 64];
             for _ in 0..2 {
                 let received = fake.stream.recv_from(&mut buffer);
@@ -4633,7 +4880,9 @@ mod tests {
             let stream = gige.stream.as_mut().unwrap();
             stream.next_traversal = Instant::now() + Duration::from_millis(50);
             thread::scope(|scope| {
-                scope.spawn(|| assert!(gige.next_frame(Duration::from_millis(500)).is_err()));
+                scope.spawn(|| {
+                    gige.next_frame(Duration::from_millis(500)).unwrap_err();
+                });
                 let received = fake.stream.recv_from(&mut buffer);
                 assert_eq!(
                     received.ok().map(|(_, from)| from.port()),
@@ -4672,7 +4921,7 @@ mod tests {
                 (frame.id, frame.data.to_vec()),
                 (block, image(WIDTH, HEIGHT))
             );
-            assert!(gige.next_frame(Duration::from_millis(50)).is_err());
+            gige.next_frame(Duration::from_millis(50)).unwrap_err();
             let port = gige
                 .stream
                 .as_ref()
@@ -4737,7 +4986,7 @@ mod tests {
             camera.registers.insert(GVCP_CAPABILITY, 0x4);
         });
         fake.send(1, false, &[4, 5, 6, 7]);
-        assert!(gige.next_frame(Duration::from_millis(5)).is_err());
+        gige.next_frame(Duration::from_millis(5)).unwrap_err();
         let before = gige.stats().unwrap().resend_requested;
         thread::sleep(FRAME_IDLE + Duration::from_millis(50));
         let (packets, destination) = {
@@ -4886,7 +5135,7 @@ mod tests {
         }
         // A frame still arriving is in flight: back to polling for resends.
         fake.send(1, false, &[4, 5, 6, 7]);
-        assert!(gige.next_frame(Duration::from_millis(5)).is_err());
+        gige.next_frame(Duration::from_millis(5)).unwrap_err();
         assert!(timeout(&gige) <= POLL, "{:?}", timeout(&gige));
         let (packets, destination) = {
             let camera = fake.camera.lock().unwrap();
@@ -4896,7 +5145,7 @@ mod tests {
             fake.stream.send_to(&packet, destination).unwrap();
         }
         assert_eq!(gige.next_frame(Duration::from_secs(1)).unwrap().id, 1);
-        assert!(gige.next_frame(Duration::from_millis(100)).is_err());
+        gige.next_frame(Duration::from_millis(100)).unwrap_err();
         assert!(timeout(&gige) > POLL * 8, "{:?}", timeout(&gige));
     }
     #[test]
@@ -4913,12 +5162,15 @@ mod tests {
             let timeout = gige.stream.as_ref().unwrap().timeout;
             assert!(timeout > POLL * 8, "{timeout:?}");
         }
-        assert!(gige.next_frame(Duration::from_millis(200)).is_err());
+        gige.next_frame(Duration::from_millis(200)).unwrap_err();
         for packet in &packets[1..] {
             fake.stream.send_to(packet, destination).unwrap();
         }
         assert_eq!(gige.next_frame(Duration::from_secs(1)).unwrap().id, 1);
-        assert!(fake.camera.lock().unwrap().requests.is_empty());
+        assert_eq!(
+            fake.camera.lock().unwrap().requests,
+            [] as [(Vec<u8>, u16); 0]
+        );
     }
     #[test]
     fn fake_camera_unavailable_packets_abandon_the_frame() {
@@ -4929,8 +5181,8 @@ mod tests {
                 camera.resend_status = status;
             });
             fake.send(1, false, &[3, 7]);
-            assert!(gige.next_frame(Duration::from_millis(300)).is_err());
-            assert!(gige.next_frame(Duration::from_millis(100)).is_err());
+            gige.next_frame(Duration::from_millis(300)).unwrap_err();
+            gige.next_frame(Duration::from_millis(100)).unwrap_err();
             let stats = gige.stats().unwrap();
             assert_eq!(
                 (
@@ -5030,6 +5282,10 @@ mod tests {
             (rgba16, 1, true, false, 2),
             (coord3d_ac16, 3, true, false, 2),
             (coord3d_c32f, 3, true, false, 4),
+            // Two-component 32-bit coordinates share the 0x0240 size code
+            // with four-component 16-bit color: the exact format wins.
+            (0x0240_00c2, 1, true, false, 4),
+            (0x0240_00c3, 1, true, false, 4),
         ] {
             let mut assembler = Assembler::new(12, 48, 0);
             assembler.big_endian = big_endian;
@@ -5067,7 +5323,10 @@ mod tests {
         assert!(error.contains("timed out"), "{error}");
         fake.send(2, false, &[]);
         assert_eq!(gige.next_frame(Duration::from_secs(1)).unwrap().id, 2);
-        assert!(fake.camera.lock().unwrap().requests.is_empty());
+        assert_eq!(
+            fake.camera.lock().unwrap().requests,
+            [] as [(Vec<u8>, u16); 0]
+        );
         let stats = gige.stats().unwrap();
         assert_eq!(
             (
@@ -5199,11 +5458,17 @@ mod tests {
                 lead[34..36].copy_from_slice(&3u16.to_be_bytes());
                 frame = vec![gvsp(block, 0, 1, extended, &lead)];
                 for chunk in image.chunks(block_size) {
-                    frame.push(gvsp(block, frame.len() as u32, 3, extended, chunk));
+                    frame.push(gvsp(
+                        block,
+                        u32::try_from(frame.len()).unwrap(),
+                        3,
+                        extended,
+                        chunk,
+                    ));
                 }
                 frame.push(gvsp(
                     block,
-                    frame.len() as u32,
+                    u32::try_from(frame.len()).unwrap(),
                     2,
                     extended,
                     &trailer(height),
@@ -5272,7 +5537,7 @@ mod tests {
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
-            (seed % n.max(1) as u64) as usize
+            usize::try_from(seed % n.max(1) as u64).unwrap()
         };
         let mut landed_total = 0;
         for round in 0..400 {
@@ -5322,10 +5587,11 @@ mod tests {
         let mut at = 0;
         while at < packets.len() {
             let count = (1 + random(batch::BATCH)).min(packets.len() - at);
-            let slots = assembler.predict_run(count);
-            let base = match slots.is_empty() {
-                true => std::ptr::null_mut(),
-                false => assembler.newest_buffer().unwrap(),
+            let slots: Vec<_> = assembler.predict_run(count).collect();
+            let base = if slots.is_empty() {
+                std::ptr::null_mut()
+            } else {
+                assembler.newest_buffer().unwrap()
             };
             let mut received = Vec::new();
             for (index, packet) in packets[at..at + count].iter().enumerate() {
@@ -5373,7 +5639,7 @@ mod tests {
             seed ^= seed << 13;
             seed ^= seed >> 7;
             seed ^= seed << 17;
-            (seed % n.max(1) as u64) as usize
+            usize::try_from(seed % n.max(1) as u64).unwrap()
         };
         let mut sizes = {
             let mut seed = 0x9e37_79b9u64;
@@ -5381,7 +5647,7 @@ mod tests {
                 seed ^= seed << 13;
                 seed ^= seed >> 7;
                 seed ^= seed << 17;
-                (seed % n.max(1) as u64) as usize
+                usize::try_from(seed % n.max(1) as u64).unwrap()
             }
         };
         let (mut landed, mut delivered) = (0, 0);
@@ -5424,7 +5690,7 @@ mod tests {
             camera.resend_status = 0x0100;
         });
         let mut gige = connect(fake.address, Duration::from_secs(1)).unwrap();
-        gige.packet_size = Some(Some(BLOCK as u32 + 36));
+        gige.packet_size = PacketSize::Verified(u32::try_from(BLOCK).unwrap() + 36);
         gige.start(1920 * 1080).unwrap();
         assert!(gige.stream.as_ref().unwrap().scatter);
         assert_eq!(
@@ -5535,16 +5801,16 @@ mod tests {
         assert!(!scatter(Some(std::ffi::OsStr::new("0"))));
         let fake = Fake::new(|camera| camera.path_mtu = 1500);
         let mut gige = connect(fake.address, Duration::from_secs(1)).unwrap();
-        gige.packet_size = Some(Some(1500));
+        gige.packet_size = PacketSize::Verified(1500);
         gige.start((WIDTH * HEIGHT) as usize).unwrap();
         gige.stream.as_mut().unwrap().scatter = false;
         fake.send(1, false, &[]);
         let frame = gige.next_frame(Duration::from_secs(2)).unwrap();
         assert_eq!(frame.data.to_vec(), image(WIDTH, HEIGHT));
-        let packets = (WIDTH * HEIGHT) as u64 / (1500 - 36) + 1;
+        let packets = u64::from(WIDTH * HEIGHT) / (1500 - 36) + 1;
         assert_eq!(
             gige.stream.as_ref().unwrap().assembler.copied,
-            (packets, (WIDTH * HEIGHT) as u64)
+            (packets, u64::from(WIDTH * HEIGHT))
         );
     }
 
@@ -5557,8 +5823,11 @@ mod tests {
                 tv_nsec: 0,
             };
             // SAFETY: clock_gettime writes the timespec it is given.
-            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) };
-            Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut time) };
+            Duration::new(
+                u64::try_from(time.tv_sec).unwrap(),
+                u32::try_from(time.tv_nsec).unwrap(),
+            )
         }
         #[cfg(not(unix))]
         Duration::ZERO
@@ -5586,7 +5855,7 @@ mod tests {
                 camera.test_packets = true;
             });
             let mut gige = connect(fake.address, Duration::from_secs(1)).unwrap();
-            gige.packet_size = Some(Some(BLOCK as u32 + 36));
+            gige.packet_size = PacketSize::Verified(u32::try_from(BLOCK).unwrap() + 36);
             gige.start(4096 * 3000).unwrap();
             gige.stream.as_mut().unwrap().scatter = scatter;
             if !batched {
@@ -5608,7 +5877,7 @@ mod tests {
                 while let Ok(block) = wait.recv() {
                     for (i, packet) in packets.iter().enumerate() {
                         let mut packet = packet.clone();
-                        packet[2..4].copy_from_slice(&(block as u16).to_be_bytes());
+                        packet[2..4].copy_from_slice(&block.to_be_bytes()[6..]);
                         source.send_to(&packet, destination).unwrap();
                         if i % 4 == 3 {
                             thread::sleep(Duration::from_micros(100));
@@ -5627,14 +5896,19 @@ mod tests {
                     received += 1;
                 }
             }
-            let (elapsed, cpu) = (started.elapsed(), thread_cpu() - cpu);
+            let (elapsed, cpu) = (
+                started.elapsed(),
+                thread_cpu()
+                    .checked_sub(cpu)
+                    .expect("thread CPU clock is monotonic"),
+            );
             drop(next);
             sender.join().unwrap();
             assert!(received > 0);
             println!(
                 "scatter {scatter}, batches {batched}: {received} of {FRAMES} frames, {:.1} fps, receiver CPU {:.2} ms per frame, copied {:?}",
-                received as f64 / elapsed.as_secs_f64(),
-                cpu.as_secs_f64() * 1e3 / received as f64,
+                f64::from(received) / elapsed.as_secs_f64(),
+                cpu.as_secs_f64() * 1e3 / f64::from(received),
                 gige.stream.as_ref().unwrap().assembler.copied,
             );
         }

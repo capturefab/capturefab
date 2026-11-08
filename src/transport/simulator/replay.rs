@@ -1,13 +1,15 @@
 //! Local test-data playback for a virtual camera. Directory membership is a
 //! snapshot of regular files directly inside the selected directory.
+#![forbid(unsafe_code)]
+#![deny(clippy::panic_in_result_fn)]
 use crate::{
     media::ReplayDecoder,
     types::{Backend, Frame, RGB8, RegisterIo, Usage},
 };
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context as _, Result, bail, ensure};
 use std::{
     fs::{self, OpenOptions},
-    io::Write,
+    io::Write as _,
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
@@ -36,38 +38,26 @@ const XML: &str = r#"<?xml version="1.0"?>
  <Integer Name="TLParamsLocked"><Visibility>Invisible</Visibility><Value>0</Value><Min>0</Min><Max>1</Max></Integer>
 </RegisterDescription>"#;
 
-fn extension(path: &Path) -> String {
-    path.extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase()
+fn extension(path: &Path) -> &str {
+    path.extension().and_then(|s| s.to_str()).unwrap_or("")
 }
 pub(crate) fn is_image(path: &Path) -> bool {
-    matches!(
-        extension(path).as_str(),
-        "png" | "jpg" | "jpeg" | "bmp" | "tif" | "tiff" | "webp" | "ppm" | "pgm" | "pbm" | "pnm"
-    )
+    let extension = extension(path);
+    [
+        "png", "jpg", "jpeg", "bmp", "tif", "tiff", "webp", "ppm", "pgm", "pbm", "pnm",
+    ]
+    .into_iter()
+    .any(|image| extension.eq_ignore_ascii_case(image))
 }
 pub(crate) fn supported(path: &Path) -> bool {
+    let suffix = extension(path);
     is_image(path)
-        || matches!(
-            extension(path).as_str(),
-            "mp4"
-                | "m4v"
-                | "mov"
-                | "mkv"
-                | "avi"
-                | "webm"
-                | "mpg"
-                | "mpeg"
-                | "ts"
-                | "mts"
-                | "m2ts"
-                | "vob"
-                | "flv"
-                | "wmv"
-                | "ogv"
-        )
+        || [
+            "mp4", "m4v", "mov", "mkv", "avi", "webm", "mpg", "mpeg", "ts", "mts", "m2ts", "vob",
+            "flv", "wmv", "ogv",
+        ]
+        .into_iter()
+        .any(|video| suffix.eq_ignore_ascii_case(video))
 }
 fn regular_file(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
@@ -85,7 +75,7 @@ fn regular_file(path: &Path) -> Result<()> {
 /// A source that is not there is `camera_not_found`, as a missing file named
 /// as a camera is; one that cannot be replayed, or a relative path, which
 /// would be from this process's folder, is a usage error.
-pub fn source_files(source: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn source_files(source: &Path) -> Result<Vec<PathBuf>> {
     crate::media::absolute_source(source, "a simulation source")?;
     let metadata = fs::symlink_metadata(source).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -128,11 +118,15 @@ pub fn source_files(source: &Path) -> Result<Vec<PathBuf>> {
         .with_context(|| format!("cannot list simulation directory {}", source.display()))?
     {
         let entry = entry.context("cannot read simulation directory entry")?;
-        if entry.file_type()?.is_file() && supported(&entry.path()) {
-            files.push(entry.path());
+        if entry.file_type()?.is_file() {
+            let path = entry.path();
+            if supported(&path) {
+                files.push(path);
+            }
         }
     }
-    files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    // Direct children share a parent, so path order is filename order.
+    files.sort_unstable();
     if files.is_empty() {
         return Err(usage(format!(
             "simulation directory {} contains no supported regular video or still image files at its top level",
@@ -161,12 +155,13 @@ impl Manifest {
         options.create_new(true).write(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
         }
-        let mut output = options
+        let output = options
             .open(&manifest.0)
             .context("cannot create simulation image manifest")?;
+        let mut output = std::io::BufWriter::new(output);
         writeln!(output, "ffconcat version 1.0")?;
         for path in files.iter().chain(files.last()) {
             regular_file(path)?;
@@ -179,7 +174,7 @@ impl Manifest {
             );
             // FFmpeg's concat syntax permits quoted filenames with an escaped
             // apostrophe outside the quote. Image2 pattern expansion is disabled.
-            writeln!(output, "file '{}'", path.replace('\'', "'\\''"))?;
+            write_concat_file(&mut output, path)?;
             writeln!(output, "option pattern_type none")?;
             writeln!(output, "option framerate {fps}")?;
             // A supported still extension cannot disguise a playlist that
@@ -193,8 +188,22 @@ impl Manifest {
         }
         // The repeated final input supplies the final timestamp. The decoder's
         // output cap ensures it never appears as an additional delivered frame.
+        output
+            .flush()
+            .context("cannot write simulation image manifest")?;
         Ok(manifest)
     }
+}
+
+fn write_concat_file(output: &mut impl std::io::Write, path: &str) -> std::io::Result<()> {
+    output.write_all(b"file '")?;
+    for (index, part) in path.split('\'').enumerate() {
+        if index != 0 {
+            output.write_all(b"'\\''")?;
+        }
+        output.write_all(part.as_bytes())?;
+    }
+    output.write_all(b"'\n")
 }
 
 fn validate_format(width: u32, height: u32, fps: f64) -> Result<()> {
@@ -209,7 +218,7 @@ fn validate_format(width: u32, height: u32, fps: f64) -> Result<()> {
     Ok(())
 }
 
-pub fn open(
+pub(crate) fn open(
     source: &Path,
     width: u32,
     height: u32,
@@ -224,7 +233,7 @@ pub fn open(
     let files = source_files(source)?;
     let sequence = files
         .iter()
-        .all(|path| is_image(path) && extension(path) == extension(&files[0]));
+        .all(|path| is_image(path) && extension(path).eq_ignore_ascii_case(extension(&files[0])));
     let now = Instant::now();
     let mut backend = Replay {
         files,
@@ -449,9 +458,8 @@ impl Backend for Replay {
             (frame.width, frame.height, frame.pixel_format) == (self.width, self.height, RGB8),
             "simulation decoder returned an unexpected frame format"
         );
-        self.frame_id += 1;
-        self.timestamp_ns = (self.epoch.elapsed().as_nanos().min(u64::MAX as u128) as u64)
-            .max(self.timestamp_ns.saturating_add(1));
+        (self.frame_id, self.timestamp_ns) =
+            next_metadata(self.frame_id, self.timestamp_ns, self.epoch.elapsed())?;
         frame.id = self.frame_id;
         frame.device_ts_ns = Some(self.timestamp_ns);
         // A simulated camera's frame arrives when it is handed out, not when
@@ -467,6 +475,17 @@ impl Backend for Replay {
         };
         Ok(frame)
     }
+}
+
+// Timestamps advance even when successive frames share a clock tick, then
+// saturate at the wire format's limit. Frame identifiers must never wrap.
+#[deny(clippy::arithmetic_side_effects, clippy::cast_possible_wrap)]
+fn next_metadata(frame_id: u64, timestamp_ns: u64, elapsed: Duration) -> Result<(u64, u64)> {
+    let frame_id = frame_id
+        .checked_add(1)
+        .context("simulation frame counter exhausted")?;
+    let elapsed_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+    Ok((frame_id, elapsed_ns.max(timestamp_ns.saturating_add(1))))
 }
 
 #[cfg(test)]
@@ -504,23 +523,21 @@ mod tests {
         encoder.set_depth(png::BitDepth::Eight);
         let mut writer = encoder.write_header().unwrap();
         writer
-            .write_image_data(&color.repeat((width * height) as usize))
+            .write_image_data(
+                &color.repeat(usize::try_from(u64::from(width) * u64::from(height)).unwrap()),
+            )
             .unwrap();
     }
     fn ffmpeg() -> Option<std::sync::Arc<crate::media::Executable>> {
         let executable = crate::media::executable().ok()?;
-        if crate::media::command(&executable)
+        crate::media::command(&executable)
             .arg("-version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .ok()?
             .success()
-        {
-            Some(executable)
-        } else {
-            None
-        }
+            .then_some(executable)
     }
     fn video(path: &Path, colors: &[[u8; 3]], fps: u32) {
         let exe = ffmpeg().expect("FFmpeg fixture generator");
@@ -585,6 +602,24 @@ mod tests {
     }
 
     #[test]
+    fn concat_file_lines_preserve_literal_filenames() {
+        for path in [
+            "",
+            "plain.png",
+            "two words.png",
+            "'",
+            "a'b''c.png",
+            "相机'帧%.png",
+            "a\\b.png",
+        ] {
+            let mut bytes = Vec::new();
+            write_concat_file(&mut bytes, path).unwrap();
+            let expected = format!("file '{}'\n", path.replace('\'', "'\\''"));
+            assert_eq!(bytes, expected.as_bytes(), "{path}");
+        }
+    }
+
+    #[test]
     fn listing_is_lexicographic_single_level_and_ignores_unrelated_files() {
         let dir = Directory::new();
         for name in ["2.mp4", "10.MKV", "01.png", "notes.txt", "playlist.m3u8"] {
@@ -602,7 +637,7 @@ mod tests {
             source_files(&dir.file("2.mp4")).unwrap(),
             [dir.file("2.mp4")]
         );
-        assert!(source_files(&dir.file("playlist.m3u8")).is_err());
+        source_files(&dir.file("playlist.m3u8")).unwrap_err();
     }
 
     #[cfg(unix)]
@@ -617,8 +652,8 @@ mod tests {
         symlink(&outside.0, dir.file("nested")).unwrap();
         symlink(outside.file("missing.mp4"), dir.file("broken.mp4")).unwrap();
         assert_eq!(source_files(&dir.0).unwrap(), [dir.file("real.mp4")]);
-        assert!(source_files(&dir.file("a.mp4")).is_err());
-        assert!(source_files(&dir.file("nested")).is_err());
+        source_files(&dir.file("a.mp4")).unwrap_err();
+        source_files(&dir.file("nested")).unwrap_err();
     }
 
     #[test]
@@ -658,6 +693,32 @@ mod tests {
     }
 
     #[test]
+    fn replay_metadata_advances_and_saturates_without_wrapping() {
+        assert_eq!(next_metadata(0, 0, Duration::ZERO).unwrap(), (1, 1));
+        assert_eq!(
+            next_metadata(1, 10, Duration::from_nanos(5)).unwrap(),
+            (2, 11)
+        );
+        assert_eq!(
+            next_metadata(1, 10, Duration::from_nanos(20)).unwrap(),
+            (2, 20)
+        );
+        for elapsed in [Duration::from_nanos(u64::MAX), Duration::MAX] {
+            assert_eq!(next_metadata(1, 10, elapsed).unwrap(), (2, u64::MAX));
+        }
+        assert_eq!(
+            next_metadata(u64::MAX - 1, u64::MAX, Duration::ZERO).unwrap(),
+            (u64::MAX, u64::MAX)
+        );
+        let error = next_metadata(u64::MAX, u64::MAX, Duration::MAX).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("simulation frame counter exhausted")
+        );
+    }
+
+    #[test]
     fn a_held_still_arrives_each_time_it_is_handed_out() {
         if ffmpeg().is_none() {
             return;
@@ -669,9 +730,10 @@ mod tests {
         let mut camera =
             crate::camera::Camera::open(&selector, &[], Duration::from_secs(3)).unwrap();
         camera.start().unwrap();
-        let times = (0..3)
-            .map(|_| camera.next_frame(Duration::from_secs(3)).unwrap().wall_ms)
-            .collect::<Vec<_>>();
+        let times =
+            std::iter::repeat_with(|| camera.next_frame(Duration::from_secs(3)).unwrap().wall_ms)
+                .take(3)
+                .collect::<Vec<_>>();
         // Three frames of a 30 fps camera span two frame periods.
         assert!(times[2] - times[0] >= 50, "{times:?}");
         camera.stop().unwrap();
@@ -691,7 +753,7 @@ mod tests {
         camera.start(64 * 64 * 3).unwrap();
         frames(&mut *camera, &[red, blue, red, blue, red, blue]);
         camera.stop().unwrap();
-        assert!(camera.next_frame(Duration::from_secs(1)).is_err());
+        camera.next_frame(Duration::from_secs(1)).unwrap_err();
     }
 
     #[test]
@@ -703,7 +765,7 @@ mod tests {
         let red = [255, 0, 0];
         let blue = [0, 0, 255];
         png(&dir.file("01.png"), 16, 16, red);
-        png(&dir.file("02.png"), 32, 16, blue);
+        png(&dir.file("02.PNG"), 32, 16, blue);
         let mut camera = open(&dir.0, 64, 64, 30.0, Duration::from_secs(3)).unwrap();
         camera.start(64 * 64 * 3).unwrap();
         frames(&mut *camera, &[red, blue, red, blue]);
@@ -746,9 +808,8 @@ mod tests {
         }
         let dir = Directory::new();
         fs::write(dir.file("bad.mp4"), b"not a video").unwrap();
-        let error = match open(&dir.file("bad.mp4"), 64, 64, 30.0, Duration::from_secs(3)) {
-            Ok(_) => panic!("corrupt media opened"),
-            Err(error) => error,
+        let Err(error) = open(&dir.file("bad.mp4"), 64, 64, 30.0, Duration::from_secs(3)) else {
+            panic!("corrupt media opened");
         };
         assert!(format!("{error:#}").contains("cannot decode simulation media"));
         fs::write(dir.file("bad.mp4"), b"").unwrap();
@@ -776,11 +837,11 @@ mod tests {
             (128, 64, 128 * 64 * 3)
         );
         let short_poll = Instant::now();
-        assert!(camera.next_frame(Duration::from_millis(5)).is_err());
+        camera.next_frame(Duration::from_millis(5)).unwrap_err();
         assert!(short_poll.elapsed() >= Duration::from_millis(4));
         thread::sleep(Duration::from_millis(150));
         camera.next_frame(Duration::from_secs(3)).unwrap();
-        assert!(camera.next_frame(Duration::from_millis(5)).is_err());
+        camera.next_frame(Duration::from_millis(5)).unwrap_err();
         camera.stop().unwrap();
         camera.start(128 * 64 * 3).unwrap();
         assert!(camera.next_frame(Duration::from_secs(3)).unwrap().id > frame.id);

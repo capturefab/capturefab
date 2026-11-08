@@ -8,7 +8,7 @@ use zeroize::Zeroizing;
 /// (LF or CRLF), which is removed. Other bytes, including spaces, are kept,
 /// and an empty line is an empty password, as many cameras ship with. The
 /// bytes are cleared from memory when the password drops.
-pub fn read_stdin_password(reader: impl Read, what: &str) -> Result<Zeroizing<String>> {
+pub(crate) fn read_stdin_password(reader: impl Read, what: &str) -> Result<Zeroizing<String>> {
     read(reader, what)
 }
 
@@ -57,10 +57,10 @@ mod tests {
             );
         }
         assert_eq!(
-            read_stdin_password("\n".as_bytes(), "x").unwrap().as_str(),
+            read_stdin_password(b"\n".as_slice(), "x").unwrap().as_str(),
             ""
         );
-        assert!(read_stdin_password("x".repeat(5000).as_bytes(), "x").is_err());
+        read_stdin_password("x".repeat(5000).as_bytes(), "x").unwrap_err();
         let invalid = read_stdin_password(&[0xff, 0xfe][..], "x").unwrap_err();
         assert!(
             format!("{invalid:#}").starts_with("x stdin must be UTF-8: invalid utf-8"),

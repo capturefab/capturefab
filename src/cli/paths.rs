@@ -3,7 +3,7 @@
 //! directory, so relative outputs and file or replay sources are made
 //! absolute before a command leaves this process.
 use crate::session::{SessionCommand, validate_selector};
-use anyhow::{Context, Result};
+use anyhow::{Context as _, Result};
 use std::path::{Component, Path, PathBuf};
 
 /// Local sources follow the same caller/file base as outputs, and an
@@ -18,11 +18,9 @@ pub(crate) fn resolve_selector(selector: &mut String, base: &Path) -> Result<()>
         let mut path = path.to_owned();
         resolve_source(&mut path, base)?;
         *selector = format!("sim:replay:{path}");
-    } else if selector
-        .get(..5)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
+    } else if let Some((scheme, path)) = selector.split_once(':')
+        && scheme.eq_ignore_ascii_case("file")
     {
-        let path = &selector[5..];
         if !path.starts_with("//") {
             let mut path = path.to_owned();
             resolve_source(&mut path, base)?;
@@ -43,7 +41,7 @@ fn resolve_source(path: &mut String, base: &Path) -> Result<()> {
     if let Ok(canonical) = canonical(Path::new(&*path))
         && let Some(canonical) = canonical.to_str()
     {
-        *path = canonical.to_owned();
+        canonical.clone_into(path);
     }
     Ok(())
 }
@@ -57,10 +55,10 @@ pub(crate) fn canonical(path: &Path) -> std::io::Result<PathBuf> {
     let canonical = std::fs::canonicalize(path)?;
     #[cfg(windows)]
     if let Some(text) = canonical.to_str() {
-        let plain = match text.strip_prefix(r"\\?\UNC\") {
-            Some(share) => Some(format!(r"\\{share}")),
-            None => text.strip_prefix(r"\\?\").map(str::to_owned),
-        };
+        let plain = text
+            .strip_prefix(r"\\?\UNC\")
+            .map(|share| format!(r"\\{share}"))
+            .or_else(|| text.strip_prefix(r"\\?\").map(str::to_owned));
         if let Some(plain) = plain.map(PathBuf::from)
             && plain.is_absolute()
             && std::path::absolute(&plain).is_ok_and(|read| read == plain)
@@ -105,11 +103,10 @@ pub(crate) fn resolve_path(output: &mut String, base: &Path) -> Result<()> {
     let path = Path::new(output);
     #[cfg(windows)]
     anyhow::ensure!(
-        !(path
-            .components()
+        path.components()
             .next()
-            .is_some_and(|component| matches!(component, std::path::Component::Prefix(_)))
-            && !path.is_absolute()),
+            .is_none_or(|component| { !matches!(component, Component::Prefix(_)) })
+            || path.is_absolute(),
         "drive-relative paths are ambiguous; use an absolute path or a relative path without a drive prefix"
     );
     let joined = if path.is_relative() {
@@ -157,14 +154,13 @@ fn normalize(path: &Path) -> PathBuf {
 fn up(normal: &mut PathBuf) {
     #[cfg(unix)]
     if std::fs::symlink_metadata(&*normal).is_ok_and(|meta| meta.file_type().is_symlink()) {
-        match std::fs::canonicalize(&*normal) {
-            Ok(target) => *normal = target,
+        if let Ok(target) = std::fs::canonicalize(&*normal) {
+            *normal = target;
+        } else {
             // A link to nothing: the system resolves the `..`, or fails,
             // once the path is used.
-            Err(_) => {
-                normal.push(Component::ParentDir);
-                return;
-            }
+            normal.push(Component::ParentDir);
+            return;
         }
     }
     match normal.components().next_back() {

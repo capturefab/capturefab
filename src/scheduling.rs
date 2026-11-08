@@ -1,15 +1,17 @@
 //! Bounded session-lifetime capture schedules. Clock times use UTC Unix milliseconds.
-use anyhow::{Context, Result, ensure};
+#![forbid(unsafe_code)]
+#![deny(clippy::missing_const_for_fn)]
+use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const MAX_DURATION_MS: u64 = 315_576_000_000;
+pub(crate) const MAX_DURATION_MS: u64 = 315_576_000_000;
 
 /// Where a capture job is: waiting for its next shot, taking one, or how
 /// it ended.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CaptureStatus {
+pub(crate) enum CaptureStatus {
     /// Waiting until its next shot is due.
     #[default]
     Pending,
@@ -25,7 +27,7 @@ pub enum CaptureStatus {
 }
 impl CaptureStatus {
     /// How the job ended, as the protocol reports it; None while it runs.
-    pub(crate) fn ended(self) -> Option<crate::session::protocol::JobStatus> {
+    pub(crate) const fn ended(self) -> Option<crate::session::protocol::JobStatus> {
         use crate::session::protocol::JobStatus;
         Some(match self {
             Self::Pending | Self::Running => return None,
@@ -38,7 +40,7 @@ impl CaptureStatus {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CaptureJob {
+pub(crate) struct CaptureJob {
     pub id: u64,
     pub status: CaptureStatus,
     pub output: String,
@@ -123,21 +125,21 @@ pub struct CaptureJob {
 }
 /// Files a job lists; a longer job keeps counting in `captured`, and its
 /// newest file is `last_file`.
-pub const MAX_JOB_FILES: usize = 1000;
+pub(crate) const MAX_JOB_FILES: usize = 1000;
 /// The shape of a saved frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JobFrame {
+pub(crate) struct JobFrame {
     pub width: u32,
     pub height: u32,
     pub pixel_format: u32,
 }
 impl CaptureJob {
-    pub fn active(&self) -> bool {
+    pub(crate) const fn active(&self) -> bool {
         self.status.ended().is_none()
     }
     /// Stop the job as `status` (failed, cancelled or interrupted), with
     /// the failure.
-    pub fn end(&mut self, status: CaptureStatus, error: Option<&anyhow::Error>) {
+    pub(crate) fn end(&mut self, status: CaptureStatus, error: Option<&anyhow::Error>) {
         self.status = status;
         self.ended_ms = Some(now_ms());
         if let Some(error) = error {
@@ -148,29 +150,31 @@ impl CaptureJob {
 }
 /// A local recording in progress, kept by the worker until it stops so the
 /// finished file can be reported with its context.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct RecordingMeta {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RecordingMeta {
     pub path: String,
     /// UTC Unix milliseconds.
     pub since_ms: u64,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub context: crate::context::Context,
 }
-pub fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u64::MAX as u128) as u64
+pub(crate) fn now_ms() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
 }
 /// UTC Unix milliseconds as an RFC 3339 time, as results and job documents
 /// show times.
-pub fn rfc3339(ms: u64) -> String {
+pub(crate) fn rfc3339(ms: u64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp_millis(i64::try_from(ms).unwrap_or(i64::MAX))
         .unwrap_or_default()
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
-pub fn validate_schedule(first_at_ms: u64, interval_ms: u64, count: u32) -> Result<()> {
+pub(crate) fn validate_schedule(first_at_ms: u64, interval_ms: u64, count: u32) -> Result<()> {
     ensure!((1..=100_000).contains(&count), "count must be 1..100000");
     ensure!(
         interval_ms <= MAX_DURATION_MS,
@@ -192,7 +196,7 @@ pub fn validate_schedule(first_at_ms: u64, interval_ms: u64, count: u32) -> Resu
 /// `interval_ms` apart, the first at the start: the duration divided by the
 /// interval, rounded up. Every 5 minutes for 24 hours is 288 frames, the last
 /// at 23:55.
-pub fn count_for(duration_ms: u64, interval_ms: u64) -> Result<u32> {
+pub(crate) fn count_for(duration_ms: u64, interval_ms: u64) -> Result<u32> {
     ensure!(
         (1..=MAX_DURATION_MS).contains(&duration_ms),
         "duration must be 1ms..10 years"
@@ -208,7 +212,7 @@ fn frame_count(count: u64) -> Result<u32> {
         (1..=100_000).contains(&count),
         "the schedule needs {count} frames; count must be 1..100000"
     );
-    Ok(count as u32)
+    u32::try_from(count).context("schedule frame count exceeds u32")
 }
 #[cfg(test)]
 mod tests {
@@ -216,8 +220,8 @@ mod tests {
     #[test]
     fn schedules_validate_every_frame_and_overflow() {
         let now = now_ms();
-        assert!(validate_schedule(now, 0, 100_000).is_ok());
-        assert!(validate_schedule(now, MAX_DURATION_MS, 2).is_ok());
+        validate_schedule(now, 0, 100_000).unwrap();
+        validate_schedule(now, MAX_DURATION_MS, 2).unwrap();
         assert!(validate_schedule(now, MAX_DURATION_MS, 3).is_err());
         assert!(validate_schedule(now, u64::MAX, 2).is_err());
         assert!(validate_schedule(u64::MAX, 1, 2).is_err());

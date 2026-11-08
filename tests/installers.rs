@@ -1,15 +1,16 @@
 //! Native Windows installer integration. Unix installer scenarios run in
 //! scripts/test-site.py. Serve real, checksummed fixture archives locally.
+#![deny(clippy::doc_markdown)]
 #[cfg(windows)]
 mod support;
 
 #[cfg(windows)]
 mod windows {
     use super::support;
-    use sha2::{Digest, Sha256};
+    use sha2::{Digest as _, Sha256};
     use std::{
         collections::HashMap,
-        io::{Cursor, Read, Write},
+        io::{Cursor, Read as _, Write as _},
         net::TcpListener,
         process::Command,
         sync::{

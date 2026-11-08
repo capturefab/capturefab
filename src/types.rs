@@ -1,6 +1,15 @@
+#![forbid(unsafe_code)]
+#![deny(clippy::missing_const_for_fn)]
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::fmt::Write as _;
 use std::time::Duration;
+
+/// Serde's borrowed predicate for fields omitted at their declared default.
+pub(crate) fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -40,7 +49,7 @@ pub struct Frame {
     pub height: u32,
     pub pixel_format: u32,
     /// The camera's own clock when it took the frame, in nanoseconds, from a
-    /// GigE Vision or USB3 Vision leader (or the simulator's clock). It is
+    /// `GigE` Vision or USB3 Vision leader (or the simulator's clock). It is
     /// comparable only between frames of one camera, or of cameras that
     /// share a PTP clock, and is never a date.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -59,7 +68,7 @@ pub struct Frame {
     pub jpeg: Option<crate::framebuf::FrameBuf>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TransportStats {
     pub packet_size: Option<u32>,
     pub receive_buffer_bytes: Option<u64>,
@@ -77,7 +86,7 @@ pub struct TransportStats {
     pub notes: Vec<String>,
 }
 
-/// Reads/writes bytes in the camera's address space. GenApi nodes determine byte order.
+/// Reads/writes bytes in the camera's address space. `GenApi` nodes determine byte order.
 pub trait RegisterIo: Send {
     fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>>;
     fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()>;
@@ -92,7 +101,7 @@ pub trait Backend: RegisterIo {
     fn forget_xml(&mut self) -> bool {
         false
     }
-    /// Configure receiving before the owner executes AcquisitionStart.
+    /// Configure receiving before the owner executes `AcquisitionStart`.
     fn start(&mut self, payload_size: usize) -> Result<()>;
     /// Request one frame from an on-demand source. Streaming transports need
     /// no explicit trigger; a paced video file starts again unpaced.
@@ -132,7 +141,7 @@ pub trait Backend: RegisterIo {
         None
     }
     /// Whether, started for a capture or an inspection, it should go on
-    /// streaming a moment after: a live FFmpeg source, slow to start, whose
+    /// streaming a moment after: a live `FFmpeg` source, slow to start, whose
     /// next frame is the newest either way.
     fn lingers(&self) -> bool {
         false
@@ -143,7 +152,7 @@ pub trait Backend: RegisterIo {
         false
     }
     /// Let go of what it opened to connect and still holds while it does
-    /// not stream: FFmpeg, which read a source's first frame and went on
+    /// not stream: `FFmpeg`, which read a source's first frame and went on
     /// decoding. The next start opens it again.
     fn rest(&mut self) {}
     /// The settings this process keeps for a camera that has nowhere else
@@ -167,7 +176,7 @@ pub const RGB8: u32 = 0x0218_0014;
 /// the failure happened, so a name inside a message (a camera called
 /// `porch_disabled`) can never change the exit code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ErrorKind {
+pub(crate) enum ErrorKind {
     OperationFailed,
     Usage,
     InvalidDuration,
@@ -199,7 +208,7 @@ pub enum ErrorKind {
     Interrupted,
 }
 impl ErrorKind {
-    pub const ALL: [Self; 27] = [
+    pub(crate) const ALL: [Self; 27] = [
         Self::OperationFailed,
         Self::Usage,
         Self::InvalidDuration,
@@ -229,15 +238,15 @@ impl ErrorKind {
         Self::Interrupted,
     ];
     /// The JSON error code and process exit code.
-    pub fn code(self) -> (&'static str, i32) {
+    pub(crate) const fn code(self) -> (&'static str, i32) {
         let (code, exit, _) = self.describe();
         (code, exit)
     }
     /// What the reason means, for `schema`.
-    pub fn meaning(self) -> &'static str {
+    pub(crate) const fn meaning(self) -> &'static str {
         self.describe().2
     }
-    fn describe(self) -> (&'static str, i32, &'static str) {
+    const fn describe(self) -> (&'static str, i32, &'static str) {
         match self {
             Self::OperationFailed => ("failed", 1, "the operation failed"),
             Self::Usage => ("usage", 2, "invalid arguments or input"),
@@ -320,7 +329,7 @@ impl ErrorKind {
             ),
         }
     }
-    pub fn from_code(code: &str) -> Option<Self> {
+    pub(crate) fn from_code(code: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|kind| kind.code().0 == code)
     }
 }
@@ -328,14 +337,14 @@ impl ErrorKind {
 /// An error whose reason was decided where it happened, with an optional
 /// hint (what to do next) and JSON details (bounds, choices, candidates).
 #[derive(Debug)]
-pub struct Categorized {
+pub(crate) struct Categorized {
     pub kind: ErrorKind,
     pub message: String,
     pub hint: Option<String>,
     pub details: Option<serde_json::Value>,
 }
 impl Categorized {
-    pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
+    pub(crate) fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
@@ -343,15 +352,15 @@ impl Categorized {
             details: None,
         }
     }
-    pub fn error(kind: ErrorKind, message: impl Into<String>) -> anyhow::Error {
+    pub(crate) fn error(kind: ErrorKind, message: impl Into<String>) -> anyhow::Error {
         Self::new(kind, message).into()
     }
-    pub fn hint(mut self, hint: impl Into<String>) -> Self {
+    pub(crate) fn hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
         self
     }
     /// JSON details; null values are dropped, since results never carry them.
-    pub fn details(mut self, details: serde_json::Value) -> Self {
+    pub(crate) fn details(mut self, details: serde_json::Value) -> Self {
         self.details = Some(without_nulls(details));
         self
     }
@@ -365,23 +374,26 @@ impl std::error::Error for Categorized {}
 
 /// `error` with `extra` merged into its details, keeping its reason and
 /// hint: partial work of a failed command goes there.
-pub fn with_details(error: anyhow::Error, extra: serde_json::Value) -> anyhow::Error {
-    let classified = classify(&error);
+pub(crate) fn with_details(error: anyhow::Error, extra: serde_json::Value) -> anyhow::Error {
+    let message = format!("{error:#}");
+    let classified = classify_owned(error);
     let mut details = match classified.details {
         Some(serde_json::Value::Object(details)) => serde_json::Value::Object(details),
-        Some(other) => serde_json::json!({ "cause": other }),
+        Some(other) => {
+            serde_json::Value::Object(std::iter::once(("cause".to_owned(), other)).collect())
+        }
         None => serde_json::json!({}),
     };
     if let (Some(details), serde_json::Value::Object(extra)) = (details.as_object_mut(), extra) {
         details.extend(extra);
     }
-    let mut categorized = Categorized::new(classified.kind, format!("{error:#}")).details(details);
+    let mut categorized = Categorized::new(classified.kind, message).details(details);
     categorized.hint = classified.hint;
     categorized.into()
 }
 
 /// `value` without null object members, at any depth.
-pub fn without_nulls(value: serde_json::Value) -> serde_json::Value {
+pub(crate) fn without_nulls(value: serde_json::Value) -> serde_json::Value {
     use serde_json::Value;
     match value {
         Value::Object(map) => Value::Object(
@@ -398,7 +410,7 @@ pub fn without_nulls(value: serde_json::Value) -> serde_json::Value {
 /// No frame arrived within the requested wait, but the source is still
 /// running: the engine keeps polling instead of counting a transport error.
 #[derive(Debug)]
-pub struct FrameWait;
+pub(crate) struct FrameWait;
 impl std::fmt::Display for FrameWait {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("frame timeout")
@@ -408,7 +420,7 @@ impl std::error::Error for FrameWait {}
 
 /// A request the caller must change (exit code 2), raised while it runs.
 #[derive(Debug)]
-pub struct Usage(pub String);
+pub(crate) struct Usage(pub String);
 impl std::fmt::Display for Usage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -417,27 +429,37 @@ impl std::fmt::Display for Usage {
 impl std::error::Error for Usage {}
 
 /// Parse a size: 10GiB/10G use binary units; 10GB uses decimal units.
-pub fn parse_bytes(value: &str) -> anyhow::Result<u64> {
+pub(crate) fn parse_bytes(value: &str) -> Result<u64> {
     use anyhow::Context as _;
+    const UNITS: &[(&[&str], u64)] = &[
+        (&["", "b"], 1),
+        (&["k", "ki", "kib"], 1024),
+        (&["m", "mi", "mib"], 1024u64.pow(2)),
+        (&["g", "gi", "gib"], 1024u64.pow(3)),
+        (&["t", "ti", "tib"], 1024u64.pow(4)),
+        (&["kb"], 1000),
+        (&["mb"], 1000u64.pow(2)),
+        (&["gb"], 1000u64.pow(3)),
+        (&["tb"], 1000u64.pow(4)),
+    ];
     let value = value.trim();
     let split = value
         .find(|character: char| !character.is_ascii_digit())
         .unwrap_or(value.len());
-    let number: u64 = value[..split]
+    let (number, unit) = value.split_at(split);
+    let number: u64 = number
         .parse()
         .context("a size must start with an integer")?;
-    let multiplier: u64 = match value[split..].trim().to_ascii_lowercase().as_str() {
-        "" | "b" => 1,
-        "k" | "ki" | "kib" => 1024,
-        "m" | "mi" | "mib" => 1024u64.pow(2),
-        "g" | "gi" | "gib" => 1024u64.pow(3),
-        "t" | "ti" | "tib" => 1024u64.pow(4),
-        "kb" => 1000,
-        "mb" => 1000u64.pow(2),
-        "gb" => 1000u64.pow(3),
-        "tb" => 1000u64.pow(4),
-        _ => anyhow::bail!("unknown size unit; use B, KiB, MiB, GiB, TiB, KB, MB, GB or TB"),
-    };
+    let unit = unit.trim();
+    let multiplier = UNITS
+        .iter()
+        .find_map(|(names, multiplier)| {
+            names
+                .iter()
+                .any(|name| unit.eq_ignore_ascii_case(name))
+                .then_some(*multiplier)
+        })
+        .context("unknown size unit; use B, KiB, MiB, GiB, TiB, KB, MB, GB or TB")?;
     let bytes = number
         .checked_mul(multiplier)
         .context("the size is too large")?;
@@ -446,19 +468,35 @@ pub fn parse_bytes(value: &str) -> anyhow::Result<u64> {
 }
 
 /// `bytes` in lowercase hex.
-pub fn hex(bytes: impl AsRef<[u8]>) -> String {
-    use std::fmt::Write as _;
+pub(crate) fn hex(bytes: impl AsRef<[u8]>) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let bytes = bytes.as_ref();
     let mut text = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(text, "{byte:02x}");
+    for &byte in bytes {
+        text.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        text.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
     }
     text
 }
 
+/// Sixteen bytes in the UUID's lowercase 8-4-4-4-12 hexadecimal groups.
+#[must_use]
+pub(crate) fn format_uuid(bytes: &[u8; 16]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut id = String::with_capacity(36);
+    for (index, &byte) in bytes.iter().enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            id.push('-');
+        }
+        id.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        id.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    id
+}
+
 /// `count` random bytes in lowercase hex: a name no other file has, a
 /// nonce or a secret.
-pub fn random_hex(count: usize) -> Result<String> {
+pub(crate) fn random_hex(count: usize) -> Result<String> {
     let mut random = vec![0u8; count];
     getrandom::fill(&mut random).map_err(|error| anyhow::anyhow!("random bytes: {error}"))?;
     Ok(hex(random))
@@ -469,12 +507,12 @@ pub fn random_hex(count: usize) -> Result<String> {
 /// cursor, clear the screen or retitle the window, becomes a space when it
 /// is whitespace and U+FFFD otherwise. For text a camera or the network
 /// supplies: names, serials and string values.
-pub fn printable_line(text: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn printable_line(text: &str) -> std::borrow::Cow<'_, str> {
     printable(text, |_| false)
 }
 /// `text` as lines a terminal shows as written: [`printable_line`], keeping
 /// line breaks and tabs. For whole results and messages before they print.
-pub fn printable_text(text: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn printable_text(text: &str) -> std::borrow::Cow<'_, str> {
     printable(text, |c| matches!(c, '\n' | '\t'))
 }
 fn printable(text: &str, keep: impl Fn(char) -> bool) -> std::borrow::Cow<'_, str> {
@@ -492,7 +530,7 @@ fn printable(text: &str, keep: impl Fn(char) -> bool) -> std::borrow::Cow<'_, st
 }
 
 /// A byte count for diagnostics, with two decimals in GiB and one below.
-pub fn human_bytes(value: u64) -> String {
+pub(crate) fn human_bytes(value: u64) -> String {
     if value >= 1_073_741_824 {
         format!("{:.2} GiB", value as f64 / 1_073_741_824.0)
     } else if value >= 1_048_576 {
@@ -505,12 +543,12 @@ pub fn human_bytes(value: u64) -> String {
 /// What an error's chain says about it: its reason and the hint and
 /// details to report. Typed causes only, never message text; anything
 /// unknown is `failed`.
-pub struct Classified {
+pub(crate) struct Classified {
     pub kind: ErrorKind,
     pub hint: Option<String>,
     pub details: Option<serde_json::Value>,
 }
-pub fn classify(error: &anyhow::Error) -> Classified {
+pub(crate) fn classify(error: &anyhow::Error) -> Classified {
     let plain = |kind| Classified {
         kind,
         hint: None,
@@ -526,18 +564,18 @@ pub fn classify(error: &anyhow::Error) -> Classified {
         let categorized = error
             .chain()
             .find_map(|cause| cause.downcast_ref::<Categorized>());
-        return match categorized {
-            Some(categorized) => Classified {
-                kind: categorized.kind,
-                hint: categorized.hint.clone(),
-                details: categorized.details.clone(),
-            },
-            None => Classified {
+        return categorized.map_or_else(
+            || Classified {
                 kind: ErrorKind::FfmpegMissing,
                 hint: Some(crate::media::ffmpeg_hint()),
                 details: None,
             },
-        };
+            |categorized| Classified {
+                kind: categorized.kind,
+                hint: categorized.hint.clone(),
+                details: categorized.details.clone(),
+            },
+        );
     }
     for cause in error.chain() {
         if let Some(categorized) = cause.downcast_ref::<Categorized>() {
@@ -606,11 +644,35 @@ pub fn classify(error: &anyhow::Error) -> Classified {
     }
 }
 
+/// Move a top-level category's metadata; wrapped errors retain the existing
+/// cause-chain classification order.
+fn classify_owned(error: anyhow::Error) -> Classified {
+    let error = if error
+        .chain()
+        .next()
+        .is_some_and(<dyn std::error::Error + 'static>::is::<Categorized>)
+    {
+        match error.downcast::<Categorized>() {
+            Ok(category) => {
+                return Classified {
+                    kind: category.kind,
+                    hint: category.hint,
+                    details: category.details,
+                };
+            }
+            Err(error) => error,
+        }
+    } else {
+        error
+    };
+    classify(&error)
+}
+
 /// The reason, hint and details sent beside an error's message when it
 /// crosses a process or socket, so the receiving side reports it the same
 /// way.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct ErrorTag {
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ErrorTag {
     pub code: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
@@ -618,7 +680,7 @@ pub struct ErrorTag {
     pub details: Option<serde_json::Value>,
 }
 /// The tag for `error`; none for a plain failure.
-pub fn error_tag(error: &anyhow::Error) -> Option<ErrorTag> {
+pub(crate) fn error_tag(error: &anyhow::Error) -> Option<ErrorTag> {
     let classified = classify(error);
     (classified.kind != ErrorKind::OperationFailed
         || classified.hint.is_some()
@@ -630,12 +692,12 @@ pub fn error_tag(error: &anyhow::Error) -> Option<ErrorTag> {
     })
 }
 /// The reason code an error would cross a process with.
-pub fn error_transport_code(error: &anyhow::Error) -> Option<&'static str> {
+pub(crate) fn error_transport_code(error: &anyhow::Error) -> Option<&'static str> {
     let kind = classify(error).kind;
     (kind != ErrorKind::OperationFailed).then(|| kind.code().0)
 }
 /// Rebuild an error received with [`error_tag`].
-pub fn error_from_tag(tag: Option<ErrorTag>, message: String) -> anyhow::Error {
+pub(crate) fn error_from_tag(tag: Option<ErrorTag>, message: String) -> anyhow::Error {
     let Some(tag) = tag else {
         return anyhow::Error::msg(message);
     };
@@ -661,7 +723,7 @@ const MAX_DURATION: Duration = Duration::from_secs(315_576_000);
 /// number-unit pairs (`250ms`, `2s`, `1.5s`, `5m`, `1h30m`, `500us`), or
 /// `0`. A bare number is refused: `5000` could mean milliseconds or
 /// seconds.
-pub fn parse_duration(text: &str) -> anyhow::Result<Duration> {
+pub(crate) fn parse_duration(text: &str) -> Result<Duration> {
     let text = text.trim();
     let invalid = |message: String| -> anyhow::Error {
         Categorized::new(ErrorKind::InvalidDuration, message)
@@ -684,7 +746,7 @@ pub fn parse_duration(text: &str) -> anyhow::Result<Duration> {
     }
     let mut rest = text;
     let mut nanos = 0u128;
-    let mut subnanos = 0f64;
+    let mut subnanos = Vec::new();
     while !rest.is_empty() {
         let number_end = rest
             .find(|c: char| !c.is_ascii_digit() && c != '.')
@@ -706,7 +768,7 @@ pub fn parse_duration(text: &str) -> anyhow::Result<Duration> {
                 .map_err(|_| invalid(format!("'{text}' is longer than ten years")))?
         };
         let scale = match unit {
-            "h" => 3_600_000_000_000u128,
+            "h" => 3_600_000_000_000u64,
             "m" => 60_000_000_000,
             "s" => 1_000_000_000,
             "ms" => 1_000_000,
@@ -719,35 +781,57 @@ pub fn parse_duration(text: &str) -> anyhow::Result<Duration> {
             }
         };
         nanos = whole
-            .checked_mul(scale)
+            .checked_mul(u128::from(scale))
             .and_then(|part| nanos.checked_add(part))
             .filter(|total| *total <= MAX_DURATION.as_nanos())
             .ok_or_else(|| invalid(format!("'{text}' is longer than ten years")))?;
-        // Scale only the fractional component in floating point. Adding it to
-        // a long duration as f64 loses nanoseconds beyond 2^53.
-        let part = if fraction.is_empty() {
-            0.0
-        } else {
-            format!("0.{fraction}")
-                .parse::<f64>()
-                .map_err(|_| invalid(format!("'{text}' is not a duration")))?
-                * scale as f64
-        };
-        nanos += part.floor() as u128;
-        subnanos += part.fract();
+        nanos += u128::from(add_fractional_nanos(fraction, scale, &mut subnanos));
         rest = after;
     }
-    nanos += subnanos.round() as u128;
+    nanos += u128::from(subnanos.first().is_some_and(|digit| *digit >= 5));
     if nanos > MAX_DURATION.as_nanos() {
         return Err(invalid(format!("'{text}' is longer than ten years")));
     }
-    Ok(Duration::from_nanos(nanos as u64))
+    Ok(Duration::from_nanos(u64::try_from(nanos).map_err(
+        |_| invalid(format!("'{text}' is longer than ten years")),
+    )?))
+}
+
+/// Add a validated decimal fraction scaled by a duration unit (at most an
+/// hour), retaining fractional nanoseconds as decimal digits. Return the
+/// whole nanoseconds, including any carry from the accumulated fraction.
+fn add_fractional_nanos(fraction: &str, scale: u64, remainder: &mut Vec<u8>) -> u64 {
+    remainder.resize(remainder.len().max(fraction.len()), 0);
+    let (mut product_carry, mut sum_carry) = (0u64, 0u8);
+    for (index, &digit) in fraction.as_bytes().iter().enumerate().rev() {
+        // Each product is below ten times the hour scale, which fits u64.
+        let product = u64::from(digit - b'0') * scale + product_carry;
+        product_carry = product / 10;
+        let sum = remainder[index]
+            + u8::try_from(product % 10).expect("a decimal digit fits u8")
+            + sum_carry;
+        remainder[index] = sum % 10;
+        sum_carry = sum / 10;
+    }
+    product_carry + u64::from(sum_carry)
+}
+
+/// Integral floats in the signed/unsigned register comparison domain fit i128.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "finite integral values within plus or minus 2^64 fit i128 exactly; Rust has no checked float-to-integer conversion"
+)]
+pub(crate) fn integral_float(value: f64) -> Option<i128> {
+    if !value.is_finite() || value.fract() != 0.0 || value.abs() > 18_446_744_073_709_551_616.0 {
+        return None;
+    }
+    Some(value as i128)
 }
 
 /// A duration as [`parse_duration`] reads it back, exactly: `1h30m`, `2s`,
 /// `1m30.25s`, `250ms`, `1.5ms`, `500us`, `0`. Every duration a message
 /// shows is written this way, so it can be pasted into a flag.
-pub fn duration_text(duration: Duration) -> String {
+pub(crate) fn duration_text(duration: Duration) -> String {
     /// `whole` and `part` billionths, without trailing zeros.
     fn decimal(whole: u128, part: u128) -> String {
         if part == 0 {
@@ -773,22 +857,22 @@ pub fn duration_text(duration: Duration) -> String {
     let mut text = String::new();
     for (unit, size) in [("h", 3600), ("m", 60)] {
         if seconds >= size {
-            text.push_str(&format!("{}{unit}", seconds / size));
+            let _ = write!(text, "{}{unit}", seconds / size);
             seconds %= size;
         }
     }
     let part = nanos % 1_000_000_000;
     if seconds > 0 || part > 0 {
-        text.push_str(&format!("{}s", decimal(seconds, part)));
+        let _ = write!(text, "{}s", decimal(seconds, part));
     }
     text
 }
 
 /// `error` as one message, `message: cause`, keeping its reason, hint and
 /// details.
-pub fn rephrase(error: anyhow::Error, message: impl std::fmt::Display) -> anyhow::Error {
+pub(crate) fn rephrase(error: anyhow::Error, message: impl std::fmt::Display) -> anyhow::Error {
     let text = format!("{message}: {error:#}");
-    let classified = classify(&error);
+    let classified = classify_owned(error);
     if classified.kind == ErrorKind::OperationFailed
         && classified.hint.is_none()
         && classified.details.is_none()
@@ -805,7 +889,7 @@ pub fn rephrase(error: anyhow::Error, message: impl std::fmt::Display) -> anyhow
 }
 
 /// A frame wait that ended without a frame, as the reason agents match.
-pub fn frame_timeout(message: impl Into<String>) -> anyhow::Error {
+pub(crate) fn frame_timeout(message: impl Into<String>) -> anyhow::Error {
     Categorized::error(ErrorKind::FrameTimeout, message)
 }
 
@@ -813,9 +897,23 @@ pub fn frame_timeout(message: impl Into<String>) -> anyhow::Error {
 mod tests {
     use super::*;
     #[test]
+    fn uuid_groups_preserve_every_input_byte() {
+        assert_eq!(
+            format_uuid(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
+            "00010203-0405-0607-0809-0a0b0c0d0e0f"
+        );
+        assert_eq!(
+            format_uuid(&[u8::MAX; 16]),
+            "ffffffff-ffff-ffff-ffff-ffffffffffff"
+        );
+    }
+    #[test]
     fn bytes_are_lowercase_hex_and_random_names_differ() {
         assert_eq!(hex([0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
         assert_eq!(hex([]), "");
+        for byte in 0..=u8::MAX {
+            assert_eq!(hex([byte]), format!("{byte:02x}"));
+        }
         let (one, two) = (random_hex(6).unwrap(), random_hex(6).unwrap());
         assert!(one.len() == 12 && one.bytes().all(|b| b.is_ascii_hexdigit()));
         assert_ne!(one, two);
@@ -953,19 +1051,147 @@ mod tests {
     }
 
     #[test]
+    fn duration_fractions_round_once_without_binary_precision_loss() {
+        for (text, nanos) in [
+            ("0.000000000499999999999999999999s", 0),
+            ("0.0000000005s", 1),
+            ("0.999999999499999999999999999999s", 999_999_999),
+            ("0.9999999995s", 1_000_000_000),
+            ("0.00025us0.00025us", 1),
+            ("0.000249999999999999999us0.00025us", 0),
+            ("0.00025us0.000249999999999999999us", 0),
+            ("0.0000000000001h0.0000000000001h0.0000000000001h", 1),
+        ] {
+            assert_eq!(
+                parse_duration(text).unwrap(),
+                Duration::from_nanos(nanos),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            parse_duration("315576000s0.00000000049s").unwrap(),
+            MAX_DURATION
+        );
+        parse_duration("315576000s0.0000000005s").unwrap_err();
+    }
+
+    #[test]
+    fn decimal_durations_agree_with_exact_scaled_fractions() {
+        let units = [
+            ("us", 1_000u128),
+            ("ms", 1_000_000),
+            ("s", 1_000_000_000),
+            ("m", 60_000_000_000),
+            ("h", 3_600_000_000_000),
+        ];
+        let denominator = 1_000_000_000_000_000_000u128;
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for index in 0..250 {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let a = seed % 1_000_000_000_000_000_000;
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let b = seed % 1_000_000;
+            let (unit_a, scale_a) = units[index % units.len()];
+            let (unit_b, scale_b) = units[(index / units.len()) % units.len()];
+            let text = format!("0.{a:018}{unit_a}0.{b:06}{unit_b}");
+            let numerator = u128::from(a) * scale_a + u128::from(b) * scale_b * 1_000_000_000_000;
+            let expected = u64::try_from((numerator + denominator / 2) / denominator).unwrap();
+            assert_eq!(
+                parse_duration(&text).unwrap(),
+                Duration::from_nanos(expected),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
     fn durations_keep_nanoseconds_at_the_limit() {
         for duration in [
             Duration::from_nanos(47_792_411_873_516_365),
-            MAX_DURATION - Duration::from_nanos(1),
+            MAX_DURATION
+                .checked_sub(Duration::from_nanos(1))
+                .expect("maximum duration is nonzero"),
             MAX_DURATION,
         ] {
             assert_eq!(parse_duration(&duration_text(duration)).unwrap(), duration);
         }
-        assert!(parse_duration("315576000.000000001s").is_err());
+        parse_duration("315576000.000000001s").unwrap_err();
         assert_eq!(
             parse_duration("0.0005us0.0005us").unwrap(),
             Duration::from_nanos(1)
         );
+    }
+
+    #[test]
+    fn owned_error_rewrites_keep_metadata_and_context_priority() {
+        let category = || {
+            anyhow::Error::from(
+                Categorized::new(ErrorKind::OutOfRange, "sensor limit")
+                    .hint("choose a lower value")
+                    .details(serde_json::json!({"max":10})),
+            )
+        };
+        let merged = with_details(category(), serde_json::json!({"saved":2}));
+        let merged = classify(&merged);
+        assert_eq!(merged.kind, ErrorKind::OutOfRange);
+        assert_eq!(merged.hint.as_deref(), Some("choose a lower value"));
+        assert_eq!(
+            merged.details.unwrap(),
+            serde_json::json!({"max":10,"saved":2})
+        );
+
+        let array = Categorized::new(ErrorKind::Incomplete, "partial")
+            .details(serde_json::json!(["one", "two"]));
+        let merged = with_details(array.into(), serde_json::json!({"saved":2}));
+        assert_eq!(
+            classify(&merged).details.unwrap(),
+            serde_json::json!({"cause":["one","two"],"saved":2})
+        );
+
+        let wrapped = rephrase(category().context("opening camera"), "capture");
+        assert_eq!(
+            format!("{wrapped:#}"),
+            "capture: opening camera: sensor limit"
+        );
+        assert_eq!(classify(&wrapped).kind, ErrorKind::OutOfRange);
+        assert_eq!(
+            classify(&wrapped).hint.as_deref(),
+            Some("choose a lower value")
+        );
+
+        let original = category().context(Usage("bad command".into()));
+        let before = classify(&original);
+        assert_eq!(before.kind, ErrorKind::OutOfRange);
+        let usage = rephrase(original, "capture");
+        let classified = classify(&usage);
+        assert_eq!(classified.kind, before.kind);
+        assert_eq!(classified.hint, before.hint);
+        assert_eq!(classified.details, before.details);
+        assert_eq!(format!("{usage:#}"), "capture: bad command: sensor limit");
+
+        // A typed Anyhow context must not replace the I/O cause's category.
+        let original =
+            anyhow::Error::from(std::io::Error::new(std::io::ErrorKind::TimedOut, "waited"))
+                .context(
+                    Categorized::new(ErrorKind::OutOfRange, "range context").hint("range hint"),
+                );
+        assert_eq!(classify(&original).kind, ErrorKind::Timeout);
+        let timeout = rephrase(original, "capture");
+        let classified = classify(&timeout);
+        assert_eq!(classified.kind, ErrorKind::Timeout);
+        assert!(classified.hint.is_none() && classified.details.is_none());
+
+        let boxed: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(Categorized::new(ErrorKind::OutOfRange, "boxed limit").hint("boxed hint"));
+        let original = anyhow::Error::from_boxed(boxed);
+        let before = classify(&original);
+        assert_eq!(before.kind, ErrorKind::OperationFailed);
+        let boxed = rephrase(original, "capture");
+        let after = classify(&boxed);
+        assert_eq!(after.kind, before.kind);
+        assert_eq!(after.hint, before.hint);
+        assert_eq!(after.details, before.details);
+        assert_eq!(boxed.to_string(), "capture: boxed limit");
     }
 
     #[test]
@@ -1000,6 +1226,31 @@ mod tests {
 
     #[test]
     fn sizes_take_binary_and_decimal_units() {
+        for (unit, multiplier) in [
+            ("b", 1),
+            ("k", 1024),
+            ("ki", 1024),
+            ("kib", 1024),
+            ("m", 1024u64.pow(2)),
+            ("mi", 1024u64.pow(2)),
+            ("mib", 1024u64.pow(2)),
+            ("g", 1024u64.pow(3)),
+            ("gi", 1024u64.pow(3)),
+            ("gib", 1024u64.pow(3)),
+            ("t", 1024u64.pow(4)),
+            ("ti", 1024u64.pow(4)),
+            ("tib", 1024u64.pow(4)),
+            ("kb", 1000),
+            ("mb", 1000u64.pow(2)),
+            ("gb", 1000u64.pow(3)),
+            ("tb", 1000u64.pow(4)),
+        ] {
+            assert_eq!(parse_bytes(&format!("1{unit}")).unwrap(), multiplier);
+            assert_eq!(
+                parse_bytes(&format!("1{}", unit.to_ascii_uppercase())).unwrap(),
+                multiplier
+            );
+        }
         assert_eq!(parse_bytes("10GiB").unwrap(), 10 * 1024u64.pow(3));
         assert_eq!(parse_bytes("10G").unwrap(), 10 * 1024u64.pow(3));
         assert_eq!(parse_bytes("10GB").unwrap(), 10_000_000_000);
@@ -1007,6 +1258,10 @@ mod tests {
         assert_eq!(parse_bytes("512").unwrap(), 512);
         for invalid in ["0", "-1", "1.5GB", "10words", "18446744073709551615TB", ""] {
             assert!(parse_bytes(invalid).is_err(), "{invalid}");
+        }
+        // The Kelvin sign normalizes to ASCII K, but is not an ASCII unit.
+        for invalid in ["1b\0", "1\u{212a}B", "1ＫＢ"] {
+            assert!(parse_bytes(invalid).is_err(), "{invalid:?}");
         }
     }
 }

@@ -3,22 +3,25 @@
 //! client; banks and controls are resolved, planned and written in the
 //! camera worker, against the live node map.
 //!
-//! A name is a GenICam feature (`ExposureTime`), a feature at a bank
+//! A name is a `GenICam` feature (`ExposureTime`), a feature at a bank
 //! (`TriggerMode[TriggerSelector=FrameStart]`, or `TriggerMode[FrameStart]`
 //! when one selector addresses it) or a lowercase canonical control
 //! (`exposure`, `gain`, `fps`, `roi`, `format`, `trigger`, `auto_exposure`,
 //! `auto_wb`), which cannot collide with SFNC names.
+#![forbid(unsafe_code)]
+#![cfg_attr(not(test), deny(clippy::panic, clippy::unreachable))]
 use crate::camera::Camera;
 use crate::genicam::Bounds;
 use crate::types::{Categorized, ErrorKind, Transport, Usage};
-use anyhow::{Context, Result};
+use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 use std::time::Duration;
 
 /// Exposure features, preferred first.
 pub(crate) const EXPOSURE: [&str; 2] = ["ExposureTime", "ExposureTimeAbs"];
-/// Gain features in dB or a multiplier, preferred first; GainRaw is the
+/// Gain features in dB or a multiplier, preferred first; `GainRaw` is the
 /// last resort for `gain`.
 pub(crate) const GAIN: [&str; 2] = ["Gain", "GainAbs"];
 /// Frame-rate limiters, preferred first.
@@ -43,31 +46,77 @@ const STREAM_COMMAND_PREFIXES: [&str; 2] = ["Acquisition", "Transfer"];
 /// Most selectors one name addresses.
 const MAX_BANK: usize = 4;
 /// Most rows `features` returns.
-pub const MAX_FEATURE_ROWS: usize = 200;
+pub(crate) const MAX_FEATURE_ROWS: usize = 200;
+
+/// A canonical control, distinct from a camera's vendor feature names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Control {
+    Exposure,
+    Gain,
+    Fps,
+    Roi,
+    Format,
+    Trigger,
+    AutoExposure,
+    AutoWb,
+}
+impl Control {
+    const ALL: [Self; 8] = [
+        Self::Exposure,
+        Self::Gain,
+        Self::Fps,
+        Self::Roi,
+        Self::Format,
+        Self::Trigger,
+        Self::AutoExposure,
+        Self::AutoWb,
+    ];
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Exposure => "exposure",
+            Self::Gain => "gain",
+            Self::Fps => "fps",
+            Self::Roi => "roi",
+            Self::Format => "format",
+            Self::Trigger => "trigger",
+            Self::AutoExposure => "auto_exposure",
+            Self::AutoWb => "auto_wb",
+        }
+    }
+    fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|control| control.name() == name)
+    }
+}
 
 /// The canonical controls, in the order `info` lists them.
-pub const CONTROLS: [(&str, &str); 8] = [
-    ("exposure", "exposure time as a duration: 500us, 10ms"),
+pub(crate) const CONTROLS: [(&str, &str); 8] = [
     (
-        "gain",
+        Control::Exposure.name(),
+        "exposure time as a duration: 500us, 10ms",
+    ),
+    (
+        Control::Gain.name(),
         "gain in dB when the camera's unit is dB, else its native unit",
     ),
     (
-        "fps",
+        Control::Fps.name(),
         "frame-rate limit in frames per second; turns the limiter on",
     ),
-    ("roi", "region x,y,w,h in pixels, or full"),
-    ("format", "pixel format, such as Mono8 or BayerRG8"),
+    (Control::Roi.name(), "region x,y,w,h in pixels, or full"),
     (
-        "trigger",
+        Control::Format.name(),
+        "pixel format, such as Mono8 or BayerRG8",
+    ),
+    (
+        Control::Trigger.name(),
         "off, software, or a line: line0[:rising|falling]",
     ),
     (
-        "auto_exposure",
+        Control::AutoExposure.name(),
         "the camera's own auto exposure: off, once, continuous",
     ),
     (
-        "auto_wb",
+        Control::AutoWb.name(),
         "the camera's own white balance: off, once, continuous",
     ),
 ];
@@ -112,10 +161,10 @@ fn usage(message: impl Into<String>) -> anyhow::Error {
 }
 
 fn control_name(name: &str) -> bool {
-    CONTROLS.iter().any(|(control, _)| *control == name)
+    Control::parse(name).is_some()
 }
 
-/// A feature or selector name: a GenICam identifier.
+/// A feature or selector name: a `GenICam` identifier.
 fn identifier(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 256
@@ -207,15 +256,17 @@ impl std::fmt::Display for Name {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.name)?;
         if !self.bank.is_empty() {
-            let entries = self
-                .bank
-                .iter()
-                .map(|entry| match &entry.selector {
-                    Some(selector) => format!("{selector}={}", entry.value),
-                    None => entry.value.clone(),
-                })
-                .collect::<Vec<_>>();
-            write!(f, "[{}]", entries.join(","))?;
+            f.write_str("[")?;
+            for (index, entry) in self.bank.iter().enumerate() {
+                if index > 0 {
+                    f.write_str(",")?;
+                }
+                if let Some(selector) = &entry.selector {
+                    write!(f, "{selector}=")?;
+                }
+                f.write_str(&entry.value)?;
+            }
+            f.write_str("]")?;
         }
         Ok(())
     }
@@ -224,22 +275,22 @@ impl Assignment {
     /// `NAME=VALUE`, split at the first `=` outside a bank.
     pub fn parse(text: &str) -> Result<Self> {
         let mut depth = 0usize;
-        let split = text.char_indices().find_map(|(index, c)| {
+        let split = text.split_once(|c| {
             match c {
                 '[' => depth += 1,
                 ']' => depth = depth.saturating_sub(1),
-                '=' if depth == 0 => return Some(index),
+                '=' if depth == 0 => return true,
                 _ => {}
             }
-            None
+            false
         });
-        let Some(split) = split else {
+        let Some((name, value)) = split else {
             return Err(usage(format!(
                 "'{text}' needs a value: NAME=VALUE, such as ExposureTime=10ms or exposure=5ms"
             )));
         };
-        let name = Name::parse(&text[..split])?;
-        let value = text[split + 1..].trim();
+        let name = Name::parse(name)?;
+        let value = value.trim();
         if value.chars().any(char::is_control) || value.len() > 1024 {
             return Err(usage(format!(
                 "the value for {name} must be at most 1024 bytes without control characters"
@@ -337,18 +388,20 @@ impl Target {
                 .count()
                 == 1
         });
-        let entries = self
-            .bank
-            .iter()
-            .map(|(selector, value)| {
-                if short {
-                    value.clone()
-                } else {
-                    format!("{selector}={value}")
-                }
-            })
-            .collect::<Vec<_>>();
-        format!("{}[{}]", self.feature, entries.join(","))
+        let mut key = self.feature.clone();
+        key.push('[');
+        for (index, (selector, value)) in self.bank.iter().enumerate() {
+            if index > 0 {
+                key.push(',');
+            }
+            if !short {
+                key.push_str(selector);
+                key.push('=');
+            }
+            key.push_str(value);
+        }
+        key.push(']');
+        key
     }
     fn read(&self, camera: &mut Camera) -> Result<Value> {
         with_bank(camera, &self.bank, |camera| camera.get(&self.feature))
@@ -356,7 +409,7 @@ impl Target {
 }
 
 /// The selectors that address a feature's bank and that a command can set.
-fn real_selectors(camera: &mut Camera, feature: &str) -> Vec<String> {
+fn real_selectors(camera: &Camera, feature: &str) -> Vec<String> {
     camera
         .selectors(feature)
         .into_iter()
@@ -372,16 +425,26 @@ fn real_selectors(camera: &mut Camera, feature: &str) -> Vec<String> {
 
 /// Up to five feature or control names close to `typed`.
 fn did_you_mean(camera: &Camera, typed: &str) -> Vec<String> {
-    let mut close = camera
+    let mut close = Vec::with_capacity(5);
+    for name in camera
         .feature_names()
         .into_iter()
         .chain(CONTROLS.iter().map(|(control, _)| *control))
-        .filter(|name| crate::hint::is_close(typed, name))
-        .map(|name| (crate::hint::edit_distance(typed, name), name.to_owned()))
-        .collect::<Vec<_>>();
-    close.sort();
-    close.dedup_by(|a, b| a.1 == b.1);
-    close.into_iter().take(5).map(|(_, name)| name).collect()
+    {
+        let Some(distance) = crate::hint::close_distance(typed, name) else {
+            continue;
+        };
+        let candidate = (distance, name);
+        if let Err(index) = close.binary_search(&candidate)
+            && index < 5
+        {
+            if close.len() == 5 {
+                close.pop();
+            }
+            close.insert(index, candidate);
+        }
+    }
+    close.into_iter().map(|(_, name)| name.to_owned()).collect()
 }
 
 fn not_found(camera: &Camera, name: &str) -> anyhow::Error {
@@ -411,41 +474,38 @@ fn resolve(camera: &mut Camera, name: &Name) -> Result<Target> {
     let selectors = real_selectors(camera, &name.name);
     let mut bank: Vec<(String, String)> = Vec::new();
     for entry in &name.bank {
-        let selector = match &entry.selector {
-            Some(selector) => {
-                if !camera.has(selector) {
-                    return Err(not_found(camera, selector));
-                }
-                selector.clone()
+        let selector = if let Some(selector) = &entry.selector {
+            if !camera.has(selector) {
+                return Err(not_found(camera, selector));
             }
-            None => {
-                let matching = selectors
-                    .iter()
-                    .filter(|selector| {
-                        camera
-                            .choices(selector)
-                            .is_ok_and(|choices| choices.contains(&entry.value))
-                    })
-                    .collect::<Vec<_>>();
-                match (matching.as_slice(), selectors.as_slice()) {
-                    ([one], _) => (*one).clone(),
-                    ([], [one]) => one.clone(),
-                    ([], []) => {
-                        return Err(usage(format!(
-                            "{} has no selector, so [{}] addresses nothing; name it without a bank",
-                            name.name, entry.value
-                        )));
-                    }
-                    _ => {
-                        return Err(usage(format!(
-                            "{}[{}] is ambiguous: name the selector, one of {}, as {}[SELECTOR={}]",
-                            name.name,
-                            entry.value,
-                            selectors.join(", "),
-                            name.name,
-                            entry.value
-                        )));
-                    }
+            selector.clone()
+        } else {
+            let matching = selectors
+                .iter()
+                .filter(|selector| {
+                    camera
+                        .choices(selector)
+                        .is_ok_and(|choices| choices.contains(&entry.value))
+                })
+                .collect::<Vec<_>>();
+            match (matching.as_slice(), selectors.as_slice()) {
+                ([one], _) => (*one).clone(),
+                ([], [one]) => one.clone(),
+                ([], []) => {
+                    return Err(usage(format!(
+                        "{} has no selector, so [{}] addresses nothing; name it without a bank",
+                        name.name, entry.value
+                    )));
+                }
+                _ => {
+                    return Err(usage(format!(
+                        "{}[{}] is ambiguous: name the selector, one of {}, as {}[SELECTOR={}]",
+                        name.name,
+                        entry.value,
+                        selectors.join(", "),
+                        name.name,
+                        entry.value
+                    )));
                 }
             }
         };
@@ -488,17 +548,25 @@ pub(crate) fn has_choice(camera: &mut Camera, feature: &str, choice: &str) -> bo
         .is_ok_and(|c| c.iter().any(|v| v == choice))
 }
 
-/// The choice of `feature` equal to `wanted` ignoring case and `_`.
+/// The choice of `feature` equal to `wanted` ignoring ASCII case, `_` and `-`.
 fn choice(camera: &mut Camera, feature: &str, wanted: &str) -> Option<String> {
-    let squash = |s: &str| s.replace(['_', '-'], "").to_ascii_lowercase();
     camera
         .choices(feature)
         .ok()?
         .into_iter()
-        .find(|choice| squash(choice) == squash(wanted))
+        .find(|choice| same_choice(choice, wanted))
 }
 
-/// The bank `GainSelector=All` (or AnalogAll) when the camera has one.
+fn same_choice(left: &str, right: &str) -> bool {
+    fn normalized(text: &str) -> impl Iterator<Item = u8> + '_ {
+        text.bytes()
+            .filter(|byte| !matches!(byte, b'_' | b'-'))
+            .map(|byte| byte.to_ascii_lowercase())
+    }
+    normalized(left).eq(normalized(right))
+}
+
+/// The bank `GainSelector=All` (or `AnalogAll`) when the camera has one.
 fn gain_bank(camera: &mut Camera) -> Vec<(String, String)> {
     if !camera.has("GainSelector") {
         return Vec::new();
@@ -510,7 +578,7 @@ fn gain_bank(camera: &mut Camera) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-/// The FrameStart bank of the trigger features, when they have one.
+/// The `FrameStart` bank of the trigger features, when they have one.
 fn trigger_bank(camera: &mut Camera) -> Vec<(String, String)> {
     if camera.has("TriggerSelector") && has_choice(camera, "TriggerSelector", "FrameStart") {
         vec![("TriggerSelector".into(), "FrameStart".into())]
@@ -551,9 +619,14 @@ fn feature_value(camera: &Camera, feature: &str, value: &str) -> Result<String> 
 
 /// A number without a trailing `.0`, rounded to nanosecond precision.
 fn number_text(value: f64) -> String {
-    let rounded = (value * 1e9).round() / 1e9;
-    if rounded.fract() == 0.0 && rounded.abs() < 1e15 {
-        format!("{}", rounded as i64)
+    let scaled = value * 1e9;
+    let rounded = if scaled.is_finite() {
+        scaled.round() / 1e9
+    } else {
+        value
+    };
+    if rounded == 0.0 {
+        "0".to_owned()
     } else {
         rounded.to_string()
     }
@@ -564,8 +637,8 @@ fn number_text(value: f64) -> String {
 fn time_text(amount: f64, unit: &str) -> Option<String> {
     let per_second = in_time_unit(Duration::from_secs(1), unit)?;
     let nanos = (amount * 1e9 / per_second).round();
-    (nanos.is_finite() && nanos >= 0.0 && nanos <= u64::MAX as f64)
-        .then(|| crate::types::duration_text(Duration::from_nanos(nanos as u64)))
+    let nanos = u64::try_from(crate::types::integral_float(nanos)?).ok()?;
+    Some(crate::types::duration_text(Duration::from_nanos(nanos)))
 }
 
 /// One write of a planned change.
@@ -581,16 +654,16 @@ struct Write {
 }
 
 /// Expand a canonical control into feature writes.
-fn expand_control(camera: &mut Camera, control: &str, value: &str) -> Result<Vec<Write>> {
+fn expand_control(camera: &mut Camera, kind: Control, value: &str) -> Result<Vec<Write>> {
+    let control = kind.name();
     let write = |target: Target, value: String| Write {
         target,
         value,
         origin: control.to_owned(),
         implied: false,
     };
-    let lower = value.trim().to_ascii_lowercase();
-    Ok(match control {
-        "exposure" => {
+    Ok(match kind {
+        Control::Exposure => {
             let feature = first_present(camera, &EXPOSURE)
                 .ok_or_else(|| unsupported(camera, control, "exposure"))?;
             let duration = crate::types::parse_duration(value)?;
@@ -598,7 +671,7 @@ fn expand_control(camera: &mut Camera, control: &str, value: &str) -> Result<Vec
             let amount = in_time_unit(duration, &unit).unwrap_or(duration.as_secs_f64() * 1e6);
             vec![write(Target::plain(feature), number_text(amount))]
         }
-        "gain" => {
+        Control::Gain => {
             let feature = first_present(camera, &GAIN)
                 .or_else(|| first_present(camera, &["GainRaw"]))
                 .ok_or_else(|| unsupported(camera, control, "gain"))?;
@@ -617,7 +690,7 @@ fn expand_control(camera: &mut Camera, control: &str, value: &str) -> Result<Vec
                 value.trim().into(),
             )]
         }
-        "fps" => {
+        Control::Fps => {
             let feature = first_present(camera, &FRAME_RATE)
                 .ok_or_else(|| unsupported(camera, control, "frame-rate"))?;
             value
@@ -646,17 +719,18 @@ fn expand_control(camera: &mut Camera, control: &str, value: &str) -> Result<Vec
             writes.push(write(Target::plain(feature), value.trim().into()));
             writes
         }
-        "format" => {
+        Control::Format => {
             if !camera.has("PixelFormat") {
                 return Err(unsupported(camera, control, "pixel format"));
             }
             vec![write(Target::plain("PixelFormat"), value.trim().into())]
         }
-        "roi" => roi(camera, value)?
+        Control::Roi => roi(camera, value)?
             .into_iter()
             .map(|(feature, value)| write(Target::plain(feature), value))
             .collect(),
-        "trigger" => {
+        Control::Trigger => {
+            let lower = value.trim().to_ascii_lowercase();
             if !camera.has("TriggerMode") {
                 return Err(unsupported(camera, control, "trigger"));
             }
@@ -727,26 +801,29 @@ fn expand_control(camera: &mut Camera, control: &str, value: &str) -> Result<Vec
             writes.push(write(at("TriggerMode"), "On".into()));
             writes
         }
-        "auto_exposure" | "auto_wb" => {
-            let feature = if control == "auto_exposure" {
+        Control::AutoExposure | Control::AutoWb => {
+            let feature = if kind == Control::AutoExposure {
                 "ExposureAuto"
             } else {
                 "BalanceWhiteAuto"
             };
             if !camera.has(feature) {
-                let what = if control == "auto_exposure" {
+                let what = if kind == Control::AutoExposure {
                     "auto exposure"
                 } else {
                     "white balance"
                 };
                 return Err(unsupported(camera, control, what));
             }
-            if !matches!(lower.as_str(), "off" | "once" | "continuous") {
+            let Some(lower) = ["off", "once", "continuous"]
+                .into_iter()
+                .find(|candidate| value.trim().eq_ignore_ascii_case(candidate))
+            else {
                 return Err(usage(format!(
                     "{control} takes off, once or continuous, not '{value}'"
                 )));
-            }
-            let Some(chosen) = choice(camera, feature, &lower) else {
+            };
+            let Some(chosen) = choice(camera, feature, lower) else {
                 let choices = camera.choices(feature).unwrap_or_default();
                 return Err(Categorized::new(
                     ErrorKind::Unsupported,
@@ -757,7 +834,6 @@ fn expand_control(camera: &mut Camera, control: &str, value: &str) -> Result<Vec
             };
             vec![write(Target::plain(feature), chosen)]
         }
-        _ => unreachable!("only canonical controls expand"),
     })
 }
 
@@ -780,22 +856,23 @@ fn roi(camera: &mut Camera, value: &str) -> Result<Vec<(&'static str, String)>> 
             .ok_or_else(|| usage("this camera does not report its maximum height"))?;
         [0.0, 0.0, w, h]
     } else {
-        let parts = value
-            .split(',')
-            .map(|part| {
-                part.trim()
-                    .parse::<f64>()
-                    .ok()
-                    .filter(|v| *v >= 0.0 && v.fract() == 0.0)
-            })
-            .collect::<Option<Vec<_>>>()
-            .filter(|parts| parts.len() == 4)
-            .ok_or_else(|| {
-                usage(format!(
+        let mut parts = value.split(',').map(|part| {
+            part.trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|v| *v >= 0.0 && v.fract() == 0.0)
+        });
+        match (
+            std::array::from_fn::<_, 4, _>(|_| parts.next().flatten()),
+            parts.next(),
+        ) {
+            ([Some(x), Some(y), Some(w), Some(h)], None) => [x, y, w, h],
+            _ => {
+                return Err(usage(format!(
                     "roi takes x,y,w,h in whole pixels or full, not '{value}'"
-                ))
-            })?;
-        [parts[0], parts[1], parts[2], parts[3]]
+                )));
+            }
+        }
     };
     let offsets = camera.has("OffsetX") && camera.has("OffsetY");
     if !offsets && (x != 0.0 || y != 0.0) {
@@ -844,8 +921,8 @@ fn plan(camera: &mut Camera, values: &[Assignment]) -> Result<Vec<Write>> {
     let mut writes = Vec::new();
     for assignment in values {
         assignment.validate()?;
-        if control_name(&assignment.name) {
-            writes.extend(expand_control(camera, &assignment.name, &assignment.value)?);
+        if let Some(control) = Control::parse(&assignment.name) {
+            writes.extend(expand_control(camera, control, &assignment.value)?);
         } else {
             let target = resolve(camera, &assignment.target())?;
             let value = feature_value(camera, &target.feature, &assignment.value)?;
@@ -873,12 +950,13 @@ fn plan(camera: &mut Camera, values: &[Assignment]) -> Result<Vec<Write>> {
                 .rev()
                 .find(|earlier| earlier.target.feature == selector)
                 .map(|earlier| earlier.value.clone());
-            match earlier.or_else(|| camera.get(&selector).ok().map(|value| text(&value))) {
-                Some(value) => bank.push((selector, value)),
-                None => {
-                    bank.clear();
-                    break;
-                }
+            if let Some(value) =
+                earlier.or_else(|| camera.get(&selector).ok().map(|value| text(&value)))
+            {
+                bank.push((selector, value));
+            } else {
+                bank.clear();
+                break;
             }
         }
         writes[index].target.bank = bank;
@@ -954,8 +1032,9 @@ fn order(camera: &mut Camera, writes: &mut Vec<Write>) {
         .drain(..)
         .enumerate()
         .map(|(index, write)| {
-            let key = crate::setup::order_key(&write.target.feature, Some(&write.value));
-            (key, index, write)
+            let (group, rank, _) =
+                crate::setup::order_key(&write.target.feature, Some(&write.value));
+            ((group, rank), index, write)
         })
         .collect::<Vec<_>>();
     keyed.sort_by(|a, b| {
@@ -963,7 +1042,7 @@ fn order(camera: &mut Camera, writes: &mut Vec<Write>) {
         if roi {
             a.1.cmp(&b.1)
         } else {
-            (&a.0, a.1).cmp(&(&b.0, b.1))
+            (a.0, &a.2.target.feature, a.1).cmp(&(b.0, &b.2.target.feature, b.1))
         }
     });
     *writes = keyed.into_iter().map(|(_, _, write)| write).collect();
@@ -1045,16 +1124,28 @@ fn order(camera: &mut Camera, writes: &mut Vec<Write>) {
     }
 }
 
+/// Boolean spellings, ignoring ASCII case without trimming whitespace.
+fn boolean_setting(text: &str) -> Option<bool> {
+    if ["true", "1", "on"]
+        .iter()
+        .any(|value| text.eq_ignore_ascii_case(value))
+    {
+        Some(true)
+    } else if ["false", "0", "off"]
+        .iter()
+        .any(|value| text.eq_ignore_ascii_case(value))
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Whether two feature values are the same setting.
 fn same(current: &Value, wanted: &str) -> bool {
     match current {
         Value::String(current) => current == wanted,
-        Value::Bool(current) => {
-            matches!(
-                (current, wanted.to_ascii_lowercase().as_str()),
-                (true, "true" | "1" | "on") | (false, "false" | "0" | "off")
-            )
-        }
+        Value::Bool(current) => boolean_setting(wanted) == Some(*current),
         Value::Number(number) => wanted
             .trim()
             .parse::<f64>()
@@ -1075,10 +1166,7 @@ fn wanted_json(current: Option<&Value>, wanted: &str) -> Value {
             .ok()
             .or_else(|| wanted.trim().parse::<f64>().ok().map(|v| json!(v)))
             .unwrap_or_else(|| json!(wanted)),
-        Some(Value::Bool(_)) => json!(matches!(
-            wanted.to_ascii_lowercase().as_str(),
-            "true" | "1" | "on"
-        )),
+        Some(Value::Bool(_)) => json!(boolean_setting(wanted) == Some(true)),
         _ => json!(wanted),
     }
 }
@@ -1104,10 +1192,7 @@ fn unlock(camera: &Camera, feature: &str, earlier: &[Write]) -> Unlock {
         .map(|other| {
             if !other.target.feature.ends_with("Auto") {
                 Unlock::Maybe
-            } else if matches!(
-                other.value.trim().to_ascii_lowercase().as_str(),
-                "off" | "false" | "0"
-            ) {
+            } else if boolean_setting(other.value.trim()) == Some(false) {
                 Unlock::Yes
             } else {
                 Unlock::No
@@ -1308,13 +1393,15 @@ fn out_of_range_hint(details: &Value, unit: Option<&str>) -> Option<String> {
     let nearest = details["nearest"].as_f64()?;
     let time = |value: f64| unit.and_then(|unit| time_text(value, unit));
     let Some(nearest_time) = time(nearest) else {
-        return Some(match unit {
-            Some(unit) => format!(
-                "the nearest accepted value is {} ({unit})",
-                number_text(nearest)
-            ),
-            None => format!("the nearest accepted value is {}", number_text(nearest)),
-        });
+        return Some(unit.map_or_else(
+            || format!("the nearest accepted value is {}", number_text(nearest)),
+            |unit| {
+                format!(
+                    "the nearest accepted value is {} ({unit})",
+                    number_text(nearest)
+                )
+            },
+        ));
     };
     let mut hint = format!("the nearest accepted value is {nearest_time}");
     let feature = details["feature"].as_str().unwrap_or("it");
@@ -1322,9 +1409,15 @@ fn out_of_range_hint(details: &Value, unit: Option<&str>) -> Option<String> {
         details["min"].as_f64().and_then(time),
         details["max"].as_f64().and_then(time),
     ) {
-        (Some(min), Some(max)) => hint.push_str(&format!("; {feature} takes {min} to {max}")),
-        (Some(min), None) => hint.push_str(&format!("; {feature} takes {min} or more")),
-        (None, Some(max)) => hint.push_str(&format!("; {feature} takes up to {max}")),
+        (Some(min), Some(max)) => {
+            let _ = write!(hint, "; {feature} takes {min} to {max}");
+        }
+        (Some(min), None) => {
+            let _ = write!(hint, "; {feature} takes {min} or more");
+        }
+        (None, Some(max)) => {
+            let _ = write!(hint, "; {feature} takes up to {max}");
+        }
         (None, None) => {}
     }
     Some(hint)
@@ -1332,7 +1425,7 @@ fn out_of_range_hint(details: &Value, unit: Option<&str>) -> Option<String> {
 
 /// One row of a change: what it was and what it is now.
 #[derive(Debug, Clone, Serialize)]
-pub struct Change {
+pub(crate) struct Change {
     pub name: String,
     pub from: Value,
     pub to: Value,
@@ -1340,7 +1433,7 @@ pub struct Change {
 
 /// The result of `set`.
 #[derive(Debug, Clone, Serialize)]
-pub struct SetResult {
+pub(crate) struct SetResult {
     pub camera: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub changed: Option<Vec<Change>>,
@@ -1353,7 +1446,7 @@ pub struct SetResult {
 }
 impl SetResult {
     /// Top-level keys and what they mean, for `schema set`.
-    pub const FIELDS: &[(&str, &str)] = &[
+    pub(crate) const FIELDS: &[(&str, &str)] = &[
         ("camera", "string — camera ID"),
         (
             "changed",
@@ -1426,7 +1519,7 @@ pub(crate) fn set(camera: &mut Camera, values: &[Assignment], dry_run: bool) -> 
             Ok(from) => written.push((write.target.clone(), from)),
             Err(error) => {
                 let error = with_unit(camera, &write.target.feature, error);
-                return Err(rollback(camera, written, &geometry, error));
+                return Err(rollback(camera, written, &geometry, &error));
             }
         }
     }
@@ -1486,7 +1579,7 @@ fn rollback(
     camera: &mut Camera,
     written: Vec<(Target, Value)>,
     geometry: &[(String, Value)],
-    error: anyhow::Error,
+    error: &anyhow::Error,
 ) -> anyhow::Error {
     let mut restored = Vec::new();
     let mut failed = Vec::new();
@@ -1544,7 +1637,7 @@ fn rollback(
             .unwrap_or_else(|| format!("did not return to {}", text(value)));
         failed.push(json!({"name": feature, "error": error}));
     }
-    let classified = crate::types::classify(&error);
+    let classified = crate::types::classify(error);
     let mut details = classified.details.unwrap_or_else(|| json!({}));
     if !details.is_object() {
         details = json!({ "cause": details });
@@ -1571,8 +1664,8 @@ pub(crate) fn get(camera: &mut Camera, names: &[Name]) -> Result<serde_json::Map
     let mut values = serde_json::Map::new();
     for name in names {
         name.validate()?;
-        if control_name(&name.name) {
-            values.insert(name.name.clone(), control_value(camera, &name.name)?);
+        if let Some(control) = Control::parse(&name.name) {
+            values.insert(name.name.clone(), control_value(camera, control)?);
             continue;
         }
         let target = resolve(camera, name)?;
@@ -1588,45 +1681,56 @@ pub(crate) fn get(camera: &mut Camera, names: &[Name]) -> Result<serde_json::Map
 }
 
 /// A canonical control's current value, in the form `set` takes.
-fn control_value(camera: &mut Camera, control: &str) -> Result<Value> {
+fn control_value(camera: &mut Camera, kind: Control) -> Result<Value> {
+    let control = kind.name();
     let read_f64 = |camera: &mut Camera, feature: &str| -> Result<f64> {
         camera
             .get(feature)?
             .as_f64()
             .with_context(|| format!("{feature} is not a number"))
     };
-    Ok(match control {
-        "exposure" => {
+    Ok(match kind {
+        Control::Exposure => {
             let feature = first_present(camera, &EXPOSURE)
                 .ok_or_else(|| unsupported(camera, control, "exposure"))?;
             let unit = camera.feature_unit(feature).unwrap_or("us").to_owned();
             let value = read_f64(camera, feature)?;
-            json!(time_text(value, &unit).unwrap_or_else(|| time_text(value, "us").unwrap()))
+            let unit = if in_time_unit(Duration::ZERO, &unit).is_some() {
+                unit.as_str()
+            } else {
+                "us"
+            };
+            json!(time_text(value, unit).with_context(|| format!(
+                "{feature} is not a representable nonnegative duration"
+            ))?)
         }
-        "gain" => {
+        Control::Gain => {
             let feature = first_present(camera, &GAIN)
                 .or_else(|| first_present(camera, &["GainRaw"]))
                 .ok_or_else(|| unsupported(camera, control, "gain"))?;
             let bank = gain_bank(camera);
             with_bank(camera, &bank, |camera| camera.get(feature))?
         }
-        "fps" => {
+        Control::Fps => {
             let feature = first_present(camera, &FRAME_RATE)
                 .ok_or_else(|| unsupported(camera, control, "frame-rate"))?;
             camera.get(feature)?
         }
-        "format" => {
+        Control::Format => {
             if !camera.has("PixelFormat") {
                 return Err(unsupported(camera, control, "pixel format"));
             }
             json!(pixel_format(camera)?)
         }
-        "roi" => {
-            let mut part = |feature: &str| -> Result<i64> {
+        Control::Roi => {
+            let mut part = |feature: &str| -> Result<u64> {
                 if !camera.has(feature) {
                     return Ok(0);
                 }
-                Ok(read_f64(camera, feature)? as i64)
+                camera
+                    .get(feature)?
+                    .as_u64()
+                    .with_context(|| format!("{feature} is not a nonnegative integer pixel count"))
             };
             json!(format!(
                 "{},{},{},{}",
@@ -1636,15 +1740,15 @@ fn control_value(camera: &mut Camera, control: &str) -> Result<Value> {
                 part("Height")?
             ))
         }
-        "trigger" => {
+        Control::Trigger => {
             if !camera.has("TriggerMode") {
                 return Err(unsupported(camera, control, "trigger"));
             }
             let trigger = trigger_state(camera)?;
             json!(trigger_text(&trigger))
         }
-        "auto_exposure" | "auto_wb" => {
-            let feature = if control == "auto_exposure" {
+        Control::AutoExposure | Control::AutoWb => {
+            let feature = if kind == Control::AutoExposure {
                 "ExposureAuto"
             } else {
                 "BalanceWhiteAuto"
@@ -1654,13 +1758,12 @@ fn control_value(camera: &mut Camera, control: &str) -> Result<Value> {
             }
             json!(text(&camera.get(feature)?).to_ascii_lowercase())
         }
-        _ => unreachable!("only canonical controls have values"),
     })
 }
 
 /// The start trigger as `info` reports it.
 #[derive(Debug, Clone, Default, Serialize)]
-pub struct Trigger {
+pub(crate) struct Trigger {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selector: Option<String>,
     pub mode: String,
@@ -1678,12 +1781,12 @@ impl Trigger {
 }
 /// Whether trigger source `source` is the camera's own timing, which sends
 /// frames as they come with the trigger on: Allied Vision cameras ship with
-/// TriggerMode On and TriggerSource Freerun, or FixedRate to run at
-/// AcquisitionFrameRateAbs.
+/// `TriggerMode` On and `TriggerSource` Freerun, or `FixedRate` to run at
+/// `AcquisitionFrameRateAbs`.
 pub(crate) fn camera_timed(source: &str) -> bool {
     matches!(source, "Freerun" | "FixedRate")
 }
-/// The start trigger in effect: the FrameStart trigger, or when it holds
+/// The start trigger in effect: the `FrameStart` trigger, or when it holds
 /// no frames back an acquisition or burst start trigger that does, else
 /// the first that is on, as with a source that is the camera's own timing.
 pub(crate) fn trigger_state(camera: &mut Camera) -> Result<Trigger> {
@@ -1707,8 +1810,8 @@ pub(crate) fn trigger_state(camera: &mut Camera) -> Result<Trigger> {
         _ => frame,
     })
 }
-/// The banks of the start triggers other than FrameStart that hold frames
-/// back: AcquisitionStart and FrameBurstStart.
+/// The banks of the start triggers other than `FrameStart` that hold frames
+/// back: `AcquisitionStart` and `FrameBurstStart`.
 fn other_start_banks(camera: &mut Camera) -> Vec<Vec<(String, String)>> {
     if !camera.has("TriggerSelector") || !has_choice(camera, "TriggerSelector", "FrameStart") {
         return Vec::new();
@@ -1790,7 +1893,7 @@ pub(crate) fn exec(camera: &mut Camera, name: &Name) -> Result<String> {
 
 /// A control as `info` describes it.
 #[derive(Debug, Clone, Serialize)]
-pub struct ControlInfo {
+pub(crate) struct ControlInfo {
     pub feature: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
@@ -1804,7 +1907,7 @@ pub struct ControlInfo {
 
 /// What an agent needs before capturing, without a feature dump.
 #[derive(Debug, Clone, Serialize)]
-pub struct Info {
+pub(crate) struct Info {
     pub camera: String,
     pub kind: &'static str,
     pub vendor: String,
@@ -1844,7 +1947,7 @@ pub struct Info {
     pub controls: serde_json::Map<String, Value>,
 }
 impl Info {
-    pub const FIELDS: &[(&str, &str)] = &[
+    pub(crate) const FIELDS: &[(&str, &str)] = &[
         ("camera", "string — camera ID"),
         ("kind", "gige|u3v|webcam|screen|onvif|stream|file|sim"),
         ("vendor", "string"),
@@ -1900,8 +2003,8 @@ fn string(camera: &mut Camera, names: &[&str]) -> Option<String> {
     })
 }
 
-/// PixelFormat by its PFNC name, also where the node is an integer PFNC
-/// code (FFmpeg sources); a code without a name reads as hex.
+/// `PixelFormat` by its PFNC name, also where the node is an integer PFNC
+/// code (`FFmpeg` sources); a code without a name reads as hex.
 fn pixel_format(camera: &mut Camera) -> Result<String> {
     Ok(match camera.get("PixelFormat")? {
         Value::Number(code) => {
@@ -1969,13 +2072,11 @@ pub(crate) fn info(camera: &mut Camera) -> Info {
     let db = gain_unit
         .as_deref()
         .is_some_and(|unit| unit.trim().eq_ignore_ascii_case("db"));
-    let limit_on = first_present(camera, &FRAME_RATE_ENABLE)
-        .map(|enable| {
-            camera
-                .get(enable)
-                .is_ok_and(|v| v == json!(true) || v == json!("On"))
-        })
-        .unwrap_or(true);
+    let limit_on = first_present(camera, &FRAME_RATE_ENABLE).is_none_or(|enable| {
+        camera
+            .get(enable)
+            .is_ok_and(|v| v == json!(true) || v == json!("On"))
+    });
     // A stream that does not say its rate has none (0), not a limit.
     let fps_limit = limit_on
         .then(|| number(camera, &FRAME_RATE))
@@ -1986,19 +2087,20 @@ pub(crate) fn info(camera: &mut Camera) -> Info {
         .then(|| trigger_state(camera).ok())
         .flatten();
     let mut controls = serde_json::Map::new();
-    for (control, _) in CONTROLS {
-        let feature = match control {
-            "exposure" => exposure,
-            "gain" => gain_feature.or_else(|| first_present(camera, &["GainRaw"])),
-            "fps" => first_present(camera, &FRAME_RATE),
-            "roi" => first_present(camera, &["Width"]).filter(|_| camera.has("Height")),
-            "format" => first_present(camera, &["PixelFormat"]),
-            "trigger" => first_present(camera, &["TriggerMode"]),
-            "auto_exposure" => first_present(camera, &["ExposureAuto"]),
-            _ => first_present(camera, &["BalanceWhiteAuto"]),
+    for kind in Control::ALL {
+        let control = kind.name();
+        let feature = match kind {
+            Control::Exposure => exposure,
+            Control::Gain => gain_feature.or_else(|| first_present(camera, &["GainRaw"])),
+            Control::Fps => first_present(camera, &FRAME_RATE),
+            Control::Roi => first_present(camera, &["Width"]).filter(|_| camera.has("Height")),
+            Control::Format => first_present(camera, &["PixelFormat"]),
+            Control::Trigger => first_present(camera, &["TriggerMode"]),
+            Control::AutoExposure => first_present(camera, &["ExposureAuto"]),
+            Control::AutoWb => first_present(camera, &["BalanceWhiteAuto"]),
         };
         let Some(feature) = feature else { continue };
-        let bounds = if matches!(control, "exposure" | "gain" | "fps") {
+        let bounds = if matches!(kind, Control::Exposure | Control::Gain | Control::Fps) {
             camera.bounds(feature).unwrap_or_default()
         } else {
             Bounds::default()
@@ -2010,7 +2112,7 @@ pub(crate) fn info(camera: &mut Camera) -> Info {
                 unit: camera.feature_unit(feature).map(str::to_owned),
                 min: bounds.min,
                 max: bounds.max,
-                value: control_value(camera, control).ok(),
+                value: control_value(camera, kind).ok(),
             }),
         );
     }
@@ -2027,8 +2129,8 @@ pub(crate) fn info(camera: &mut Camera) -> Info {
             .address
             .filter(|_| info.transport != Transport::Media)
             .map(|a| crate::media::redact_url(&a)),
-        width: number(camera, &["Width"]).map(|v| v as u64),
-        height: number(camera, &["Height"]).map(|v| v as u64),
+        width: camera.get("Width").ok().and_then(|value| value.as_u64()),
+        height: camera.get("Height").ok().and_then(|value| value.as_u64()),
         bits: pixel_format.as_deref().and_then(bits),
         pixel_format,
         fps: number(camera, &RESULTING_RATE),
@@ -2102,19 +2204,22 @@ const COMMON: [&str; 20] = [
 /// A pattern match ignoring case: a glob when it has `*` or `?`, else a
 /// substring.
 fn matches_pattern(pattern: &str, name: &str) -> bool {
-    let pattern = pattern.to_ascii_lowercase();
-    let name = name.to_ascii_lowercase();
-    if !pattern.contains(['*', '?']) {
-        return name.contains(&pattern);
+    let (pattern, name) = (pattern.as_bytes(), name.as_bytes());
+    if !pattern.iter().any(|byte| matches!(byte, b'*' | b'?')) {
+        return pattern.is_empty()
+            || name
+                .windows(pattern.len())
+                .any(|part| part.eq_ignore_ascii_case(pattern));
     }
     // Remember the last star and extend its match on a mismatch. Recursive
     // alternatives take exponential time for patterns such as *a*a*...b.
-    let (pattern, name) = (pattern.as_bytes(), name.as_bytes());
     let (mut p, mut n) = (0, 0);
     let mut star = None;
     let mut retry = 0;
     while n < name.len() {
-        if p < pattern.len() && pattern[p] != b'*' && (pattern[p] == b'?' || pattern[p] == name[n])
+        if p < pattern.len()
+            && pattern[p] != b'*'
+            && (pattern[p] == b'?' || pattern[p].eq_ignore_ascii_case(&name[n]))
         {
             p += 1;
             n += 1;
@@ -2138,7 +2243,7 @@ fn matches_pattern(pattern: &str, name: &str) -> bool {
 
 /// One `features` row.
 #[derive(Debug, Clone, Serialize)]
-pub struct FeatureRow {
+pub(crate) struct FeatureRow {
     pub name: String,
     #[serde(rename = "type")]
     pub kind: &'static str,
@@ -2165,14 +2270,14 @@ pub struct FeatureRow {
 
 /// The `features` result.
 #[derive(Debug, Clone, Serialize)]
-pub struct FeatureList {
+pub(crate) struct FeatureList {
     pub camera: String,
     pub features: Vec<FeatureRow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncated: Option<usize>,
 }
 impl FeatureList {
-    pub const FIELDS: &[(&str, &str)] = &[
+    pub(crate) const FIELDS: &[(&str, &str)] = &[
         ("camera", "string — camera ID"),
         (
             "features",
@@ -2191,7 +2296,6 @@ fn normalized_type(kind: &str) -> &'static str {
         "Float" | "FloatReg" | "SwissKnife" | "Converter" => "float",
         "Boolean" => "bool",
         "Enumeration" => "enum",
-        "String" | "StringReg" => "string",
         "Command" => "command",
         _ => "string",
     }
@@ -2199,12 +2303,8 @@ fn normalized_type(kind: &str) -> &'static str {
 
 pub(crate) fn features(camera: &mut Camera, filter: &FeatureFilter) -> Result<FeatureList> {
     filter.validate()?;
-    let names = camera
+    let selected = camera
         .feature_names()
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let selected = names
         .into_iter()
         // A pattern or category is a search: it looks at every level.
         .filter(|name| {
@@ -2212,7 +2312,7 @@ pub(crate) fn features(camera: &mut Camera, filter: &FeatureFilter) -> Result<Fe
                 || filter.pattern.is_some()
                 || filter.category.is_some()
                 || camera.visibility(name) == "Beginner"
-                || COMMON.contains(&name.as_str())
+                || COMMON.contains(name)
         })
         .filter(|name| {
             filter
@@ -2227,6 +2327,7 @@ pub(crate) fn features(camera: &mut Camera, filter: &FeatureFilter) -> Result<Fe
                     .is_some_and(|category| category.eq_ignore_ascii_case(wanted))
             })
         })
+        .map(str::to_owned)
         .collect::<Vec<_>>();
     if selected.is_empty()
         && let Some(category) = &filter.category
@@ -2277,13 +2378,141 @@ pub(crate) fn features(camera: &mut Camera, filter: &FeatureFilter) -> Result<Fe
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn canonical_control_names_and_order_remain_stable() {
+        let names = [
+            "exposure",
+            "gain",
+            "fps",
+            "roi",
+            "format",
+            "trigger",
+            "auto_exposure",
+            "auto_wb",
+        ];
+        assert_eq!(Control::ALL.map(Control::name), names);
+        assert_eq!(CONTROLS.map(|(name, _)| name), names);
+        for name in names {
+            assert_eq!(Control::parse(name).unwrap().name(), name);
+        }
+        for feature in ["ExposureTime", "Gain", "ROI", "AutoExposure", "unknown"] {
+            assert_eq!(Control::parse(feature), None);
+        }
+    }
+
     use super::*;
+
+    #[test]
+    fn roi_requires_exactly_four_nonnegative_integer_components() {
+        let mut camera = sim();
+        assert_eq!(
+            roi(&mut camera, " 0 , 0 , 64 , 48 ").unwrap(),
+            roi(&mut camera, "0,0,64,48").unwrap()
+        );
+        for value in [
+            "",
+            "0,0,64",
+            "0,0,64,48,1",
+            "0,0,64,48,",
+            "0,,64,48",
+            "-1,0,64,48",
+            "0,0,64.5,48",
+            "0,0,NaN,48",
+            "0,0,inf,48",
+            "0,0,６４,48",
+        ] {
+            let error = roi(&mut camera, value).unwrap_err();
+            assert!(
+                error.to_string().starts_with("roi takes x,y,w,h"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn boolean_settings_keep_invalid_values_distinct_from_false() {
+        for (text, expected) in [
+            ("true", Some(true)),
+            ("TrUe", Some(true)),
+            ("1", Some(true)),
+            ("ON", Some(true)),
+            ("false", Some(false)),
+            ("FaLsE", Some(false)),
+            ("0", Some(false)),
+            ("OFF", Some(false)),
+            ("", None),
+            (" true ", None),
+            ("yes", None),
+            ("ｏｎ", None),
+            ("é", None),
+        ] {
+            assert_eq!(boolean_setting(text), expected, "{text:?}");
+            for current in [false, true] {
+                assert_eq!(
+                    same(&json!(current), text),
+                    expected == Some(current),
+                    "{text:?} compared with {current}"
+                );
+                assert_eq!(
+                    wanted_json(Some(&json!(current)), text),
+                    json!(expected == Some(true)),
+                    "{text:?} with current {current}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn choices_ignore_only_ascii_case_underscores_and_hyphens() {
+        for (left, right, equal) in [
+            ("AnalogAll", "analog_all", true),
+            ("Frame-Start", "FRAME_START", true),
+            ("_a--B_", "ab", true),
+            ("", "_-", true),
+            ("É_A", "É-a", true),
+            ("É", "é", false),
+            ("a b", "ab", false),
+            ("a", "aa", false),
+            ("a/b", "ab", false),
+        ] {
+            assert_eq!(same_choice(left, right), equal, "{left:?}, {right:?}");
+            assert_eq!(same_choice(right, left), equal, "{right:?}, {left:?}");
+        }
+    }
 
     fn sim() -> Camera {
         Camera::open("sim:0", &[], Duration::from_secs(2)).unwrap()
     }
     fn assign(text: &str) -> Assignment {
         Assignment::parse(text).unwrap()
+    }
+
+    #[test]
+    fn bounded_suggestions_match_the_complete_ranking() {
+        let camera = sim();
+        let names: Vec<_> = camera
+            .feature_names()
+            .into_iter()
+            .chain(CONTROLS.iter().map(|(name, _)| *name))
+            .collect();
+        let queries = [
+            "", "e", "Exposure", "Trigger", "gain", "exposur", "__", "三",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .chain(names.iter().map(|name| name.chars().take(3).collect()));
+        for typed in queries {
+            let mut ranked: Vec<_> = names
+                .iter()
+                .filter_map(|name| {
+                    crate::hint::close_distance(&typed, name).map(|distance| (distance, *name))
+                })
+                .collect();
+            ranked.sort_unstable();
+            ranked.dedup_by(|a, b| a.1 == b.1);
+            let expected: Vec<_> = ranked.into_iter().take(5).map(|(_, name)| name).collect();
+            assert_eq!(did_you_mean(&camera, &typed), expected, "{typed:?}");
+        }
     }
 
     #[test]
@@ -2303,13 +2532,13 @@ mod tests {
         }
         for code in 0..4096usize {
             let mut code = code;
-            let pattern: String = (0..6)
-                .map(|_| {
-                    let c = b"ab*?"[code % 4];
-                    code /= 4;
-                    c as char
-                })
-                .collect();
+            let pattern: String = std::iter::repeat_with(|| {
+                let c = b"ab*?"[code % 4];
+                code /= 4;
+                c as char
+            })
+            .take(6)
+            .collect();
             for bits in 0..32usize {
                 let name: String = (0..5)
                     .map(|i| if bits & (1 << i) == 0 { 'a' } else { 'b' })
@@ -2323,6 +2552,14 @@ mod tests {
                     matches_pattern(&pattern, &name),
                     expected,
                     "{pattern} {name}"
+                );
+                assert_eq!(
+                    matches_pattern(&pattern.to_ascii_uppercase(), &name),
+                    expected
+                );
+                assert_eq!(
+                    matches_pattern(&pattern, &name.to_ascii_uppercase()),
+                    expected
                 );
             }
         }
@@ -2341,7 +2578,37 @@ mod tests {
     }
 
     #[test]
+    fn feature_patterns_preserve_ascii_case_and_utf8_byte_matching() {
+        for (pattern, name, expected) in [
+            ("", "", true),
+            ("", "ExposureTime", true),
+            ("exposure", "ExposureTime", true),
+            ("EXPO*TIME", "ExposureTime", true),
+            ("éx", "éX", true),
+            ("Éx", "éX", false),
+            ("*é*", "AéB", true),
+            ("?", "é", false),
+            ("??", "é", true),
+            ("longer", "short", false),
+        ] {
+            assert_eq!(
+                matches_pattern(pattern, name),
+                expected,
+                "{pattern:?} {name:?}"
+            );
+        }
+    }
+
+    #[test]
     fn names_parse_banks_and_controls() {
+        for text in [
+            "ExposureTime",
+            "Gain[AnalogAll]",
+            "Setting[BankSelector=A,OtherSelector=B]",
+            "Setting[BankSelector=é,二]",
+        ] {
+            assert_eq!(Name::parse(text).unwrap().to_string(), text);
+        }
         let name = Name::parse("TriggerMode[TriggerSelector=FrameStart]").unwrap();
         assert_eq!(name.name, "TriggerMode");
         assert_eq!(
@@ -2361,6 +2628,12 @@ mod tests {
         );
         assert_eq!(assign("exposure=5ms").value, "5ms");
         assert_eq!(assign("A=B=C").value, "B=C");
+        let assignment = assign("Setting[BankSelector=é,二]= 三=四 ");
+        assert_eq!(assignment.value, "三=四");
+        assert_eq!(
+            assignment.bank,
+            Name::parse("Setting[BankSelector=é,二]").unwrap().bank
+        );
         for bad in [
             "",
             "Exposure Time",
@@ -2379,6 +2652,109 @@ mod tests {
                 ErrorKind::Usage,
                 "{bad}"
             );
+        }
+    }
+
+    #[test]
+    fn number_formatting_preserves_finite_values_and_normalizes_zero() {
+        assert!(time_text(18_446_744_073_709_551_616.0, "ns").is_none());
+        assert!(time_text(18_446_744_073_709_549_568.0, "ns").is_some());
+        for (value, expected) in [
+            (0.0, "0"),
+            (-0.0, "0"),
+            (-0.000_000_000_1, "0"),
+            (1.0, "1"),
+            (1.25, "1.25"),
+            (1.234_567_890_4, "1.23456789"),
+        ] {
+            assert_eq!(number_text(value), expected);
+        }
+        for value in [f64::MAX, -f64::MAX, 1e300, -1e300] {
+            assert_eq!(number_text(value).parse::<f64>().unwrap(), value);
+        }
+    }
+
+    #[test]
+    fn camera_readbacks_keep_exact_pixels_and_reject_invalid_values() {
+        struct Geometry(String);
+        impl crate::types::RegisterIo for Geometry {
+            fn read_memory(&mut self, _: u64, _: usize) -> Result<Vec<u8>> {
+                anyhow::bail!("literal geometry needs no register reads")
+            }
+            fn write_memory(&mut self, _: u64, _: &[u8]) -> Result<()> {
+                anyhow::bail!("read-only geometry")
+            }
+        }
+        impl crate::types::Backend for Geometry {
+            fn xml(&mut self) -> Result<String> {
+                Ok(self.0.clone())
+            }
+            fn start(&mut self, _: usize) -> Result<()> {
+                anyhow::bail!("no acquisition")
+            }
+            fn next_frame(&mut self, _: Duration) -> Result<crate::types::Frame> {
+                anyhow::bail!("no frames")
+            }
+            fn stop(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+        for (kind, width, expected) in [
+            (
+                "Integer",
+                "9007199254740993",
+                Some(9_007_199_254_740_993u64),
+            ),
+            ("Integer", "-1", None),
+            ("Float", "640.5", None),
+        ] {
+            let xml = format!(
+                "<RegisterDescription><{kind} Name='Width'><Value>{width}</Value></{kind}>\
+                 <Integer Name='Height'><Value>480</Value></Integer></RegisterDescription>"
+            );
+            let mut camera =
+                Camera::from_backend(crate::transport::simulator::info(), Box::new(Geometry(xml)))
+                    .unwrap();
+            let report = info(&mut camera);
+            assert_eq!(report.width, expected, "{width}");
+            assert_eq!(report.height, Some(480));
+            match expected {
+                Some(width) => assert_eq!(
+                    control_value(&mut camera, Control::Roi).unwrap(),
+                    format!("0,0,{width},480")
+                ),
+                None => assert!(
+                    control_value(&mut camera, Control::Roi)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("nonnegative integer pixel count")
+                ),
+            }
+        }
+        for (amount, unit, expected) in [
+            ("10000", "us", Some("10ms")),
+            ("10", "vendor-unit", Some("10us")),
+            ("-1", "us", None),
+            ("1e300", "us", None),
+            ("1e12", "s", None),
+        ] {
+            let xml = format!(
+                "<RegisterDescription><Float Name='ExposureTime'><Value>{amount}</Value>\
+                 <Unit>{unit}</Unit></Float></RegisterDescription>"
+            );
+            let mut camera =
+                Camera::from_backend(crate::transport::simulator::info(), Box::new(Geometry(xml)))
+                    .unwrap();
+            let result = control_value(&mut camera, Control::Exposure);
+            match expected {
+                Some(expected) => assert_eq!(result.unwrap(), expected),
+                None => assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("representable nonnegative duration")
+                ),
+            }
         }
     }
 
@@ -2483,6 +2859,27 @@ mod tests {
             crate::types::classify(&error).hint.unwrap(),
             "the nearest accepted value is 24 (dB)"
         );
+    }
+
+    #[test]
+    fn automatic_modes_preserve_case_insensitive_choices() {
+        let mut camera = sim();
+        for (input, expected) in [
+            (" oFf ", "Off"),
+            ("ONcE", "Once"),
+            ("continuous", "Continuous"),
+        ] {
+            let writes = expand_control(&mut camera, Control::AutoExposure, input).unwrap();
+            assert_eq!(writes.len(), 1);
+            assert_eq!(writes[0].value, expected);
+        }
+        for input in ["", "once more", "ＯＦＦ"] {
+            let error = expand_control(&mut camera, Control::AutoExposure, input).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("auto_exposure takes off, once or continuous, not '{input}'")
+            );
+        }
     }
 
     #[test]
@@ -2725,8 +3122,8 @@ mod tests {
 
     /// A binning written and rolled back scales the width and offset
     /// twice, rounding them: the rollback puts the geometry back as a
-    /// group, within the simulator's dynamic bounds (OffsetX at most
-    /// WidthMax - Width).
+    /// group, within the simulator's dynamic bounds (`OffsetX` at most
+    /// `WidthMax` - Width).
     #[test]
     fn a_failed_change_restores_the_geometry_a_write_rescaled() {
         let mut camera = sim();
@@ -2781,7 +3178,7 @@ mod tests {
             &mut camera,
             written,
             &[],
-            Categorized::error(ErrorKind::OutOfRange, "Width is too large"),
+            &Categorized::error(ErrorKind::OutOfRange, "Width is too large"),
         );
         let classified = crate::types::classify(&error);
         assert_eq!(classified.kind, ErrorKind::OutOfRange);

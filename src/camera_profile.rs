@@ -2,6 +2,8 @@
 //!
 //! Classification is deliberately conservative: acquisition geometry, bit depth,
 //! vendor names and a one-row ROI are not enough to identify a specialty camera.
+#![forbid(unsafe_code)]
+#![deny(clippy::missing_const_for_fn)]
 use crate::{genicam::FeatureInfo, types::CameraInfo};
 use serde::{Deserialize, Serialize};
 
@@ -20,11 +22,13 @@ pub enum CameraKind {
 impl CameraKind {
     /// Brightness-driven auto adjustment is meaningful only for image cameras.
     /// Scientific scalar measurements and line timing need their own controls.
-    pub fn supports_auto(self) -> bool {
+    #[must_use]
+    pub const fn supports_auto(self) -> bool {
         matches!(self, Self::Unknown | Self::AreaScan | Self::Microscope)
     }
 
-    pub fn label(self) -> &'static str {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
         match self {
             Self::Unknown => "Camera",
             Self::AreaScan => "Area scan",
@@ -162,13 +166,15 @@ fn identity_kind(info: &CameraInfo) -> Option<CameraKind> {
     // also makes visible-light cameras and a URL can contain arbitrary words.
     let words: Vec<_> = info
         .model
-        .to_ascii_lowercase()
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|w| !w.is_empty())
-        .map(str::to_string)
         .collect();
-    let word = |value: &str| words.iter().any(|w| w == value);
-    let phrase = |a: &str, b: &str| words.windows(2).any(|w| w[0] == a && w[1] == b);
+    let word = |value: &str| words.iter().any(|w| w.eq_ignore_ascii_case(value));
+    let phrase = |a: &str, b: &str| {
+        words
+            .windows(2)
+            .any(|w| matches!(w, [first, second] if first.eq_ignore_ascii_case(a) && second.eq_ignore_ascii_case(b)))
+    };
     if word("microscope") || word("microscopy") {
         Some(CameraKind::Microscope)
     } else if word("realsense")
@@ -178,7 +184,11 @@ fn identity_kind(info: &CameraInfo) -> Option<CameraKind> {
         || phrase("depth", "sensor")
         || phrase("3d", "camera")
         || phrase("tof", "camera")
-        || words.windows(3).any(|w| w == ["time", "of", "flight"])
+        || words.windows(3).any(|w| {
+            w.iter()
+                .zip(["time", "of", "flight"])
+                .all(|(word, expected)| word.eq_ignore_ascii_case(expected))
+        })
     {
         Some(CameraKind::Depth)
     } else if phrase("thermal", "camera")
@@ -197,7 +207,7 @@ fn identity_kind(info: &CameraInfo) -> Option<CameraKind> {
 
 /// Detect from read-only metadata. Missing metadata leaves a camera usable
 /// with its ordinary feature list.
-pub fn detect(info: &CameraInfo, features: &[FeatureInfo]) -> CameraProfile {
+pub(crate) fn detect(info: &CameraInfo, features: &[FeatureInfo]) -> CameraProfile {
     let profile = |kind, source, evidence| CameraProfile {
         kind,
         source,
@@ -274,7 +284,7 @@ mod tests {
             model: model.into(),
             serial: "1".into(),
             address: None,
-            profile: Default::default(),
+            profile: CameraProfile::default(),
         }
     }
     fn f(name: &str, value: serde_json::Value) -> FeatureInfo {
@@ -427,10 +437,24 @@ mod tests {
             ("Pattern line scan camera", CameraKind::LineScan),
             ("Pattern depth camera", CameraKind::Depth),
             ("Pattern thermal camera", CameraKind::Thermal),
+            ("µMICROSCOPE", CameraKind::Microscope),
+            ("Pattern LiNe-ScAn camera", CameraKind::LineScan),
+            ("TiMe OF FLIGHT camera", CameraKind::Depth),
+            ("THERMAL—IMAGING", CameraKind::Thermal),
+            ("AREA SCAN", CameraKind::AreaScan),
         ] {
             let p = detect(&camera(model), &[]);
             assert_eq!(p.kind, kind, "{model}");
             assert_eq!(p.source, DetectionSource::Identity);
+        }
+        for model in [
+            "MicroscopeX",
+            "depthcamera",
+            "PreLinescanPost",
+            "thermalimaging",
+            "TiMé Of Flight",
+        ] {
+            assert_eq!(identity_kind(&camera(model)), None, "{model}");
         }
     }
 

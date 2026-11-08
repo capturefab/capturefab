@@ -4,6 +4,7 @@
 //! broadcast. An address may since belong to another camera, so what the
 //! cache names is checked before it is opened. Best effort: a cache that
 //! cannot be read or written is no cache.
+#![forbid(unsafe_code)]
 use crate::types::{CameraInfo, Transport};
 use serde::{Deserialize, Serialize};
 use std::{io::Read, path::PathBuf, time::Duration};
@@ -39,8 +40,13 @@ fn read() -> Cache {
     let Some(Ok(file)) = path().map(std::fs::File::open) else {
         return Cache::default();
     };
+    read_cache(file)
+}
+
+fn read_cache(reader: impl Read) -> Cache {
+    let mut reader = reader.take(MAX_FILE + 1);
     let mut text = Vec::new();
-    if file.take(MAX_FILE + 1).read_to_end(&mut text).is_err() || text.len() as u64 > MAX_FILE {
+    if reader.read_to_end(&mut text).is_err() || reader.limit() == 0 {
         return Cache::default();
     }
     serde_json::from_slice(&text).unwrap_or_default()
@@ -125,6 +131,20 @@ fn write(cache: &Cache) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cache_reads_accept_the_limit_and_stop_after_one_extra_byte() {
+        let mut text = br#"{"cameras":[],"everywhere_ms":42}"#.to_vec();
+        text.resize(usize::try_from(MAX_FILE).unwrap(), b' ');
+        assert_eq!(read_cache(text.as_slice()).everywhere_ms, Some(42));
+
+        text.extend_from_slice(b"  ");
+        let mut reader = std::io::Cursor::new(text);
+        assert_eq!(read_cache(&mut reader).everywhere_ms, None);
+        assert_eq!(reader.position(), MAX_FILE + 1);
+        assert!(read_cache(b"not JSON".as_slice()).cameras.is_empty());
+        assert!(read_cache(b"\xff".as_slice()).cameras.is_empty());
+    }
+
     fn camera(id: &str, transport: Transport) -> CameraInfo {
         CameraInfo {
             id: id.into(),
@@ -133,7 +153,7 @@ mod tests {
             model: String::new(),
             serial: format!("SN-{id}"),
             address: None,
-            profile: Default::default(),
+            profile: crate::camera_profile::CameraProfile::default(),
         }
     }
 
@@ -143,7 +163,7 @@ mod tests {
         let webcam = camera("avfoundation:FaceTime HD Camera", Transport::Media);
         let cache = merge(
             Cache::default(),
-            &[gige("gige:a"), gige("gige:b"), webcam.clone()],
+            &[gige("gige:a"), gige("gige:b"), webcam],
             None,
             false,
             1_000,
@@ -204,9 +224,9 @@ mod tests {
         let text = serde_json::to_string(&cache).unwrap();
         let parsed = || serde_json::from_str::<Cache>(&text).unwrap();
         assert_eq!(fresh_at(parsed(), 1_000 + ttl - 1).0.len(), 1);
-        assert!(fresh_at(parsed(), 1_000 + ttl).0.is_empty());
+        assert_eq!(fresh_at(parsed(), 1_000 + ttl).0, [] as [CameraInfo; 0]);
         // A clock that went back trusts nothing.
-        assert!(fresh_at(parsed(), 500).0.is_empty());
+        assert_eq!(fresh_at(parsed(), 500).0, [] as [CameraInfo; 0]);
     }
 
     #[test]

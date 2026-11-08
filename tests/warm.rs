@@ -3,6 +3,8 @@
 //! holds the connection, not the stream, ends unused, starts once when
 //! several commands arrive together, names itself when it holds a camera
 //! another command wants, and is skipped where no session can start.
+#![deny(clippy::doc_markdown)]
+#![deny(clippy::cast_precision_loss)]
 mod support;
 
 use serde_json::{Value, json};
@@ -90,7 +92,9 @@ fn a_short_keep_ends_the_session_unused() {
         std::thread::sleep(Duration::from_millis(100));
     }
     #[cfg(unix)]
-    assert!(!support::cli::process_lives(started[0].1 as i32));
+    assert!(!support::cli::process_lives(support::cli::process_id(
+        started[0].1
+    )));
     // The next command starts it again.
     home.warm(&["--json", "get", "-c", "sim:0", "Width"])
         .success();
@@ -346,6 +350,14 @@ fn a_session_command_without_a_name_leaves_the_auto_session_aside() {
         .success();
     assert_eq!(sessions(&home).len(), 2);
     assert_eq!(home.ok(&["session", "status"])["session"], "default");
+    home.ok(&["session", "start", "--name", "other", "-c", "sim:2"]);
+    let ambiguous = home.fails(2, &["session", "status"]);
+    assert_eq!(ambiguous["code"], "usage");
+    assert_eq!(
+        ambiguous["details"]["sessions"],
+        json!(["auto", "default", "other"])
+    );
+    home.ok(&["session", "stop", "other"]);
     assert_eq!(home.ok(&["session", "stop"])["session"], "default");
     // Alone, the auto session is the one.
     assert_eq!(home.ok(&["session", "status"])["session"], "auto");
@@ -375,7 +387,7 @@ fn verbose_shows_what_the_session_logged_for_the_command() {
 #[cfg(unix)]
 #[test]
 fn without_a_writable_runtime_folder_a_command_opens_its_camera_alone() {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::PermissionsExt as _;
     let home = Home::new("warm-read-only");
     let locked = home.root.join("read-only");
     std::fs::create_dir_all(&locked).unwrap();
@@ -505,7 +517,7 @@ fn a_command_goes_on_without_an_auto_session_that_is_ending() {
             &["--json", "--session", "auto", "debug", "rpc"],
         )
         .success();
-    let worker = status["cameras"][0]["worker_pid"].as_i64().unwrap() as i32;
+    let worker = support::cli::process_id(status["cameras"][0]["worker_pid"].as_i64().unwrap());
     let signal = |signal| {
         // SAFETY: kill only sends a signal to a worker this test started.
         assert_eq!(unsafe { libc::kill(worker, signal) }, 0);
@@ -540,5 +552,5 @@ fn a_command_goes_on_without_an_auto_session_that_is_ending() {
     }
     signal(libc::SIGCONT);
     assert!(stop.wait().unwrap().success());
-    assert!(sessions(&home).is_empty());
+    assert_eq!(sessions(&home), [] as [(String, i64); 0]);
 }

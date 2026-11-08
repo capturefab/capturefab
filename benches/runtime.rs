@@ -1,3 +1,5 @@
+#![deny(clippy::doc_markdown)]
+#![deny(clippy::missing_const_for_fn)]
 #[cfg(feature = "jpeg")]
 use capturefab::testing::jpeg;
 use capturefab::testing::{
@@ -8,7 +10,7 @@ use capturefab::testing::{
     storage::{self, SyncMode},
     types::{Frame, MONO8, RGB8},
 };
-use sha2::{Digest, Sha256};
+use sha2::{Digest as _, Sha256};
 use std::{
     hint::black_box,
     path::PathBuf,
@@ -41,7 +43,7 @@ const FORMATS: [(&str, u32); 21] = [
 
 struct Rng(u64);
 impl Rng {
-    fn next(&mut self) -> u64 {
+    const fn next(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
@@ -62,6 +64,11 @@ fn scene(width: u32, height: u32) -> Vec<u8> {
                 80.0 + 50.0 * (fx * fy * 9.0).sin(),
             ] {
                 let noise = (rng.next() % 5 + rng.next() % 5) as f32 - 4.0;
+                #[expect(
+                    clippy::cast_sign_loss,
+                    clippy::cast_possible_truncation,
+                    reason = "the clamped benchmark scene retains saturating float-to-byte conversion"
+                )]
                 rgb.push((base + texture + noise).clamp(0.0, 255.0) as u8);
             }
         }
@@ -77,10 +84,13 @@ fn packed_rows(samples: &[u16], width: usize, bits: usize, gige: bool) -> Vec<u8
             let shift = bits - 8;
             let mask = (1 << shift) - 1;
             for pair in row.chunks(2) {
-                output.extend_from_slice(&[(pair[0] >> shift) as u8, (pair[0] & mask) as u8]);
+                output.extend_from_slice(&[
+                    u8::try_from(pair[0] >> shift).unwrap(),
+                    u8::try_from(pair[0] & mask).unwrap(),
+                ]);
                 if let Some(&second) = pair.get(1) {
-                    *output.last_mut().unwrap() |= ((second & mask) << 4) as u8;
-                    output.push((second >> shift) as u8);
+                    *output.last_mut().unwrap() |= u8::try_from((second & mask) << 4).unwrap();
+                    output.push(u8::try_from(second >> shift).unwrap());
                 }
             }
         } else {
@@ -89,13 +99,13 @@ fn packed_rows(samples: &[u16], width: usize, bits: usize, gige: bool) -> Vec<u8
                 word |= u32::from(sample) << present;
                 present += bits;
                 while present >= 8 {
-                    output.push(word as u8);
+                    output.push(word.to_le_bytes()[0]);
                     word >>= 8;
                     present -= 8;
                 }
             }
             if present > 0 {
-                output.push(word as u8);
+                output.push(word.to_le_bytes()[0]);
             }
         }
     }
@@ -105,10 +115,15 @@ fn packed_rows(samples: &[u16], width: usize, bits: usize, gige: bool) -> Vec<u8
 fn frame(width: u32, height: u32, pixel_format: u32) -> Frame {
     let rgb = scene(width, height);
     let pixels = rgb.as_chunks::<3>().0;
-    let luma =
-        |p: &[u8; 3]| ((p[0] as u32 * 54 + p[1] as u32 * 183 + p[2] as u32 * 19) >> 8) as u16;
+    let luma = |p: &[u8; 3]| {
+        u16::try_from((u32::from(p[0]) * 54 + u32::from(p[1]) * 183 + u32::from(p[2]) * 19) >> 8)
+            .unwrap()
+    };
     let data = match pixel_format {
-        MONO8 => pixels.iter().map(|p| luma(p) as u8).collect(),
+        MONO8 => pixels
+            .iter()
+            .map(|p| u8::try_from(luma(p)).unwrap())
+            .collect(),
         RGB8 => rgb.clone(),
         0x0218_0015 => pixels.iter().flat_map(|p| [p[2], p[1], p[0]]).collect(),
         0x0220_0016 => pixels
@@ -121,12 +136,14 @@ fn frame(width: u32, height: u32, pixel_format: u32) -> Frame {
         0x0230_001a => rgb
             .iter()
             .enumerate()
-            .flat_map(|(i, &v)| ((u16::from(v) << 4) | (i as u16 & 15)).to_le_bytes())
+            .flat_map(|(i, &v)| {
+                ((u16::from(v) << 4) | (u16::try_from(i & 15).unwrap())).to_le_bytes()
+            })
             .collect(),
         0x0230_0024 => (0..3)
             .flat_map(|c| {
                 pixels.iter().enumerate().flat_map(move |(i, p)| {
-                    ((u16::from(p[c]) << 8) | (i as u16 & 255)).to_le_bytes()
+                    ((u16::from(p[c]) << 8) | (u16::try_from(i & 255).unwrap())).to_le_bytes()
                 })
             })
             .collect(),
@@ -134,7 +151,7 @@ fn frame(width: u32, height: u32, pixel_format: u32) -> Frame {
             let samples: Vec<u16> = rgb
                 .iter()
                 .enumerate()
-                .map(|(i, &v)| (u16::from(v) << 4) | (i as u16 & 15))
+                .map(|(i, &v)| (u16::from(v) << 4) | (u16::try_from(i & 15).unwrap()))
                 .collect();
             packed_rows(&samples, width as usize * 3, 12, false)
         }
@@ -155,7 +172,8 @@ fn frame(width: u32, height: u32, pixel_format: u32) -> Frame {
                     } else {
                         luma(p)
                     };
-                    (value << (bits - 8)) | (i as u16 & ((1 << (bits - 8)) - 1))
+                    (value << (bits - 8))
+                        | (u16::try_from(i & ((1usize << (bits - 8)) - 1)).unwrap())
                 })
                 .collect();
             if pixel_format == 0x0110_0011 {
@@ -166,6 +184,11 @@ fn frame(width: u32, height: u32, pixel_format: u32) -> Frame {
         }
         0x0218_0020 | 0x0210_0041 => {
             let limited = pixel_format == 0x0210_0041;
+            #[expect(
+                clippy::cast_sign_loss,
+                clippy::cast_possible_truncation,
+                reason = "the reference YCbCr matrix retains rounded, clamped float-to-byte conversion"
+            )]
             let yuv = |p: &[u8; 3]| {
                 let [r, g, b] = p.map(f64::from);
                 let values = if limited {
@@ -190,7 +213,9 @@ fn frame(width: u32, height: u32, pixel_format: u32) -> Frame {
                     .iter()
                     .flat_map(|p| {
                         let (a, b) = (yuv(&p[0]), yuv(&p[1]));
-                        let mean = |c: usize| (u16::from(a[c]) + u16::from(b[c])).div_ceil(2) as u8;
+                        let mean = |c: usize| {
+                            u8::try_from((u16::from(a[c]) + u16::from(b[c])).div_ceil(2)).unwrap()
+                        };
                         [a[0], mean(1), b[0], mean(2)]
                     })
                     .collect()
@@ -214,7 +239,9 @@ fn frame(width: u32, height: u32, pixel_format: u32) -> Frame {
             pixels
                 .iter()
                 .flat_map(|p| {
-                    ((luma(p) << shift) | (rng.next() as u16 & ((1 << shift) - 1))).to_le_bytes()
+                    ((luma(p) << shift)
+                        | (u16::try_from(rng.next() & ((1u64 << shift) - 1)).unwrap()))
+                    .to_le_bytes()
                 })
                 .collect()
         }
@@ -222,6 +249,11 @@ fn frame(width: u32, height: u32, pixel_format: u32) -> Frame {
         // (yuv420p), 4:2:0 with interleaved chroma (NV12), and 4:2:2 as
         // Cb Y Cr Y (UYVY). Chroma is the mean of the pixels it covers.
         0x820c_0002 | 0x820c_0011 | 0x0210_0044 => {
+            #[expect(
+                clippy::cast_sign_loss,
+                clippy::cast_possible_truncation,
+                reason = "the reference YCbCr matrix retains rounded, clamped float-to-byte conversion"
+            )]
             let ycc = |p: &[u8; 3]| {
                 let [r, g, b] = p.map(f64::from);
                 [
@@ -238,16 +270,17 @@ fn frame(width: u32, height: u32, pixel_format: u32) -> Frame {
                 (2, 2)
             };
             let chroma = |c: usize, cx: usize, cy: usize| {
-                let block: Vec<u32> = (cy * sy..(cy * sy + sy).min(h))
+                let (sum, count) = (cy * sy..(cy * sy + sy).min(h))
                     .flat_map(|y| (cx * sx..(cx * sx + sx).min(w)).map(move |x| (x, y)))
-                    .map(|(x, y)| u32::from(ycc(&pixels[y * w + x])[c]))
-                    .collect();
-                (block.iter().sum::<u32>() as f64 / block.len() as f64).round() as u8
+                    .fold((0u32, 0u32), |(sum, count), (x, y)| {
+                        (sum + u32::from(ycc(&pixels[y * w + x])[c]), count + 1)
+                    });
+                u8::try_from((sum + count / 2) / count).expect("rounded chroma mean fits u8")
             };
             let (cw, ch) = (w.div_ceil(sx), h.div_ceil(sy));
             let luma = |x: usize, y: usize| ycc(&pixels[y * w + x])[0];
-            match pixel_format {
-                0x0210_0044 => (0..h)
+            if pixel_format == 0x0210_0044 {
+                (0..h)
                     .flat_map(|y| {
                         (0..cw).flat_map(move |cx| {
                             [
@@ -258,19 +291,18 @@ fn frame(width: u32, height: u32, pixel_format: u32) -> Frame {
                             ]
                         })
                     })
-                    .collect(),
-                _ => {
-                    let mut data: Vec<u8> = pixels.iter().map(|p| ycc(p)[0]).collect();
-                    let blocks = (0..ch).flat_map(|cy| (0..cw).map(move |cx| (cx, cy)));
-                    if pixel_format == 0x820c_0011 {
-                        data.extend(blocks.flat_map(|(x, y)| [chroma(1, x, y), chroma(2, x, y)]));
-                    } else {
-                        for c in [1, 2] {
-                            data.extend(blocks.clone().map(|(x, y)| chroma(c, x, y)));
-                        }
+                    .collect()
+            } else {
+                let mut data: Vec<u8> = pixels.iter().map(|p| ycc(p)[0]).collect();
+                let blocks = (0..ch).flat_map(|cy| (0..cw).map(move |cx| (cx, cy)));
+                if pixel_format == 0x820c_0011 {
+                    data.extend(blocks.flat_map(|(x, y)| [chroma(1, x, y), chroma(2, x, y)]));
+                } else {
+                    for c in [1, 2] {
+                        data.extend(blocks.clone().map(|(x, y)| chroma(c, x, y)));
                     }
-                    data
                 }
+                data
             }
         }
         0x0108_0009 => (0..height as usize)
@@ -342,7 +374,7 @@ const PACKED_BASELINES: [(&str, &str); 5] = [
     ("BayerRG14p", "BayerRG12"),
 ];
 const PACKED_LIMIT: f64 = 6.0;
-/// How many times as long as RGB8 measuring Y'CbCr of the same size may
+/// How many times as long as RGB8 measuring `Y'CbCr` of the same size may
 /// take, when both are benchmarked. With its layout looked up for every
 /// pixel read, decoded video took four to five times as long.
 const YCBCR_MEASURE_LIMIT: f64 = 3.0;
@@ -378,7 +410,7 @@ fn temp(name: &str) -> PathBuf {
     std::fs::create_dir_all(&path).unwrap();
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     path
@@ -393,8 +425,18 @@ fn main() {
         filter: args.into_iter().filter(|a| !a.starts_with("--")).collect(),
     };
     // JPEG rows measure libjpeg-turbo unless they name an engine.
-    // SAFETY: the benchmark is single-threaded here.
-    unsafe { std::env::set_var("CAPTUREFAB_JPEG", "cpu") };
+    let session = temp("session");
+    for (key, value) in [
+        ("CAPTUREFAB_JPEG", std::ffi::OsStr::new("cpu")),
+        ("CAPTUREFAB_SESSION_DIR", session.as_os_str()),
+        (
+            "CAPTUREFAB_EXECUTABLE",
+            std::ffi::OsStr::new(env!("CARGO_BIN_EXE_capturefab")),
+        ),
+    ] {
+        // SAFETY: the benchmark is single-threaded here.
+        unsafe { std::env::set_var(key, value) };
+    }
     for (width, height) in [(1920, 1200), (640, 480)] {
         let mut medians = std::collections::HashMap::new();
         for (name, format) in FORMATS {
@@ -498,7 +540,7 @@ fn main() {
         if b.selected(&label) {
             let f = frame(width, height, format);
             b.run(&label, f.data.len(), || {
-                capturefab::testing::frame::encode_parts(&f, "raw", None, Some(&meta)).unwrap()
+                frame::encode_parts(&f, "raw", None, Some(&meta)).unwrap()
             });
         }
     }
@@ -509,10 +551,7 @@ fn main() {
             b.run(
                 &format!("encode/{label}/Mono8/4096x3000"),
                 f.data.len(),
-                || {
-                    capturefab::testing::frame::encode_parts(&f, "jpeg", quality, Some(&meta))
-                        .unwrap()
-                },
+                || frame::encode_parts(&f, "jpeg", quality, Some(&meta)).unwrap(),
             );
         }
     }
@@ -536,7 +575,7 @@ fn main() {
         let f = frame(width, height, format);
         #[cfg(feature = "jpeg")]
         b.run(&format!("encode/jpeg/{suffix}"), f.data.len(), || {
-            capturefab::testing::frame::encode_parts(&f, "jpeg", None, Some(&meta)).unwrap()
+            frame::encode_parts(&f, "jpeg", None, Some(&meta)).unwrap()
         });
         #[cfg(feature = "jpeg")]
         // Through an RGB image, as converted color stills were compressed
@@ -549,21 +588,18 @@ fn main() {
         {
             // SAFETY: as above.
             unsafe { std::env::set_var("CAPTUREFAB_JPEG", "videotoolbox") };
-            if capturefab::testing::frame::encode_parts(&f, "jpeg", None, None).is_ok() {
+            if frame::encode_parts(&f, "jpeg", None, None).is_ok() {
                 b.run(
                     &format!("encode/jpeg-videotoolbox/{suffix}"),
                     f.data.len(),
-                    || {
-                        capturefab::testing::frame::encode_parts(&f, "jpeg", None, Some(&meta))
-                            .unwrap()
-                    },
+                    || frame::encode_parts(&f, "jpeg", None, Some(&meta)).unwrap(),
                 );
             }
             // SAFETY: as above.
             unsafe { std::env::set_var("CAPTUREFAB_JPEG", "cpu") };
         }
         b.run(&format!("encode/png/{suffix}"), f.data.len(), || {
-            capturefab::testing::frame::encode_parts(&f, "png", None, Some(&meta)).unwrap()
+            frame::encode_parts(&f, "png", None, Some(&meta)).unwrap()
         });
         for (label, region) in [
             ("inspect", None),
@@ -672,8 +708,8 @@ fn main() {
         ("best-adaptive", png::Compression::Best, None),
     ] {
         for (content, data, color) in [
-            ("BayerRG8-rgb", &rgb[..], png::ColorType::Rgb),
-            ("Mono8-gray", &mono.data[..], png::ColorType::Grayscale),
+            ("BayerRG8-rgb", (&*rgb), png::ColorType::Rgb),
+            ("Mono8-gray", (&*mono.data), png::ColorType::Grayscale),
         ] {
             let name = format!("png-settings/{label}/{content}");
             if b.selected(&name) {
@@ -701,8 +737,6 @@ fn main() {
     }
     let data = vec![0x5a; 8 << 20];
     b.run("sha256/8MiB", data.len(), || Sha256::digest(&data));
-    let session = temp("session");
-    unsafe { std::env::set_var("CAPTUREFAB_SESSION_DIR", &session) };
     let output = temp("output");
     let mut index = 0;
     for (encoding, format) in [("raw", 0x0108_0009), ("png", 0x0108_0009), ("raw", MONO8)] {
@@ -713,7 +747,7 @@ fn main() {
             || {
                 index += 1;
                 storage::save(
-                    &capturefab::testing::frame::encode(&f, encoding).unwrap(),
+                    &frame::encode(&f, encoding).unwrap(),
                     &output.join(format!("{index}.{encoding}")),
                     SyncMode::File,
                     None,
@@ -732,7 +766,6 @@ fn main() {
     // Session snapshots, as status takes them, with eight idle simulated
     // cameras on real workers and a full session log.
     if b.selected("session/snapshot") {
-        unsafe { std::env::set_var("CAPTUREFAB_EXECUTABLE", env!("CARGO_BIN_EXE_capturefab")) };
         let h = SessionHandle::new();
         for camera in 0..8 {
             h.request(SessionCommand::connect(format!("sim:{camera}"), 5000))

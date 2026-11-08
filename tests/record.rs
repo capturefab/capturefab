@@ -1,5 +1,6 @@
-//! `record` end to end. Recording needs FFmpeg: those tests are ignored
-//! unless run with `-- --ignored` and CAPTUREFAB_FFMPEG set.
+//! `record` end to end. Recording needs `FFmpeg`: those tests are ignored
+//! unless run with `-- --ignored` and `CAPTUREFAB_FFMPEG` set.
+#![deny(clippy::doc_markdown)]
 mod support;
 
 use serde_json::Value;
@@ -123,8 +124,8 @@ fn lossless_recordings_keep_bayer_mosaics() {
     }
 }
 
-/// A Matroska recording, which FFmpeg writes through a pipe, has its
-/// length and an index as a file FFmpeg wrote itself would; and deep RGB
+/// A Matroska recording, which `FFmpeg` writes through a pipe, has its
+/// length and an index as a file `FFmpeg` wrote itself would; and deep RGB
 /// keeps every bit in FFV1.
 #[test]
 #[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
@@ -165,7 +166,7 @@ fn matroska_recordings_have_a_length_and_an_index() {
         let checked = std::process::Command::new(support::cli::ffmpeg())
             .args(["-v", "error", "-err_detect", "crccheck", "-i"])
             .arg(&path)
-            .args(["-f", "null", "-"])
+            .args(["-fps_mode", "passthrough", "-f", "framemd5", "-"])
             .output()
             .unwrap();
         assert!(
@@ -399,8 +400,8 @@ fn serve_finishes_a_recording_on_a_signal() {
     }
 }
 
-/// A session records with its own FFmpeg: a shell whose FFmpeg setting
-/// would not work, as one without FFmpeg, still records through it. A
+/// A session records with its own `FFmpeg`: a shell whose `FFmpeg` setting
+/// would not work, as one without `FFmpeg`, still records through it. A
 /// command's own worker records with the command's, which is checked
 /// before its camera opens.
 #[test]
@@ -457,7 +458,7 @@ fn a_session_records_a_relative_file_target_where_the_caller_is() {
     std::fs::create_dir_all(&elsewhere).unwrap();
     let mut command = home.command();
     command.current_dir(&elsewhere);
-    let _session = home.serve_in(&mut command, "away", &["sim:0"], &[]);
+    let _session = Home::serve_in(&mut command, "away", &["sim:0"], &[]);
     let recorded = home.ok(&[
         "--session",
         "away",
@@ -674,8 +675,8 @@ fn a_session_recording_leaves_its_commands_free_space_floor() {
 }
 
 /// --max-size ends a recording successfully before that size, its file
-/// finished by FFmpeg, every frame it reports in it; one too small for
-/// FFmpeg to finish within is cut at the size and says so. Without it
+/// finished by `FFmpeg`, every frame it reports in it; one too small for
+/// `FFmpeg` to finish within is cut at the size and says so. Without it
 /// nothing caps a recording.
 #[test]
 #[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
@@ -685,7 +686,7 @@ fn a_recording_ends_as_asked_at_its_maximum_size() {
         let played = std::process::Command::new(support::cli::ffmpeg())
             .args(["-v", "error", "-i"])
             .arg(home.path(name))
-            .args(["-f", "framemd5", "-"])
+            .args(["-fps_mode", "passthrough", "-f", "framemd5", "-"])
             .output()
             .unwrap();
         let frames = String::from_utf8_lossy(&played.stdout)
@@ -779,13 +780,17 @@ fn a_second_signal_ends_at_once_with_a_document() {
         .trim()
         .parse::<i32>()
         .unwrap();
-    // SAFETY: kill only sends signals to processes this test started:
-    // the command, and the group its worker leads.
-    unsafe {
-        assert_eq!(libc::kill(-worker, libc::SIGSTOP), 0);
-        assert_eq!(libc::kill(child.id() as i32, libc::SIGINT), 0);
-        std::thread::sleep(Duration::from_millis(200));
-        assert_eq!(libc::kill(child.id() as i32, libc::SIGINT), 0);
+    // SAFETY: this is the process group led by the worker this test spawned.
+    assert_eq!(unsafe { libc::kill(-worker, libc::SIGSTOP) }, 0);
+    for attempt in 0..2 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert_eq!(
+            // SAFETY: this is the command process this test spawned.
+            unsafe { libc::kill(i32::try_from(child.id()).unwrap(), libc::SIGINT) },
+            0
+        );
     }
     let output = child.wait_with_output().unwrap();
     // SAFETY: as above; signal 0 only asks whether the group has members.
@@ -960,7 +965,7 @@ fn a_signal_ends_a_copied_recording_normally() {
 #[test]
 #[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
 fn naming_the_sources_codec_copies_it_without_an_encoder() {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::PermissionsExt as _;
     let home = Home::new("record-copy-no-encoder");
     h264_clip(&home, "clip.mp4");
     // FFmpeg, with every H.264 encoder failing.

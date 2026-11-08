@@ -35,14 +35,19 @@
 //! copied. A GPU engine unused for a minute rests: its helper stops,
 //! releasing the GPU, and under `auto` the next frame is the CPU's while it
 //! starts again. Apple's engine keeps its sessions.
+#![deny(clippy::missing_const_for_fn)]
 // Builds without a hardware engine for their platform use only the CPU.
 #![cfg_attr(
     not(any(
         all(feature = "videotoolbox", target_os = "macos"),
         all(jpeg_helper, target_os = "linux")
     )),
-    allow(dead_code)
+    allow(
+        dead_code,
+        reason = "hardware encoder interfaces are shared across platform and feature combinations for tests and doctor reporting"
+    )
 )]
+#![deny(clippy::significant_drop_tightening)]
 use super::QUALITY;
 use crate::{
     frame::{Body, FrameRef},
@@ -78,7 +83,7 @@ pub(crate) enum Choice {
 /// A hardware JPEG engine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Kind {
-    /// Apple's JPEG engine through VideoToolbox, in the worker (macOS).
+    /// Apple's JPEG engine through `VideoToolbox`, in the worker (macOS).
     VideoToolbox,
     /// NVIDIA's nvJPEG on a CUDA GPU, in a helper process (Linux).
     Nvjpeg,
@@ -89,25 +94,25 @@ pub(crate) enum Kind {
 }
 
 impl Kind {
-    pub(crate) fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
-            Kind::VideoToolbox => "videotoolbox",
-            Kind::Nvjpeg => "nvjpeg",
-            Kind::Vaapi => "vaapi",
+            Self::VideoToolbox => "videotoolbox",
+            Self::Nvjpeg => "nvjpeg",
+            Self::Vaapi => "vaapi",
             #[cfg(all(test, feature = "jpeg"))]
-            Kind::Fake => "fake",
+            Self::Fake => "fake",
         }
     }
 }
 
 impl Choice {
     pub(crate) fn parse(value: Option<&str>) -> Result<Self> {
-        Ok(match value.map(str::trim).unwrap_or("") {
-            "" | "auto" => Choice::Auto,
-            "cpu" => Choice::Cpu,
-            "videotoolbox" => Choice::Named(Kind::VideoToolbox),
-            "nvjpeg" => Choice::Named(Kind::Nvjpeg),
-            "vaapi" => Choice::Named(Kind::Vaapi),
+        Ok(match value.map_or("", str::trim) {
+            "" | "auto" => Self::Auto,
+            "cpu" => Self::Cpu,
+            "videotoolbox" => Self::Named(Kind::VideoToolbox),
+            "nvjpeg" => Self::Named(Kind::Nvjpeg),
+            "vaapi" => Self::Named(Kind::Vaapi),
             other => {
                 return Err(Categorized::error(
                     ErrorKind::Usage,
@@ -118,11 +123,11 @@ impl Choice {
             }
         })
     }
-    pub(crate) fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
-            Choice::Auto => "auto",
-            Choice::Cpu => "cpu",
-            Choice::Named(kind) => kind.name(),
+            Self::Auto => "auto",
+            Self::Cpu => "cpu",
+            Self::Named(kind) => kind.name(),
         }
     }
 }
@@ -203,7 +208,13 @@ pub(crate) enum Fault {
     /// Less faithful than libjpeg-turbo's on this frame, which may be down
     /// to the frame's content.
     // Only libjpeg-turbo can find an engine unfaithful.
-    #[cfg_attr(not(feature = "jpeg"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "jpeg"),
+        allow(
+            dead_code,
+            reason = "hardware encoder interfaces are shared across platform and feature combinations for tests and doctor reporting"
+        )
+    )]
     Unfaithful(String),
     /// It declined the frame.
     Declined(String),
@@ -214,10 +225,10 @@ pub(crate) enum Fault {
 impl std::fmt::Display for Fault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Fault::Broken(reason)
-            | Fault::Unfaithful(reason)
-            | Fault::Declined(reason)
-            | Fault::Unready(reason) => f.write_str(reason),
+            Self::Broken(reason)
+            | Self::Unfaithful(reason)
+            | Self::Declined(reason)
+            | Self::Unready(reason) => f.write_str(reason),
         }
     }
 }
@@ -344,10 +355,10 @@ fn unavailable(kind: Kind, reason: &str) -> anyhow::Error {
 /// What the engine thread does: open the backend, then encode what it is
 /// sent, resting after `idle` without a frame.
 fn run(
-    shared: Weak<Shared>,
+    shared: &Weak<Shared>,
     open: Opener,
     opened: mpsc::SyncSender<Result<(), String>>,
-    requests: mpsc::Receiver<Message>,
+    requests: &mpsc::Receiver<Message>,
     idle: Duration,
 ) {
     let mut backend = match open() {
@@ -361,6 +372,7 @@ fn run(
         *shared.about.lock().unwrap_or_else(PoisonError::into_inner) = backend.describe();
     }
     let _ = opened.send(Ok(()));
+    drop(opened);
     let mut resting = false;
     // Why waking failed: every later frame fails with it.
     let mut woken: Result<(), String> = Ok(());
@@ -431,7 +443,7 @@ impl Shared {
             let (shared, idle) = (Arc::downgrade(self), self.idle);
             let spawned = std::thread::Builder::new()
                 .name(format!("jpeg-{}", self.kind.name()))
-                .spawn(move || run(shared, open, opened, requests, idle));
+                .spawn(move || run(&shared, open, opened, &requests, idle));
             // A driver that hangs while opening keeps only its own thread,
             // which ends once it opens: no request will reach it.
             *state = match spawned {
@@ -476,14 +488,17 @@ impl Shared {
     /// go to the CPU from now on.
     fn turn_off(&self, reason: String) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if matches!(*state, State::Open(_)) {
-            crate::eprintln!(
-                "capturefab worker: the {} JPEG encoder stopped ({reason}); JPEGs are encoded on the CPU",
-                self.kind.name()
-            );
-        }
-        *state = State::Off(reason);
+        let message = matches!(*state, State::Open(_)).then(|| format!(
+            "capturefab worker: the {} JPEG encoder stopped ({reason}); JPEGs are encoded on the CPU",
+            self.kind.name()
+        ));
+        let previous = std::mem::replace(&mut *state, State::Off(reason));
         self.off.store(true, Ordering::Release);
+        drop(state);
+        drop(previous);
+        if let Some(message) = message {
+            crate::eprintln!("{message}");
+        }
     }
 
     /// `frame` encoded on the engine within its deadline, checked to be a
@@ -629,11 +644,13 @@ enum Plan {
 }
 
 impl Engine {
+    #[deny(trivial_casts)]
     pub(crate) fn new<B: Backend + 'static>(
         kind: Kind,
         open: impl FnOnce() -> Result<B> + Send + 'static,
     ) -> Self {
-        let open: Opener = Box::new(move || open().map(|backend| Box::new(backend) as _));
+        let open: Opener =
+            Box::new(move || open().map(|backend| -> Box<dyn Backend> { Box::new(backend) }));
         Self {
             accepts: B::accepts,
             shared: Arc::new(Shared {
@@ -655,7 +672,13 @@ impl Engine {
 
     /// Not opened, and unavailable, on a host where `absent` says why.
     // The GPU engines run on Linux.
-    #[cfg_attr(not(all(jpeg_helper, target_os = "linux")), allow(dead_code))]
+    #[cfg_attr(
+        not(all(jpeg_helper, target_os = "linux")),
+        allow(
+            dead_code,
+            reason = "hardware encoder interfaces are shared across platform and feature combinations for tests and doctor reporting"
+        )
+    )]
     pub(crate) fn absent_when(mut self, absent: fn() -> Option<String>) -> Self {
         Arc::get_mut(&mut self.shared)
             .expect("not shared yet")
@@ -664,7 +687,13 @@ impl Engine {
     }
 
     /// Allowed `wait` to open, and to wake from rest.
-    #[cfg_attr(not(all(jpeg_helper, target_os = "linux")), allow(dead_code))]
+    #[cfg_attr(
+        not(all(jpeg_helper, target_os = "linux")),
+        allow(
+            dead_code,
+            reason = "hardware encoder interfaces are shared across platform and feature combinations for tests and doctor reporting"
+        )
+    )]
     pub(crate) fn open_within(mut self, wait: Duration) -> Self {
         Arc::get_mut(&mut self.shared)
             .expect("not shared yet")
@@ -677,8 +706,8 @@ impl Engine {
     }
 
     /// `auto` hands it frames of any size.
-    #[cfg(all(test, feature = "jpeg"))]
-    pub(crate) fn any_size(mut self) -> Self {
+    #[cfg(all(test, feature = "jpeg", jpeg_helper))]
+    pub(crate) const fn any_size(mut self) -> Self {
         self.any_size = true;
         self
     }
@@ -887,7 +916,10 @@ pub(crate) fn deadline(frame: &Frame) -> Duration {
 /// reads in place; and its quality follows a calibrated setting.
 #[cfg_attr(
     not(all(feature = "videotoolbox", target_os = "macos")),
-    allow(dead_code)
+    allow(
+        dead_code,
+        reason = "hardware encoder interfaces are shared across platform and feature combinations for tests and doctor reporting"
+    )
 )]
 pub(crate) fn color_at_default_quality(view: FrameRef<'_>, quality: i32) -> bool {
     quality == QUALITY
@@ -902,7 +934,11 @@ fn gradient(width: u32, height: u32) -> Frame {
     let data: Vec<u8> = (0..w * h)
         .flat_map(|i| {
             let (x, y) = (i % w, i / w);
-            [(x * 255 / w) as u8, (y * 255 / h) as u8, 200]
+            [
+                u8::try_from(x * 255 / w).expect("gradient is within 0..255"),
+                u8::try_from(y * 255 / h).expect("gradient is within 0..255"),
+                200,
+            ]
         })
         .collect();
     Frame {
@@ -920,14 +956,39 @@ fn gradient(width: u32, height: u32) -> Frame {
 /// below the CPU's, and at least 30 dB where the CPU's is (else it is
 /// unfaithful). A detailed frame can be below 30 dB from any JPEG of it.
 #[cfg(feature = "jpeg")]
+#[deny(clippy::cast_precision_loss)]
 pub(crate) fn accurate(frame: &Frame, engine: &[u8], cpu: &[u8]) -> Result<(), Fault> {
     let source =
         crate::frame::rgb_samples(frame).map_err(|error| Fault::Broken(format!("{error:#}")))?;
-    let decode = |jpeg: &[u8]| {
-        turbojpeg::decompress(jpeg, turbojpeg::PixelFormat::RGB)
-            .map_err(|error| Fault::Broken(format!("its JPEG does not decode: {error}")))
+    let dimensions = (frame.width as usize, frame.height as usize);
+    let failed = |error| Fault::Broken(format!("its JPEG does not decode: {error}"));
+    let prepare = |jpeg: &[u8], mismatch: &str| {
+        let mut decoder = turbojpeg::Decompressor::new().map_err(failed)?;
+        let header = decoder.read_header(jpeg).map_err(failed)?;
+        if (header.width, header.height) != dimensions {
+            return Err(Fault::Broken(mismatch.into()));
+        }
+        Ok(decoder)
     };
-    let (engine, cpu) = (decode(engine)?, decode(cpu)?);
+    // Validate both headers before allocating either decoded image, each
+    // with its own decoder state as independent JPEG streams.
+    let engine_decoder = prepare(engine, "its JPEG has another size")?;
+    let cpu_decoder = prepare(cpu, "libjpeg-turbo's JPEG has another size")?;
+    let decode = |mut decoder: turbojpeg::Decompressor, jpeg: &[u8]| {
+        let mut image = turbojpeg::Image {
+            pixels: vec![0; source.len()],
+            width: dimensions.0,
+            pitch: dimensions.0 * 3,
+            height: dimensions.1,
+            format: turbojpeg::PixelFormat::RGB,
+        };
+        decoder
+            .decompress(jpeg, image.as_deref_mut())
+            .map_err(failed)?;
+        Ok::<_, Fault>(image)
+    };
+    let (engine, cpu) = (decode(engine_decoder, engine)?, decode(cpu_decoder, cpu)?);
+    let samples = 3.0 * f64::from(frame.width) * f64::from(frame.height);
     let compare = |image: &turbojpeg::Image<Vec<u8>>| {
         let mut squared = 0f64;
         let mut bias = [0f64; 3];
@@ -941,7 +1002,6 @@ pub(crate) fn accurate(frame: &Frame, engine: &[u8], cpu: &[u8]) -> Result<(), F
                 bias[i % 3] += difference;
             }
         }
-        let samples = (3 * width * image.height) as f64;
         let mse = squared / samples;
         let psnr = if mse == 0.0 {
             f64::INFINITY
@@ -950,9 +1010,6 @@ pub(crate) fn accurate(frame: &Frame, engine: &[u8], cpu: &[u8]) -> Result<(), F
         };
         (psnr, bias.map(|total| total / (samples / 3.0)))
     };
-    if (engine.width, engine.height) != (frame.width as usize, frame.height as usize) {
-        return Err(Fault::Broken("its JPEG has another size".into()));
-    }
     let (psnr, bias) = compare(&engine);
     let (cpu_psnr, _) = compare(&cpu);
     if let Some((channel, shift)) = bias
@@ -995,7 +1052,7 @@ fn choose<'a>(engines: &'a [Engine], frame: &Frame, quality: i32) -> Option<&'a 
 }
 
 /// Whether this build has the engine for this platform.
-fn compiled(kind: Kind) -> bool {
+const fn compiled(kind: Kind) -> bool {
     match kind {
         Kind::VideoToolbox => cfg!(all(feature = "videotoolbox", target_os = "macos")),
         Kind::Nvjpeg => cfg!(all(jpeg_helper, feature = "nvjpeg", target_os = "linux")),
@@ -1028,14 +1085,17 @@ pub(crate) fn encode(frame: &Frame, quality: Option<u8>) -> Result<Body<'static>
     let quality = quality.map_or(QUALITY, i32::from);
     match choice()? {
         Choice::Cpu => cpu(frame, quality),
-        Choice::Auto => match choose(engines(), frame, quality) {
-            Some(engine) => engine.encode(frame, quality, false),
-            None => cpu(frame, quality),
-        },
-        Choice::Named(kind) => match engines().iter().find(|engine| engine.kind() == kind) {
-            Some(engine) => engine.encode(frame, quality, true),
-            None => Err(unavailable(kind, &missing(kind))),
-        },
+        Choice::Auto => choose(engines(), frame, quality).map_or_else(
+            || cpu(frame, quality),
+            |engine| engine.encode(frame, quality, false),
+        ),
+        Choice::Named(kind) => engines()
+            .iter()
+            .find(|engine| engine.kind() == kind)
+            .map_or_else(
+                || Err(unavailable(kind, &missing(kind))),
+                |engine| engine.encode(frame, quality, true),
+            ),
     }
 }
 
@@ -1083,20 +1143,19 @@ pub(crate) fn report() -> Value {
 /// and verified, why not, and what it says of itself.
 fn check(engine: &Engine) -> Value {
     let mut entry = serde_json::json!({"available": false});
-    match engine.unavailable() {
-        Some(reason) => entry["reason"] = reason.into(),
-        None => {
-            entry["available"] = true.into();
-            match engine.self_test() {
-                Ok(()) => entry["verified"] = true.into(),
-                Err(reason) => {
-                    entry["verified"] = false.into();
-                    entry["reason"] = reason.into();
-                }
+    if let Some(reason) = engine.unavailable() {
+        entry["reason"] = reason.into();
+    } else {
+        entry["available"] = true.into();
+        match engine.self_test() {
+            Ok(()) => entry["verified"] = true.into(),
+            Err(reason) => {
+                entry["verified"] = false.into();
+                entry["reason"] = reason.into();
             }
-            for (key, value) in engine.about() {
-                entry[key] = value;
-            }
+        }
+        for (key, value) in engine.about() {
+            entry[key] = value;
         }
     }
     entry
@@ -1105,7 +1164,7 @@ fn check(engine: &Engine) -> Value {
 /// What `doctor` found of each engine, kept in the cache for the boot, so
 /// a later `doctor` neither opens the hardware nor encodes its test frame
 /// again: under this build and the variables that choose a device, and a
-/// failure for five minutes only, as FFmpeg's probes are.
+/// failure for five minutes only, as `FFmpeg`'s probes are.
 mod checked {
     use serde::{Deserialize, Serialize};
     use serde_json::Value;
@@ -1152,9 +1211,10 @@ mod checked {
             exe.display(),
             meta.len()
         );
+        use std::fmt::Write as _;
         for name in SETTINGS {
             let value = std::env::var_os(name).unwrap_or_default();
-            key.push_str(&format!("\n{name}={}", value.to_string_lossy()));
+            let _ = write!(key, "\n{name}={}", value.to_string_lossy());
         }
         Some(key)
     }
@@ -1235,7 +1295,9 @@ mod tests {
             self.1.fetch_add(1, Ordering::Relaxed);
             match &self.0 {
                 Scenario::Echo(seen) => {
-                    seen.lock().unwrap().push(view.frame.data.as_ptr() as usize);
+                    seen.lock()
+                        .map_err(|_| anyhow::anyhow!("test fixture lock is poisoned"))?
+                        .push(view.frame.data.as_ptr() as usize);
                     super::super::encode(view.frame, quality)
                 }
                 Scenario::Fails => bail!("engine error"),
@@ -1280,7 +1342,7 @@ mod tests {
         let ramp = Frame {
             pixel_format: crate::types::MONO8,
             data: (0..96 * 64)
-                .map(|i| ((i % 96 + i / 96) * 255 / 160) as u8)
+                .map(|i| u8::try_from((i % 96 + i / 96) * 255 / 160).unwrap())
                 .collect(),
             ..frame
         };
@@ -1340,6 +1402,7 @@ mod tests {
             seen.iter()
                 .all(|&address| address == frame.data.as_ptr() as usize)
         );
+        drop(seen);
         assert_eq!(engine.verified(), Some(true));
     }
 
@@ -1364,7 +1427,7 @@ mod tests {
             let cpu = cpu(&frame, QUALITY).unwrap();
             assert_eq!(engine.encode(&frame, QUALITY, false).unwrap(), cpu);
             assert_eq!(engine.settled().verified(), Some(false));
-            let (engine, _) = super::tests::engine(scenario);
+            let (engine, _) = tests::engine(scenario);
             let error = engine.encode(&frame, QUALITY, true).unwrap_err();
             assert_eq!(crate::types::classify(&error).kind, ErrorKind::Unavailable);
         }
@@ -1439,7 +1502,7 @@ mod tests {
         assert_eq!(jpeg, cpu(&frame, QUALITY).unwrap());
         assert_eq!(engine.verified(), Some(true));
 
-        let (engine, calls) = super::tests::engine(Scenario::Coarse(coarse.clone()));
+        let (engine, calls) = tests::engine(Scenario::Coarse(coarse.clone()));
         coarse.store(true, Ordering::Relaxed);
         let mut checked = Vec::new();
         for _ in 0..8 {
@@ -1489,6 +1552,46 @@ mod tests {
             accurate(&smooth, &coarse, &reference),
             Err(Fault::Unfaithful(_))
         ));
+    }
+
+    #[test]
+    fn quality_comparison_requires_both_jpegs_to_have_the_frame_dimensions() {
+        let frame = gradient(96, 64);
+        let reference = cpu(&frame, QUALITY).unwrap();
+        for (width, height) in [(128, 64), (16, 16), (64, 96)] {
+            let wrong = cpu(&gradient(width, height), QUALITY).unwrap();
+            assert!(matches!(
+                accurate(&frame, &reference, &wrong),
+                Err(Fault::Broken(_))
+            ));
+            assert!(matches!(
+                accurate(&frame, &wrong, &reference),
+                Err(Fault::Broken(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn quality_comparison_checks_dimensions_before_decoding_pixels() {
+        let frame = gradient(96, 64);
+        let reference = cpu(&frame, QUALITY).unwrap();
+        let wrong = cpu(&gradient(128, 64), QUALITY).unwrap();
+        let scan = wrong
+            .windows(2)
+            .position(|bytes| bytes == [0xff, 0xda])
+            .unwrap();
+        let length = usize::from(u16::from_be_bytes([wrong[scan + 2], wrong[scan + 3]]));
+        let header = &wrong[..scan + 2 + length];
+        assert_eq!(
+            accurate(&frame, header, &reference),
+            Err(Fault::Broken("its JPEG has another size".into()))
+        );
+        assert_eq!(
+            accurate(&frame, &reference, header),
+            Err(Fault::Broken(
+                "libjpeg-turbo's JPEG has another size".into()
+            ))
+        );
     }
 
     #[test]
@@ -1574,7 +1677,7 @@ mod tests {
             data: wide.data[..48 * 64 * 3].to_vec().into(),
             ..wide.clone()
         };
-        assert!(engine.encode(&narrow, QUALITY, true).is_ok());
+        engine.encode(&narrow, QUALITY, true).unwrap();
         assert_eq!(engine.verified(), Some(true));
     }
 
@@ -1595,7 +1698,7 @@ mod tests {
             }
         }
         let calls = Arc::new(AtomicUsize::new(0));
-        let counter = calls.clone();
+        let counter = calls;
         let mut engine = Engine::new(Kind::Fake, move || Ok(Short(counter)));
         engine.any_size = true;
         let frame = frame(crate::types::RGB8);
@@ -1713,13 +1816,13 @@ mod tests {
         let frame = frame(0x0108_0009);
         let engines = [first, second];
         let chosen = choose(&engines, &frame, QUALITY).unwrap();
-        assert!(std::ptr::eq(chosen, &engines[0]));
+        assert!(std::ptr::eq(chosen, &raw const engines[0]));
         // The first fails its check and is turned off.
         chosen.encode(&frame, QUALITY, false).unwrap();
         chosen.settled();
         assert!(first_calls.load(Ordering::Relaxed) > 0);
         let chosen = choose(&engines, &frame, QUALITY).unwrap();
-        assert!(std::ptr::eq(chosen, &engines[1]));
+        assert!(std::ptr::eq(chosen, &raw const engines[1]));
         chosen.encode(&frame, QUALITY, false).unwrap();
         chosen.settled();
         assert!(second_calls.load(Ordering::Relaxed) > 0);

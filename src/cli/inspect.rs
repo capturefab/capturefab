@@ -3,6 +3,7 @@
 //! and writes the preview, by default to a private folder; this turns the
 //! measurements into a short document with a verdict and a suggested
 //! exposure.
+#![forbid(unsafe_code)]
 use super::{
     Client, Global, args::CamerasArg, args::KeepArg, args::Wait, millis, output::Report, term,
 };
@@ -18,7 +19,7 @@ use serde_json::{Value, json};
 use std::{fmt::Write as _, path::PathBuf, time::Duration};
 
 #[derive(Debug, Args)]
-pub struct InspectArgs {
+pub(crate) struct InspectArgs {
     #[command(flatten)]
     pub cameras: CamerasArg,
     /// Measure only this part of the frame: X,Y,W,H as fractions 0..1
@@ -48,8 +49,8 @@ pub struct InspectArgs {
     /// Time between samples with --for (default 200ms)
     #[arg(long, value_name = "DUR", value_parser = super::args::duration, requires = "sample_for")]
     pub every: Option<Duration>,
-    /// Share of the measured pixels at full scale above which the verdict says clipped_high (default: any pixel with --region, else 0.005)
-    #[arg(long, value_name = "SHARE", value_parser = parse_share)]
+    /// Share of the measured pixels at full scale above which the verdict says `clipped_high` (default: any pixel with --region, else 0.005)
+    #[arg(help = "Share of the measured pixels at full scale above which the verdict says clipped_high (default: any pixel with --region, else 0.005)", long, value_name = "SHARE", value_parser = parse_share)]
     pub clip_threshold: Option<f64>,
     /// Draw the preview in this terminal under the measurements (kitty, iTerm2, or colour blocks)
     #[arg(long)]
@@ -78,14 +79,25 @@ fn parse_share(text: &str) -> std::result::Result<f64, String> {
 }
 
 pub(super) fn parse_region(text: &str) -> std::result::Result<[f64; 4], String> {
-    let parts = text
-        .split(',')
-        .map(|part| part.trim().parse::<f64>())
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|_| "a region is X,Y,W,H as fractions, such as 0.25,0.25,0.5,0.5".to_owned())?;
-    let region: [f64; 4] = parts
-        .try_into()
-        .map_err(|_| "a region has four numbers: X,Y,W,H".to_owned())?;
+    let mut parts = text.split(',').map(|part| {
+        part.trim()
+            .parse::<f64>()
+            .map_err(|_| "a region is X,Y,W,H as fractions, such as 0.25,0.25,0.5,0.5".to_owned())
+    });
+    let mut region = [0.0; 4];
+    for value in &mut region {
+        *value = parts
+            .next()
+            .ok_or_else(|| "a region has four numbers: X,Y,W,H".to_owned())??;
+    }
+    let mut extra = false;
+    for part in parts {
+        part?;
+        extra = true;
+    }
+    if extra {
+        return Err("a region has four numbers: X,Y,W,H".to_owned());
+    }
     crate::inspect::validate(0, 1, 0, Some(region)).map_err(|error| error.to_string())?;
     Ok(region)
 }
@@ -96,7 +108,7 @@ const TARGET: f64 = 0.45;
 /// exact exposure.
 const SATURATED: f64 = 0.25;
 
-pub fn run(global: &Global, args: InspectArgs) -> Result<Report> {
+pub(super) fn run(global: &Global, args: &InspectArgs) -> Result<Report> {
     if let Some(Wait::For(wait)) = args.timeout
         && (wait.is_zero() || millis(wait) > crate::inspect::MAX_WAIT_MS)
     {
@@ -158,7 +170,7 @@ pub fn run(global: &Global, args: InspectArgs) -> Result<Report> {
     };
     let each = |camera: Option<&str>| -> Result<Value> {
         let client = Client::open_with(global, camera, args.keep.route())?;
-        inspect(&client, &args, &settings, &preview, global.verbose, show)
+        inspect(&client, args, &settings, &preview, global.verbose, show)
     };
     let value = if cameras.len() == 1 {
         each(cameras[0])?
@@ -167,15 +179,14 @@ pub fn run(global: &Global, args: InspectArgs) -> Result<Report> {
         // stops what it waits for too.
         let lineage = super::signals::Lineage::here();
         let results = std::thread::scope(|scope| {
-            let threads = cameras
-                .iter()
-                .map(|camera| {
-                    scope.spawn(move || {
-                        lineage.enter();
-                        each(*camera)
-                    })
-                })
-                .collect::<Vec<_>>();
+            // Start every camera before waiting for any of them.
+            let mut threads = Vec::with_capacity(cameras.len());
+            for camera in &cameras {
+                threads.push(scope.spawn(move || {
+                    lineage.enter();
+                    each(*camera)
+                }));
+            }
             threads
                 .into_iter()
                 .map(|thread| {
@@ -219,10 +230,10 @@ pub fn run(global: &Global, args: InspectArgs) -> Result<Report> {
         }
         shown
     };
-    let text = match value["cameras"].as_array() {
-        Some(cameras) => cameras.iter().map(shown).collect(),
-        None => shown(&value),
-    };
+    let text = value["cameras"].as_array().map_or_else(
+        || shown(&value),
+        |cameras| cameras.iter().map(shown).collect(),
+    );
     Ok(Report::json(value).drawn(text))
 }
 
@@ -275,10 +286,12 @@ fn inspect(
         _ if show => PreviewFormat::Png,
         _ => PreviewFormat::Auto,
     };
-    let threshold = args.clip_threshold.unwrap_or(if args.region.is_some() {
-        0.0
-    } else {
-        crate::inspect::CLIP_WARN
+    let threshold = args.clip_threshold.unwrap_or_else(|| {
+        if args.region.is_some() {
+            0.0
+        } else {
+            crate::inspect::CLIP_WARN
+        }
     });
     let camera = crate::media::redact_url(info["camera"].as_str().unwrap_or("the camera"));
     // The camera's worker writes a preview file with this command's floor.
@@ -452,16 +465,23 @@ fn trigger_hint(error: anyhow::Error) -> anyhow::Error {
 fn clipped(reply: &Value) -> (f64, f64) {
     let clipping = &reply["clipping"];
     let exposure = &reply["exposure"];
-    match clipping["pixels"].as_f64().filter(|pixels| *pixels > 0.0) {
-        Some(pixels) => (
-            clipping["high_px"].as_f64().unwrap_or(0.0) / pixels,
-            clipping["low_px"].as_f64().unwrap_or(0.0) / pixels,
-        ),
-        None => (
-            exposure["highlights"].as_f64().unwrap_or(0.0),
-            exposure["shadows"].as_f64().unwrap_or(0.0),
-        ),
-    }
+    clipping["pixels"]
+        .as_f64()
+        .filter(|pixels| *pixels > 0.0)
+        .map_or_else(
+            || {
+                (
+                    exposure["highlights"].as_f64().unwrap_or(0.0),
+                    exposure["shadows"].as_f64().unwrap_or(0.0),
+                )
+            },
+            |pixels| {
+                (
+                    clipping["high_px"].as_f64().unwrap_or(0.0) / pixels,
+                    clipping["low_px"].as_f64().unwrap_or(0.0) / pixels,
+                )
+            },
+        )
 }
 
 pub(super) fn document(info: &Value, reply: &Value, threshold: f64, verbose: bool) -> Value {
@@ -470,9 +490,7 @@ pub(super) fn document(info: &Value, reply: &Value, threshold: f64, verbose: boo
     let measured = exposure.is_object();
     let (clipped_high, clipped_low) = clipped(reply);
     let mut verdict = Vec::new();
-    if !measured {
-        verdict.push("not_measured");
-    } else {
+    if measured {
         let share = |key: &str| exposure[key].as_f64().unwrap_or(0.0);
         let mean = share("mean");
         if clipped_high > threshold {
@@ -486,6 +504,8 @@ pub(super) fn document(info: &Value, reply: &Value, threshold: f64, verbose: boo
         } else if mean > crate::inspect::BRIGHT {
             verdict.push("bright");
         }
+    } else {
+        verdict.push("not_measured");
     }
     if reply["settled"] == false {
         verdict.push("not_settled");
@@ -580,7 +600,7 @@ fn settings(info: &Value) -> Value {
         "exposure_us": info["exposure_us"],
         "gain_db": info["gain_db"],
         "gain": info["gain"],
-        "fps": info["fps"].as_f64().or(info["fps_limit"].as_f64()),
+        "fps": info["fps"].as_f64().or_else(|| info["fps_limit"].as_f64()),
         "pixel_format": info["pixel_format"],
     }))
 }
@@ -592,8 +612,10 @@ fn settings(info: &Value) -> Value {
 fn suggest(info: &Value, reply: &Value) -> Option<Value> {
     let meter = &reply["auto_meter"];
     let exposure = &reply["exposure"];
-    let mean = meter["mean"].as_f64().or(exposure["mean"].as_f64())?;
-    let p99 = meter["p99"].as_f64().or(exposure["p99"].as_f64())?;
+    let mean = meter["mean"]
+        .as_f64()
+        .or_else(|| exposure["mean"].as_f64())?;
+    let p99 = meter["p99"].as_f64().or_else(|| exposure["p99"].as_f64())?;
     let mut ev = crate::auto::error(crate::auto::Meter {
         mean: mean.max(1.0 / 1024.0),
         p99: p99.max(1.0 / 255.0),
@@ -623,14 +645,10 @@ fn suggest(info: &Value, reply: &Value) -> Option<Value> {
             Some("ns") => 1e-3,
             _ => 1.0,
         };
-        let min = control["min"]
-            .as_f64()
-            .map(|min| min * scale)
-            .unwrap_or(0.0);
+        let min = control["min"].as_f64().map_or(0.0, |min| min * scale);
         let max = control["max"]
             .as_f64()
-            .map(|max| max * scale)
-            .unwrap_or(f64::INFINITY);
+            .map_or(f64::INFINITY, |max| max * scale);
         let wanted = (current * ev.exp2()).clamp(min, max.max(min));
         value["exposure_us"] = json!(wanted.round());
         if wanted >= max {
@@ -702,7 +720,7 @@ fn text(value: &Value) -> String {
 }
 
 /// Result fields, for `schema`.
-pub const FIELDS: &[(&str, &str)] = &[
+pub(super) const FIELDS: &[(&str, &str)] = &[
     ("camera", "string — camera ID"),
     (
         "frame",
@@ -833,5 +851,27 @@ mod tests {
         for bad in ["0.5,0.5", "a,b,c,d", "0.5,0.5,0.6,0.1", "0,0,0,1"] {
             assert!(parse_region(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn region_errors_preserve_parse_count_and_bounds_precedence() {
+        for text in ["", "x", "0,0,x", "0,0,1,1,x", "0,0,1,1,2,x", "0,0,1,1,"] {
+            assert_eq!(
+                parse_region(text).unwrap_err(),
+                "a region is X,Y,W,H as fractions, such as 0.25,0.25,0.5,0.5",
+                "{text}"
+            );
+        }
+        for text in ["0", "0,0", "0,0,1", "0,0,1,1,0", "NaN,0,1,1,0"] {
+            assert_eq!(
+                parse_region(text).unwrap_err(),
+                "a region has four numbers: X,Y,W,H",
+                "{text}"
+            );
+        }
+        assert_eq!(
+            parse_region(&format!("0,0,1,1{}", ",0".repeat(10_000))).unwrap_err(),
+            "a region has four numbers: X,Y,W,H"
+        );
     }
 }

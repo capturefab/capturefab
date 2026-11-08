@@ -3,6 +3,8 @@
 //! wait for one. A job's ID is `<session>-<n>`; n counts a session's jobs,
 //! across its runs. The jobs of a session that ended are read from what it
 //! saved.
+#![forbid(unsafe_code)]
+#![deny(clippy::panic_in_result_fn)]
 use super::{Global, output::Report, term};
 use crate::{
     ipc,
@@ -18,13 +20,13 @@ use std::{
 };
 
 #[derive(Debug, Args)]
-pub struct JobsArgs {
+pub(crate) struct JobsArgs {
     #[command(subcommand)]
     pub action: Option<JobsAction>,
 }
 
 #[derive(Debug, Subcommand)]
-pub enum JobsAction {
+pub(crate) enum JobsAction {
     /// Every session's jobs, finished ones and those of ended sessions included; or the jobs named, as they are now
     #[command(
         after_help = "Examples:\n  capturefab jobs list\n  capturefab jobs list --running\n  capturefab --json jobs list auto-1 auto-2\n  capturefab --json jobs"
@@ -62,13 +64,16 @@ pub enum JobsAction {
 
 /// `--progress`, of the commands that wait for a job.
 #[derive(Debug, Clone, Copy, Args)]
-pub struct ProgressArg {
-    /// Report progress on stderr, also without a terminal: a JSON line {progress:{job,camera,kind,state,saved,planned?,bytes?,elapsed_s,left_s?,next_s?}} as the job changes, at least each second
-    #[arg(long)]
+pub(crate) struct ProgressArg {
+    /// Report progress on stderr, also without a terminal: a JSON line `{progress:{job,camera,kind,state,saved,planned?,bytes?,elapsed_s,left_s?,next_s?}}` as the job changes, at least each second
+    #[arg(
+        help = "Report progress on stderr, also without a terminal: a JSON line {progress:{job,camera,kind,state,saved,planned?,bytes?,elapsed_s,left_s?,next_s?}} as the job changes, at least each second",
+        long
+    )]
     pub progress: bool,
 }
 
-pub fn run(global: &Global, args: JobsArgs) -> Result<Report> {
+pub(super) fn run(global: &Global, args: JobsArgs) -> Result<Report> {
     let action = args.action.unwrap_or(JobsAction::List {
         ids: Vec::new(),
         running: false,
@@ -85,8 +90,11 @@ pub fn run(global: &Global, args: JobsArgs) -> Result<Report> {
 }
 
 /// Every job of camera `camera`, a session status entry.
-pub(super) fn of_camera(camera: &Value) -> Vec<Value> {
-    camera["jobs"].as_array().cloned().unwrap_or_default()
+pub(super) fn of_camera(camera: &Value) -> &[Value] {
+    camera["jobs"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
 }
 
 /// A job in one line, for people.
@@ -132,10 +140,14 @@ fn every_job(global: &Global) -> Vec<(String, Vec<Value>)> {
     let mut all = running
         .iter()
         .filter_map(|descriptor| {
-            let jobs = ipc::call(&descriptor.name, Request::Jobs, Duration::from_secs(5)).ok()?;
+            let mut jobs =
+                ipc::call(&descriptor.name, Request::Jobs, Duration::from_secs(5)).ok()?;
             Some((
                 descriptor.name.clone(),
-                jobs["jobs"].as_array().cloned().unwrap_or_default(),
+                jobs.get_mut("jobs")
+                    .and_then(Value::as_array_mut)
+                    .map(std::mem::take)
+                    .unwrap_or_default(),
             ))
         })
         .collect::<Vec<_>>();
@@ -167,12 +179,12 @@ fn list(global: &Global, ids: &[String], running: bool) -> Result<Report> {
         every
     } else {
         ids.iter()
-            .map(
-                |id| match every.iter().find(|job| job["id"] == id.as_str()) {
-                    Some(job) => Ok(job.clone()),
-                    None => named_job(id),
-                },
-            )
+            .map(|id| {
+                every
+                    .iter()
+                    .find(|job| job["id"] == id.as_str())
+                    .map_or_else(|| named_job(id), |job| Ok(job.clone()))
+            })
             .collect::<Result<Vec<_>>>()?
     };
     if running {
@@ -333,8 +345,8 @@ fn wait(ids: &[String], timeout: super::args::Wait, progress: ProgressArg) -> Re
             deadline.saturating_duration_since(Instant::now())
         });
         // Each job in turn, so one that ends is seen within a second.
-        let turn =
-            (left.min(Duration::from_secs(1)) / waiting as u32).max(Duration::from_millis(1));
+        let waiting = u32::try_from(waiting).unwrap_or(u32::MAX);
+        let turn = (left.min(Duration::from_secs(1)) / waiting).max(Duration::from_millis(1));
         for job in followed.iter_mut().filter(|job| job.waiting()) {
             let host = job.host.as_ref().expect("a job waited for runs");
             let reply = host.wait(&job.id, job.seq, turn)?;
@@ -372,15 +384,12 @@ fn followed_details(followed: &[Followed]) -> Value {
 /// the first that is not as its own error.
 fn waited(followed: Vec<Followed>) -> Result<Report> {
     if let [one] = followed.as_slice() {
-        return finished(one.job.clone());
+        return finished(&one.job);
     }
     let details = followed_details(&followed);
     let jobs = followed.into_iter().map(|job| job.job).collect::<Vec<_>>();
     if let Some(failed) = jobs.iter().find(|job| job["state"] != "done") {
-        return match finished(failed.clone()) {
-            Ok(_) => unreachable!("only a done job is a result"),
-            Err(error) => Err(crate::types::with_details(error, details)),
-        };
+        return Err(crate::types::with_details(job_failure(failed), details));
     }
     let mut text = String::new();
     for job in &jobs {
@@ -409,11 +418,10 @@ fn still_running(followed: &[Followed]) -> anyhow::Error {
             running.join(", ")
         ),
     };
+    let ids = running.join(" ");
     Categorized::new(ErrorKind::Timeout, message)
         .hint(format!(
-            "wait again with capturefab jobs wait {}, or look without waiting with capturefab jobs list {}",
-            running.join(" "),
-            running.join(" ")
+            "wait again with capturefab jobs wait {ids}, or look without waiting with capturefab jobs list {ids}"
         ))
         .details(followed_details(followed))
         .into()
@@ -447,8 +455,11 @@ fn estimate(job: &Value, began: Instant) -> Estimate {
     let saved = job["saved"].as_u64().unwrap_or(0);
     let estimate = || {
         let planned = job["planned"].as_u64()?;
-        (saved > 0 && planned > saved)
-            .then(|| elapsed.mul_f64((planned - saved) as f64 / saved as f64))
+        if saved == 0 || planned <= saved {
+            return None;
+        }
+        let seconds = elapsed.as_secs_f64() * ((planned - saved) as f64 / saved as f64);
+        Duration::try_from_secs_f64(seconds).ok()
     };
     let left = until("ends_at").or_else(estimate);
     Estimate {
@@ -466,29 +477,29 @@ pub(super) fn progress(job: &Value, began: Instant) -> String {
         left,
         next,
     } = estimate(job, began);
-    let mut parts = Vec::new();
+    let mut text = crate::media::redact_url(job["camera"].as_str().unwrap_or("camera"));
+    text.push_str(": ");
     let saved = job["saved"].as_u64().unwrap_or(0);
     match (job["kind"].as_str(), job["planned"].as_u64()) {
-        (Some("record"), _) => parts.push(format!("recording {}", term::clock(elapsed))),
-        (_, Some(planned)) => parts.push(format!("{saved}/{planned} saved")),
-        _ => parts.push(format!("{saved} saved")),
+        (Some("record"), _) => write!(text, "recording {}", term::clock(elapsed)),
+        (_, Some(planned)) => write!(text, "{saved}/{planned} saved"),
+        _ => write!(text, "{saved} saved"),
     }
+    .expect("writing to a String cannot fail");
     if let Some(bytes) = job["bytes"].as_u64().filter(|bytes| *bytes > 0) {
-        parts.push(crate::types::human_bytes(bytes));
+        text.push_str(" · ");
+        text.push_str(&crate::types::human_bytes(bytes));
     }
     if job["kind"] != "record" {
-        parts.push(term::clock(elapsed));
+        text.push_str(" · ");
+        text.push_str(&term::clock(elapsed));
     }
     if let Some(left) = left {
-        parts.push(format!("{} left", term::clock(left)));
+        write!(text, " · {} left", term::clock(left)).expect("writing to a String cannot fail");
     } else if let Some(next) = next {
-        parts.push(format!("next in {}", term::clock(next)));
+        write!(text, " · next in {}", term::clock(next)).expect("writing to a String cannot fail");
     }
-    format!(
-        "{}: {}",
-        crate::media::redact_url(job["camera"].as_str().unwrap_or("camera")),
-        parts.join(" · ")
-    )
+    text
 }
 
 /// How far job `job` is, as a `--progress` line.
@@ -575,14 +586,19 @@ impl Progress {
 }
 
 /// A finished job as a result (done) or as its own error.
-fn finished(job: Value) -> Result<Report> {
-    let id = job["id"].as_str().unwrap_or_default().to_owned();
-    match job["state"].as_str() {
-        Some("done") => {
-            let text = format!("{}\n", line(&job));
-            Ok(Report::json(json!({ "job": job })).text(text))
-        }
-        Some("cancelled" | "interrupted" | "lost") => Err(Categorized::new(
+fn finished(job: &Value) -> Result<Report> {
+    if job["state"] == "done" {
+        let text = format!("{}\n", line(job));
+        Ok(Report::json(json!({ "job": job })).text(text))
+    } else {
+        Err(job_failure(job))
+    }
+}
+
+fn job_failure(job: &Value) -> anyhow::Error {
+    let id = job["id"].as_str().unwrap_or_default();
+    if let Some("cancelled" | "interrupted" | "lost") = job["state"].as_str() {
+        Categorized::new(
             ErrorKind::Incomplete,
             match job["state"].as_str() {
                 Some("lost") => format!("job {id} was lost when its session ended"),
@@ -591,22 +607,21 @@ fn finished(job: Value) -> Result<Report> {
             },
         )
         .details(json!({ "job": job }))
-        .into()),
-        _ => {
-            let kind = job["error"]["code"]
+        .into()
+    } else {
+        let kind = job["error"]["code"]
+            .as_str()
+            .and_then(ErrorKind::from_code)
+            .unwrap_or(ErrorKind::OperationFailed);
+        Categorized::new(
+            kind,
+            job["error"]["message"]
                 .as_str()
-                .and_then(ErrorKind::from_code)
-                .unwrap_or(ErrorKind::OperationFailed);
-            Err(Categorized::new(
-                kind,
-                job["error"]["message"]
-                    .as_str()
-                    .unwrap_or("the job failed")
-                    .to_owned(),
-            )
-            .details(json!({ "job": job }))
-            .into())
-        }
+                .unwrap_or("the job failed")
+                .to_owned(),
+        )
+        .details(json!({ "job": job }))
+        .into()
     }
 }
 
@@ -618,7 +633,7 @@ macro_rules! job_row {
     };
 }
 pub(super) use job_row;
-pub const LIST_FIELDS: &[(&str, &str)] = &[(
+pub(super) const LIST_FIELDS: &[(&str, &str)] = &[(
     "jobs",
     concat!(
         "[",
@@ -626,11 +641,11 @@ pub const LIST_FIELDS: &[(&str, &str)] = &[(
         "] — every session's, a session that ended included, as it saved them (those that had not ended as lost); finished ones for an hour after they end; with IDs, those jobs in that order; with --running, only those that have not ended"
     ),
 )];
-pub const STOP_FIELDS: &[(&str, &str)] = &[(
+pub(super) const STOP_FIELDS: &[(&str, &str)] = &[(
     "stopped",
     concat!("[", job_row!(), "] — the jobs as they are after stopping"),
 )];
-pub const WAIT_FIELDS: &[(&str, &str)] = &[
+pub(super) const WAIT_FIELDS: &[(&str, &str)] = &[
     (
         "job",
         concat!(
@@ -653,6 +668,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn finished_jobs_preserve_failure_kinds_messages_and_all_details() {
+        for (state, kind, message) in [
+            (
+                "cancelled",
+                ErrorKind::Incomplete,
+                "job bench-1 was stopped after 2 file(s)",
+            ),
+            (
+                "interrupted",
+                ErrorKind::Incomplete,
+                "job bench-1 ended with its session",
+            ),
+            (
+                "lost",
+                ErrorKind::Incomplete,
+                "job bench-1 was lost when its session ended",
+            ),
+            ("failed", ErrorKind::StorageFull, "disk full"),
+        ] {
+            let job = json!({"id": "bench-1", "state": state, "saved": 2,
+                "error": {"code": "storage_full", "message": "disk full"}});
+            let error = finished(&job).err().unwrap();
+            let classified = crate::types::classify(&error);
+            assert_eq!(classified.kind, kind);
+            assert_eq!(error.to_string(), message);
+            assert_eq!(classified.details.unwrap()["job"], job);
+
+            let done = json!({"id": "bench-0", "state": "done"});
+            let jobs = [done, job];
+            let followed = jobs
+                .iter()
+                .map(|job| Followed {
+                    id: job["id"].as_str().unwrap().into(),
+                    host: None,
+                    seq: 0,
+                    job: job.clone(),
+                })
+                .collect();
+            let error = waited(followed).err().unwrap();
+            assert_eq!(error.to_string(), message);
+            assert_eq!(
+                crate::types::classify(&error).details.unwrap()["jobs"],
+                json!(jobs)
+            );
+        }
+    }
+
+    #[test]
     fn only_session_jobs_can_be_waited_for_by_id() {
         assert_eq!(session_of("line-1-12").unwrap(), "line-1");
         for bad in ["auto", "auto-0", "-3", "auto-x", "a b-1", "direct-1"] {
@@ -663,8 +726,20 @@ mod tests {
     }
 
     #[test]
+    fn unrepresentable_progress_estimates_are_unavailable() {
+        let began = Instant::now()
+            .checked_sub(Duration::from_secs(3))
+            .expect("test clock can represent three seconds ago");
+        let job = json!({"camera": "sim:0", "saved": 1, "planned": u64::MAX});
+        assert!(estimate(&job, began).left.is_none());
+        assert!(!progress(&job, began).contains(" left"));
+    }
+
+    #[test]
     fn progress_says_what_a_job_did_and_what_is_left() {
-        let began = Instant::now() - Duration::from_millis(2500);
+        let began = Instant::now()
+            .checked_sub(Duration::from_millis(2500))
+            .expect("test clock can represent a job begun 2.5 seconds ago");
         // A job joined late is timed from when it started, not from when
         // the wait began: 30 of 40 frames in 3 s leave 1 s.
         let joined = json!({
@@ -699,5 +774,17 @@ mod tests {
         let shown = progress(&recording, began);
         assert!(shown.ends_with(": recording 0:02 · 3.0 MiB"), "{shown}");
         assert!(!shown.contains("secret"), "{shown}");
+        assert_eq!(
+            progress(&json!({"kind": "record", "bytes": 0}), began),
+            "camera: recording 0:02"
+        );
+        let waiting = json!({
+            "saved": 0, "bytes": 0,
+            "next_at": crate::scheduling::rfc3339(crate::scheduling::now_ms() + 20_500),
+        });
+        assert_eq!(
+            progress(&waiting, began),
+            "camera: 0 saved · 0:02 · next in 0:20"
+        );
     }
 }

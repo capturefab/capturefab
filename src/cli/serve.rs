@@ -1,18 +1,19 @@
 //! `capturefab serve`: a session in the foreground. `session start` runs
 //! the same command detached, with a pipe to say when it is ready and an
 //! idle time after which it ends.
+#![deny(clippy::panic_in_result_fn)]
 use super::{CONNECT_TIMEOUT, Global, args::CamerasArg, millis, output::Report, signals};
 use crate::{
     ipc,
     session::{SessionCommand, SessionHandle},
 };
-use anyhow::{Context, Result};
+use anyhow::{Context as _, Result};
 use clap::Args;
 use serde_json::{Value, json};
-use std::{io::Write, time::Duration};
+use std::{io::Write as _, time::Duration};
 
 #[derive(Debug, Args)]
-pub struct ServeArgs {
+pub(crate) struct ServeArgs {
     /// Session name other commands pass to --session
     #[arg(long, default_value = "default", value_name = "NAME")]
     pub name: String,
@@ -39,13 +40,17 @@ pub struct ServeArgs {
 const MOST_CAMERAS: u64 = 1 << 20;
 
 /// The cameras `session start` wrote to stdin, and closed it.
-fn stdin_cameras() -> Result<Vec<String>> {
-    use std::io::Read;
+fn read_cameras(reader: impl std::io::Read) -> Result<Vec<String>> {
+    use std::io::Read as _;
     let mut bytes = Vec::new();
-    std::io::stdin()
-        .take(MOST_CAMERAS)
+    reader
+        .take(MOST_CAMERAS + 1)
         .read_to_end(&mut bytes)
         .context("reading the cameras on stdin")?;
+    anyhow::ensure!(
+        u64::try_from(bytes.len())? <= MOST_CAMERAS,
+        "the cameras on stdin exceed 1 MiB"
+    );
     serde_json::from_slice(&bytes).context("the cameras on stdin are not a JSON list of strings")
 }
 
@@ -61,26 +66,31 @@ impl Ready {
         // they run, should this process die before it says anything.
         #[cfg(unix)]
         let file = {
-            use std::os::fd::FromRawFd;
+            use std::os::fd::FromRawFd as _;
             let fd = i32::try_from(fd).context("--ready-fd is not a descriptor")?;
             // SAFETY: `session start` passed this descriptor for this
             // process alone to write once and close.
-            unsafe {
-                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-                std::fs::File::from_raw_fd(fd)
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+                return Err(std::io::Error::last_os_error().into());
             }
+            // SAFETY: fcntl verified the inherited descriptor; this process
+            // owns it and closes it after the readiness message.
+            unsafe { std::fs::File::from_raw_fd(fd) }
         };
         #[cfg(windows)]
         let file = {
-            use std::os::windows::io::FromRawHandle;
+            use std::os::windows::io::FromRawHandle as _;
             use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
-            let handle = fd as usize as std::os::windows::io::RawHandle;
+            let handle = usize::try_from(fd).context("--ready-fd exceeds host handle size")?
+                as std::os::windows::io::RawHandle;
             // SAFETY: `session start` made this pipe handle inheritable for
             // this process alone to write once and close.
-            unsafe {
-                SetHandleInformation(handle as _, HANDLE_FLAG_INHERIT, 0);
-                std::fs::File::from_raw_handle(handle)
+            let file = unsafe { std::fs::File::from_raw_handle(handle) };
+            // SAFETY: file owns this inherited handle while its flag changes.
+            if unsafe { SetHandleInformation(handle.cast(), HANDLE_FLAG_INHERIT, 0) } == 0 {
+                return Err(std::io::Error::last_os_error().into());
             }
+            file
         };
         Ok(Self(Some(file)))
     }
@@ -105,7 +115,7 @@ pub(super) fn failure(error: &anyhow::Error) -> Value {
     json!({ "error": body })
 }
 
-pub fn run(global: &Global, args: ServeArgs) -> Result<Option<Report>> {
+pub(super) fn run(global: &Global, args: &ServeArgs) -> Result<Option<Report>> {
     signals::take_over();
     let out = global.output();
     let mut ready = Ready::open(args.ready_fd)?;
@@ -120,7 +130,7 @@ pub fn run(global: &Global, args: ServeArgs) -> Result<Option<Report>> {
     let started = (|| -> Result<ipc::Server> {
         let mut cameras = args.cameras.cameras.clone();
         if args.cameras_stdin {
-            cameras.extend(stdin_cameras()?);
+            cameras.extend(read_cameras(std::io::stdin())?);
         }
         // Cameras connect before the session is announced: one that fails
         // ends it, as the person who named it asked for all of them.
@@ -155,7 +165,7 @@ pub fn run(global: &Global, args: ServeArgs) -> Result<Option<Report>> {
         let name = args.name.clone();
         let _ = std::thread::Builder::new()
             .name("capturefab-log".into())
-            .spawn(move || {
+            .spawn(move || -> ! {
                 loop {
                     std::thread::sleep(Duration::from_secs(10));
                     super::session::rotate_log(&name);
@@ -212,26 +222,47 @@ pub fn run(global: &Global, args: ServeArgs) -> Result<Option<Report>> {
     Ok(None)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
+    #[test]
+    fn camera_lists_cannot_hide_input_past_the_limit() {
+        let limit = usize::try_from(MOST_CAMERAS).unwrap();
+        let mut input = b"[]".to_vec();
+        input.resize(limit, b' ');
+        assert_eq!(read_cameras(input.as_slice()).unwrap(), [] as [String; 0]);
+        input.extend_from_slice(b"not JSON after the limit");
+        let mut reader = std::io::Cursor::new(input);
+        read_cameras(&mut reader).unwrap_err();
+        assert_eq!(reader.position(), MOST_CAMERAS + 1);
+    }
+
     use super::*;
 
     #[test]
+    #[cfg(unix)]
     fn the_ready_pipe_is_not_inherited_by_the_processes_serve_starts() {
-        use std::os::fd::{AsRawFd, IntoRawFd};
+        use std::os::fd::{AsRawFd as _, IntoRawFd as _};
         let (reader, writer) = std::io::pipe().unwrap();
         let fd = writer.into_raw_fd();
         // As `session start` passes it: inheritable across the exec.
         // SAFETY: fcntl on a descriptor this test owns.
         unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
-        let mut ready = Ready::open(Some(fd as u64)).unwrap();
+        let mut ready = Ready::open(Some(u64::try_from(fd).unwrap())).unwrap();
         let file = ready.0.as_ref().unwrap();
         // SAFETY: as above.
         let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0);
         assert_ne!(flags & libc::FD_CLOEXEC, 0);
         ready.say(&json!({"ready": true}));
         let mut line = String::new();
         std::io::Read::read_to_string(&mut &reader, &mut line).unwrap();
         assert_eq!(line, "{\"ready\":true}\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn invalid_ready_descriptors_are_rejected() {
+        assert!(Ready::open(Some(u64::try_from(i32::MAX).unwrap())).is_err());
+        assert!(Ready::open(Some(u64::MAX)).is_err());
     }
 }

@@ -7,34 +7,36 @@
 //! and model, since their identifiers fingerprint the stream's host and path.
 //! The camera worker reads and restores setups (`engine::history::setup`);
 //! this module owns the document, its limits and the store.
+#![forbid(unsafe_code)]
+#![deny(clippy::missing_const_for_fn)]
 use crate::types::{CameraInfo, Categorized, ErrorKind, Transport};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context as _, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
     fs,
-    io::Read,
+    io::Read as _,
     path::{Path, PathBuf},
 };
 
 /// Largest setup file.
-pub const MAX_SETUP_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_SETUP_BYTES: usize = 256 * 1024;
 /// Most values one setup holds.
-pub const MAX_SETUP_VALUES: usize = 512;
+pub(crate) const MAX_SETUP_VALUES: usize = 512;
 /// Most setups the store keeps.
-pub const MAX_SETUPS: usize = 128;
+pub(crate) const MAX_SETUPS: usize = 128;
 /// Longest note, in characters.
-pub const MAX_NOTE: usize = 512;
+pub(crate) const MAX_NOTE: usize = 512;
 /// Longest string value, selector value or camera field, in bytes.
-pub const MAX_STRING: usize = 1024;
+pub(crate) const MAX_STRING: usize = 1024;
 /// Most selectors that address one value.
-pub const MAX_BANKS: usize = 4;
+pub(crate) const MAX_BANKS: usize = 4;
 /// Most skipped entries a setup records.
-pub const MAX_SKIPPED: usize = 1024;
+pub(crate) const MAX_SKIPPED: usize = 1024;
 /// Selectors whose every bank a setup reads, so per-line, per-trigger and
 /// per-counter configuration round-trips. Other selectors stay at the bank
 /// selected when the setup is saved.
-pub const SETUP_ALL_BANKS: [&str; 8] = [
+pub(crate) const SETUP_ALL_BANKS: [&str; 8] = [
     "GainSelector",
     "BlackLevelSelector",
     "BalanceRatioSelector",
@@ -49,9 +51,9 @@ pub const SETUP_ALL_BANKS: [&str; 8] = [
 // features: setups never save or restore them. Image-quality features are
 // reversible changes; any other writable feature is disruptive.
 
-/// Name prefixes of features Capturefab manages: GigE and transport-layer
-/// settings (writing GevSCDA would send the stream elsewhere), SFNC 2.x
-/// stream-channel settings such as DeviceStreamChannelPacketSize (the
+/// Name prefixes of features Capturefab manages: `GigE` and transport-layer
+/// settings (writing `GevSCDA` would send the stream elsewhere), SFNC 2.x
+/// stream-channel settings such as `DeviceStreamChannelPacketSize` (the
 /// transport negotiates the packet size itself), device resets and
 /// firmware, user sets and persistent settings that survive a reboot,
 /// camera file access, events and chunk data.
@@ -130,14 +132,14 @@ const IMAGE_QUALITY_PREFIXES: [&str; 5] = ["Focus", "Iris", "Zoom", "Binning", "
 /// Capturefab manages this feature: by name, by its SFNC category when the
 /// camera reports one, or because it is a raw register or command node
 /// rather than a value.
-pub fn managed(name: &str, category: Option<&str>, kind: Option<&str>) -> bool {
+pub(crate) fn managed(name: &str, category: Option<&str>, kind: Option<&str>) -> bool {
     managed_name(name)
         || category.is_some_and(|category| MANAGED_CATEGORIES.contains(&category))
         || kind.is_some_and(not_a_value)
 }
 
 /// The feature name alone marks it as managed by Capturefab.
-pub fn managed_name(name: &str) -> bool {
+pub(crate) fn managed_name(name: &str) -> bool {
     MANAGED_PREFIXES
         .iter()
         .any(|prefix| name.starts_with(prefix))
@@ -145,13 +147,13 @@ pub fn managed_name(name: &str) -> bool {
 
 /// Register (`IntReg`, `StringReg`, …) and command nodes hold no value a
 /// setup may save or restore.
-pub fn not_a_value(kind: &str) -> bool {
+pub(crate) fn not_a_value(kind: &str) -> bool {
     kind == "Command" || kind.ends_with("Reg")
 }
 
 /// Writing this feature only changes how the image looks, frames or is
 /// sized, so it is a Reversible change. Unknown features are not.
-pub fn image_quality(name: &str) -> bool {
+pub(crate) fn image_quality(name: &str) -> bool {
     !managed_name(name)
         && (IMAGE_QUALITY.contains(&name)
             || IMAGE_QUALITY_PREFIXES
@@ -160,7 +162,7 @@ pub fn image_quality(name: &str) -> bool {
 }
 
 /// One saved value: a JSON boolean, number or string.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Scalar {
     Bool(bool),
@@ -201,7 +203,7 @@ pub struct Bank {
     pub value: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetupValue {
     pub feature: String,
@@ -211,7 +213,7 @@ pub struct SetupValue {
 }
 
 /// Capturefab's software auto exposure, which a restore turns on.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SavedAuto {
     /// What presets saved before the balance was fixed carry: read and
@@ -221,7 +223,7 @@ pub struct SavedAuto {
 }
 
 /// A value the setup left out, and why.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Skipped {
     pub feature: String,
@@ -231,7 +233,7 @@ pub struct Skipped {
 }
 
 /// The camera a setup was saved from. Never its address.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SavedCamera {
     pub transport: Transport,
@@ -302,7 +304,7 @@ pub struct Setup {
 /// What a camera worker read for a new setup (`read_setup`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Reading {
+pub(crate) struct Reading {
     pub camera: SavedCamera,
     #[serde(default)]
     pub auto: Option<SavedAuto>,
@@ -314,7 +316,7 @@ pub struct Reading {
 /// Why `setup list` cannot read a file in the setups folder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum FileStatus {
+pub(crate) enum FileStatus {
     /// Damaged, edited by hand, or named differently from its file.
     Unreadable,
     /// Written by a newer Capturefab.
@@ -324,8 +326,8 @@ pub enum FileStatus {
 /// One row of `preset list`. A file the store cannot read is listed under
 /// its file name with `status` and `reason`, and no camera, date or values,
 /// so it can be seen and deleted.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Summary {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Summary {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<Transport>,
@@ -344,7 +346,7 @@ pub struct Summary {
 }
 impl Summary {
     /// The row for a file the store cannot read.
-    pub fn unreadable(name: &str, status: FileStatus, reason: &str) -> Self {
+    pub(crate) fn unreadable(name: &str, status: FileStatus, reason: &str) -> Self {
         Self {
             name: name.into(),
             transport: None,
@@ -362,14 +364,14 @@ impl Summary {
 
 /// `text` without control characters, bounded, for a reason taken from a
 /// file the store cannot read.
+#[deny(clippy::arithmetic_side_effects)]
 fn printable(text: &str) -> String {
     const MAX_REASON: usize = 240;
-    let mut text = text
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect::<String>();
-    if text.chars().count() > MAX_REASON {
-        text = text.chars().take(MAX_REASON - 1).collect::<String>() + "…";
+    let mut characters = text.chars().map(|c| if c.is_control() { ' ' } else { c });
+    let mut text: String = characters.by_ref().take(MAX_REASON).collect();
+    if characters.next().is_some() {
+        text.pop();
+        text.push('…');
     }
     text
 }
@@ -377,14 +379,14 @@ fn printable(text: &str) -> String {
 /// How a saved setup's camera compares with a connected one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Match {
+pub(crate) enum Match {
     SameCamera,
     SameModel,
     OtherModel,
     UnknownSource,
 }
 impl Match {
-    pub fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::SameCamera => "same_camera",
             Self::SameModel => "same_model",
@@ -400,7 +402,7 @@ fn same(a: &str, b: &str) -> bool {
 
 /// Compare the camera a setup was saved from with a connected one. The
 /// transport is ignored: the same camera may be reached another way.
-pub fn matching(saved: &SavedCamera, live: &CameraInfo) -> (Match, Vec<String>) {
+pub(crate) fn matching(saved: &SavedCamera, live: &CameraInfo) -> (Match, Vec<String>) {
     if saved.transport == Transport::Media || live.transport == Transport::Media {
         return if saved.transport == live.transport && same(&saved.model, &live.model) {
             (
@@ -452,7 +454,7 @@ fn article(model: &str) -> String {
 }
 
 /// The refusal for a setup from another model, naming the flag that allows it.
-pub fn other_model_message(setup: &Setup, live: &CameraInfo) -> String {
+pub(crate) fn other_model_message(setup: &Setup, live: &CameraInfo) -> String {
     format!(
         "{} was saved from {}; this camera is {}. Pass allow_other_model (CLI: --allow-other-model) to apply the settings both share.",
         setup.name,
@@ -462,13 +464,13 @@ pub fn other_model_message(setup: &Setup, live: &CameraInfo) -> String {
 }
 
 /// Apply order: geometry and format first; then switches that disarm or
-/// release (TriggerMode = Off, LineMode = Input, `*Enable` = false); other
+/// release (`TriggerMode` = Off, `LineMode` = Input, `*Enable` = false); other
 /// modes; other values alphabetically; then switches that arm or drive
-/// (TriggerMode = On, LineMode = Output, `*Enable` = true), so a trigger
+/// (`TriggerMode` = On, `LineMode` = Output, `*Enable` = true), so a trigger
 /// or output line never runs from a stale source; auto flags; and
 /// selectors last, so the inspector shows the saved bank afterwards.
 /// `target` is the value about to be written, as text.
-pub fn order_key(feature: &str, target: Option<&str>) -> (u8, u8, String) {
+pub(crate) fn order_key<'a>(feature: &'a str, target: Option<&str>) -> (u8, u8, &'a str) {
     const GEOMETRY: [&str; 6] = [
         "PixelFormat",
         "Binning",
@@ -486,7 +488,11 @@ pub fn order_key(feature: &str, target: Option<&str>) -> (u8, u8, String) {
                 .position(|prefix| feature.starts_with(prefix))
                 .unwrap_or(GEOMETRY.len())
         };
-        return (0, rank as u8, feature.into());
+        return (
+            0,
+            u8::try_from(rank).expect("the geometry ordering has at most seven positions"),
+            feature,
+        );
     }
     let switch = matches!(feature, "TriggerMode" | "LineMode") || feature.ends_with("Enable");
     let group = if feature.ends_with("Selector") {
@@ -504,11 +510,11 @@ pub fn order_key(feature: &str, target: Option<&str>) -> (u8, u8, String) {
     } else {
         3
     };
-    (group, 0, feature.into())
+    (group, 0, feature)
 }
 
 /// Sort values into apply order.
-pub fn sort_values(values: &mut [SetupValue]) {
+pub(crate) fn sort_values(values: &mut [SetupValue]) {
     values.sort_by(|a, b| {
         order_key(&a.feature, Some(&a.value.text()))
             .cmp(&order_key(&b.feature, Some(&b.value.text())))
@@ -518,7 +524,7 @@ pub fn sort_values(values: &mut [SetupValue]) {
 
 /// Setup names make their file names, so they avoid names some file
 /// systems reserve.
-pub fn validate_name(name: &str) -> Result<()> {
+pub(crate) fn validate_name(name: &str) -> Result<()> {
     const RULE: &str = "Preset names are 1-64 letters, digits, '.', '-' and '_', cannot start or end with '.', and cannot be a reserved Windows name such as con or nul";
     // The character set first: the reserved-name check below slices bytes.
     ensure!(
@@ -545,7 +551,7 @@ pub fn validate_name(name: &str) -> Result<()> {
 }
 
 /// Check a setup note: bounded, on one line, with no terminal escapes.
-pub fn validate_note(note: &str) -> Result<()> {
+pub(crate) fn validate_note(note: &str) -> Result<()> {
     ensure!(
         note.chars().count() <= MAX_NOTE,
         "a preset note is at most {MAX_NOTE} characters"
@@ -585,7 +591,7 @@ fn validate_bank(feature: &str, bank: &Bank) -> Result<()> {
 
 /// Check a setup without a camera: limits, names and values. Node kinds are
 /// checked by the camera worker.
-pub fn validate(setup: &Setup) -> Result<()> {
+pub(crate) fn validate(setup: &Setup) -> Result<()> {
     check_version(setup.version.into())?;
     validate_name(&setup.name)?;
     if let Some(note) = &setup.note {
@@ -679,7 +685,7 @@ fn stored_bytes(setup: &Setup) -> Result<Vec<u8>> {
 
 /// A document version this Capturefab cannot read.
 #[derive(Debug)]
-pub struct NewerVersion(pub u64);
+pub(crate) struct NewerVersion(pub u64);
 impl std::fmt::Display for NewerVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -705,7 +711,7 @@ fn check_version(version: u64) -> Result<()> {
 /// Parse a preset document strictly and validate it. Only the document
 /// itself: the `--json` output of `preset show`, which wraps it in a
 /// result, is refused.
-pub fn parse(bytes: &[u8]) -> Result<Setup> {
+pub(crate) fn parse(bytes: &[u8]) -> Result<Setup> {
     ensure!(
         bytes.len() <= MAX_SETUP_BYTES,
         "a preset is at most 256 KiB"
@@ -716,7 +722,7 @@ pub fn parse(bytes: &[u8]) -> Result<Setup> {
 
 /// A preset document, checked strictly and validated. A newer version is
 /// reported as such before any field it may have added.
-pub fn from_value(value: serde_json::Value) -> Result<Setup> {
+pub(crate) fn from_value(value: serde_json::Value) -> Result<Setup> {
     let setup = document(value)?;
     validate(&setup)?;
     Ok(setup)
@@ -732,21 +738,19 @@ fn document(document: serde_json::Value) -> Result<Setup> {
 
 /// Deserialize an inline `setup` field, as `from_value` reads it. The
 /// command's `validate` checks its values.
-pub fn deserialize_inline<'de, D>(deserializer: D) -> Result<Option<Setup>, D::Error>
+pub(crate) fn deserialize_inline<'de, D>(deserializer: D) -> Result<Option<Setup>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::de::Error;
-    match Option::<serde_json::Value>::deserialize(deserializer)? {
-        None => Ok(None),
-        Some(value) => document(value)
-            .map(Some)
-            .map_err(|error| D::Error::custom(format!("{error:#}"))),
-    }
+    use serde::de::Error as _;
+    Option::<serde_json::Value>::deserialize(deserializer)?
+        .map(document)
+        .transpose()
+        .map_err(|error| D::Error::custom(format!("{error:#}")))
 }
 
 /// Read and validate a setup file, reading at most `MAX_SETUP_BYTES`.
-pub fn read_file(path: &Path) -> Result<Setup> {
+pub(crate) fn read_file(path: &Path) -> Result<Setup> {
     parse(&read_bytes(path)?).with_context(|| format!("read preset {}", path.display()))
 }
 
@@ -773,13 +777,14 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>> {
 
 /// The file name alone, for messages: the folder is shown elsewhere.
 fn file_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string())
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
 }
 
 /// Build a setup from what a camera worker read. Values go in apply order.
-pub fn from_read(name: &str, note: Option<String>, mut reading: Reading) -> Result<Setup> {
+pub(crate) fn from_read(name: &str, note: Option<String>, mut reading: Reading) -> Result<Setup> {
     validate_name(name)?;
     if reading.values.is_empty() {
         return Err(Categorized::error(
@@ -872,13 +877,16 @@ fn fit_skipped(setup: &mut Setup, mut dropped: usize) -> Result<()> {
 fn closest<'a>(name: &str, names: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
     names
         .into_iter()
-        .filter(|candidate| crate::hint::is_close(name, candidate))
-        .min_by_key(|candidate| crate::hint::edit_distance(name, candidate))
+        .filter_map(|candidate| {
+            crate::hint::close_distance(name, candidate).map(|distance| (distance, candidate))
+        })
+        .min_by_key(|(distance, _)| *distance)
+        .map(|(_, candidate)| candidate)
 }
 
 /// A setup name was taken and `replace` was not given.
 #[derive(Debug)]
-pub struct NameTaken {
+pub(crate) struct NameTaken {
     /// The saved setup's name, or the requested one when its file cannot
     /// be read or holds another setup.
     pub name: String,
@@ -921,12 +929,14 @@ impl std::fmt::Display for Misnamed {
 impl std::error::Error for Misnamed {}
 
 fn newer(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| cause.is::<NewerVersion>())
+    error
+        .chain()
+        .any(<dyn std::error::Error + 'static>::is::<NewerVersion>)
 }
 
 /// What `Store::remove` deleted.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Removed {
+pub(crate) struct Removed {
     /// The setup's name, or the file's when it could not be read.
     pub name: String,
     pub readable: bool,
@@ -939,27 +949,27 @@ fn stem(path: &Path) -> Option<&str> {
 }
 
 /// The presets folder: one `<lowercase name>.json` per preset.
-pub struct Store {
+pub(crate) struct Store {
     dir: PathBuf,
 }
 impl Store {
     /// The store in this user's state directory.
     /// Without a state folder there are no presets: a typed error names
     /// the variable that gives them one.
-    pub fn session() -> Result<Self> {
+    pub(crate) fn session() -> Result<Self> {
         Ok(Self::at(crate::dirs::state()?.join("presets")))
     }
-    pub fn at(dir: impl Into<PathBuf>) -> Self {
+    pub(crate) fn at(dir: impl Into<PathBuf>) -> Self {
         Self { dir: dir.into() }
     }
-    pub fn dir(&self) -> &Path {
+    pub(crate) fn dir(&self) -> &Path {
         &self.dir
     }
     fn path(&self, name: &str) -> PathBuf {
         self.dir.join(format!("{}.json", name.to_ascii_lowercase()))
     }
     fn lock(&self) -> Result<fs::File> {
-        use fs2::FileExt;
+        use fs2::FileExt as _;
         crate::dirs::ensure_private_dir(&self.dir)?;
         let lock = fs::OpenOptions::new()
             .create(true)
@@ -991,7 +1001,7 @@ impl Store {
     /// a setup named differently from its file, is listed with a `status`
     /// and `reason` under its file name, so it can be deleted. Files whose
     /// names no setup could have are not setups and are left out.
-    pub fn list(&self) -> Result<Vec<Summary>> {
+    pub(crate) fn list(&self) -> Result<Vec<Summary>> {
         let mut summaries = Vec::new();
         for path in self.files()? {
             let Some(name) = stem(&path) else {
@@ -1020,7 +1030,7 @@ impl Store {
                 }
             });
         }
-        summaries.sort_by_key(|summary| summary.name.to_ascii_lowercase());
+        summaries.sort_by_cached_key(|summary| summary.name.to_ascii_lowercase());
         Ok(summaries)
     }
     /// The setup in `path`, which `get(name)` opens, refusing one that is
@@ -1046,18 +1056,18 @@ impl Store {
         Ok(setup)
     }
     /// The saved setup, or an `unavailable` error suggesting a close name.
-    pub fn get(&self, name: &str) -> Result<Setup> {
+    pub(crate) fn get(&self, name: &str) -> Result<Setup> {
         validate_name(name)?;
         let path = self.path(name);
         if !path.exists() {
             return Err(self.missing(name));
         }
         self.read_named(&path, name)
-            .map_err(|error| self.unusable(name, &path, error))
+            .map_err(|error| Self::unusable(name, &path, &error))
     }
     /// Why a saved setup's file cannot be used, and what to do about it.
-    fn unusable(&self, name: &str, path: &Path, error: anyhow::Error) -> anyhow::Error {
-        if newer(&error) {
+    fn unusable(name: &str, path: &Path, error: &anyhow::Error) -> anyhow::Error {
+        if newer(error) {
             return Categorized::error(
                 ErrorKind::Unsupported,
                 format!(
@@ -1067,16 +1077,15 @@ impl Store {
             );
         }
         let quoted = crate::hint::shell_quote(name);
-        let hint = if let Some(misnamed) = error.downcast_ref::<Misnamed>() {
-            format!(
+        let hint = error.downcast_ref::<Misnamed>().map_or_else(
+            || format!(
+                "{error:#}. Save the camera again with: capturefab preset save {quoted} -c ID --replace, or remove it with: capturefab preset rm {quoted}"
+            ),
+            |misnamed| format!(
                 "{misnamed}. Save it under this name with: capturefab preset import {} --name {quoted} --replace, or remove the copy with: capturefab preset rm {quoted}",
                 crate::hint::shell_quote(&path.display().to_string())
-            )
-        } else {
-            format!(
-                "{error:#}. Save the camera again with: capturefab preset save {quoted} -c ID --replace, or remove it with: capturefab preset rm {quoted}"
-            )
-        };
+            ),
+        );
         Categorized::error(
             ErrorKind::Unavailable,
             format!("Preset {name} cannot be read: {hint}"),
@@ -1095,7 +1104,7 @@ impl Store {
     /// Whether `name` can be saved: refuses a taken name unless `replace`,
     /// and a new name when the store is full. `save` checks again under
     /// its lock; this lets a command refuse before reading a camera.
-    pub fn check_free(&self, name: &str, replace: bool) -> Result<()> {
+    pub(crate) fn check_free(&self, name: &str, replace: bool) -> Result<()> {
         let path = self.path(name);
         if path.exists() {
             if !replace {
@@ -1129,15 +1138,15 @@ impl Store {
     }
     /// Save `setup`, refusing an existing name unless `replace`. Returns
     /// the file written.
-    pub fn save(&self, setup: &Setup, replace: bool) -> Result<PathBuf> {
+    pub(crate) fn save(&self, setup: &Setup, replace: bool) -> Result<PathBuf> {
         validate(setup)?;
         let _lock = self.lock()?;
         self.check_free(&setup.name, replace)?;
         let path = self.path(&setup.name);
-        self.write(&path, setup)?;
+        Self::write(&path, setup)?;
         Ok(path)
     }
-    fn write(&self, path: &Path, setup: &Setup) -> Result<()> {
+    fn write(path: &Path, setup: &Setup) -> Result<()> {
         let bytes = stored_bytes(setup)?;
         ensure!(
             bytes.len() <= MAX_SETUP_BYTES,
@@ -1148,7 +1157,7 @@ impl Store {
     /// Delete a saved setup's file without parsing it, so a damaged or
     /// newer file can be removed too. A file name with capital letters,
     /// which `list` shows as unreadable, is deleted when named exactly.
-    pub fn remove(&self, name: &str) -> Result<Removed> {
+    pub(crate) fn remove(&self, name: &str) -> Result<Removed> {
         validate_name(name)?;
         let _lock = self.lock()?;
         let mut path = self.path(name);
@@ -1170,7 +1179,9 @@ impl Store {
 
 /// Replace a setup name in `apply_setup` or `setup_diff` with the saved
 /// document, so the camera worker never reads the state directory.
-pub fn resolve(command: crate::session::SessionCommand) -> Result<crate::session::SessionCommand> {
+pub(crate) fn resolve(
+    command: crate::session::SessionCommand,
+) -> Result<crate::session::SessionCommand> {
     use crate::session::SessionCommand;
     let load = |name: &Option<String>, setup: Option<Setup>| -> Result<Option<Setup>> {
         match (name, setup) {
@@ -1313,13 +1324,13 @@ mod tests {
             model: model.into(),
             serial: serial.into(),
             address: Some("192.168.1.20".into()),
-            profile: Default::default(),
+            profile: crate::camera_profile::CameraProfile::default(),
         }
     }
-    fn value(feature: &str, value: serde_json::Value) -> SetupValue {
+    fn value(feature: &str, value: &serde_json::Value) -> SetupValue {
         SetupValue {
             feature: feature.into(),
-            value: Scalar::from_value(&value).unwrap(),
+            value: Scalar::from_value(value).unwrap(),
             at: Vec::new(),
         }
     }
@@ -1332,8 +1343,8 @@ mod tests {
             camera: SavedCamera::from_info(&info("Basler", "acA1920-40gm", "23456789")),
             auto: None,
             values: vec![
-                value("Width", serde_json::json!(1920)),
-                value("ExposureTime", serde_json::json!(5000.5)),
+                value("Width", &serde_json::json!(1920)),
+                value("ExposureTime", &serde_json::json!(5000.5)),
             ],
             skipped: Vec::new(),
         }
@@ -1381,7 +1392,7 @@ mod tests {
         assert_eq!(parse(&bytes).unwrap(), setup);
         let mut json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         json["extra"] = serde_json::json!(1);
-        assert!(parse(&serde_json::to_vec(&json).unwrap()).is_err());
+        parse(&serde_json::to_vec(&json).unwrap()).unwrap_err();
         let mut json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         json["version"] = serde_json::json!(2);
         let error = format!(
@@ -1403,7 +1414,7 @@ mod tests {
         ] {
             let mut json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             json["values"][0]["value"] = bad;
-            assert!(parse(&serde_json::to_vec(&json).unwrap()).is_err());
+            parse(&serde_json::to_vec(&json).unwrap()).unwrap_err();
         }
         // Auto mode, saved on: a preset saved with a balance still reads,
         // and is written without it.
@@ -1419,7 +1430,7 @@ mod tests {
         }
         let mut json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         json["auto"] = serde_json::json!({"mode": 1});
-        assert!(parse(&serde_json::to_vec(&json).unwrap()).is_err());
+        parse(&serde_json::to_vec(&json).unwrap()).unwrap_err();
     }
 
     #[test]
@@ -1429,10 +1440,10 @@ mod tests {
             f64::from_bits(4999.8f64.to_bits() + 1),
             1.0 / 3.0,
             1e-300,
-            123456.789,
+            123_456.789,
         ] {
             let mut setup = setup("bench");
-            setup.values[1] = value("ExposureTime", serde_json::json!(float));
+            setup.values[1] = value("ExposureTime", &serde_json::json!(float));
             for bytes in [
                 serde_json::to_vec_pretty(&setup).unwrap(),
                 serde_json::to_vec(&setup).unwrap(),
@@ -1450,7 +1461,7 @@ mod tests {
     fn limits_hold_and_a_maximal_setup_fits_one_request() {
         let mut big = setup("big");
         big.values = (0..MAX_SETUP_VALUES)
-            .map(|i| value(&format!("Feature{i}"), serde_json::json!("x".repeat(400))))
+            .map(|i| value(&format!("Feature{i}"), &serde_json::json!("x".repeat(400))))
             .collect();
         validate(&big).unwrap();
         let line = serde_json::to_vec(&SessionCommand::ApplySetup {
@@ -1461,11 +1472,11 @@ mod tests {
         })
         .unwrap();
         assert!(line.len() < 1024 * 1024);
-        big.values.push(value("One", serde_json::json!(1)));
+        big.values.push(value("One", &serde_json::json!(1)));
         assert!(validate(&big).is_err());
         let mut huge = setup("huge");
         huge.values = (0..MAX_SETUP_VALUES)
-            .map(|i| value(&format!("Feature{i}"), serde_json::json!("x".repeat(1000))))
+            .map(|i| value(&format!("Feature{i}"), &serde_json::json!("x".repeat(1000))))
             .collect();
         assert!(format!("{:#}", validate(&huge).unwrap_err()).contains("256 KiB"));
         let mut note = setup("note");
@@ -1482,7 +1493,7 @@ mod tests {
             "FileAccessLength",
         ] {
             let mut s = setup("bench");
-            s.values.push(value(feature, serde_json::json!(1)));
+            s.values.push(value(feature, &serde_json::json!(1)));
             assert!(validate(&s).is_err(), "{feature}");
         }
         for selector in ["UserSetSelector", "Width", "Gain Selector"] {
@@ -1512,7 +1523,7 @@ mod tests {
             "AcquisitionFrameRateEnable",
             "BlackLevel",
         ]
-        .map(|f| value(f, serde_json::json!(1)));
+        .map(|f| value(f, &serde_json::json!(1)));
         sort_values(&mut values);
         assert_eq!(
             values
@@ -1547,7 +1558,7 @@ mod tests {
             ("CounterEnable", "false"),
             ("LineSelector", "Line1"),
         ]
-        .map(|(f, v)| value(f, serde_json::json!(v)));
+        .map(|(f, v)| value(f, &serde_json::json!(v)));
         sort_values(&mut values);
         assert_eq!(
             values
@@ -1606,7 +1617,7 @@ mod tests {
             model: "RTSP input".into(),
             serial: "0123abcd".into(),
             address: Some("rtsp://user:pass@cam.example:554/live".into()),
-            profile: Default::default(),
+            profile: crate::camera_profile::CameraProfile::default(),
         };
         let saved_rtsp = SavedCamera::from_info(&rtsp);
         let mut other_rtsp = rtsp.clone();
@@ -1638,7 +1649,7 @@ mod tests {
             model: "RTSP input".into(),
             serial: "9f8e7d6c".into(),
             address: Some("rtsp://user:pass@cam.example:554/live".into()),
-            profile: Default::default(),
+            profile: crate::camera_profile::CameraProfile::default(),
         };
         let mut setup = setup("rtsp");
         setup.camera = SavedCamera::from_info(&rtsp);
@@ -1653,12 +1664,12 @@ mod tests {
         ] {
             assert!(!text.contains(secret), "{secret} in {text}");
         }
-        let gige = serde_json::to_string(&setup_with_info(info("A", "B", "C"))).unwrap();
+        let gige = serde_json::to_string(&setup_with_info(&info("A", "B", "C"))).unwrap();
         assert!(!gige.contains("192.168"));
     }
-    fn setup_with_info(info: CameraInfo) -> Setup {
+    fn setup_with_info(info: &CameraInfo) -> Setup {
         Setup {
-            camera: SavedCamera::from_info(&info),
+            camera: SavedCamera::from_info(info),
             ..setup("x")
         }
     }
@@ -1666,12 +1677,12 @@ mod tests {
     #[test]
     fn the_store_saves_lists_replaces_across_case_and_deletes() {
         let store = Store::at(temp("store"));
-        assert!(store.list().unwrap().is_empty());
+        assert_eq!(store.list().unwrap(), [] as [Summary; 0]);
         let path = store.save(&setup("bench"), false).unwrap();
         assert!(path.ends_with("bench.json"));
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
+            use std::os::unix::fs::PermissionsExt as _;
             assert_eq!(
                 fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o600
@@ -1709,7 +1720,7 @@ mod tests {
             "No saved preset named bnch. Did you mean BENCH? See capturefab preset list"
         );
         store.remove("Bench").unwrap();
-        assert!(store.list().unwrap().is_empty());
+        assert_eq!(store.list().unwrap(), [] as [Summary; 0]);
         let names = fs::read_dir(store.dir())
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
@@ -1745,7 +1756,7 @@ mod tests {
         assert_eq!(store.list().unwrap().len(), 2);
         // A directory where the file would go makes the rename fail.
         fs::create_dir(store.dir().join("blocked.json")).unwrap();
-        assert!(store.save(&setup("blocked"), true).is_err());
+        store.save(&setup("blocked"), true).unwrap_err();
         let temps = fs::read_dir(store.dir())
             .unwrap()
             .filter(|e| {
@@ -1775,7 +1786,7 @@ mod tests {
                 .unwrap_err()
                 .is::<NameTaken>()
         );
-        assert!(import(&store, &file, "con", false).is_err());
+        import(&store, &file, "con", false).unwrap_err();
         fs::write(&file, vec![b' '; MAX_SETUP_BYTES + 1]).unwrap();
         assert!(format!("{:#}", read_file(&file).unwrap_err()).contains("256 KiB"));
         let _ = fs::remove_dir_all(&dir);
@@ -1859,7 +1870,7 @@ mod tests {
         );
         assert_eq!(store.remove("FUTURE").unwrap().name, "FUTURE");
         assert_eq!(store.remove("good").unwrap().name, "good");
-        assert!(store.list().unwrap().is_empty());
+        assert_eq!(store.list().unwrap(), [] as [Summary; 0]);
         let missing = store.remove("good").unwrap_err();
         assert_eq!(
             crate::types::error_transport_code(&missing),
@@ -1948,6 +1959,28 @@ mod tests {
     }
 
     #[test]
+    fn printable_reasons_bound_characters_without_splitting_utf8() {
+        for character in ['a', 'é', '像', '🦀', '\n', '\0'] {
+            let visible = if character.is_control() {
+                ' '
+            } else {
+                character
+            };
+            for length in [0, 1, 239, 240, 241, 10_000] {
+                let source = character.to_string().repeat(length);
+                let expected = if length <= 240 {
+                    visible.to_string().repeat(length)
+                } else {
+                    let mut expected = visible.to_string().repeat(239);
+                    expected.push('…');
+                    expected
+                };
+                assert_eq!(printable(&source), expected, "{character:?}, {length}");
+            }
+        }
+    }
+
+    #[test]
     fn reasons_name_files_not_long_paths() {
         let deep = temp("long").join("a".repeat(120)).join("b".repeat(120));
         let store = Store::at(deep.join("presets"));
@@ -1989,7 +2022,7 @@ mod tests {
             let error = format!("{:#}", validate(&note).unwrap_err());
             assert!(error.contains("control characters"), "{bad:?}: {error}");
             assert!(validate_note(bad).is_err());
-            assert!(parse(&serde_json::to_vec(&note).unwrap()).is_err());
+            parse(&serde_json::to_vec(&note).unwrap()).unwrap_err();
         }
         validate_note("Ring light at 60% · überall").unwrap();
     }
@@ -2006,8 +2039,8 @@ mod tests {
         assert_eq!(list[0].status, Some(FileStatus::Unreadable), "{list:?}");
         let reason = list[0].reason.as_deref().unwrap_or_default();
         assert!(reason.contains("control characters"), "{list:?}");
-        assert!(store.get("tabbed").is_err());
-        assert!(read_file(&path).is_err());
+        store.get("tabbed").unwrap_err();
+        read_file(&path).unwrap_err();
         let _ = fs::remove_dir_all(store.dir());
     }
 
@@ -2016,7 +2049,7 @@ mod tests {
         let reading = Reading {
             camera: setup("x").camera,
             auto: None,
-            values: vec![value("Gain", serde_json::json!(1))],
+            values: vec![value("Gain", &serde_json::json!(1))],
             skipped: (0..1500)
                 .map(|i| Skipped {
                     feature: format!("S{i}"),
@@ -2053,7 +2086,7 @@ mod tests {
             values: (0..MAX_SETUP_VALUES)
                 .map(|i| SetupValue {
                     at: banks(),
-                    ..value(&format!("Feature{i}"), serde_json::json!(i))
+                    ..value(&format!("Feature{i}"), &serde_json::json!(i))
                 })
                 .collect(),
             skipped: (0..MAX_SKIPPED)

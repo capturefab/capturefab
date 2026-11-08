@@ -1,12 +1,13 @@
 //! ONVIF Device and Media1 operations used to discover and open a test stream.
 //! This is an integration fixture, not a claim of ONVIF profile conformance.
-//! Operation schemas: https://www.onvif.org/ver10/media/wsdl/media.wsdl and
-//! https://www.onvif.org/ver10/device/wsdl/devicemgmt.wsdl
+//! Operation schemas: <https://www.onvif.org/ver10/media/wsdl/media.wsdl> and
+//! <https://www.onvif.org/ver10/device/wsdl/devicemgmt.wsdl>
 use super::{LatestFrame, ServerOptions, escape};
-use anyhow::{Context, Result, ensure};
-use chrono::{Datelike, Timelike};
+use crate::types::format_uuid;
+use anyhow::{Context as _, Result, ensure};
+use chrono::{Datelike as _, Timelike as _};
 use std::{
-    io::{Read, Write},
+    io::{Read as _, Write as _},
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     sync::{
         Arc,
@@ -47,7 +48,7 @@ struct Service {
     rtsp: String,
     uuid: String,
     scopes: Vec<String>,
-    /// WS-Discovery AppSequence: the start time, and the last message number.
+    /// WS-Discovery `AppSequence`: the start time, and the last message number.
     instance: u64,
     messages: AtomicU64,
     width: u32,
@@ -93,8 +94,8 @@ impl OnvifServer {
             scopes: [
                 "Profile/Streaming".to_owned(),
                 "type/video_encoder".into(),
-                format!("hardware/{}", percent_encode(MODEL)),
-                format!("name/{}", percent_encode(&options.name)),
+                format!("hardware/{}", crate::logins::encode(MODEL)),
+                format!("name/{}", crate::logins::encode(&options.name)),
                 "location/test".into(),
             ]
             .iter()
@@ -106,6 +107,11 @@ impl OnvifServer {
             messages: AtomicU64::new(0),
             width,
             height,
+            #[expect(
+                clippy::cast_sign_loss,
+                clippy::cast_possible_truncation,
+                reason = "the advertised fixture rate retains rounded, saturating float-to-integer conversion"
+            )]
             fps: options.fps.round() as u32,
             bitrate: bitrate_kbps(&options.bitrate),
             address: options.advertise,
@@ -152,7 +158,7 @@ impl OnvifServer {
                                 }));
                             }
                             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                                thread::sleep(Duration::from_millis(10))
+                                thread::sleep(Duration::from_millis(10));
                             }
                             Err(_) => break,
                         }
@@ -209,15 +215,19 @@ impl Drop for OnvifServer {
         }
     }
 }
+#[expect(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    reason = "the clamped fixture bitrate retains Rust's saturating float conversion, including zero for NaN"
+)]
 fn bitrate_kbps(value: &str) -> u32 {
-    let (number, multiplier) = if let Some(value) = value.strip_suffix(['M', 'm']) {
-        (value, 1000.0)
-    } else if let Some(value) = value.strip_suffix(['K', 'k']) {
-        (value, 1.0)
-    } else {
-        (value, 0.001)
-    };
-    (number.parse::<f64>().unwrap_or(4_000_000.0) * multiplier).clamp(1.0, u32::MAX as f64) as u32
+    let (number, multiplier) = value
+        .strip_suffix(['M', 'm'])
+        .map(|value| (value, 1000.0))
+        .or_else(|| value.strip_suffix(['K', 'k']).map(|value| (value, 1.0)))
+        .unwrap_or((value, 0.001));
+    (number.parse::<f64>().unwrap_or(4_000_000.0) * multiplier).clamp(1.0, f64::from(u32::MAX))
+        as u32
 }
 fn uuid() -> Result<String> {
     let mut bytes = [0u8; 16];
@@ -227,17 +237,7 @@ fn uuid() -> Result<String> {
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Ok(format_uuid(&bytes))
 }
-fn format_uuid(bytes: &[u8; 16]) -> String {
-    let h = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    format!(
-        "{}-{}-{}-{}-{}",
-        &h[..8],
-        &h[8..12],
-        &h[12..16],
-        &h[16..20],
-        &h[20..]
-    )
-}
+
 fn discovery_socket(interface: Ipv4Addr) -> Result<UdpSocket> {
     let socket = socket2::Socket::new(
         socket2::Domain::IPV4,
@@ -255,7 +255,7 @@ fn discovery_socket(interface: Ipv4Addr) -> Result<UdpSocket> {
 const MULTICAST: (Ipv4Addr, u16) = (Ipv4Addr::new(239, 255, 255, 250), 3702);
 /// A name-based UUID (RFC 9562 version 8) from SHA-256.
 fn stable_uuid(name: &str) -> String {
-    use sha2::Digest;
+    use sha2::Digest as _;
     let mut bytes: [u8; 16] = sha2::Sha256::digest(name.as_bytes())[..16]
         .try_into()
         .unwrap();
@@ -263,20 +263,7 @@ fn stable_uuid(name: &str) -> String {
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     format_uuid(&bytes)
 }
-/// Percent-encodes everything but RFC 3986 unreserved characters.
-fn percent_encode(value: &str) -> String {
-    value
-        .bytes()
-        .map(|byte| {
-            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-                char::from(byte).to_string()
-            } else {
-                format!("%{byte:02X}")
-            }
-        })
-        .collect()
-}
-/// A WS-Discovery message with the AppSequence header ONVIF Core 7.3 requires.
+/// A WS-Discovery message with the `AppSequence` header ONVIF Core 7.3 requires.
 fn discovery_message(
     s: &Service,
     (addressing, discovery): (&str, &str),
@@ -472,10 +459,7 @@ fn serve(stream: &mut TcpStream, service: &Service) -> Result<()> {
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                continue;
-            }
+                ) => {}
             Err(error) => return Err(error.into()),
         }
     };
@@ -534,10 +518,7 @@ fn serve(stream: &mut TcpStream, service: &Service) -> Result<()> {
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                continue;
-            }
+                ) => {}
             Err(error) => return Err(error.into()),
         }
     }
@@ -574,7 +555,7 @@ fn soap_reply(request: &str, s: &Service) -> (u16, String) {
         let operation = doc
             .descendants()
             .find(|n| n.is_element() && n.tag_name().name() == "Body")
-            .and_then(|body| body.children().find(|n| n.is_element()))
+            .and_then(|body| body.children().find(roxmltree::Node::is_element))
             .ok_or(MALFORMED)?;
         ensure!(
             [Some(DEVICE_NS), Some(MEDIA_NS)].contains(&operation.tag_name().namespace()),
@@ -630,7 +611,15 @@ fn soap_reply(request: &str, s: &Service) -> (u16, String) {
             "GetCapabilities"=>format!("<tds:GetCapabilitiesResponse><tds:Capabilities><tt:Device><tt:XAddr>{endpoint}</tt:XAddr><tt:Network><tt:IPFilter>false</tt:IPFilter><tt:ZeroConfiguration>false</tt:ZeroConfiguration><tt:IPVersion6>false</tt:IPVersion6><tt:DynDNS>false</tt:DynDNS></tt:Network><tt:System><tt:DiscoveryResolve>true</tt:DiscoveryResolve><tt:DiscoveryBye>true</tt:DiscoveryBye><tt:RemoteDiscovery>false</tt:RemoteDiscovery><tt:SystemBackup>false</tt:SystemBackup><tt:SystemLogging>false</tt:SystemLogging><tt:FirmwareUpgrade>false</tt:FirmwareUpgrade><tt:SupportedVersions><tt:Major>2</tt:Major><tt:Minor>0</tt:Minor></tt:SupportedVersions></tt:System><tt:Security><tt:TLS1.1>false</tt:TLS1.1><tt:TLS1.2>false</tt:TLS1.2><tt:OnboardKeyGeneration>false</tt:OnboardKeyGeneration><tt:AccessPolicyConfig>false</tt:AccessPolicyConfig><tt:X.509Token>false</tt:X.509Token><tt:SAMLToken>false</tt:SAMLToken><tt:KerberosToken>false</tt:KerberosToken><tt:RELToken>false</tt:RELToken></tt:Security></tt:Device><tt:Media><tt:XAddr>{media}</tt:XAddr><tt:StreamingCapabilities><tt:RTPMulticast>false</tt:RTPMulticast><tt:RTP_TCP>true</tt:RTP_TCP><tt:RTP_RTSP_TCP>true</tt:RTP_RTSP_TCP></tt:StreamingCapabilities></tt:Media></tds:Capabilities></tds:GetCapabilitiesResponse>"),
             "GetServiceCapabilities" if operation.tag_name().namespace()==Some(MEDIA_NS)=>format!("<trt:GetServiceCapabilitiesResponse>{}</trt:GetServiceCapabilitiesResponse>",media_capabilities()),
             "GetServiceCapabilities"=>format!("<tds:GetServiceCapabilitiesResponse>{}</tds:GetServiceCapabilitiesResponse>",device_capabilities()),
-            "GetScopes"=>format!("<tds:GetScopesResponse>{}</tds:GetScopesResponse>",s.scopes.iter().map(|scope| format!("<tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef><tt:ScopeItem>{}</tt:ScopeItem></tds:Scopes>",escape(scope))).collect::<String>()),
+            "GetScopes" => {
+                use std::fmt::Write as _;
+                let mut body = String::from("<tds:GetScopesResponse>");
+                for scope in &s.scopes {
+                    let _ = write!(body, "<tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef><tt:ScopeItem>{}</tt:ScopeItem></tds:Scopes>", escape(scope));
+                }
+                body.push_str("</tds:GetScopesResponse>");
+                body
+            },
             "GetHostname"=>format!("<tds:GetHostnameResponse><tds:HostnameInformation><tt:FromDHCP>false</tt:FromDHCP><tt:Name>{}</tt:Name></tds:HostnameInformation></tds:GetHostnameResponse>",escape(&s.name)),
             "GetNetworkInterfaces"=>format!("<tds:GetNetworkInterfacesResponse><tds:NetworkInterfaces token=\"simulation\"><tt:Enabled>true</tt:Enabled><tt:Info><tt:Name>simulation</tt:Name><tt:HwAddress>02:00:00:00:00:01</tt:HwAddress><tt:MTU>1500</tt:MTU></tt:Info><tt:IPv4><tt:Enabled>true</tt:Enabled><tt:Config><tt:Manual><tt:Address>{}</tt:Address><tt:PrefixLength>24</tt:PrefixLength></tt:Manual><tt:DHCP>false</tt:DHCP></tt:Config></tt:IPv4></tds:NetworkInterfaces></tds:GetNetworkInterfacesResponse>",s.address),
             "GetNetworkProtocols"=>format!("<tds:GetNetworkProtocolsResponse><tds:NetworkProtocols><tt:Name>HTTP</tt:Name><tt:Enabled>true</tt:Enabled><tt:Port>{}</tt:Port></tds:NetworkProtocols><tds:NetworkProtocols><tt:Name>RTSP</tt:Name><tt:Enabled>true</tt:Enabled><tt:Port>{}</tt:Port></tds:NetworkProtocols></tds:GetNetworkProtocolsResponse>",port(&s.endpoint,80),port(&s.rtsp,554)),
@@ -909,7 +898,7 @@ mod tests {
                 service.endpoint.trim_end_matches("/onvif/device_service")
             ))
         );
-        assert_eq!(&uuid[14..15], "8");
+        assert_eq!(uuid.get(14..15).unwrap(), "8");
         // The probe Capturefab's own discovery sends.
         let reply = discovery_reply(
             &probe("<d:Types>dn:NetworkVideoTransmitter</d:Types>", ""),
@@ -1039,7 +1028,7 @@ mod tests {
             bind: Ipv4Addr::LOCALHOST,
             advertise: Ipv4Addr::LOCALHOST,
             gige_port: None,
-            name: "Camera & test".into(),
+            name: "Camera & test /é".into(),
             fps: 15.0,
             bitrate: "2M".into(),
         };
@@ -1054,11 +1043,14 @@ mod tests {
             stop,
         )
         .unwrap();
+        assert!(server.service.scopes.iter().any(|scope| {
+            scope == "onvif://www.onvif.org/name/Camera%20%26%20test%20%2F%C3%A9"
+        }));
         let profiles =
             crate::onvif::resolve(server.endpoint(), None, None, Duration::from_secs(2)).unwrap();
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].token, "main");
-        assert_eq!(profiles[0].name, "Camera & test");
+        assert_eq!(profiles[0].name, "Camera & test /é");
         assert_eq!(profiles[0].width, Some(640));
         assert_eq!(profiles[0].height, Some(480));
         assert_eq!(profiles[0].uri, "rtsp://127.0.0.1:8554/camera");

@@ -34,7 +34,11 @@ impl RegisterIo for NetworkBackend {
     }
 
     fn write_memory(&mut self, address: u64, bytes: &[u8]) -> Result<()> {
-        self.state.lock().unwrap().calls.push(Call::Write(address));
+        self.state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("test fixture lock is poisoned"))?
+            .calls
+            .push(Call::Write(address));
         self.simulator.write_memory(address, bytes)
     }
 }
@@ -54,7 +58,10 @@ impl Backend for NetworkBackend {
 
     fn start(&mut self, payload: usize) -> Result<()> {
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test fixture lock is poisoned"))?;
             state.calls.push(Call::Start);
             state.starts += 1;
             ensure!(
@@ -71,7 +78,10 @@ impl Backend for NetworkBackend {
 
     fn stop(&mut self) -> Result<()> {
         let fail = {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test fixture lock is poisoned"))?;
             state.calls.push(Call::Stop);
             state.fail_stop
         };
@@ -81,7 +91,10 @@ impl Backend for NetworkBackend {
     }
 
     fn optimize_network(&mut self, _: usize) -> Result<NetworkTuning> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("test fixture lock is poisoned"))?;
         state.calls.push(Call::Optimize);
         ensure!(!state.fail_tuning, "injected tuning failure");
         Ok(NetworkTuning {
@@ -140,7 +153,7 @@ impl Harness {
             next_job: 1,
             scheduled_stream: JobStream::default(),
         };
-        refresh(&harness.handle, &harness.camera);
+        refresh(&harness.handle, harness.camera.as_ref());
         harness.backend.lock().unwrap().calls.clear();
         harness
     }
@@ -148,12 +161,14 @@ impl Harness {
     fn run(&mut self, command: impl Into<WorkerCommand>) -> Result<Value> {
         process_plain(
             &self.handle,
-            &mut self.camera,
-            &mut self.forwarder,
-            &mut self.auto,
-            &mut self.jobs,
-            &mut self.next_job,
-            &mut self.scheduled_stream,
+            CommandState {
+                camera: &mut self.camera,
+                forwarder: &mut self.forwarder,
+                auto: &mut self.auto,
+                jobs: &mut self.jobs,
+                next_job: &mut self.next_job,
+                scheduled_stream: &mut self.scheduled_stream,
+            },
             command.into(),
         )
     }
@@ -318,10 +333,10 @@ fn pending_and_running_capture_jobs_prevent_network_writes() {
                 label: "camera".into(),
                 serial: "unknown".into(),
             },
-            on_exists: Default::default(),
+            on_exists: crate::naming::OnExists::default(),
             next: None,
             shots: 0,
-            free: Default::default(),
+            free: BTreeSet::new(),
             stop_by: None,
             trigger: None,
             unanswered: 0,
@@ -343,10 +358,10 @@ fn pending_and_running_capture_jobs_prevent_network_writes() {
             },
             timeout_ms: 1000,
             format: "png".into(),
-            sync: Default::default(),
+            sync: crate::storage::SyncMode::default(),
             manifest: None,
-            source: Default::default(),
-            folders: Default::default(),
+            source: Source::default(),
+            folders: crate::storage::Folders::default(),
             deadline: None,
             warm: None,
             utc_offset_s: None,
@@ -373,7 +388,7 @@ fn non_gige_camera_is_rejected_before_pausing_or_writing() {
     let mut harness = Harness::new(Transport::Simulator, true);
     let error = harness.optimize().unwrap_err();
     assert!(error.to_string().contains("requires a GigE camera"));
-    assert!(harness.backend.lock().unwrap().calls.is_empty());
+    assert_eq!(harness.backend.lock().unwrap().calls, [] as [Call; 0]);
     assert!(harness.camera.as_ref().unwrap().is_streaming());
 }
 
@@ -396,5 +411,5 @@ fn status_refreshes_live_transport_counters() {
             count
         );
     }
-    assert!(harness.backend.lock().unwrap().calls.is_empty());
+    assert_eq!(harness.backend.lock().unwrap().calls, [] as [Call; 0]);
 }

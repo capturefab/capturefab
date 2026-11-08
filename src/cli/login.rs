@@ -5,24 +5,31 @@ use crate::session::{SessionCommand, SessionHandle};
 use anyhow::Result;
 use clap::Subcommand;
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 use std::time::Duration;
 
-pub const PASSWORD_ENV: &str = "CAPTUREFAB_CAMERA_PASSWORD";
+pub(crate) const PASSWORD_ENV: &str = "CAPTUREFAB_CAMERA_PASSWORD";
 
 #[derive(Debug, Subcommand)]
-pub enum LoginCommand {
+pub(crate) enum LoginCommand {
     /// Check a camera sign-in, then save it in the OS credential store
     #[command(
         after_help = "Examples:\n  printf '%s\\n' \"$PASS\" | capturefab login add rtsp://cam.local/stream --user admin --password-stdin\n  CAPTUREFAB_CAMERA_PASSWORD=secret capturefab login add onvif://cam.local --user admin"
     )]
     Add {
-        /// A credential-free rtsp://, rtsps://, onvif:http://… or onvif://HOST address
+        /// A credential-free `rtsp://`, `rtsps://`, `onvif:http://…` or `onvif://HOST` address
+        #[arg(
+            help = "A credential-free rtsp://, rtsps://, onvif:http://… or onvif://HOST address"
+        )]
         address: String,
         /// Camera user name
         #[arg(long)]
         user: Option<String>,
-        /// Read the password from stdin (an empty line is an empty password); otherwise CAPTUREFAB_CAMERA_PASSWORD
-        #[arg(long)]
+        /// Read the password from stdin (an empty line is an empty password); otherwise `CAPTUREFAB_CAMERA_PASSWORD`
+        #[arg(
+            help = "Read the password from stdin (an empty line is an empty password); otherwise CAPTUREFAB_CAMERA_PASSWORD",
+            long
+        )]
         password_stdin: bool,
         /// Save without connecting to the camera first
         #[arg(long)]
@@ -130,7 +137,7 @@ fn password(stdin: bool) -> Result<zeroize::Zeroizing<String>> {
     Ok(zeroize::Zeroizing::new(value))
 }
 
-pub fn run(global: &Global, command: &LoginCommand) -> Result<Report> {
+pub(crate) fn run(global: &Global, command: &LoginCommand) -> Result<Report> {
     let value = run_with(command, global.session.as_deref(), CHECK_TIMEOUT)?;
     let text = human(command, &value);
     Ok(Report::json(value).text(text))
@@ -195,7 +202,7 @@ fn check(address: &str, login: &CameraLogin, timeout: Duration) -> Result<Value>
     let handle = SessionHandle::new();
     let result = handle.request(SessionCommand::Connect {
         camera: address.to_owned(),
-        timeout_ms: timeout.as_millis().clamp(1, u64::MAX as u128) as u64,
+        timeout_ms: super::millis(timeout).max(1),
         login: Some(login.clone()),
         saved_login: false,
     });
@@ -208,10 +215,10 @@ fn check(address: &str, login: &CameraLogin, timeout: Duration) -> Result<Value>
 }
 
 /// Human-readable output.
-pub fn human(command: &LoginCommand, value: &Value) -> String {
+pub(crate) fn human(command: &LoginCommand, value: &Value) -> String {
     match command {
         LoginCommand::List => {
-            let logins = value["logins"].as_array().cloned().unwrap_or_default();
+            let logins = value["logins"].as_array().map_or(&[][..], Vec::as_slice);
             if logins.is_empty() {
                 return if value["supported"] == true {
                     "No saved camera sign-ins. Add one with `capturefab login add ADDRESS --user USER --password-stdin`.\n".into()
@@ -219,17 +226,17 @@ pub fn human(command: &LoginCommand, value: &Value) -> String {
                     "Saving camera sign-ins is unsupported in this build.\n".into()
                 };
             }
-            logins
-                .iter()
-                .map(|entry| {
-                    format!(
-                        "{}  {}  saved {}\n",
-                        entry["address"].as_str().unwrap_or_default(),
-                        entry["user"].as_str().unwrap_or_default(),
-                        entry["saved_at"].as_str().unwrap_or_default()
-                    )
-                })
-                .collect()
+            let mut text = String::new();
+            for entry in logins {
+                let _ = writeln!(
+                    text,
+                    "{}  {}  saved {}",
+                    entry["address"].as_str().unwrap_or_default(),
+                    entry["user"].as_str().unwrap_or_default(),
+                    entry["saved_at"].as_str().unwrap_or_default()
+                );
+            }
+            text
         }
         LoginCommand::Add { .. } => format!(
             "{} sign-in for {} as {}\n",
@@ -271,6 +278,6 @@ mod tests {
         }
         let onvif = "onvif://cam.local?mode=media";
         assert_eq!(target(onvif, None, timeout).unwrap(), onvif);
-        assert!(target("http://cam.local/x", None, timeout).is_err());
+        target("http://cam.local/x", None, timeout).unwrap_err();
     }
 }

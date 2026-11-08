@@ -1,11 +1,25 @@
 //! `capture -o -`: the image streams from the camera's worker, through a
 //! pipe for a worker of the command or a private file for a session, at any
 //! size, and a reader that goes away ends the command quietly.
+#![deny(clippy::doc_markdown)]
 mod support;
 
 use serde_json::Value;
-use std::{io::Read, process::Stdio};
+use std::{io::Read as _, process::Stdio};
 use support::cli::Home;
+
+#[test]
+fn the_overview_exits_cleanly_when_stdout_is_closed() {
+    let home = Home::new("overview-closed");
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let output = home.command().stdout(Stdio::from(writer)).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
 
 /// A frame far larger than a pipe holds streams whole.
 #[test]
@@ -47,9 +61,7 @@ fn a_session_holding_the_camera_streams_through_a_private_file() {
     // The session's camera, with its settings.
     assert_eq!(run.raw.len(), 320 * 240);
     let out = home.sessions.join("out");
-    let left = std::fs::read_dir(&out)
-        .map(|entries| entries.count())
-        .unwrap_or(0);
+    let left = std::fs::read_dir(&out).map_or(0, Iterator::count);
     assert_eq!(left, 0, "the private file is deleted");
     // A typed --session works too, and a PNG decodes.
     let run = home.run(&["--session", "held", "capture", "-o", "-"]);

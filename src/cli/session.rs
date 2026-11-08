@@ -17,7 +17,7 @@ use std::{
 };
 
 #[derive(Debug, Subcommand)]
-pub enum SessionAction {
+pub(crate) enum SessionAction {
     /// Start a session in the background; it ends after --idle unused
     #[command(
         after_help = "Examples:\n  capturefab session start -c sim:0\n  capturefab session start --name line1 -c gige:00c0df123456 --live --idle 8h"
@@ -49,7 +49,7 @@ pub enum SessionAction {
 }
 
 #[derive(Debug, Args)]
-pub struct StartArgs {
+pub(crate) struct StartArgs {
     /// Session name other commands pass to --session
     #[arg(long, default_value = "default", value_name = "NAME")]
     pub name: String,
@@ -71,16 +71,16 @@ const MAX_LOG: u64 = 10 * 1024 * 1024;
 /// to exit.
 const STOP_WAIT: Duration = Duration::from_secs(30);
 
-pub fn run(global: &Global, action: SessionAction) -> Result<Report> {
+pub(super) fn run(global: &Global, action: SessionAction) -> Result<Report> {
     match action {
-        SessionAction::Start(args) => start(global, args),
+        SessionAction::Start(args) => start(global, &args),
         SessionAction::Stop { name } => stop(global, name),
         SessionAction::Status { name } => status(global, name),
         SessionAction::List => list(),
     }
 }
 
-fn start(global: &Global, args: StartArgs) -> Result<Report> {
+fn start(global: &Global, args: &StartArgs) -> Result<Report> {
     ipc::validate_name(&args.name).map_err(super::input)?;
     if args.idle.is_zero() {
         return Err(Usage("--idle must be longer than 0".into()).into());
@@ -138,7 +138,7 @@ fn start(global: &Global, args: StartArgs) -> Result<Report> {
                 json!({
                     "session": descriptor.name,
                     "pid": descriptor.pid,
-                    "cameras": descriptor.cameras.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+                    "cameras": descriptor.cameras.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
                 }),
                 false,
             )
@@ -261,10 +261,10 @@ pub(super) fn log_path(name: &str) -> Result<PathBuf> {
 }
 /// Where to look for why session `name` failed.
 fn see_log(name: &str) -> String {
-    match log_path(name) {
-        Ok(path) => format!("see {}", path.display()),
-        Err(_) => format!("run capturefab serve --name {name} to see why"),
-    }
+    log_path(name).map_or_else(
+        |_| format!("run capturefab serve --name {name} to see why"),
+        |path| format!("see {}", path.display()),
+    )
 }
 
 /// The session's log, private, with an older one kept once it grows past
@@ -280,7 +280,7 @@ fn open_log(name: &str) -> Result<std::fs::File> {
     options.create(true).append(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
     options
@@ -306,6 +306,21 @@ fn rotate(path: &std::path::Path, most: u64) {
     }
 }
 
+fn read_ready(reader: impl std::io::Read) -> std::io::Result<Vec<u8>> {
+    use std::io::BufRead as _;
+    let mut line = Vec::new();
+    std::io::BufReader::new(reader.take(MAX_READY + 1)).read_until(b'\n', &mut line)?;
+    if !u64::try_from(line.len()).is_ok_and(|length| length <= MAX_READY)
+        || line.last() != Some(&b'\n')
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "session ready line exceeds 64 KiB or is unterminated",
+        ));
+    }
+    Ok(line)
+}
+
 /// Start `serve` as session `name` of its own, detached from this
 /// terminal, holding `cameras` (only as long as `camera_keep` unused, when
 /// given) and ending after `idle` unused, and wait for it to say it is
@@ -317,6 +332,14 @@ fn detach(
     (idle, camera_keep): (Duration, Option<Duration>),
     warnings: &mut Vec<String>,
 ) -> Result<Value> {
+    let attempts = u32::try_from(cameras.len())
+        .ok()
+        .and_then(|count| count.checked_add(1))
+        .context("too many cameras to start a session")?;
+    let wait = CONNECT_TIMEOUT
+        .checked_mul(attempts)
+        .and_then(|wait| wait.checked_add(Duration::from_secs(30)))
+        .context("session startup timeout exceeds the supported duration")?;
     let executable = std::env::var_os("CAPTUREFAB_EXECUTABLE")
         .map(PathBuf::from)
         .map_or_else(std::env::current_exe, Ok)?;
@@ -364,25 +387,16 @@ fn detach(
     // Only the session holds the write end now: a session that dies
     // before it is ready closes the pipe.
     drop(writer);
-    let wait = Duration::from_secs(30) + CONNECT_TIMEOUT * (cameras.len() as u32 + 1);
     let (sent, received) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("capturefab-ready".into())
         .spawn(move || {
-            use std::io::{BufRead, Read};
-            let mut line = Vec::new();
-            let read = std::io::BufReader::new(reader)
-                .take(MAX_READY)
-                .read_until(b'\n', &mut line);
-            let _ = sent.send(read.map(|_| line));
+            let _ = sent.send(read_ready(reader));
         })
         .context("session ready reader")?;
-    let line = match received.recv_timeout(wait) {
-        Ok(read) => read.context("reading the session's ready line")?,
-        Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(Categorized::new(
+    let line = received.recv_timeout(wait).map_or_else(
+        |_| {
+            Err(Categorized::new(
                 ErrorKind::Timeout,
                 format!(
                     "session {name} did not start within {}",
@@ -390,7 +404,16 @@ fn detach(
                 ),
             )
             .hint(see_log(name))
-            .into());
+            .into())
+        },
+        |read| read.context("reading the session's ready line"),
+    );
+    let line = match line {
+        Ok(line) => line,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
         }
     };
     let value = serde_json::from_slice::<Value>(&line).ok();
@@ -401,8 +424,13 @@ fn detach(
             Ok(value)
         }
         Some(value) => {
-            let _ = child.wait();
             let error = &value["error"];
+            if !error["message"].is_string() {
+                // Valid JSON can still be an invalid ready document.
+                // Only a reported failure needs time to shut down its cameras.
+                let _ = child.kill();
+            }
+            let _ = child.wait();
             let tag = serde_json::from_value::<crate::types::ErrorTag>(error.clone()).ok();
             Err(crate::types::error_from_tag(
                 tag,
@@ -413,6 +441,9 @@ fn detach(
             ))
         }
         None => {
+            // An invalid ready document gives us no running session to
+            // keep. Do not wait indefinitely for its sender to exit.
+            let _ = child.kill();
             let status = child.wait().ok();
             Err(Categorized::new(
                 ErrorKind::OperationFailed,
@@ -431,8 +462,9 @@ fn detach(
 
 #[cfg(unix)]
 mod platform {
-    use super::*;
-    use std::os::{fd::AsRawFd, unix::process::CommandExt};
+
+    use super::{Command, Context as _, Result};
+    use std::os::{fd::AsRawFd as _, unix::process::CommandExt as _};
 
     /// Spawn `command` in a new Unix session, out of this terminal's reach,
     /// with `ready` inherited and named by `--ready-fd`.
@@ -443,27 +475,27 @@ mod platform {
     ) -> Result<std::process::Child> {
         let fd = ready.as_raw_fd();
         command.args(["--ready-fd", &fd.to_string()]);
-        // SAFETY: setsid and fcntl are async-signal-safe, as pre_exec
-        // requires; the descriptor is this process's own pipe.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::setsid() < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        let prepare = move || {
+            // SAFETY: setsid takes no arguments and changes only this child.
+            if unsafe { libc::setsid() } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: fd names the readiness pipe kept open through spawn.
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        };
+        // SAFETY: prepare uses only async-signal-safe syscalls and errno reads.
+        unsafe { command.pre_exec(prepare) };
         command.spawn().context("start the session")
     }
 }
 
 #[cfg(windows)]
 mod platform {
-    use super::*;
-    use std::os::windows::{io::AsRawHandle, process::CommandExt};
+    use super::{Command, Context as _, Result};
+    use std::os::windows::{io::AsRawHandle as _, process::CommandExt as _};
 
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
@@ -482,7 +514,7 @@ mod platform {
         use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
         let handle = ready.as_raw_handle();
         // SAFETY: the handle is this process's own pipe end.
-        if unsafe { SetHandleInformation(handle as _, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }
+        if unsafe { SetHandleInformation(handle.cast(), HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }
             == 0
         {
             return Err(std::io::Error::last_os_error()).context("session ready pipe");
@@ -525,20 +557,19 @@ mod platform {
             };
             let mut withheld = Vec::new();
             for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-                // SAFETY: these only read and change whether this process's
-                // own standard handles are inherited.
-                unsafe {
-                    let handle = GetStdHandle(which);
-                    let mut flags = 0;
-                    if !handle.is_null()
-                        && handle != INVALID_HANDLE_VALUE
-                        && !withheld.contains(&handle)
-                        && GetHandleInformation(handle, &mut flags) != 0
-                        && flags & HANDLE_FLAG_INHERIT != 0
-                        && SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) != 0
-                    {
-                        withheld.push(handle);
-                    }
+                // SAFETY: which names one of this process's standard handles.
+                let handle = unsafe { GetStdHandle(which) };
+                let mut flags = 0;
+                if !handle.is_null()
+                    && handle != INVALID_HANDLE_VALUE
+                    && !withheld.contains(&handle)
+                    // SAFETY: handle is valid and flags points to writable local storage.
+                    && unsafe { GetHandleInformation(handle, &raw mut flags) } != 0
+                    && flags & HANDLE_FLAG_INHERIT != 0
+                    // SAFETY: only this process's standard handle inheritance bit is changed.
+                    && unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0
+                {
+                    withheld.push(handle);
                 }
             }
             Self(withheld)
@@ -565,14 +596,12 @@ fn named(global: &Global, name: Option<String>) -> Result<String> {
         return Ok(name);
     }
     let sessions = ipc::sessions();
-    let started = sessions
+    let mut started = sessions
         .iter()
-        .filter(|session| session.name != super::AUTO_SESSION)
-        .collect::<Vec<_>>();
-    match (sessions.as_slice(), started.as_slice()) {
-        ([session], _) => Ok(session.name.clone()),
-        (_, [session]) => Ok(session.name.clone()),
-        ([], _) => Err(
+        .filter(|session| session.name != super::AUTO_SESSION);
+    match (sessions.as_slice(), started.next(), started.next()) {
+        ([session], _, _) | (_, Some(session), None) => Ok(session.name.clone()),
+        ([], _, _) => Err(
             Categorized::new(ErrorKind::SessionNotFound, "no session is running")
                 .hint("start one with capturefab session start -c CAMERA")
                 .into(),
@@ -589,7 +618,7 @@ fn named(global: &Global, name: Option<String>) -> Result<String> {
                     .join(", ")
             ),
         )
-        .details(json!({"sessions": sessions.iter().map(|s| s.name.clone()).collect::<Vec<_>>()}))
+        .details(json!({"sessions": sessions.iter().map(|s| s.name.as_str()).collect::<Vec<_>>()}))
         .into()),
     }
 }
@@ -649,24 +678,30 @@ mod platform_stop {
     /// this system can tell.
     #[cfg(target_os = "linux")]
     fn serves(pid: libc::pid_t, name: &str) -> bool {
-        std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
-            let args = cmdline
-                .split(|byte| *byte == 0)
-                .map(String::from_utf8_lossy)
-                .collect::<Vec<_>>();
-            args.iter().any(|arg| arg == "serve") && args.iter().any(|arg| arg == name)
-        })
+        std::fs::read(format!("/proc/{pid}/cmdline"))
+            .is_ok_and(|cmdline| command_line_is_session(&cmdline, name))
+    }
+    #[cfg(any(test, target_os = "linux"))]
+    fn command_line_is_session(cmdline: &[u8], name: &str) -> bool {
+        // Validated session names are ASCII; argv needs no lossy decoding.
+        let mut args = cmdline.split(|byte| *byte == 0);
+        args.clone().any(|arg| arg == b"serve") && args.any(|arg| arg == name.as_bytes())
     }
     #[cfg(target_os = "macos")]
     fn serves(pid: libc::pid_t, _name: &str) -> bool {
-        let mut path = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        let size = usize::try_from(libc::PROC_PIDPATHINFO_MAXSIZE)
+            .expect("proc_pidpath's fixed buffer size fits usize");
+        let mut path = vec![0u8; size];
+        let capacity = u32::try_from(path.len()).expect("proc_pidpath's fixed buffer fits u32");
         // SAFETY: proc_pidpath writes at most the buffer's length.
-        let length =
-            unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
-        if length <= 0 {
+        let length = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), capacity) };
+        let Ok(length) = usize::try_from(length) else {
+            return false;
+        };
+        if length == 0 {
             return false;
         }
-        path.truncate(length as usize);
+        path.truncate(length);
         let theirs = std::path::PathBuf::from(String::from_utf8_lossy(&path).into_owned());
         std::env::current_exe().is_ok_and(|ours| theirs.file_name() == ours.file_name())
     }
@@ -675,8 +710,27 @@ mod platform_stop {
         true
     }
     #[cfg(not(unix))]
-    pub(super) fn terminate(_name: &str, _pid: u32) -> bool {
+    pub(super) const fn terminate(_name: &str, _pid: u32) -> bool {
         false
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn session_arguments_are_whole_nul_separated_words() {
+            for (cmdline, expected) in [
+                (&b"capturefab\0serve\0--session\0bench\0"[..], true),
+                (&b"capturefab\0serve\0bench"[..], true),
+                (&b"capturefab\0serve\0bench-extra\0"[..], false),
+                (&b"capturefab\0preserve\0bench\0"[..], false),
+                (&b"capturefab\0serve bench\0"[..], false),
+                (&b"capturefab\0serve\0\xffbench\0"[..], false),
+                (&b"capturefab\0\xff\0serve\0bench\0"[..], true),
+                (&b""[..], false),
+            ] {
+                assert_eq!(super::command_line_is_session(cmdline, "bench"), expected);
+            }
+        }
     }
 }
 
@@ -710,7 +764,7 @@ fn status(global: &Global, name: Option<String>) -> Result<Report> {
             camera["state"].as_str().unwrap_or_default(),
             camera["error"]["message"]
                 .as_str()
-                .or(camera["last_error"].as_str())
+                .or_else(|| camera["last_error"].as_str())
                 .map(|error| format!("  last error: {error}"))
                 .unwrap_or_default()
         );
@@ -805,7 +859,7 @@ fn list() -> Result<Report> {
                 "session": descriptor.name,
                 "pid": descriptor.pid,
                 "uptime_s": uptime(&descriptor),
-                "cameras": descriptor.cameras.iter().map(|camera| camera.id.clone()).collect::<Vec<_>>(),
+                "cameras": descriptor.cameras.iter().map(|camera| camera.id.as_str()).collect::<Vec<_>>(),
             })
         })
         .collect::<Vec<_>>();
@@ -834,7 +888,7 @@ fn list() -> Result<Report> {
 }
 
 /// Result fields, for `schema`.
-pub const START_FIELDS: &[(&str, &str)] = &[
+pub(super) const START_FIELDS: &[(&str, &str)] = &[
     ("session", "string — its name, for --session"),
     ("pid", "int"),
     ("cameras", "[string] — camera IDs it holds"),
@@ -842,12 +896,12 @@ pub const START_FIELDS: &[(&str, &str)] = &[
     ("log", "string — where its output goes"),
     ("warnings", "[string]"),
 ];
-pub const STOP_FIELDS: &[(&str, &str)] = &[
+pub(super) const STOP_FIELDS: &[(&str, &str)] = &[
     ("session", "string"),
     ("pid", "int"),
     ("stopped", "bool — true once the process has exited"),
 ];
-pub const STATUS_FIELDS: &[(&str, &str)] = &[
+pub(super) const STATUS_FIELDS: &[(&str, &str)] = &[
     ("session", "string"),
     ("pid", "int"),
     ("uptime_s", "int"),
@@ -856,9 +910,9 @@ pub const STATUS_FIELDS: &[(&str, &str)] = &[
         "[{id,state:idle|streaming|recording|error,error?:{code,message,hint?,details?:{exit?,signal?,stderr_tail?}},last_error?,config_state?:unknown,frames?,dropped?,lost?,incomplete?,resent?,fps?,jobs:[job]}] — job as jobs lists it; fps: the rate frames arrive at while it streams, by the camera's clock where it stamps them; error: the camera's worker exited (code worker_crashed, with its exit status or signal and last lines of stderr) or did not answer, and the next command on the camera starts another; last_error: the worker's last logged error; lost: frames lost on the way, incomplete: frames the transport received incomplete, resent: packets the camera sent again, where it can tell; config_state unknown: it exited during a settings change, until settings are written again",
     ),
 ];
-pub const LIST_FIELDS: &[(&str, &str)] =
+pub(super) const LIST_FIELDS: &[(&str, &str)] =
     &[("sessions", "[{session,pid,uptime_s,cameras:[string]}]")];
-pub const SERVE_FIELDS: &[(&str, &str)] = &[
+pub(super) const SERVE_FIELDS: &[(&str, &str)] = &[
     ("session", "string — its name, for --session"),
     ("pid", "int"),
     ("cameras", "[string] — camera IDs it holds"),
@@ -868,7 +922,28 @@ pub const SERVE_FIELDS: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::Write as _;
+
+    #[test]
+    fn ready_messages_must_end_within_the_limit() {
+        let limit = usize::try_from(MAX_READY).unwrap();
+        let mut message = br#"{"session":"bench"}"#.to_vec();
+        message.resize(limit - 1, b' ');
+        message.push(b'\n');
+        assert_eq!(read_ready(message.as_slice()).unwrap(), message);
+        message.pop();
+        assert_eq!(
+            read_ready(message.as_slice()).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        message.extend_from_slice(b"garbage after the limit\n");
+        let mut reader = std::io::Cursor::new(message);
+        assert_eq!(
+            read_ready(&mut reader).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(reader.position(), MAX_READY + 1);
+    }
 
     #[test]
     fn a_running_sessions_log_is_rotated_under_its_writers() {

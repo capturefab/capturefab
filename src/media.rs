@@ -1,9 +1,9 @@
-//! FFmpeg-backed media inputs and bounded frame forwarding. The optional FFmpeg
+//! `FFmpeg`-backed media inputs and bounded frame forwarding. The optional `FFmpeg`
 //! executable is compressed at build time and extracted into a private
 //! directory that later processes reuse (`bundled`). No shell is involved in
 //! launching decoders or encoders.
 mod bundled;
-pub mod copy;
+pub(crate) mod copy;
 mod encoders;
 pub(crate) mod hwdec;
 mod learned;
@@ -20,11 +20,12 @@ mod v4l2;
 use crate::types::{
     Backend, CameraInfo, Categorized, ErrorKind, Frame, RGB8, RegisterIo, Transport,
 };
-use anyhow::{Context, Result, anyhow, bail, ensure};
-pub use copy::StreamCopy;
-pub use encoders::*;
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
+pub(crate) use copy::StreamCopy;
+pub(crate) use encoders::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::fmt::Write as _;
 use std::{
     cmp::Reverse,
     collections::{HashSet, VecDeque},
@@ -39,9 +40,9 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-pub use url::*;
+pub(crate) use url::*;
 
-/// The FFmpeg build.rs embedded, compressed; empty when the build has none.
+/// The `FFmpeg` build.rs embedded, compressed; empty when the build has none.
 const EMBEDDED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/capturefab-ffmpeg.bin"));
 const LICENSE: &str = include_str!(concat!(env!("OUT_DIR"), "/capturefab-ffmpeg-license.txt"));
 const MAX_FRAME: usize = 256 * 1024 * 1024;
@@ -59,19 +60,19 @@ pub(crate) struct Executable {
 impl Executable {
     /// One whose probes this process alone remembers.
     #[cfg(all(test, unix))]
-    fn external(path: PathBuf) -> Self {
+    const fn external(path: PathBuf) -> Self {
         Self {
             path,
             probes: None,
             _in_use: None,
         }
     }
-    /// An FFmpeg installed outside the cache, whose probes are kept in the
+    /// An `FFmpeg` installed outside the cache, whose probes are kept in the
     /// cache for its build and the boot, as the bundled copy's are: under
     /// its path, size and time, which an upgrade changes.
     fn installed(path: PathBuf) -> Self {
         let probes = fs::metadata(&path).ok().and_then(|meta| {
-            use sha2::{Digest, Sha256};
+            use sha2::{Digest as _, Sha256};
             let modified = meta
                 .modified()
                 .ok()?
@@ -81,12 +82,7 @@ impl Executable {
             hash.update(path.as_os_str().as_encoded_bytes());
             hash.update(meta.len().to_le_bytes());
             hash.update(modified.as_nanos().to_le_bytes());
-            let name = hash
-                .finalize()
-                .iter()
-                .take(8)
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
+            let name = crate::types::hex(&hash.finalize()[..8]);
             Some(
                 crate::dirs::cache()?
                     .join("probes")
@@ -107,7 +103,7 @@ const FFMPEG_NAME: &str = if cfg!(windows) {
 };
 #[cfg(test)]
 thread_local! {
-    /// A stand-in FFmpeg for the current test thread.
+    /// A stand-in `FFmpeg` for the current test thread.
     static FAKE_FFMPEG: std::cell::RefCell<Option<Arc<Executable>>> =
         const { std::cell::RefCell::new(None) };
     /// The stand-in writes raw video as it describes it, rather than PPM.
@@ -116,11 +112,11 @@ thread_local! {
     static PUSH_RACE: std::cell::Cell<Option<fn(&WriterQueue)>> =
         const { std::cell::Cell::new(None) };
 }
-/// Where the FFmpeg this process runs comes from, in the order they are
+/// Where the `FFmpeg` this process runs comes from, in the order they are
 /// tried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FfmpegSource {
-    /// CAPTUREFAB_FFMPEG names it.
+    /// `CAPTUREFAB_FFMPEG` names it.
     Override,
     /// Built into this executable, and extracted to the cache on first use.
     Bundled,
@@ -130,7 +126,7 @@ pub(crate) enum FfmpegSource {
     Path,
 }
 impl FfmpegSource {
-    pub(crate) fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Override => "CAPTUREFAB_FFMPEG",
             Self::Bundled => "bundled",
@@ -139,7 +135,7 @@ impl FfmpegSource {
         }
     }
 }
-/// The FFmpeg to run: CAPTUREFAB_FFMPEG, else the one built in, else one
+/// The `FFmpeg` to run: `CAPTUREFAB_FFMPEG`, else the one built in, else one
 /// beside this executable, else one on PATH. None of them is `ffmpeg_missing`.
 pub(crate) fn executable() -> Result<Arc<Executable>> {
     resolve().map(|(exe, _)| exe)
@@ -173,7 +169,7 @@ fn resolve() -> Result<(Arc<Executable>, FfmpegSource)> {
         (None, _) => Err(ffmpeg_missing()),
     }
 }
-/// The FFmpeg `setting` (CAPTUREFAB_FFMPEG) names. Empty, as an
+/// The `FFmpeg` `setting` (`CAPTUREFAB_FFMPEG`) names. Empty, as an
 /// `Environment=` or `-e` line that names it leaves it, is unset, as for
 /// the folder variables; a relative path would run whatever the working
 /// folder holds.
@@ -204,7 +200,7 @@ fn ffmpeg_missing() -> anyhow::Error {
     ))
     .into()
 }
-/// An FFmpeg installed beside the executable, in `beside`, or else in a
+/// An `FFmpeg` installed beside the executable, in `beside`, or else in a
 /// folder of `path` (PATH). Relative PATH entries are skipped: they would
 /// run whatever the working folder holds.
 fn installed(
@@ -217,7 +213,7 @@ fn installed(
         };
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
+            use std::os::unix::fs::PermissionsExt as _;
             meta.is_file() && meta.permissions().mode() & 0o111 != 0
         }
         #[cfg(not(unix))]
@@ -234,11 +230,11 @@ fn installed(
         .find(|file| runnable(file))
         .map(|file| (file, FfmpegSource::Path))
 }
-/// Whether this build has FFmpeg built in.
-pub(crate) fn bundled() -> bool {
+/// Whether this build has `FFmpeg` built in.
+pub(crate) const fn bundled() -> bool {
     !EMBEDDED.is_empty()
 }
-/// What to do about a missing FFmpeg, on this OS.
+/// What to do about a missing `FFmpeg`, on this OS.
 pub(crate) fn ffmpeg_hint() -> String {
     let install = if cfg!(target_os = "macos") {
         "`brew install ffmpeg`"
@@ -258,7 +254,7 @@ fn new_private_file(path: &std::path::Path, executable: bool) -> Result<fs::File
     options.create_new(true).write(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(if executable { 0o700 } else { 0o600 });
     }
     #[cfg(not(unix))]
@@ -271,7 +267,7 @@ fn nonce() -> Result<String> {
 fn cores() -> usize {
     crate::host::threads(crate::host::cpus())
 }
-/// FFmpeg's default frame threading runs cores + 1 threads per stream, each
+/// `FFmpeg`'s default frame threading runs cores + 1 threads per stream, each
 /// holding frames and adding latency.
 fn decoder_threads(cores: usize) -> usize {
     cores.clamp(1, 4)
@@ -280,7 +276,7 @@ fn decoder_threads(cores: usize) -> usize {
 /// core rises.
 fn x264_preset(width: u32, height: u32, fps: f64, cores: usize) -> &'static str {
     const PRESETS: [&str; 3] = ["veryfast", "superfast", "ultrafast"];
-    let per_core = width as f64 * height as f64 * fps / cores.max(1) as f64;
+    let per_core = f64::from(width) * f64::from(height) * fps / cores.max(1) as f64;
     let step = if per_core <= 12e6 {
         0
     } else if per_core <= 24e6 {
@@ -290,10 +286,10 @@ fn x264_preset(width: u32, height: u32, fps: f64, cores: usize) -> &'static str 
     };
     PRESETS[step]
 }
-/// Context for a decoder whose FFmpeg could not be extracted or started,
-/// unlike a source FFmpeg reached and failed on. Callers test for it with
+/// Context for a decoder whose `FFmpeg` could not be extracted or started,
+/// unlike a source `FFmpeg` reached and failed on. Callers test for it with
 /// `error.downcast_ref::<FfmpegUnavailable>()`, never by message text:
-/// explained source failures quote FFmpeg's log too.
+/// explained source failures quote `FFmpeg`'s log too.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FfmpegUnavailable;
 impl std::fmt::Display for FfmpegUnavailable {
@@ -305,8 +301,8 @@ pub(crate) fn command(exe: &Executable) -> Command {
     let mut cmd = Command::new(&exe.path);
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
+        use std::os::windows::process::CommandExt as _;
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
     }
     cmd.stdin(Stdio::null());
     cmd
@@ -315,7 +311,7 @@ fn bounded_output(exe: &Executable, args: &[String], timeout: Duration) -> Resul
     let (success, output, _) = timed_output(exe, args, &[], timeout)?;
     Ok((success, output))
 }
-/// Run FFmpeg with a deadline, feeding it `input` when there is any:
+/// Run `FFmpeg` with a deadline, feeding it `input` when there is any:
 /// whether it succeeded, what it wrote, and whether it ended without an
 /// answer, because it ran past `timeout` or something outside it, such as
 /// a memory limit's out-of-memory killer, stopped it ([`stopped_from_outside`]).
@@ -387,7 +383,7 @@ fn timed_output(
 fn stopped_from_outside(status: std::process::ExitStatus) -> bool {
     #[cfg(unix)]
     {
-        use std::os::unix::process::ExitStatusExt;
+        use std::os::unix::process::ExitStatusExt as _;
         matches!(
             status.signal(),
             Some(libc::SIGKILL | libc::SIGTERM | libc::SIGINT | libc::SIGHUP)
@@ -399,23 +395,23 @@ fn stopped_from_outside(status: std::process::ExitStatus) -> bool {
         false
     }
 }
-/// The bundled FFmpeg's license notice, with the license texts it is
+/// The bundled `FFmpeg`'s license notice, with the license texts it is
 /// distributed under.
-pub(crate) fn license_notice() -> &'static str {
+pub(crate) const fn license_notice() -> &'static str {
     LICENSE
 }
-/// Which FFmpeg this process would run, and whether it starts.
+/// Which `FFmpeg` this process would run, and whether it starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FfmpegHealth {
     /// Where it was found: [`FfmpegSource::name`].
     pub source: &'static str,
     pub path: String,
-    /// FFmpeg's first `-version` line, such as `ffmpeg version 7.1 ...`.
+    /// `FFmpeg`'s first `-version` line, such as `ffmpeg version 7.1 ...`.
     pub version: String,
-    /// Why the bundled FFmpeg is not the one used, when this build has one.
+    /// Why the bundled `FFmpeg` is not the one used, when this build has one.
     pub bundled_error: Option<String>,
 }
-/// Run FFmpeg's `-version` with a 3 s deadline, for `doctor`. Extracting
+/// Run `FFmpeg`'s `-version` with a 3 s deadline, for `doctor`. Extracting
 /// the bundled copy goes to the cache directory, as for any first use.
 pub(crate) fn ffmpeg_health() -> Result<FfmpegHealth> {
     let (exe, source) = resolve()?;
@@ -442,7 +438,14 @@ pub(crate) fn ffmpeg_health() -> Result<FfmpegHealth> {
     })
 }
 
-pub fn native_devices_with_timeout(timeout: Duration) -> Result<Value> {
+#[cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "macOS and Windows discovery runs FFmpeg and can fail; the platform interface shares one result contract"
+    )
+)]
+pub(crate) fn native_devices_with_timeout(timeout: Duration) -> Result<Value> {
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     let _ = timeout;
     #[cfg(target_os = "linux")]
@@ -451,7 +454,7 @@ pub fn native_devices_with_timeout(timeout: Duration) -> Result<Value> {
         let devices = v4l2_devices(std::path::Path::new("/sys/class/video4linux"), |path| {
             captures_by(deadline, path, v4l2::captures_video)
         });
-        return Ok(json!({"platform":"linux","devices":devices}));
+        Ok(json!({"platform":"linux","devices":devices}))
     }
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
@@ -474,7 +477,7 @@ pub fn native_devices_with_timeout(timeout: Duration) -> Result<Value> {
                 "dummy"
             },
         ]
-        .map(str::to_string);
+        .map(str::to_owned);
         let (_, listing, timed_out) = timed_output(&exe, &args, &[], timeout)?;
         ensure!(
             !timed_out,
@@ -490,12 +493,14 @@ pub fn native_devices_with_timeout(timeout: Duration) -> Result<Value> {
         } else {
             dshow_devices(&listing)
         };
-        return Ok(json!({"platform":std::env::consts::OS,"devices":devices,"diagnostic":listing}));
+        Ok(json!({"platform":std::env::consts::OS,"devices":devices,"diagnostic":listing}))
     }
-    #[allow(unreachable_code)]
-    Err(anyhow!(
-        "native camera enumeration is supported on macOS, Linux and Windows"
-    ))
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        Err(anyhow!(
+            "native camera enumeration is supported on macOS, Linux and Windows"
+        ))
+    }
 }
 /// The video capture nodes in the `video4linux` sysfs class, in node order.
 /// The class also holds UVC metadata, codec, ISP, subdevice, VBI and radio
@@ -514,7 +519,7 @@ fn v4l2_devices(
             node.starts_with("video") && captures(std::path::Path::new(&format!("/dev/{node}")))
         })
         .collect::<Vec<_>>();
-    nodes.sort_by_key(|node| (node.len(), node.clone()));
+    nodes.sort_by(|left, right| (left.len(), left).cmp(&(right.len(), right)));
     nodes
         .into_iter()
         .map(|node| {
@@ -550,7 +555,7 @@ fn avfoundation_devices(listing: &str) -> Vec<Value> {
             video = true;
         } else if video
             && let Some(device) = line.match_indices('[').find_map(|(start, _)| {
-                let (index, name) = line[start + 1..].split_once("] ")?;
+                let (index, name) = line.get(start + 1..)?.split_once("] ")?;
                 index
                     .parse::<u32>()
                     .is_ok()
@@ -584,12 +589,12 @@ fn avfoundation_devices(listing: &str) -> Vec<Value> {
         .collect()
 }
 
-/// The video input devices in FFmpeg's DirectShow listing. FFmpeg lists the
+/// The video input devices in `FFmpeg`'s `DirectShow` listing. `FFmpeg` lists the
 /// video category before the audio one, each device as its friendly name,
 /// the media types of its capture pins ("(none)" when it could not read
 /// them, as for some virtual cameras) and its moniker ("Alternative name").
 /// The moniker selects a device whose friendly name another device shares
-/// or FFmpeg cannot parse; its `?` is written `%3F`, since `?` starts the
+/// or `FFmpeg` cannot parse; its `?` is written `%3F`, since `?` starts the
 /// locator's options.
 #[cfg(any(test, target_os = "macos", target_os = "windows"))]
 fn dshow_devices(listing: &str) -> Vec<Value> {
@@ -597,10 +602,9 @@ fn dshow_devices(listing: &str) -> Vec<Value> {
     let mut found: Vec<(&str, bool, Option<&str>)> = Vec::new();
     let (mut kept, mut audio) = (false, false);
     for line in listing.lines() {
-        let text = match line.strip_prefix('[') {
-            Some(rest) => rest.split_once("] ").map_or(line, |(_, text)| text),
-            None => line,
-        };
+        let text = line.strip_prefix('[').map_or(line, |rest| {
+            rest.split_once("] ").map_or(line, |(_, text)| text)
+        });
         if let Some(moniker) = text
             .trim_start()
             .strip_prefix("Alternative name \"")
@@ -643,11 +647,11 @@ fn dshow_devices(listing: &str) -> Vec<Value> {
 
 struct Log {
     bytes: Mutex<VecDeque<u8>>,
-    /// What FFmpeg says it writes, once it has said it, and whether its log
+    /// What `FFmpeg` says it writes, once it has said it, and whether its log
     /// has ended (`collect_lines`).
     output: Mutex<(Option<native::Described>, bool)>,
     described: Condvar,
-    /// The input video FFmpeg reads, once it has said (`collect_lines`).
+    /// The input video `FFmpeg` reads, once it has said (`collect_lines`).
     input: Mutex<Option<native::Input>>,
 }
 impl Log {
@@ -660,13 +664,16 @@ impl Log {
         })
     }
     fn keep(&self, bytes: &[u8]) {
-        let mut stored = self.bytes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stored = self
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         stored.extend(bytes);
         let excess = stored.len().saturating_sub(MAX_LOG);
         stored.drain(..excess);
     }
     /// Collect an info-level log a line at a time: its error lines as
-    /// `collect` would at the error level, and the description of FFmpeg's
+    /// `collect` would at the error level, and the description of `FFmpeg`'s
     /// output, which `described` waits for.
     fn collect_lines(self: &Arc<Self>, mut input: impl Read + Send + 'static) -> JoinHandle<()> {
         let log = self.clone();
@@ -676,25 +683,36 @@ impl Log {
             let mut said = |said| match said {
                 native::Said::Error(line) => log.keep(&line),
                 native::Said::Input(input) => {
-                    *log.input.lock().unwrap_or_else(|e| e.into_inner()) = Some(input);
+                    *log.input
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(input);
                 }
                 native::Said::Output(output) => {
-                    log.output.lock().unwrap_or_else(|e| e.into_inner()).0 = Some(output);
+                    log.output
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .0 = Some(output);
                     log.described.notify_all();
                 }
             };
-            while let Ok(count) = input.read(&mut buffer) {
-                if count == 0 {
-                    break;
-                }
+            loop {
+                let count = match input.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => count,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
                 lines.push(&buffer[..count], &mut said);
             }
             lines.finish(&mut said);
-            log.output.lock().unwrap_or_else(|e| e.into_inner()).1 = true;
+            log.output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .1 = true;
             log.described.notify_all();
         })
     }
-    /// What FFmpeg says it writes, waiting up to `patience` for it to say
+    /// What `FFmpeg` says it writes, waiting up to `patience` for it to say
     /// so; None when it has not, its log ended first, or the decoder stopped.
     fn wait_described(
         &self,
@@ -702,7 +720,10 @@ impl Log {
         patience: Duration,
     ) -> Option<native::Described> {
         let deadline = Instant::now() + patience;
-        let mut output = self.output.lock().unwrap_or_else(|e| e.into_inner());
+        let mut output = self
+            .output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             if output.0.is_some()
                 || output.1
@@ -714,7 +735,7 @@ impl Log {
             output = self
                 .described
                 .wait_timeout(output, Duration::from_millis(100))
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
         }
     }
@@ -722,7 +743,7 @@ impl Log {
         let bytes = self
             .bytes
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .copied()
             .collect::<Vec<_>>();
@@ -732,10 +753,13 @@ impl Log {
         let log = self.clone();
         thread::spawn(move || {
             let mut buffer = [0; 4096];
-            while let Ok(count) = input.read(&mut buffer) {
-                if count == 0 {
-                    break;
-                }
+            loop {
+                let count = match input.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => count,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
                 log.keep(&buffer[..count]);
             }
         })
@@ -746,11 +770,11 @@ struct Decoded {
     error: Option<String>,
     /// Why the frames must be asked for as RGB instead (`NeedsRgb`).
     needs_rgb: Option<String>,
-    /// Why the source's JPEGs must be decoded by FFmpeg instead
+    /// Why the source's JPEGs must be decoded by `FFmpeg` instead
     /// (`NeedsDecoding`).
     needs_decoding: Option<String>,
 }
-/// What frames a decoder asks FFmpeg for.
+/// What frames a decoder asks `FFmpeg` for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Output {
     /// RGB24, as PPM images: each frame says its size.
@@ -761,7 +785,7 @@ enum Output {
     /// here, each frame keeping its JPEG (`mjpeg`).
     Jpeg,
 }
-/// FFmpeg would decode the source to frames Capturefab does not carry as
+/// `FFmpeg` would decode the source to frames Capturefab does not carry as
 /// they are, or did not say what it writes: the source is opened again
 /// for RGB frames.
 #[derive(Debug)]
@@ -772,7 +796,7 @@ impl std::fmt::Display for NeedsRgb {
     }
 }
 impl std::error::Error for NeedsRgb {}
-/// The source's JPEGs did not decode here: FFmpeg decodes them instead.
+/// The source's JPEGs did not decode here: `FFmpeg` decodes them instead.
 #[derive(Debug)]
 struct NeedsDecoding(String);
 impl std::fmt::Display for NeedsDecoding {
@@ -783,7 +807,7 @@ impl std::fmt::Display for NeedsDecoding {
 impl std::error::Error for NeedsDecoding {}
 /// The decoder has exited: every later read fails the same way until the
 /// source is opened again. The engine counts it as a transport error even when
-/// FFmpeg's reason mentions a timeout.
+/// `FFmpeg`'s reason mentions a timeout.
 #[derive(Debug)]
 pub(crate) struct StreamEnded(pub String);
 impl std::fmt::Display for StreamEnded {
@@ -801,7 +825,10 @@ impl DecoderQueue {
     /// The newest frame decoded so far, without waiting; the older ones
     /// waiting with it are dropped.
     fn newest(&self) -> Option<Frame> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let newest = state.frames.pop_back();
         state.frames.clear();
         drop(state);
@@ -819,29 +846,38 @@ struct Decoder {
     log: Arc<Log>,
     _exe: Arc<Executable>,
     source: String,
-    /// Why FFmpeg's output ended, formatted once with its log.
+    /// Why `FFmpeg`'s output ended, formatted once with its log.
     failure: Option<String>,
     status: Option<std::process::ExitStatus>,
     /// Its first frame has been looked at (`MediaBackend::observe`).
     observed: bool,
-    /// What it asked FFmpeg for.
+    /// What it asked `FFmpeg` for.
     output: Output,
 }
+#[deny(clippy::arithmetic_side_effects, clippy::panic_in_result_fn)]
 fn ppm_token(reader: &mut impl BufRead) -> Result<Vec<u8>> {
     let mut token = Vec::new();
     loop {
-        let available = reader.fill_buf()?;
+        let available = match reader.fill_buf() {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            filled => filled?,
+        };
         ensure!(!available.is_empty(), "media stream ended");
         let byte = available[0];
         reader.consume(1);
         if token.is_empty() && byte == b'#' {
             let mut line = Vec::new();
-            reader.read_until(b'\n', &mut line)?;
+            // Read only one byte beyond the allowed comment, not an
+            // unbounded line from a decoder that may never end it.
+            reader.by_ref().take(4097).read_until(b'\n', &mut line)?;
             ensure!(line.len() <= 4096, "PPM comment is too long");
             continue;
         }
         if byte.is_ascii_whitespace() {
-            if token.is_empty() { continue } else { break }
+            if token.is_empty() {
+                continue;
+            }
+            break;
         }
         token.push(byte);
         ensure!(token.len() <= 32, "PPM header token is too long");
@@ -895,7 +931,7 @@ fn read_ppm(
 }
 /// Frames from a Motion JPEG source's own JPEGs (`Output::Jpeg`). A JPEG
 /// that is not whole or does not decode is skipped; a source none of whose
-/// first JPEGs decode goes back to FFmpeg's decoder (`NeedsDecoding`).
+/// first JPEGs decode goes back to `FFmpeg`'s decoder (`NeedsDecoding`).
 #[derive(Default)]
 struct JpegReader {
     #[cfg(feature = "jpeg")]
@@ -907,55 +943,56 @@ struct JpegReader {
 }
 impl JpegReader {
     /// How many JPEGs in a row may fail to decode before a source that
-    /// delivered none goes back to FFmpeg, and one that did ends.
+    /// delivered none goes back to `FFmpeg`, and one that did ends.
     #[cfg(feature = "jpeg")]
     const FAILURES: [u32; 2] = [3, 30];
+    #[cfg(feature = "jpeg")]
     fn next(
         &mut self,
         reader: &mut impl BufRead,
         id: u64,
         pool: &crate::framebuf::FramePool,
     ) -> Result<Frame> {
-        #[cfg(feature = "jpeg")]
-        {
-            let decompressor = match &mut self.decompressor {
-                Some(decompressor) => decompressor,
-                None => self.decompressor.insert(
-                    turbojpeg::Decompressor::new()
-                        .map_err(|error| NeedsDecoding(format!("libjpeg-turbo: {error}")))?,
-                ),
-            };
-            let mut failures = 0;
-            loop {
-                let error = match self.jpegs.next(reader) {
-                    Ok(Some(jpeg)) => match mjpeg::decode(decompressor, jpeg, id, pool) {
-                        Ok(frame) => {
-                            self.delivered = true;
-                            return Ok(frame);
-                        }
-                        Err(error) => error,
-                    },
-                    Ok(None) => bail!("media stream ended"),
-                    Err(error) if error.is::<mjpeg::Malformed>() => error,
-                    Err(error) => return Err(error),
-                };
-                failures += 1;
-                if failures >= Self::FAILURES[usize::from(self.delivered)] {
-                    if self.delivered {
-                        return Err(error.context("the source's JPEGs stopped decoding"));
+        let decompressor = match &mut self.decompressor {
+            Some(decompressor) => decompressor,
+            None => self.decompressor.insert(
+                turbojpeg::Decompressor::new()
+                    .map_err(|error| NeedsDecoding(format!("libjpeg-turbo: {error}")))?,
+            ),
+        };
+        let mut failures = 0;
+        loop {
+            let error = match self.jpegs.next(reader) {
+                Ok(Some(jpeg)) => match mjpeg::decode(decompressor, jpeg, id, pool) {
+                    Ok(frame) => {
+                        self.delivered = true;
+                        return Ok(frame);
                     }
-                    return Err(NeedsDecoding(format!(
-                        "its JPEGs do not decode here ({error:#}); FFmpeg decodes them"
-                    ))
-                    .into());
+                    Err(error) => error,
+                },
+                Ok(None) => bail!("media stream ended"),
+                Err(error) if error.is::<mjpeg::Malformed>() => error,
+                Err(error) => return Err(error),
+            };
+            failures += 1;
+            if failures >= Self::FAILURES[usize::from(self.delivered)] {
+                if self.delivered {
+                    return Err(error.context("the source's JPEGs stopped decoding"));
                 }
+                return Err(NeedsDecoding(format!(
+                    "its JPEGs do not decode here ({error:#}); FFmpeg decodes them"
+                ))
+                .into());
             }
         }
-        #[cfg(not(feature = "jpeg"))]
-        {
-            let _ = (reader, id, pool);
-            Err(NeedsDecoding("this build has no JPEG decoder".into()).into())
-        }
+    }
+    #[cfg(not(feature = "jpeg"))]
+    #[expect(
+        clippy::unused_self,
+        reason = "the no-JPEG reader preserves the stateful decoder interface while reporting the missing feature"
+    )]
+    fn next(&self, _: &mut impl BufRead, _: u64, _: &crate::framebuf::FramePool) -> Result<Frame> {
+        Err(NeedsDecoding("this build has no JPEG decoder".into()).into())
     }
 }
 impl Decoder {
@@ -972,9 +1009,10 @@ impl Decoder {
     ) -> Result<Self> {
         Self::spawn_with_output(source, timeout, options, &[], output, None)
     }
-    /// FFmpeg decoding `source` with input `options`, writing `output`
+    /// `FFmpeg` decoding `source` with input `options`, writing `output`
     /// frames after `output_options`, and with a `tap` also copying the
     /// video it reads to the tap.
+    #[deny(clippy::significant_drop_tightening)]
     fn spawn_with_output(
         source: &str,
         timeout: Duration,
@@ -1027,7 +1065,7 @@ impl Decoder {
                 &timeout_us,
             ]
         } else if scheme(source)
-            .is_some_and(|s| !matches!(s.as_str(), "file" | "avfoundation" | "v4l2" | "dshow"))
+            .is_some_and(|s| !matches!(s.as_ref(), "file" | "avfoundation" | "v4l2" | "dshow"))
         {
             vec!["-rw_timeout", &timeout_us]
         } else {
@@ -1120,7 +1158,7 @@ impl Decoder {
         let live = scheme(source).is_some_and(|s| s != "file");
         #[cfg(target_os = "linux")]
         let mut enlarge = Some({
-            use std::os::fd::AsRawFd;
+            use std::os::fd::AsRawFd as _;
             stdout.as_raw_fd()
         });
         let thread = thread::spawn(move || {
@@ -1130,13 +1168,17 @@ impl Decoder {
                 Output::Rgb | Output::Jpeg => None,
                 Output::Native => {
                     let fail = |error: Option<String>, needs_rgb: Option<String>| {
-                        let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut state = shared
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         (state.error, state.needs_rgb) = (error, needs_rgb);
+                        drop(state);
                         shared.changed.notify_all();
                     };
                     // FFmpeg describes its output before it writes the first
                     // frame, though its log may be read a moment later.
-                    if reader.fill_buf().map_or(true, |bytes| bytes.is_empty()) {
+                    if reader.fill_buf().map_or(true, <[u8]>::is_empty) {
                         return fail(Some("media stream ended".into()), None);
                     }
                     let output = described.wait_described(&shared.stopped, Duration::from_secs(2));
@@ -1158,7 +1200,9 @@ impl Decoder {
                 }
             };
             let mut id = 0;
-            let mut jpegs = JpegReader::default();
+            let jpegs = JpegReader::default();
+            #[cfg(feature = "jpeg")]
+            let mut jpegs = jpegs;
             while !shared.stopped.load(Ordering::Relaxed) {
                 id += 1;
                 let pool = crate::framebuf::pool();
@@ -1168,7 +1212,10 @@ impl Decoder {
                     }
                     None if output == Output::Jpeg => match jpegs.next(&mut reader, id, pool) {
                         Err(error) if error.is::<NeedsDecoding>() => {
-                            let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut state = shared
+                                .state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             state.needs_decoding = Some(format!("{error:#}"));
                             shared.changed.notify_all();
                             break;
@@ -1187,7 +1234,10 @@ impl Decoder {
                 if let (Ok(frame), Some(fd)) = (&result, enlarge.take()) {
                     pipes::enlarge(fd, frame.jpeg.as_ref().unwrap_or(&frame.data).len());
                 }
-                let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                let mut state = shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 match result {
                     Ok(frame) => {
                         if live {
@@ -1200,7 +1250,7 @@ impl Decoder {
                                 state = shared
                                     .changed
                                     .wait(state)
-                                    .unwrap_or_else(|e| e.into_inner());
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                             }
                         }
                         if shared.stopped.load(Ordering::Relaxed) {
@@ -1232,16 +1282,20 @@ impl Decoder {
             output,
         })
     }
-    /// The input video FFmpeg said it reads and the format it said it
+    /// The input video `FFmpeg` said it reads and the format it said it
     /// writes, for raw video output.
     fn facts(&self) -> (Option<native::Input>, Option<String>) {
         let input = self
             .log
             .input
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let output = self.log.output.lock().unwrap_or_else(|e| e.into_inner());
+        let output = self
+            .log
+            .output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         (
             input,
             output.0.as_ref().map(|output| output.pix_fmt.clone()),
@@ -1250,7 +1304,10 @@ impl Decoder {
     fn next(&mut self, timeout: Duration) -> Result<Frame> {
         let deadline = Instant::now() + timeout;
         let queue = self.queue.clone();
-        let mut state = queue.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = queue
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             if let Some(frame) = state.frames.pop_front() {
                 queue.changed.notify_all();
@@ -1275,14 +1332,14 @@ impl Decoder {
             state = queue
                 .changed
                 .wait_timeout(state, remaining)
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
         }
     }
     fn newest(&self) -> Option<Frame> {
         self.queue.newest()
     }
-    /// Why the stream ended, formatted the first time it is asked for. FFmpeg
+    /// Why the stream ended, formatted the first time it is asked for. `FFmpeg`
     /// gets a moment to exit first, so the log it leaves is complete.
     fn fail(&mut self, error: &str) -> &str {
         if self.failure.is_none() {
@@ -1307,11 +1364,11 @@ impl Decoder {
         }
         self.failure.as_deref().unwrap_or_default()
     }
-    /// FFmpeg's output has ended, as the last frame error reported.
-    fn ended(&self) -> bool {
+    /// `FFmpeg`'s output has ended, as the last frame error reported.
+    const fn ended(&self) -> bool {
         self.failure.is_some()
     }
-    /// FFmpeg exited successfully, for example at the end of a file.
+    /// `FFmpeg` exited successfully, for example at the end of a file.
     fn succeeded(&mut self) -> bool {
         if self.status.is_none() {
             self.status = self.child.try_wait().ok().flatten();
@@ -1321,7 +1378,11 @@ impl Decoder {
     fn stop(&mut self) {
         // Under the lock, so a reader between seeing it run and waiting for
         // room cannot miss the wake-up.
-        let state = self.queue.state.lock().unwrap_or_else(|e| e.into_inner());
+        let state = self
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.queue.stopped.store(true, Ordering::Relaxed);
         drop(state);
         self.queue.changed.notify_all();
@@ -1338,7 +1399,7 @@ impl Decoder {
         }
     }
     /// It copies the video it reads to a tap.
-    fn tapped(&self) -> bool {
+    const fn tapped(&self) -> bool {
         self.tap_thread.is_some()
     }
 }
@@ -1429,7 +1490,7 @@ impl ReplayDecoder {
             "-reinit_filter",
             "0",
         ]
-        .map(str::to_string);
+        .map(str::to_owned);
         let mut output = Self::output(width, height, Some(fps));
         output.extend(["-frames:v".into(), count.to_string()]);
         Self::spawn(manifest, timeout, &options, &output)
@@ -1439,7 +1500,7 @@ impl ReplayDecoder {
             "scale={width}:{height}:force_original_aspect_ratio=decrease:eval=frame,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:eval=frame"
         );
         if let Some(fps) = fps {
-            filter.push_str(&format!(",fps={fps}"));
+            let _ = write!(filter, ",fps={fps}");
         }
         vec!["-vf".into(), filter, "-filter_threads".into(), "1".into()]
     }
@@ -1459,7 +1520,12 @@ impl ReplayDecoder {
             .checked_add(timeout)
             .context("simulation frame timeout exceeds the monotonic clock")?;
         loop {
-            let mut state = self.0.queue.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self
+                .0
+                .queue
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(frame) = state.frames.pop_front() {
                 self.0.queue.changed.notify_all();
                 return Ok(Some(frame));
@@ -1503,12 +1569,12 @@ impl ReplayDecoder {
                 .queue
                 .changed
                 .wait_timeout(state, remaining)
-                .unwrap_or_else(|e| e.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
     }
 }
-/// How much of an input FFmpeg reads before it decodes, which for a live
-/// source is how long the first frame waits. By default FFmpeg reads up to
+/// How much of an input `FFmpeg` reads before it decodes, which for a live
+/// source is how long the first frame waits. By default `FFmpeg` reads up to
 /// 5 s of a stream to measure its frame rate, which frames passed through
 /// as they come never need: a camera on this computer sends whole frames,
 /// whose first says all there is to know, and a network stream says its
@@ -1586,7 +1652,7 @@ fn native_input(source: &str) -> Result<Option<(&'static str, String)>> {
         },
     ))
 }
-/// FFmpeg's DirectShow input for a `dshow:` locator, with the `?` restored
+/// `FFmpeg`'s `DirectShow` input for a `dshow:` locator, with the `?` restored
 /// in a moniker as `dshow_devices` lists it.
 fn dshow_input(name: &str) -> String {
     if name.starts_with("video=@device") {
@@ -1622,16 +1688,16 @@ struct Mode {
     height: u32,
     fps: Option<(f64, f64)>,
     input_format: Option<usize>,
-    /// The DirectShow frame intervals, in 100 ns, to request at the top and
-    /// bottom of `fps`: FFmpeg only opens a capability whose interval range
+    /// The `DirectShow` frame intervals, in 100 ns, to request at the top and
+    /// bottom of `fps`: `FFmpeg` only opens a capability whose interval range
     /// holds the interval it derives from `-framerate`.
     intervals: Option<(u32, u32)>,
-    /// The smallest size of a DirectShow capability that takes any size up
+    /// The smallest size of a `DirectShow` capability that takes any size up
     /// to this mode's, and the lowest rate it takes them at.
     min_size: Option<((u32, u32), f64)>,
 }
 impl Mode {
-    fn size(&self) -> (u32, u32) {
+    const fn size(&self) -> (u32, u32) {
         (self.width, self.height)
     }
     fn fits(&self, (width, height): (u32, u32)) -> bool {
@@ -1657,10 +1723,15 @@ impl Mode {
         }
     }
     fn rank(&self) -> (bool, u64, u64, u64, u32) {
+        #[expect(
+            clippy::cast_sign_loss,
+            clippy::cast_possible_truncation,
+            reason = "floating-point rate scores retain Rust's saturating float-to-integer behavior"
+        )]
         let fps = self
             .fps
             .map_or(0, |(_, high)| (high * 100.0).round() as u64);
-        let area = self.width as u64 * self.height as u64;
+        let area = u64::from(self.width) * u64::from(self.height);
         let smooth = fps >= 2500;
         (smooth, if smooth { area } else { 0 }, fps, area, self.width)
     }
@@ -1713,7 +1784,7 @@ fn merge(mut modes: Vec<Mode>, mode: Mode) -> Vec<Mode> {
     }
     modes
 }
-/// The modes FFmpeg's AVFoundation input can open, from its listing of each
+/// The modes `FFmpeg`'s `AVFoundation` input can open, from its listing of each
 /// format's frame rate ranges. It makes the last format of the requested
 /// size active and applies the range of any same-size format whose maximum
 /// is the requested rate, which the active format accepts when one of its
@@ -1732,7 +1803,7 @@ fn avfoundation_modes(log: &str) -> Vec<Mode> {
             Some((last, ranges))
                 if *last == size && ranges.last().is_some_and(|r| r.1 > range.1) =>
             {
-                ranges.push(range)
+                ranges.push(range);
             }
             _ => formats.push((size, vec![range])),
         }
@@ -1800,28 +1871,49 @@ fn dshow_modes(log: &str) -> Vec<Mode> {
         })
         .fold(Vec::new(), merge)
 }
-/// The frame intervals, in 100 ns, that FFmpeg's DirectShow listing prints
+/// A positive device interval, truncated to whole 100 ns ticks.
+#[deny(clippy::cast_precision_loss)]
+fn dshow_interval(value: f64) -> Option<u32> {
+    u32::try_from(crate::types::integral_float(value.floor())?)
+        .ok()
+        .filter(|&ticks| ticks > 0)
+}
+
+/// The frame intervals, in 100 ns, that `FFmpeg`'s `DirectShow` listing prints
 /// as the rate `text`, in ascending order. It prints `1e7 / interval` to six
 /// significant digits, so 24 fps can stand for 416666 or 416667. Taking the
 /// largest at the top of a range and the smallest at its bottom stays inside
 /// it.
+#[deny(clippy::cast_precision_loss)]
 fn dshow_intervals(text: &str) -> Vec<u32> {
     let six = |fps: f64| format!("{fps:.5e}").parse::<f64>().ok();
-    let Some(fps) = text.parse::<f64>().ok().filter(|fps| *fps >= 0.1) else {
+    let Some(fps) = text
+        .parse::<f64>()
+        .ok()
+        .filter(|fps| fps.is_finite() && *fps >= 0.1)
+    else {
         return Vec::new();
     };
     let center = 1e7 / fps;
     let spread = (center * 6e-6).ceil() + 2.0;
-    ((center - spread).max(1.0) as u32..=(center + spread) as u32)
-        .filter(|&interval| six(1e7 / interval as f64) == six(fps))
+    let (Some(low), Some(high)) = (
+        dshow_interval((center - spread).max(1.0)),
+        dshow_interval(center + spread),
+    ) else {
+        return Vec::new();
+    };
+    let advertised = six(fps);
+    (low..=high)
+        .filter(|&interval| six(1e7 / f64::from(interval)) == advertised)
         .collect()
 }
 /// The interval a device with a single listed rate most likely uses: the
 /// whole or NTSC rate it approximates, truncated to 100 ns as UVC cameras
 /// (15 fps as 666666) and Blackmagic cards (60 fps as 166666) do.
+#[deny(clippy::cast_precision_loss)]
 fn dshow_nominal(intervals: &[u32]) -> Option<u32> {
-    let &first = intervals.first()?;
-    let fps = 1e7 / first as f64;
+    let &first = intervals.iter().find(|&&ticks| ticks > 0)?;
+    let fps = 1e7 / f64::from(first);
     let whole = fps.round().max(1.0);
     let ntsc = (fps * 1.001).round() / 1.001;
     let nominal = 1e7
@@ -1830,17 +1922,22 @@ fn dshow_nominal(intervals: &[u32]) -> Option<u32> {
         } else {
             ntsc
         };
-    let truncated = nominal.floor() as u32;
-    if intervals.contains(&truncated) {
+    if let Some(truncated) = dshow_interval(nominal)
+        && intervals.contains(&truncated)
+    {
         return Some(truncated);
     }
-    intervals.iter().copied().min_by(|a, b| {
-        (*a as f64 - nominal)
-            .abs()
-            .total_cmp(&(*b as f64 - nominal).abs())
-    })
+    intervals
+        .iter()
+        .copied()
+        .filter(|&ticks| ticks > 0)
+        .min_by(|a, b| {
+            (f64::from(*a) - nominal)
+                .abs()
+                .total_cmp(&(f64::from(*b) - nominal).abs())
+        })
 }
-/// Modes from FFmpeg's V4L2 format listing, with the frame rate bounds
+/// Modes from `FFmpeg`'s V4L2 format listing, with the frame rate bounds
 /// `rates` reports for a format's listed description and a size.
 fn v4l2_modes(
     log: &str,
@@ -1877,7 +1974,7 @@ fn v4l2_modes(
     let mut modes: Vec<Mode> = Vec::new();
     for (_, name, description, sizes) in formats {
         let input_format = Some(names.len());
-        names.push(name.to_string());
+        names.push(name.to_owned());
         for (width, height) in sizes {
             let fps = rates(description, (width, height))
                 .map(|(low, high)| (rounded(low), rounded(high)))
@@ -1909,7 +2006,7 @@ fn v4l2_modes(
     (modes, names)
 }
 /// The frame rate bounds the driver reports for a format, by its description
-/// in FFmpeg's listing, and a size; FFmpeg lists only the sizes.
+/// in `FFmpeg`'s listing, and a size; `FFmpeg` lists only the sizes.
 #[cfg(target_os = "linux")]
 fn v4l2_rates(path: &str) -> impl Fn(&str, (u32, u32)) -> Option<(f64, f64)> {
     let formats = v4l2::Formats::open(std::path::Path::new(path)).ok();
@@ -1932,7 +2029,7 @@ fn probe(source: &str) -> (Vec<Mode>, Vec<String>) {
     let args = ["-hide_banner", "-f", format]
         .iter()
         .chain(options)
-        .map(|arg| arg.to_string())
+        .map(ToString::to_string)
         .chain(["-i".into(), input.clone()])
         .collect::<Vec<_>>();
     let Ok((_, log)) = executable().and_then(|exe| bounded_output(&exe, &args, PROBE_TIMEOUT))
@@ -1946,7 +2043,7 @@ fn probe(source: &str) -> (Vec<Mode>, Vec<String>) {
     }
 }
 /// How a host camera's connect error begins when the system refused access.
-pub const CAMERA_ACCESS_DENIED: &str = "camera access denied";
+pub(crate) const CAMERA_ACCESS_DENIED: &str = "camera access denied";
 
 fn native_failure(
     log: &str,
@@ -2049,7 +2146,7 @@ fn native_failure(
 fn network_parts(source: &str) -> Option<(String, String, Option<u16>, String)> {
     let (scheme, rest) = source.split_once("://")?;
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..end];
+    let (authority, tail) = rest.split_at(end);
     let host_port = authority
         .rsplit_once('@')
         .map_or(authority, |(_, host)| host);
@@ -2059,7 +2156,7 @@ fn network_parts(source: &str) -> Option<(String, String, Option<u16>, String)> 
         }
         _ => (host_port, None),
     };
-    let path = rest[end..].split(['?', '#']).next().unwrap_or_default();
+    let path = tail.split(['?', '#']).next().unwrap_or_default();
     (!host.is_empty()).then(|| {
         (
             scheme.to_ascii_lowercase(),
@@ -2071,12 +2168,12 @@ fn network_parts(source: &str) -> Option<(String, String, Option<u16>, String)> 
 }
 
 /// Why a network stream failed to open, in one sentence with its likely
-/// fix, from FFmpeg's log of the attempt. `timed_out` is when no frame came
-/// within `timeout` while FFmpeg still ran. The category is decided here, so
-/// exit codes no longer depend on FFmpeg's wording: refused, unresolved,
+/// fix, from `FFmpeg`'s log of the attempt. `timed_out` is when no frame came
+/// within `timeout` while `FFmpeg` still ran. The category is decided here, so
+/// exit codes no longer depend on `FFmpeg`'s wording: refused, unresolved,
 /// unreachable and missing streams are `unavailable`, rejected credentials
 /// `operation_failed` (as before: asking again cannot fix them) and silence
-/// `timeout`. None keeps the error FFmpeg gave, for logs this does not know.
+/// `timeout`. None keeps the error `FFmpeg` gave, for logs this does not know.
 fn network_failure(
     source: &str,
     log: &str,
@@ -2087,10 +2184,7 @@ fn network_failure(
     // carries an RTMP stream key or a query token.
     let url = redact_url(source);
     let (scheme, host, port, path) = network_parts(&url)?;
-    let at = match port {
-        Some(port) => format!("{host}:{port}"),
-        None => host.clone(),
-    };
+    let at = port.map_or_else(|| host.clone(), |port| format!("{host}:{port}"));
     // The first log line saying one of `texts`, which follows the
     // explanation as FFmpeg's own words.
     let line = |texts: &[&str]| {
@@ -2215,7 +2309,7 @@ fn longer_wait(timeout: Duration) -> Option<u128> {
     let suggested = (current * 2).clamp(10_000, 60_000);
     (suggested > current).then_some(suggested)
 }
-/// A log line without FFmpeg's internals: its `[tcp @ 0x…]` component
+/// A log line without `FFmpeg`'s internals: its `[tcp @ 0x…]` component
 /// prefix and the `?timeout=` Capturefab passed, with any URL redacted.
 fn ffmpeg_words(line: &str) -> String {
     let mut line = line.trim();
@@ -2228,10 +2322,9 @@ fn ffmpeg_words(line: &str) -> String {
     }
     line.split(' ')
         .map(|word| {
-            let word = match word.find("?timeout=") {
-                Some(query) => &word[..query],
-                None => word,
-            };
+            let word = word
+                .split_once("?timeout=")
+                .map_or(word, |(before, _)| before);
             if word.contains("://") {
                 redact_url(word)
             } else {
@@ -2250,7 +2343,7 @@ struct NativeOptions {
 /// Whether `selector` names a camera the operating system attaches to this
 /// computer (`avfoundation:`, `v4l2:` or `dshow:`), such as a webcam, rather
 /// than a network stream, a file or a machine-vision camera.
-pub fn is_host_camera(selector: &str) -> bool {
+pub(crate) fn is_host_camera(selector: &str) -> bool {
     matches!(
         scheme(selector).as_deref(),
         Some("avfoundation" | "v4l2" | "dshow")
@@ -2260,7 +2353,7 @@ pub fn is_host_camera(selector: &str) -> bool {
 /// device its ID opens. Webcams listed by name keep it; a Linux video node
 /// still has the name it was listed with, as one renumbered after a replug
 /// may not; a webcam listed by its index is listed again.
-pub fn host_camera_unchanged(info: &CameraInfo) -> bool {
+pub(crate) fn host_camera_unchanged(info: &CameraInfo) -> bool {
     let Some((backend, device)) = info.id.split_once(':') else {
         return false;
     };
@@ -2345,10 +2438,10 @@ struct MediaBackend {
     modes: Vec<Mode>,
     mode: Option<usize>,
     formats: Vec<String>,
-    /// Set while a network stream is being reopened after FFmpeg exited.
+    /// Set while a network stream is being reopened after `FFmpeg` exited.
     reconnect: Option<Reconnect>,
     /// A video file plays at its own frame rate, like a camera, unless
-    /// PlaybackSpeed asks for every frame as fast as it decodes.
+    /// `PlaybackSpeed` asks for every frame as fast as it decodes.
     paced: bool,
     /// Whether this acquisition's first frame was asked for on demand, by a
     /// capture, rather than taken from a running stream; unknown until then.
@@ -2357,17 +2450,17 @@ struct MediaBackend {
     /// with was still there: that frame is taken, and the file starts again
     /// unpaced only if another is asked for.
     unpace: bool,
-    /// The frames asked of FFmpeg: decoded as they are, until the source
+    /// The frames asked of `FFmpeg`: decoded as they are, until the source
     /// turns out to need RGB.
     output: Output,
-    /// The last frame's pixel format, for the PixelFormat register.
+    /// The last frame's pixel format, for the `PixelFormat` register.
     pixel_format: u32,
     /// The hardware decoding method of the running decoder, if any.
     hwdec: Option<&'static str>,
     /// A launch with hardware decoding failed: this source decodes in
     /// software from now on.
     software: bool,
-    /// The video FFmpeg last said the source has.
+    /// The video `FFmpeg` last said the source has.
     known: Option<native::Input>,
     /// A Motion JPEG source is read as its own JPEGs (`Output::Jpeg`) until
     /// they turn out not to decode here.
@@ -2376,15 +2469,15 @@ struct MediaBackend {
     /// ([`learned`]): its JPEGs are asked for from the first launch.
     jpeg_before: bool,
     /// The source's video as it arrives, for a recording that copies it:
-    /// every FFmpeg it starts copies it here until the camera stops with no
+    /// every `FFmpeg` it starts copies it here until the camera stops with no
     /// recording attached.
     tap: Option<Arc<copy::Tap>>,
 }
 /// How a media source's stream ended, for callers that act on the end rather
 /// than on the wording of its error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StreamEnd {
-    /// FFmpeg exited and the network source is being reopened. The message
+pub(crate) enum StreamEnd {
+    /// `FFmpeg` exited and the network source is being reopened. The message
     /// says "timed out", so a caller waiting for a frame keeps waiting.
     Lost,
     /// A video file played to its end.
@@ -2404,7 +2497,7 @@ impl std::fmt::Display for Ended {
 }
 impl std::error::Error for Ended {}
 /// The stream end a frame error reports, if it reports one.
-pub fn stream_end(error: &anyhow::Error) -> Option<StreamEnd> {
+pub(crate) fn stream_end(error: &anyhow::Error) -> Option<StreamEnd> {
     error
         .chain()
         .find_map(|cause| cause.downcast_ref::<Ended>())
@@ -2456,8 +2549,8 @@ impl Reconnect {
         )
     }
 }
-/// FFmpeg's wording when the server rejects the credentials, which asking
-/// again cannot fix. A missing stream path can: a relay such as MediaMTX
+/// `FFmpeg`'s wording when the server rejects the credentials, which asking
+/// again cannot fix. A missing stream path can: a relay such as `MediaMTX`
 /// answers 404 while its camera is away.
 fn refused(reason: &str) -> bool {
     let reason = reason.to_ascii_lowercase();
@@ -2466,13 +2559,13 @@ fn refused(reason: &str) -> bool {
         .any(|text| reason.contains(text))
 }
 impl MediaBackend {
-    /// Network streams are reopened when FFmpeg exits; files and local
+    /// Network streams are reopened when `FFmpeg` exits; files and local
     /// devices report their end instead.
     fn reconnects(&self) -> bool {
         scheme(&self.source)
-            .is_some_and(|s| !matches!(s.as_str(), "file" | "avfoundation" | "v4l2" | "dshow"))
+            .is_some_and(|s| !matches!(s.as_ref(), "file" | "avfoundation" | "v4l2" | "dshow"))
     }
-    /// The next frame within `timeout`. A network stream whose FFmpeg exited
+    /// The next frame within `timeout`. A network stream whose `FFmpeg` exited
     /// is relaunched with backoff, and the wait for the next launch fits in
     /// `timeout`, so a caller polling for frames never spins.
     fn decode(&mut self, timeout: Duration) -> Result<Frame> {
@@ -2495,12 +2588,19 @@ impl MediaBackend {
                     Err(error) => error,
                 };
                 // A stream that came back decoding to another format.
-                if self.output == Output::Native && error.chain().any(|c| c.is::<NeedsRgb>()) {
+                if self.output == Output::Native
+                    && error
+                        .chain()
+                        .any(<dyn std::error::Error + 'static>::is::<NeedsRgb>)
+                {
                     self.output = Output::Rgb;
                     self.decoder = Some(self.spawn()?);
                     continue;
                 }
-                if error.chain().any(|c| c.is::<NeedsDecoding>()) {
+                if error
+                    .chain()
+                    .any(<dyn std::error::Error + 'static>::is::<NeedsDecoding>)
+                {
                     self.passthrough = false;
                     self.decoder = Some(self.spawn()?);
                     continue;
@@ -2529,7 +2629,7 @@ impl MediaBackend {
                     return Err(error);
                 }
                 self.decoder = None;
-                return Err(self.lost(format!("{error:#}")));
+                return Err(self.lost(&format!("{error:#}")));
             }
             let reconnect = self.reconnect.as_mut().context("media decoder stopped")?;
             let wait = reconnect.retry_at.saturating_duration_since(Instant::now());
@@ -2541,7 +2641,7 @@ impl MediaBackend {
             }
             match self.spawn() {
                 Ok(decoder) => self.decoder = Some(decoder),
-                Err(error) => return Err(self.lost(format!("{error:#}"))),
+                Err(error) => return Err(self.lost(&format!("{error:#}"))),
             }
         }
     }
@@ -2554,11 +2654,11 @@ impl MediaBackend {
             self.reconnect = None;
         }
     }
-    /// The network stream's FFmpeg exited: schedule the next launch, or
+    /// The network stream's `FFmpeg` exited: schedule the next launch, or
     /// stop once the server has rejected the credentials several times in a
     /// row. A loss is reported when the stream was up, and the backoff of
     /// an outage carries on until the stream stays up.
-    fn lost(&mut self, reason: String) -> anyhow::Error {
+    fn lost(&mut self, reason: &str) -> anyhow::Error {
         let url = redact_url(&self.source);
         let attempt = match self.reconnect.as_mut() {
             None => self.reconnect.insert(Reconnect::new()).attempt,
@@ -2569,7 +2669,7 @@ impl MediaBackend {
                 reconnect.attempt
             }
             Some(reconnect) => {
-                reconnect.refused = if refused(&reason) {
+                reconnect.refused = if refused(reason) {
                     reconnect.refused + 1
                 } else {
                     0
@@ -2611,7 +2711,7 @@ impl MediaBackend {
             options.size.is_none_or(|size| m.fits(size))
                 && options
                     .fps
-                    .is_none_or(|fps| m.honors_at(options.size.unwrap_or(m.size()), fps))
+                    .is_none_or(|fps| m.honors_at(options.size.unwrap_or_else(|| m.size()), fps))
         })
         .ok_or_else(|| {
             let (width, height) = options.size.unwrap_or_else(|| {
@@ -2641,9 +2741,10 @@ impl MediaBackend {
         let mode = self.modes[index];
         self.mode = Some(index);
         (self.width, self.height) = mode.size();
-        self.fps = mode.fps.map_or(fps.unwrap_or(self.fps), |(low, high)| {
-            fps.map_or(high, |fps| fps.clamp(low, high))
-        });
+        self.fps = mode.fps.map_or_else(
+            || fps.unwrap_or(self.fps),
+            |(low, high)| fps.map_or(high, |fps| fps.clamp(low, high)),
+        );
     }
     fn unsupported(&self, width: u32, height: u32, fps: f64) -> anyhow::Error {
         let mut listed = self.modes.clone();
@@ -2681,17 +2782,17 @@ impl MediaBackend {
             }) if self.fps >= high || self.fps <= low => {
                 // A rate FFmpeg turns back into exactly this interval.
                 let interval = if self.fps >= high { fast } else { slow };
-                format!("{:.9}", 1e7 / (interval as f64 + 0.5))
+                format!("{:.9}", 1e7 / (f64::from(interval) + 0.5))
             }
             _ => self.fps.to_string(),
         };
-        let mut options = vec!["-framerate".to_string(), rate];
+        let mut options = vec!["-framerate".to_owned(), rate];
         let size = (self.width, self.height);
         if let Some((width, height)) = self
             .mode
             .map(|index| self.modes[index])
             .map(|mode| if mode.fits(size) { size } else { mode.size() })
-            .or(self.requested_size.then_some(size))
+            .or_else(|| self.requested_size.then_some(size))
         {
             options.extend(["-video_size".into(), format!("{width}x{height}")]);
         }
@@ -2708,7 +2809,7 @@ impl MediaBackend {
         }
         options
     }
-    /// FFmpeg decoding the source as it is set up now, in hardware where
+    /// `FFmpeg` decoding the source as it is set up now, in hardware where
     /// `hwdec` chooses it.
     fn spawn(&mut self) -> Result<Decoder> {
         let mut options = self.input_options();
@@ -2744,7 +2845,7 @@ impl MediaBackend {
             self.tap.as_ref(),
         )
     }
-    /// What a launch asks FFmpeg for: a Motion JPEG source's own JPEGs
+    /// What a launch asks `FFmpeg` for: a Motion JPEG source's own JPEGs
     /// while they decode here, else `output`.
     fn launch_output(&self) -> Output {
         let mjpeg = self
@@ -2756,53 +2857,19 @@ impl MediaBackend {
             self.output
         }
     }
-    /// The source's JPEGs do not decode here: FFmpeg decodes them from now
+    /// The source's JPEGs do not decode here: `FFmpeg` decodes them from now
     /// on.
     fn needs_decoding(&mut self, error: &anyhow::Error) -> bool {
-        let needs = error.chain().any(|cause| cause.is::<NeedsDecoding>());
+        let needs = error
+            .chain()
+            .any(<dyn std::error::Error + 'static>::is::<NeedsDecoding>);
         if needs {
             self.passthrough = false;
         }
         needs
     }
-    /// The tap a recording copies the source from, when its codec is one
-    /// `wanted` takes for a recording in `codec`: a decoder that does not
-    /// copy yet is started again with the tap, from the source's next key
-    /// frame. A source that cannot be tapped is encoded instead.
-    fn copy_stream(&mut self, wanted: StreamCopy, codec: &str) -> Result<Option<Arc<copy::Tap>>> {
-        if cfg!(not(unix)) {
-            return Ok(None);
-        }
-        let Some(source) = self.codec().and_then(copy::copyable) else {
-            return Ok(None);
-        };
-        if !wanted.takes(source, codec) {
-            return Ok(None);
-        }
-        let tap = match &self.tap {
-            Some(tap) if tap.codec() == source => tap.clone(),
-            _ => copy::Tap::new(source),
-        };
-        self.tap = Some(tap.clone());
-        if self
-            .decoder
-            .as_ref()
-            .is_some_and(|decoder| !decoder.tapped())
-        {
-            self.decoder = None;
-            self.first = None;
-            if let Err(error) = self.launch() {
-                // FFmpeg could not copy this video as MPEG-TS: the
-                // recording encodes it instead.
-                self.tap = None;
-                self.launch().map_err(|_| error)?;
-                return Ok(None);
-            }
-        }
-        Ok(Some(tap))
-    }
     /// A tap no recording is attached to goes once the camera lets its
-    /// FFmpeg go.
+    /// `FFmpeg` go.
     fn untap(&mut self) {
         if self.tap.as_ref().is_some_and(|tap| !tap.attached()) {
             self.tap = None;
@@ -2826,7 +2893,7 @@ impl MediaBackend {
         })
     }
     /// The source's codec: a webcam mode's compressed format, else what
-    /// FFmpeg last said.
+    /// `FFmpeg` last said.
     fn codec(&self) -> Option<&str> {
         if self.native {
             let format = self
@@ -2869,8 +2936,10 @@ impl MediaBackend {
     /// The source would decode to frames carried only as RGB: ask for RGB
     /// from now on.
     fn needs_rgb(&mut self, error: &anyhow::Error) -> bool {
-        let needs =
-            self.output == Output::Native && error.chain().any(|cause| cause.is::<NeedsRgb>());
+        let needs = self.output == Output::Native
+            && error
+                .chain()
+                .any(<dyn std::error::Error + 'static>::is::<NeedsRgb>);
         if needs {
             self.output = Output::Rgb;
         }
@@ -2912,7 +2981,9 @@ impl MediaBackend {
         // a bad sign-in), or that sent no frame in time, which software
         // would not change, is not opened again for nothing.
         if let Err(error) = &first
-            && error.chain().any(|cause| cause.is::<StreamEnded>())
+            && error
+                .chain()
+                .any(<dyn std::error::Error + 'static>::is::<StreamEnded>)
             && let Some(method) = self.hwdec
             && let input @ Some(_) = decoder.facts().0
         {
@@ -2952,7 +3023,7 @@ impl MediaBackend {
                     .queue
                     .state
                     .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .error
                     .is_none();
                 decoder.stop();
@@ -2965,15 +3036,15 @@ impl MediaBackend {
                 if !self.reconnects() {
                     return error.context("open media input");
                 }
-                let timed_out = !error.chain().any(|cause| cause.is::<StreamEnded>());
+                let timed_out = !error
+                    .chain()
+                    .any(<dyn std::error::Error + 'static>::is::<StreamEnded>);
                 decoder.stop();
                 let log = decoder.log.text(&self.source);
-                match network_failure(&self.source, &log, timed_out, self.timeout) {
-                    // FFmpeg's own words stay below the explanation, for
-                    // `{error:#}` and whoever debugs it.
-                    Some(explained) => explained,
-                    None => error.context("open media input"),
-                }
+                // FFmpeg's own words stay below the explanation, for
+                // `{error:#}` and whoever debugs it.
+                network_failure(&self.source, &log, timed_out, self.timeout)
+                    .unwrap_or_else(|| error.context("open media input"))
             })?
         };
         if self.native && (self.requested_size || self.mode.is_some()) {
@@ -3000,7 +3071,7 @@ impl MediaBackend {
     }
 }
 /// What frames a source is asked for first: as it decodes them, except from
-/// a test's stand-in FFmpeg that writes PPM.
+/// a test's stand-in `FFmpeg` that writes PPM.
 fn first_output() -> Output {
     #[cfg(test)]
     if FAKE_FFMPEG.with_borrow(Option::is_some) && !FAKE_NATIVE.get() {
@@ -3008,7 +3079,7 @@ fn first_output() -> Output {
     }
     Output::Native
 }
-pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
+pub(crate) fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
     ensure!(
         info.transport == Transport::Media,
         "camera is not a media input"
@@ -3023,10 +3094,10 @@ pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
     );
     open_url(&source, timeout)
 }
-pub fn open_url(source: &str, timeout: Duration) -> Result<Box<dyn Backend>> {
+pub(crate) fn open_url(source: &str, timeout: Duration) -> Result<Box<dyn Backend>> {
     open_url_with(source, None, timeout)
 }
-/// FFmpeg's wording when an RTSP server asks for credentials or refuses them.
+/// `FFmpeg`'s wording when an RTSP server asks for credentials or refuses them.
 /// 403 is left out: RTSP servers often answer it for an address or ACL
 /// restriction that no password changes.
 fn auth_refused(reason: &str) -> bool {
@@ -3037,7 +3108,7 @@ fn auth_refused(reason: &str) -> bool {
 /// or refusal from an rtsp:// or rtsps:// server becomes a typed
 /// `auth_required` or `auth_rejected` error naming the address without
 /// credentials.
-pub fn open_url_with(
+pub(crate) fn open_url_with(
     source: &str,
     login: Option<&crate::logins::CameraLogin>,
     timeout: Duration,
@@ -3064,7 +3135,7 @@ pub fn open_url_with(
         }
     })
 }
-/// FFmpeg's RTSP client copies the user name and password, as written in the
+/// `FFmpeg`'s RTSP client copies the user name and password, as written in the
 /// address, into a 128-byte buffer and silently cuts what does not fit
 /// (`av_url_split` in `ff_rtsp_connect`), so the camera refuses a cut-off
 /// password.
@@ -3073,7 +3144,7 @@ fn check_rtsp_userinfo(source: &str) -> Result<()> {
     let Some((_, rest)) = source.split_once("://") else {
         return Ok(());
     };
-    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
     match authority.rsplit_once('@') {
         Some((userinfo, _)) if userinfo.len() > MAX => Err(Categorized::error(
             ErrorKind::Unsupported,
@@ -3156,22 +3227,26 @@ fn backend_xml(native: bool, modes: &[Mode], playback: bool) -> String {
         } else {
             ""
         };
-        xml.push_str(&format!("<Integer Name='{name}'><pValue>{name}Reg</pValue>{bounds}</Integer><IntReg Name='{name}Reg'><Address>{address}</Address><Length>4</Length><AccessMode>{access}</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>"));
+        let _ = write!(
+            xml,
+            "<Integer Name='{name}'><pValue>{name}Reg</pValue>{bounds}</Integer><IntReg Name='{name}Reg'><Address>{address}</Address><Length>4</Length><AccessMode>{access}</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>"
+        );
     }
     let access = if native { "RW" } else { "RO" };
-    xml.push_str(&format!("<Float Name='AcquisitionFrameRate'><pValue>FrameRateReg</pValue><Min>0.1</Min><Max>240</Max><Unit>Hz</Unit><pIsLocked>IsAcquiring</pIsLocked></Float><FloatReg Name='FrameRateReg'><Address>20</Address><Length>8</Length><AccessMode>{access}</AccessMode><Endianess>LittleEndian</Endianess></FloatReg><Integer Name='IsAcquiring'><pValue>AcquiringReg</pValue></Integer><IntReg Name='AcquiringReg'><Address>16</Address><Length>4</Length><AccessMode>RO</AccessMode><Endianess>LittleEndian</Endianess></IntReg>"));
+    let _ = write!(
+        xml,
+        "<Float Name='AcquisitionFrameRate'><pValue>FrameRateReg</pValue><Min>0.1</Min><Max>240</Max><Unit>Hz</Unit><pIsLocked>IsAcquiring</pIsLocked></Float><FloatReg Name='FrameRateReg'><Address>20</Address><Length>8</Length><AccessMode>{access}</AccessMode><Endianess>LittleEndian</Endianess></FloatReg><Integer Name='IsAcquiring'><pValue>AcquiringReg</pValue></Integer><IntReg Name='AcquiringReg'><Address>16</Address><Length>4</Length><AccessMode>RO</AccessMode><Endianess>LittleEndian</Endianess></IntReg>"
+    );
     if !modes.is_empty() {
-        let entries = modes
-            .iter()
-            .enumerate()
-            .map(|(index, mode)| {
-                format!(
-                    "<EnumEntry Name='{}'><Value>{index}</Value></EnumEntry>",
-                    mode.label()
-                )
-            })
-            .collect::<String>();
-        xml.push_str(&format!("<Enumeration Name='VideoMode'><pValue>VideoModeReg</pValue>{entries}<pIsLocked>IsAcquiring</pIsLocked></Enumeration><IntReg Name='VideoModeReg'><Address>28</Address><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>"));
+        xml.push_str("<Enumeration Name='VideoMode'><pValue>VideoModeReg</pValue>");
+        for (index, mode) in modes.iter().enumerate() {
+            let _ = write!(
+                xml,
+                "<EnumEntry Name='{}'><Value>{index}</Value></EnumEntry>",
+                mode.label()
+            );
+        }
+        xml.push_str("<pIsLocked>IsAcquiring</pIsLocked></Enumeration><IntReg Name='VideoModeReg'><Address>28</Address><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>");
     } else if playback {
         xml.push_str("<Enumeration Name='PlaybackSpeed'><ToolTip>RealTime plays the file at its frame rate in live view and recordings, while captures read it as fast as they ask; Fastest always decodes every frame as fast as possible</ToolTip><EnumEntry Name='RealTime'><Value>1</Value></EnumEntry><EnumEntry Name='Fastest'><Value>0</Value></EnumEntry><pValue>PlaybackReg</pValue><pIsLocked>IsAcquiring</pIsLocked></Enumeration><IntReg Name='PlaybackReg'><Address>32</Address><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>");
     }
@@ -3195,7 +3270,7 @@ fn registers(
     registers[4..8].copy_from_slice(&height.to_le_bytes());
     registers[8..12].copy_from_slice(&pixel_format.to_le_bytes());
     registers[12..16].copy_from_slice(&u32::try_from(payload).unwrap_or(u32::MAX).to_le_bytes());
-    registers[16..20].copy_from_slice(&(running as u32).to_le_bytes());
+    registers[16..20].copy_from_slice(&u32::from(running).to_le_bytes());
     registers[20..28].copy_from_slice(&fps.to_le_bytes());
     registers[28..32].copy_from_slice(&mode.to_le_bytes());
     registers
@@ -3212,6 +3287,12 @@ fn register_range(registers: &[u8], address: u64, length: usize) -> Result<Vec<u
 }
 impl RegisterIo for MediaBackend {
     fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
+        let mode = self
+            .mode
+            .map(u32::try_from)
+            .transpose()
+            .context("media mode index exceeds u32")?
+            .unwrap_or(u32::MAX);
         let mut registers = [0u8; 36];
         registers[..32].copy_from_slice(&self::registers(
             self.width,
@@ -3219,9 +3300,9 @@ impl RegisterIo for MediaBackend {
             self.pixel_format,
             self.running,
             self.fps,
-            self.mode.map_or(u32::MAX, |i| i as u32),
+            mode,
         ));
-        registers[32..36].copy_from_slice(&(self.paced as u32).to_le_bytes());
+        registers[32..36].copy_from_slice(&u32::from(self.paced).to_le_bytes());
         register_range(&registers, address, length)
     }
     fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
@@ -3270,8 +3351,9 @@ impl RegisterIo for MediaBackend {
                         .iter()
                         .enumerate()
                         .filter(|(_, m)| {
-                            let (low_width, low_height) =
-                                m.min_size.map_or(m.size(), |(smallest, _)| smallest);
+                            let (low_width, low_height) = m
+                                .min_size
+                                .map_or_else(|| m.size(), |(smallest, _)| smallest);
                             if address == 0 {
                                 (low_width..=m.width).contains(&w)
                             } else {
@@ -3375,7 +3457,7 @@ impl Backend for MediaBackend {
     /// A capture that asks for frames before a stream takes any reads a
     /// paced file as fast as it asks, like frames from a triggered camera;
     /// the file starts again unpaced. Its first frame is the one it opened
-    /// with when that is still there, so one frame needs one FFmpeg.
+    /// with when that is still there, so one frame needs one `FFmpeg`.
     fn request_frame(&mut self) -> Result<()> {
         if self.on_demand.is_none() {
             self.on_demand = Some(true);
@@ -3430,13 +3512,46 @@ impl Backend for MediaBackend {
         self.untap();
         Ok(())
     }
+    /// The tap a recording copies the source from, when its codec is one
+    /// `wanted` takes for a recording in `codec`: a decoder that does not
+    /// copy yet is started again with the tap, from the source's next key
+    /// frame. A source that cannot be tapped is encoded instead.
     fn copy_stream(&mut self, wanted: StreamCopy, codec: &str) -> Result<Option<Arc<copy::Tap>>> {
-        MediaBackend::copy_stream(self, wanted, codec)
+        if cfg!(not(unix)) {
+            return Ok(None);
+        }
+        let Some(source) = self.codec().and_then(copy::copyable) else {
+            return Ok(None);
+        };
+        if !wanted.takes(source, codec) {
+            return Ok(None);
+        }
+        let tap = match &self.tap {
+            Some(tap) if tap.codec() == source => tap.clone(),
+            _ => copy::Tap::new(source),
+        };
+        self.tap = Some(tap.clone());
+        if self
+            .decoder
+            .as_ref()
+            .is_some_and(|decoder| !decoder.tapped())
+        {
+            self.decoder = None;
+            self.first = None;
+            if let Err(error) = self.launch() {
+                // FFmpeg could not copy this video as MPEG-TS: the
+                // recording encodes it instead.
+                self.tap = None;
+                self.launch().map_err(|_| error)?;
+                return Ok(None);
+            }
+        }
+        Ok(Some(tap))
     }
     /// A webcam's video mode, size and rate, and a file's playback speed,
-    /// which FFmpeg is opened with: kept for the next process to open the
+    /// which `FFmpeg` is opened with: kept for the next process to open the
     /// camera as a webcam keeps them until it is unplugged.
-    fn emulated_settings(&mut self) -> Option<serde_json::Value> {
+    fn emulated_settings(&mut self) -> Option<Value> {
         if self.native {
             Some(serde_json::json!({
                 "mode": self.mode.map(|index| self.modes[index].label()),
@@ -3451,7 +3566,7 @@ impl Backend for MediaBackend {
             None
         }
     }
-    fn restore_settings(&mut self, settings: &serde_json::Value) -> Result<()> {
+    fn restore_settings(&mut self, settings: &Value) -> Result<()> {
         if let Some(paced) = settings["paced"].as_bool().filter(|_| self.file()) {
             return self.write_memory(32, &u32::from(paced).to_le_bytes());
         }
@@ -3460,7 +3575,12 @@ impl Backend for MediaBackend {
             .as_str()
             .and_then(|label| self.modes.iter().position(|mode| mode.label() == label))
         {
-            self.write_memory(28, &(index as u32).to_le_bytes())?;
+            self.write_memory(
+                28,
+                &u32::try_from(index)
+                    .context("saved media mode index exceeds u32")?
+                    .to_le_bytes(),
+            )?;
         }
         if settings["requested_size"] == true {
             for (address, key) in [(0, "width"), (4, "height")] {
@@ -3477,14 +3597,14 @@ impl Backend for MediaBackend {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ForwardConfig {
+pub(crate) struct ForwardConfig {
     pub output: String,
     pub codec: String,
     pub encoder: String,
     pub fps: f64,
     pub bitrate: String,
     /// A local recording ends, as asked, within this many bytes, stopped
-    /// while FFmpeg can still finish it there (`NearEnd`); none by default.
+    /// while `FFmpeg` can still finish it there (`NearEnd`); none by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_file_bytes: Option<u64>,
     /// The client's own free-space floor, which a local recording leaves
@@ -3495,7 +3615,7 @@ pub struct ForwardConfig {
 impl ForwardConfig {
     /// Validate forwarding settings before starting a process, changing camera
     /// settings or creating a file.
-    pub fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         ensure!(
             self.fps.is_finite() && (0.1..=240.0).contains(&self.fps),
             "forwarding FPS must be a finite number within 0.1..240"
@@ -3534,16 +3654,16 @@ impl ForwardConfig {
 impl ForwardConfig {
     /// The new file of a local recording at `path`, bounded by
     /// `max_file_bytes` when it has one.
-    pub fn writer(&self, path: &std::path::Path) -> Result<crate::storage::Recording> {
+    pub(crate) fn writer(&self, path: &std::path::Path) -> Result<crate::storage::Recording> {
         crate::storage::Recording::create(path, self.max_file_bytes, self.min_free)
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ForwardStats {
+pub(crate) struct ForwardStats {
     pub accepted: u64,
     pub written: u64,
     pub dropped: u64,
-    /// Frames replaced while FFmpeg was still taking an earlier one: the
+    /// Frames replaced while `FFmpeg` was still taking an earlier one: the
     /// encoder cannot keep up. `dropped` includes them.
     #[serde(default)]
     pub late: u64,
@@ -3573,12 +3693,12 @@ struct WriterQueue {
     written: AtomicU64,
     dropped: AtomicU64,
     late: AtomicU64,
-    /// The writer is blocked handing a frame to FFmpeg.
+    /// The writer is blocked handing a frame to `FFmpeg`.
     busy: AtomicBool,
     /// Writing the encoded recording failed, for example on a full disk.
     output_failed: AtomicBool,
     /// The recording is near its maximum size, which ends it as asked:
-    /// its FFmpeg is stopped while what it still holds fits
+    /// its `FFmpeg` is stopped while what it still holds fits
     /// ([`NearEnd`]), or the file reached that size.
     full_size: AtomicBool,
     epoch: Instant,
@@ -3593,6 +3713,11 @@ struct WriterQueue {
 const STALL: Duration = Duration::from_secs(2);
 /// A recording this small holds at most its container's header, no video.
 const HEADER_BYTES: u64 = 4096;
+enum WriterFrame {
+    New(Frame),
+    Repeat,
+}
+
 impl WriterQueue {
     fn new() -> Self {
         Self {
@@ -3623,10 +3748,13 @@ impl WriterQueue {
         self.epoch + Duration::from_millis(self.arrived_ms.load(Ordering::Relaxed))
     }
     /// Wait until `slot` and a new frame. From `repeat_from` on the slot
-    /// alone is enough, and `Some(None)` asks for the previous frame again.
-    /// `None` once the writer stops.
-    fn take(&self, slot: Instant, repeat_from: Option<Instant>) -> Option<Option<Frame>> {
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+    /// alone is enough for `WriterFrame::Repeat`. Returns `None` once the
+    /// writer stops.
+    fn take(&self, slot: Instant, repeat_from: Option<Instant>) -> Option<WriterFrame> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             if !self.running.load(Ordering::Acquire) {
                 return None;
@@ -3635,7 +3763,10 @@ impl WriterQueue {
             let ready = state.latest.is_some() || repeat_from.is_some_and(|from| now >= from);
             let wait = slot.saturating_duration_since(now);
             if ready && wait.is_zero() {
-                let taken = state.latest.take();
+                let taken = state
+                    .latest
+                    .take()
+                    .map_or(WriterFrame::Repeat, WriterFrame::New);
                 // A source that waits for its frame to be taken goes on.
                 self.changed.notify_all();
                 return Some(taken);
@@ -3650,14 +3781,14 @@ impl WriterQueue {
             state = self
                 .changed
                 .wait_timeout(state, wait)
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
         }
     }
     fn fail(&self, error: String) {
         self.state
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .error
             .get_or_insert(error);
     }
@@ -3671,24 +3802,24 @@ enum Splicer {}
 /// When a writer sends the last frame again on a slot without a new one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Repeat {
-    /// Never: FFmpeg stamps a recording's frames itself, so a stall leaves
+    /// Never: `FFmpeg` stamps a recording's frames itself, so a stall leaves
     /// a gap.
     Never,
-    /// While the camera streams: GStreamer stamps a recording's frames by
+    /// While the camera streams: `GStreamer` stamps a recording's frames by
     /// count.
     UntilStalled,
-    /// On every slot, stalled or not: a Jetson stream's FFmpeg only copies
-    /// GStreamer's video, and its receivers may drop a silent publisher.
+    /// On every slot, stalled or not: a Jetson stream's `FFmpeg` only copies
+    /// `GStreamer`'s video, and its receivers may drop a silent publisher.
     Always,
     /// Once no new frame has come for `KEEP_ALIVE`, on every slot after:
-    /// a stream's FFmpeg repeats frames to keep its rate (`-fps_mode cfr`),
+    /// a stream's `FFmpeg` repeats frames to keep its rate (`-fps_mode cfr`),
     /// but its receivers may drop a publisher silent for long.
     AfterSilence,
 }
 impl Repeat {
-    /// How the writer of a Jetson encoder or of FFmpeg's, for a local
+    /// How the writer of a Jetson encoder or of `FFmpeg`'s, for a local
     /// recording or a stream, repeats.
-    fn of(jetson: bool, local: bool) -> Self {
+    const fn of(jetson: bool, local: bool) -> Self {
         match (jetson, local) {
             (true, true) => Self::UntilStalled,
             (true, false) => Self::Always,
@@ -3728,7 +3859,7 @@ fn write_frames(
         let Some(fresh) = shared.take(next, repeat_from) else {
             break;
         };
-        if let Some(frame) = fresh {
+        if let WriterFrame::New(frame) = fresh {
             taken += 1;
             // A frame that needs converting is converted here, once: the
             // frames a newer one replaced in the queue never are, and a
@@ -3756,10 +3887,8 @@ fn write_frames(
             #[cfg(target_os = "linux")]
             (Some(splicer), Payload::Slice(bytes)) if !raw.converts() && jetson.is_none() => {
                 crate::copies::record(crate::copies::Site::PipeSplice, bytes.len());
-                splicer.send(frame, bytes)
+                splicer.send(frame, bytes.len())
             }
-            #[cfg(not(target_os = "linux"))]
-            (Some(never), _) => match *never {},
             _ => {
                 crate::copies::record(crate::copies::Site::PipeWrite, payload.len());
                 payload.write_to(input)
@@ -3812,11 +3941,10 @@ fn write_copied(shared: &WriterQueue, feed: &copy::Feed, input: &mut impl Write)
             copy::Taken::Waiting | copy::Taken::Closed => break,
         };
         shared.busy.store(true, Ordering::Relaxed);
-        let written = match &tables {
-            Some(tables) => input.write_all(tables),
-            None => Ok(()),
-        }
-        .and_then(|()| input.write_all(&frame.data));
+        let written = tables
+            .as_ref()
+            .map_or(Ok(()), |tables| input.write_all(tables))
+            .and_then(|()| input.write_all(&frame.data));
         shared.busy.store(false, Ordering::Relaxed);
         if let Err(e) = written {
             shared.fail(format!("FFmpeg input failed: {e}"));
@@ -3831,7 +3959,7 @@ fn write_copied(shared: &WriterQueue, feed: &copy::Feed, input: &mut impl Write)
         }
     }
 }
-/// What a recording's FFmpeg reads.
+/// What a recording's `FFmpeg` reads.
 enum Input {
     /// Camera frames, converted where it cannot read them; through a
     /// Jetson encoder when there is one.
@@ -3842,7 +3970,7 @@ enum Input {
 struct EncoderProcess {
     child: Child,
     /// The frame writer: it ends with the frames whose pages may still be
-    /// in the pipe (`pipes::Splicer`), which live until FFmpeg has exited.
+    /// in the pipe (`pipes::Splicer`), which live until `FFmpeg` has exited.
     writer: Option<JoinHandle<Vec<Frame>>>,
     output_thread: Option<JoinHandle<EncodedOutput>>,
     log_thread: Option<JoinHandle<()>>,
@@ -3851,11 +3979,11 @@ struct EncoderProcess {
     _exe: Arc<Executable>,
     width: u32,
     height: u32,
-    /// How frames reach FFmpeg; none when it copies the source's video.
+    /// How frames reach `FFmpeg`; none when it copies the source's video.
     raw: Option<RawInput>,
-    /// Set when a GStreamer Jetson encoder process precedes FFmpeg.
+    /// Set when a `GStreamer` Jetson encoder process precedes `FFmpeg`.
     jetson: Option<JetsonInput>,
-    /// The source's tap and the feed FFmpeg copies from.
+    /// The source's tap and the feed `FFmpeg` copies from.
     copied: Option<(Arc<copy::Tap>, Arc<copy::Feed>)>,
     stage: Option<Child>,
     stage_log: Option<JoinHandle<()>>,
@@ -3876,7 +4004,7 @@ struct EncodedOutput {
 /// waits for the writer to take the one before, as while the encoder
 /// starts; after that it replaces it.
 const WAIT_FOR_WRITER: Duration = Duration::from_secs(3);
-pub struct Forwarder {
+pub(crate) struct Forwarder {
     config: ForwardConfig,
     process: Option<EncoderProcess>,
     final_stats: ForwardStats,
@@ -3903,24 +4031,41 @@ enum JetsonInput {
     I420,
     Rgba,
 }
+#[deny(clippy::cast_precision_loss)]
 impl JetsonInput {
-    fn caps(self) -> &'static str {
+    const fn caps(self) -> &'static str {
         match self {
             Self::I420 => "i420",
             Self::Rgba => "rgba",
         }
     }
-    /// The bytes of each frame GStreamer reads.
-    fn frame_bytes(self, width: u32, height: u32) -> usize {
-        let (width, height) = (width as usize, height as usize);
-        match self {
-            Self::I420 => width * height + 2 * width.div_ceil(2) * height.div_ceil(2),
-            Self::Rgba => width * height * 4,
-        }
+    /// The bytes of each frame `GStreamer` reads.
+    #[deny(clippy::arithmetic_side_effects)]
+    fn frame_bytes(self, width: u32, height: u32) -> Result<usize> {
+        let width = usize::try_from(width).context("invalid Jetson input width")?;
+        let height = usize::try_from(height).context("invalid Jetson input height")?;
+        ensure!(width > 0 && height > 0, "invalid Jetson input dimensions");
+        let pixels = width.checked_mul(height);
+        let bytes = match self {
+            Self::I420 => {
+                let chroma = width
+                    .div_ceil(2)
+                    .checked_mul(height.div_ceil(2))
+                    .and_then(|plane| plane.checked_mul(2));
+                pixels
+                    .zip(chroma)
+                    .and_then(|(luma, chroma)| luma.checked_add(chroma))
+            }
+            Self::Rgba => pixels.and_then(|pixels| pixels.checked_mul(4)),
+        };
+        bytes
+            .filter(|&bytes| bytes <= MAX_FRAME)
+            .context("Jetson input frame exceeds size limit")
     }
     /// Convert `frame` into `scratch` for `payload`, in one pass: RGBA, or
     /// gray for a monochrome frame that is not 8-bit gray already.
     fn prepare(self, frame: &Frame, scratch: &mut Scratch) -> Result<()> {
+        self.frame_bytes(frame.width, frame.height)?;
         match self {
             Self::Rgba => {
                 crate::frame::convert_into(frame, &mut scratch.rgba, |[r, g, b]| [r, g, b, 255])?;
@@ -3930,7 +4075,15 @@ impl JetsonInput {
                 );
             }
             Self::I420 => {
-                if !Self::gray8(frame) {
+                if Self::gray8(frame) {
+                    let required =
+                        crate::frame::frame_len(frame.pixel_format, frame.width, frame.height)
+                            .context("Jetson grayscale frame size overflow")?;
+                    ensure!(
+                        frame.data.len() >= required,
+                        "truncated Jetson grayscale frame"
+                    );
+                } else {
                     crate::frame::convert_into(frame, &mut scratch.bytes, |[gray, _, _]| gray)?;
                     crate::copies::record(crate::copies::Site::JetsonInput, scratch.bytes.len());
                 }
@@ -3943,7 +4096,7 @@ impl JetsonInput {
         Ok(())
     }
     /// Whether the frame's bytes are the luma plane as they are.
-    fn gray8(frame: &Frame) -> bool {
+    const fn gray8(frame: &Frame) -> bool {
         matches!(
             frame.pixel_format,
             crate::types::MONO8 | 0x0108_00b1 | 0x0108_00c6
@@ -3959,7 +4112,7 @@ impl JetsonInput {
                 let luma = if Self::gray8(frame) {
                     &frame.data[..pixels]
                 } else {
-                    &scratch.bytes[..]
+                    scratch.bytes.as_slice()
                 };
                 Payload::Parts([luma, &scratch.chroma])
             }
@@ -3981,7 +4134,7 @@ impl JetsonInput {
 enum Payload<'a> {
     Slice(&'a [u8]),
     /// Rows of `row` bytes, each followed by `pad`: odd-width 4:2:2, whose
-    /// rows FFmpeg reads as whole pixel pairs.
+    /// rows `FFmpeg` reads as whole pixel pairs.
     Rows {
         data: &'a [u8],
         row: usize,
@@ -4001,16 +4154,16 @@ impl Payload<'_> {
     /// Write it to `out`, gathering parts and rows into as few writes as
     /// the pipe takes.
     fn write_to(&self, out: &mut impl Write) -> std::io::Result<()> {
-        /// Slices per write, within every platform's IOV_MAX.
+        /// Slices per write, within every platform's `IOV_MAX`.
         const BATCH: usize = 1024;
-        match *self {
+        match self {
             Payload::Slice(data) => out.write_all(data),
             Payload::Parts(parts) => {
                 crate::frame::write_all_vectored(out, &mut parts.map(IoSlice::new))
             }
-            Payload::Rows { data, row, ref pad } => {
+            Payload::Rows { data, row, pad } => {
                 let mut slices = Vec::with_capacity(BATCH);
-                for line in data.chunks_exact(row) {
+                for line in data.chunks_exact(*row) {
                     slices.extend([IoSlice::new(line), IoSlice::new(pad)]);
                     if slices.len() == BATCH {
                         crate::frame::write_all_vectored(out, &mut slices)?;
@@ -4040,11 +4193,12 @@ fn output_args(output: &str) -> Result<Vec<String>> {
     let mut args = Vec::new();
     match scheme(output).as_deref() {
         Some("rtsp" | "rtsps") => {
-            args.extend(["-f", "rtsp", "-rtsp_transport", "tcp"].map(str::to_string))
+            args.extend(["-f", "rtsp", "-rtsp_transport", "tcp"].map(str::to_owned));
         }
-        Some("rtmp" | "rtmps") => args.extend(["-f", "flv"].map(str::to_string)),
-        Some("srt" | "udp" | "tcp") => args.extend(["-f", "mpegts"].map(str::to_string)),
-        Some("http" | "https") => args.extend(["-f", "mpegts"].map(str::to_string)),
+        Some("rtmp" | "rtmps") => args.extend(["-f", "flv"].map(str::to_owned)),
+        Some("srt" | "udp" | "tcp" | "http" | "https") => {
+            args.extend(["-f", "mpegts"].map(str::to_owned));
+        }
         Some("file") | None => {
             ensure!(
                 !output.to_ascii_lowercase().ends_with(".m3u8"),
@@ -4066,14 +4220,12 @@ fn recording_output(output: &str) -> Result<Option<(PathBuf, &'static str)>> {
         return Ok(None);
     }
     let path = local_file_path(output)?;
-    ensure!(
-        !path.as_os_str().is_empty()
-            && path != std::path::Path::new("-")
-            && !output.ends_with('/')
-            && !(cfg!(windows) && output.ends_with('\\'))
-            && path.file_name().is_some(),
-        "recording needs an output file"
-    );
+    let invalid = path.as_os_str().is_empty()
+        || path == std::path::Path::new("-")
+        || output.ends_with('/')
+        || cfg!(windows) && output.ends_with('\\')
+        || path.file_name().is_none();
+    ensure!(!invalid, "recording needs an output file");
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
@@ -4089,7 +4241,7 @@ fn recording_output(output: &str) -> Result<Option<(PathBuf, &'static str)>> {
     Ok(Some((path, container)))
 }
 
-pub fn local_file_path(value: &str) -> Result<PathBuf> {
+pub(crate) fn local_file_path(value: &str) -> Result<PathBuf> {
     if scheme(value).as_deref() != Some("file") {
         return Ok(value.into());
     }
@@ -4132,12 +4284,17 @@ fn decode_file_url_path(path: &str) -> Result<String> {
             bytes.push(byte);
             continue;
         }
-        let high = source.next().and_then(|b| (*b as char).to_digit(16));
-        let low = source.next().and_then(|b| (*b as char).to_digit(16));
+        let hex = |byte: &u8| {
+            char::from(*byte)
+                .to_digit(16)
+                .and_then(|digit| u8::try_from(digit).ok())
+        };
+        let high = source.next().and_then(hex);
+        let low = source.next().and_then(hex);
         let (Some(high), Some(low)) = (high, low) else {
             bail!("file URL path contains invalid percent escaping");
         };
-        bytes.push((high * 16 + low) as u8);
+        bytes.push(high * 16 + low);
     }
     let decoded = String::from_utf8(bytes).context("file URL path must be valid UTF-8")?;
     ensure!(
@@ -4146,27 +4303,46 @@ fn decode_file_url_path(path: &str) -> Result<String> {
     );
     Ok(decoded)
 }
-/// How a camera frame is handed to FFmpeg: its rawvideo pixel format, bytes
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RawPreparation {
+    Direct,
+    Unpack,
+    GrayOrRgb,
+    /// Deep RGB for FFV1, preserving every bit in planar G, B and R.
+    Gbr,
+}
+impl RawPreparation {
+    const fn active(self) -> bool {
+        !matches!(self, Self::Direct)
+    }
+    const fn decodes(self) -> bool {
+        matches!(self, Self::GrayOrRgb | Self::Gbr)
+    }
+    const fn unpacks(self) -> bool {
+        matches!(self, Self::Unpack)
+    }
+}
+
+/// How a camera frame is handed to `FFmpeg`: its rawvideo pixel format, bytes
 /// per pixel and whether it carries color. Sending sensor-native bytes
 /// avoids a CPU conversion on the camera thread and, for mono and Bayer, moves
-/// a third of the bytes RGB24 would through the pipe. FFmpeg reads no packed
+/// a third of the bytes RGB24 would through the pipe. `FFmpeg` reads no packed
 /// samples and no 10- or 12-bit Bayer, so those are unpacked and widened to
 /// its 16-bit formats first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[deny(clippy::struct_excessive_bools)]
 struct RawInput {
     pixel_format: u32,
     ffmpeg: &'static str,
     bytes_per_pixel: usize,
     color: bool,
-    /// Packed samples, unpacked before the pipe.
-    unpack: bool,
-    /// Formats FFmpeg cannot consume directly are converted to gray or RGB.
-    convert: bool,
+    /// The exclusive preparation pass before the pipe, if one is needed.
+    preparation: RawPreparation,
     /// Bits each 16-bit sample is shifted up to span the full range.
     widen: u32,
-    /// The color range and matrix of Y'CbCr frames, for FFmpeg's input
+    /// The color range and matrix of `Y'CbCr` frames, for `FFmpeg`'s input
     /// options: full-range BT.601 for PFNC's YUV and YCbCr formats, video
-    /// levels for its YCbCr601 and YCbCr709 ones.
+    /// levels for its `YCbCr601` and `YCbCr709` ones.
     yuv: Option<(&'static str, &'static str)>,
     /// Planar or semiplanar: the frame is its planes, not equal rows.
     planes: bool,
@@ -4174,17 +4350,15 @@ struct RawInput {
     /// by this shift, for an encoder that keeps 8 bits (`for_encoder`):
     /// `ffmpeg` and `bytes_per_pixel` then describe the 8-bit samples.
     narrow: Option<u32>,
-    /// RGB or BGR deeper than 8 bits converted, for FFV1, to planar
-    /// `gbrpNNle` with every bit rather than to RGB24 (`for_encoder`).
-    gbr: bool,
 }
-/// FFmpeg's planar and semiplanar Y'CbCr layouts.
+/// `FFmpeg`'s planar and semiplanar `Y'CbCr` layouts.
 fn planes(pix_fmt: &str) -> bool {
     matches!(
         pix_fmt,
         "nv12" | "nv21" | "nv16" | "yuv420p" | "yuv422p" | "yuv444p"
     )
 }
+#[deny(clippy::cast_precision_loss)]
 impl RawInput {
     fn for_format(pixel_format: u32) -> Result<Self> {
         let unpacked = crate::frame::packing(pixel_format).map_or(pixel_format, |(v, ..)| v);
@@ -4195,7 +4369,7 @@ impl RawInput {
             0x0110_0005 => ("gray12le", 2, false),
             0x0110_0025 => ("gray14le", 2, false),
             0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => ("gray16le", 2, false),
-            crate::types::RGB8 => ("rgb24", 3, true),
+            RGB8 => ("rgb24", 3, true),
             0x0218_0015 => ("bgr24", 3, true),
             0x0220_0016 => ("rgba", 4, true),
             0x0220_0017 => ("bgra", 4, true),
@@ -4211,14 +4385,10 @@ impl RawInput {
             0x0108_0009 => ("bayer_rggb8", 1, true),
             0x0108_000a => ("bayer_gbrg8", 1, true),
             0x0108_000b => ("bayer_bggr8", 1, true),
-            0x0110_000c | 0x0110_0010 | 0x0110_002e => ("bayer_grbg16le", 2, true),
-            0x0110_000d | 0x0110_0011 | 0x0110_002f => ("bayer_rggb16le", 2, true),
-            0x0110_000e | 0x0110_0012 | 0x0110_0030 => ("bayer_gbrg16le", 2, true),
-            0x0110_000f | 0x0110_0013 | 0x0110_0031 => ("bayer_bggr16le", 2, true),
-            0x0110_0109 => ("bayer_grbg16le", 2, true),
-            0x0110_010a => ("bayer_rggb16le", 2, true),
-            0x0110_010b => ("bayer_gbrg16le", 2, true),
-            0x0110_010c => ("bayer_bggr16le", 2, true),
+            0x0110_000c | 0x0110_0010 | 0x0110_002e | 0x0110_0109 => ("bayer_grbg16le", 2, true),
+            0x0110_000d | 0x0110_0011 | 0x0110_002f | 0x0110_010a => ("bayer_rggb16le", 2, true),
+            0x0110_000e | 0x0110_0012 | 0x0110_0030 | 0x0110_010b => ("bayer_gbrg16le", 2, true),
+            0x0110_000f | 0x0110_0013 | 0x0110_0031 | 0x0110_010c => ("bayer_bggr16le", 2, true),
             _ if crate::frame::convertible(pixel_format) => {
                 convert = true;
                 if crate::frame::monochrome(pixel_format) {
@@ -4242,8 +4412,13 @@ impl RawInput {
             ffmpeg,
             bytes_per_pixel,
             color,
-            unpack: !convert && unpacked != pixel_format,
-            convert,
+            preparation: if convert {
+                RawPreparation::GrayOrRgb
+            } else if unpacked != pixel_format {
+                RawPreparation::Unpack
+            } else {
+                RawPreparation::Direct
+            },
             widen,
             yuv: match pixel_format {
                 0x0210_003e
@@ -4265,14 +4440,13 @@ impl RawInput {
             },
             planes: planes(ffmpeg),
             narrow: None,
-            gbr: false,
         })
     }
-    /// What `encoder` reads: frames FFmpeg gets only after a pass that
+    /// What `encoder` reads: frames `FFmpeg` gets only after a pass that
     /// unpacks or widens 10- to 16-bit samples (packed monochrome, and
     /// Bayer mosaics deeper than 8 bits) are narrowed to 8 bits in that
     /// pass for any encoder but FFV1, which keeps every bit: every other
-    /// encoder's input is 8-bit 4:2:0 or RGB, so the pipe and FFmpeg's
+    /// encoder's input is 8-bit 4:2:0 or RGB, so the pipe and `FFmpeg`'s
     /// conversion take half the bytes. Samples keep their top 8 bits, as
     /// stills do.
     fn for_encoder(self, encoder: &str) -> Self {
@@ -4290,14 +4464,14 @@ impl RawInput {
                     _ => "gbrp16le",
                 },
                 bytes_per_pixel: 6,
-                gbr: true,
+                preparation: RawPreparation::Gbr,
                 ..base
             };
         }
         if encoder == "ffv1"
             || jetson_encoder(encoder)
-            || base.convert
-            || !(base.unpack || base.widen > 0)
+            || base.preparation.decodes()
+            || !(base.preparation.unpacks() || base.widen > 0)
         {
             return base;
         }
@@ -4314,7 +4488,7 @@ impl RawInput {
             None => base,
         }
     }
-    /// The pixel format FFmpeg reads these frames as for `encoder`: their
+    /// The pixel format `FFmpeg` reads these frames as for `encoder`: their
     /// own, except that FFV1 gets a Bayer mosaic as gray, which it stores
     /// losslessly as it is (players show the mosaic in gray) where it would
     /// otherwise demosaic 8-bit Bayer into RGB and reject 16-bit Bayer at
@@ -4333,19 +4507,28 @@ impl RawInput {
     fn rgb(&self) -> bool {
         matches!(self.ffmpeg, "rgb24" | "bgr24" | "rgba" | "bgra")
     }
-    /// The bytes FFmpeg reads for each frame: odd-width 4:2:2 rows end in
+    /// The bytes `FFmpeg` reads for each frame: odd-width 4:2:2 rows end in
     /// a whole pixel pair.
+    #[deny(clippy::arithmetic_side_effects)]
     fn pipe_len(&self, width: u32, height: u32) -> Result<usize> {
+        let length = self.frame_len(width, height)?;
         if self.pairs() && !width.is_multiple_of(2) {
-            return Ok((width as usize + 1) * 2 * height as usize);
+            let width = usize::try_from(width).context("invalid forwarding width")?;
+            let height = usize::try_from(height).context("invalid forwarding height")?;
+            return width
+                .checked_add(1)
+                .and_then(|width| width.checked_mul(2))
+                .and_then(|row| row.checked_mul(height))
+                .filter(|&length| length <= MAX_FRAME)
+                .context("padded forwarding frame exceeds size limit");
         }
-        self.frame_len(width, height)
+        Ok(length)
     }
     /// YUV 4:2:2, where each two pixels share one Cb and one Cr.
     fn pairs(&self) -> bool {
         matches!(self.ffmpeg, "uyvy422" | "yuyv422")
     }
-    /// FFmpeg input options for the frames' color range and matrix.
+    /// `FFmpeg` input options for the frames' color range and matrix.
     fn color_options(&self) -> Vec<&'static str> {
         match self.yuv {
             Some((range, matrix)) => vec!["-color_range", range, "-colorspace", matrix],
@@ -4353,8 +4536,12 @@ impl RawInput {
         }
     }
     /// Size of the normalized image, checked before unpacking or allocating.
+    #[deny(clippy::arithmetic_side_effects)]
     fn frame_len(&self, width: u32, height: u32) -> Result<usize> {
-        let pixels = (width as usize).checked_mul(height as usize);
+        let pixels = usize::try_from(width)
+            .ok()
+            .zip(usize::try_from(height).ok())
+            .and_then(|(width, height)| width.checked_mul(height));
         ensure!(
             width > 0 && height > 0 && pixels.is_some_and(|n| n <= MAX_FRAME / 3),
             "invalid forwarding dimensions"
@@ -4378,10 +4565,10 @@ impl RawInput {
             "the camera's pixel format changed; start a new recording to continue"
         );
         let name = crate::frame::pixel_format_name(frame.pixel_format);
-        if self.convert {
+        if self.preparation.decodes() {
             return crate::frame::validate_source(frame);
         }
-        let needed = if self.unpack || self.narrow.is_some() {
+        let needed = if self.preparation.unpacks() || self.narrow.is_some() {
             crate::frame::row_bytes(frame.width, frame.pixel_format)
                 .checked_mul(frame.height as usize)
                 .context("forwarding frame exceeds size limit")?
@@ -4397,11 +4584,11 @@ impl RawInput {
         }
         Ok(())
     }
-    /// Whether FFmpeg reads a conversion of the frame rather than its bytes.
-    fn converts(&self) -> bool {
-        self.convert || self.unpack || self.widen > 0 || self.narrow.is_some()
+    /// Whether `FFmpeg` reads a conversion of the frame rather than its bytes.
+    const fn converts(&self) -> bool {
+        self.preparation.active() || self.widen > 0 || self.narrow.is_some()
     }
-    /// Convert a checked `frame` into `scratch` when FFmpeg cannot read its
+    /// Convert a checked `frame` into `scratch` when `FFmpeg` cannot read its
     /// bytes: packed samples are unpacked and widened in one pass a row at
     /// a time, and other layouts converted to gray or RGB.
     fn prepare(&self, frame: &Frame, scratch: &mut Vec<u8>) -> Result<()> {
@@ -4412,29 +4599,27 @@ impl RawInput {
         if let Some(shift) = self.narrow {
             scratch.resize(length, 0);
             let width = frame.width as usize;
-            let eight = |sample: &[u8; 2]| (u16::from_le_bytes(*sample) >> shift).min(255) as u8;
-            match crate::frame::packing(frame.pixel_format) {
-                Some((_, bits, packing)) => {
-                    let row = crate::frame::row_bytes(frame.width, frame.pixel_format);
-                    let rows = frame.data[..row * frame.height as usize].chunks_exact(row);
-                    let mut samples = vec![[0; 2]; width];
-                    for (line, out) in rows.zip(scratch.chunks_exact_mut(width)) {
-                        crate::frame::unpack_row(line, bits, packing, &mut samples);
-                        for (value, sample) in out.iter_mut().zip(&samples) {
-                            *value = eight(sample);
-                        }
-                    }
-                }
-                None => {
-                    let source = frame.data[..2 * length].as_chunks::<2>().0;
-                    for (value, sample) in scratch.iter_mut().zip(source) {
+            let eight =
+                |sample: &[u8; 2]| crate::frame::clamp8(u16::from_le_bytes(*sample) >> shift);
+            if let Some((_, bits, packing)) = crate::frame::packing(frame.pixel_format) {
+                let row = crate::frame::row_bytes(frame.width, frame.pixel_format);
+                let rows = frame.data[..row * frame.height as usize].chunks_exact(row);
+                let mut samples = vec![[0; 2]; width];
+                for (line, out) in rows.zip(scratch.chunks_exact_mut(width)) {
+                    crate::frame::unpack_row(line, bits, packing, &mut samples);
+                    for (value, sample) in out.iter_mut().zip(&samples) {
                         *value = eight(sample);
                     }
                 }
+            } else {
+                let source = frame.data[..2 * length].as_chunks::<2>().0;
+                for (value, sample) in scratch.iter_mut().zip(source) {
+                    *value = eight(sample);
+                }
             }
-        } else if self.gbr {
+        } else if self.preparation == RawPreparation::Gbr {
             crate::frame::gbr_planes(frame, scratch)?;
-        } else if self.convert {
+        } else if self.preparation.decodes() {
             let channels = if self.color {
                 crate::frame::Channels::Rgb
             } else {
@@ -4447,25 +4632,26 @@ impl RawInput {
                 let value = u16::from_le_bytes(sample).min(u16::MAX >> self.widen);
                 (value << self.widen).to_le_bytes()
             };
-            match crate::frame::packing(frame.pixel_format).filter(|_| self.unpack) {
-                Some((_, bits, packing)) => {
-                    let row = crate::frame::row_bytes(frame.width, frame.pixel_format);
-                    let rows = frame.data[..row * frame.height as usize].chunks_exact(row);
-                    let out_row = frame.width as usize * 2;
-                    for (line, out) in rows.zip(scratch.chunks_exact_mut(out_row)) {
-                        let samples = out.as_chunks_mut::<2>().0;
-                        crate::frame::unpack_row(line, bits, packing, samples);
-                        if self.widen > 0 {
-                            samples.iter_mut().for_each(|s| *s = widened(*s));
+            if let Some((_, bits, packing)) =
+                crate::frame::packing(frame.pixel_format).filter(|_| self.preparation.unpacks())
+            {
+                let row = crate::frame::row_bytes(frame.width, frame.pixel_format);
+                let rows = frame.data[..row * frame.height as usize].chunks_exact(row);
+                let out_row = frame.width as usize * 2;
+                for (line, out) in rows.zip(scratch.chunks_exact_mut(out_row)) {
+                    let samples = out.as_chunks_mut::<2>().0;
+                    crate::frame::unpack_row(line, bits, packing, samples);
+                    if self.widen > 0 {
+                        for sample in samples {
+                            *sample = widened(*sample);
                         }
                     }
                 }
+            } else {
                 // Whole 16-bit samples, widened on their way.
-                None => {
-                    let source = frame.data[..length].as_chunks::<2>().0;
-                    for (out, sample) in scratch.as_chunks_mut::<2>().0.iter_mut().zip(source) {
-                        *out = widened(*sample);
-                    }
+                let source = frame.data[..length].as_chunks::<2>().0;
+                for (out, sample) in scratch.as_chunks_mut::<2>().0.iter_mut().zip(source) {
+                    *out = widened(*sample);
                 }
             }
         }
@@ -4477,9 +4663,9 @@ impl RawInput {
         );
         Ok(())
     }
-    /// What FFmpeg reads of a prepared frame: the sensor buffer itself
+    /// What `FFmpeg` reads of a prepared frame: the sensor buffer itself
     /// unless its samples are packed or widened, a 4:2:2 frame's rows each
-    /// with the half pixel pair FFmpeg's rows end in.
+    /// with the half pixel pair `FFmpeg`'s rows end in.
     fn payload<'a>(&self, frame: &'a Frame, scratch: &'a [u8]) -> Payload<'a> {
         if self.converts() {
             return Payload::Slice(scratch);
@@ -4507,20 +4693,20 @@ impl RawInput {
         }
         Payload::Slice(&frame.data[..length])
     }
-    /// The bytes FFmpeg reads for `frame`, as one buffer.
+    /// The bytes `FFmpeg` reads for `frame`, as one buffer.
     #[cfg(test)]
-    fn bytes(&self, frame: Frame) -> Result<Vec<u8>> {
-        self.check(&frame)?;
+    fn bytes(&self, frame: &Frame) -> Result<Vec<u8>> {
+        self.check(frame)?;
         let mut scratch = Vec::new();
-        self.prepare(&frame, &mut scratch)?;
-        let payload = self.payload(&frame, &scratch);
+        self.prepare(frame, &mut scratch)?;
+        let payload = self.payload(frame, &scratch);
         let mut bytes = Vec::with_capacity(payload.len());
         payload.write_to(&mut bytes)?;
         Ok(bytes)
     }
 }
 impl Forwarder {
-    pub fn new(config: ForwardConfig) -> Result<Self> {
+    pub(crate) fn new(config: ForwardConfig) -> Result<Self> {
         config.validate()?;
         check_codec(&config)?;
         Ok(Self {
@@ -4535,7 +4721,7 @@ impl Forwarder {
     }
     /// Use an output the caller already named. `reserved` is the already
     /// created recording file, if any.
-    pub fn with_resolved(
+    pub(crate) fn with_resolved(
         config: ForwardConfig,
         reserved: Option<crate::storage::Recording>,
     ) -> Result<Self> {
@@ -4558,7 +4744,7 @@ impl Forwarder {
     /// Record the source's own video from `tap` (`MediaBackend::copy_stream`)
     /// in its codec, which `config` names: no encoder is needed. `reserved`
     /// is the already created recording file, if any.
-    pub fn copying(
+    pub(crate) fn copying(
         config: ForwardConfig,
         reserved: Option<crate::storage::Recording>,
         tap: Arc<copy::Tap>,
@@ -4588,14 +4774,19 @@ impl Forwarder {
         })
     }
     /// The local file this forwarder records to, if it records.
-    pub fn recording_path(&self) -> Option<PathBuf> {
+    pub(crate) fn recording_path(&self) -> Option<PathBuf> {
         recording_output(&self.config.output)
             .ok()
             .flatten()
             .map(|(path, _)| path)
     }
+    #[deny(clippy::cast_possible_wrap)]
     fn spawn(&mut self, width: u32, height: u32, raw: RawInput) -> Result<()> {
         raw.frame_len(width, height)?;
+        let gop = crate::types::integral_float((self.config.fps * 2.0).round().max(1.0))
+            .and_then(|frames| u32::try_from(frames).ok())
+            .context("recording keyframe interval exceeds the encoder range")?
+            .to_string();
         let exe = executable()?;
         let skip = self.failed.as_slice();
         let encoder = select_encoder(&exe, &self.config, (width, height), &raw, skip)?;
@@ -4610,14 +4801,13 @@ impl Forwarder {
         let mut stage = None;
         if let Some(input) = jetson {
             let (fps_numerator, fps_denominator) = jetson_framerate(self.config.fps)?;
-            let gop = ((self.config.fps * 2.0).round().max(1.0) as u32).to_string();
             let mut gst = Command::new("gst-launch-1.0");
             gst.args([
                 "-q",
                 "fdsrc",
                 "fd=0",
                 // A frame a read, rather than 4 KiB.
-                &format!("blocksize={}", input.frame_bytes(width, height)),
+                &format!("blocksize={}", input.frame_bytes(width, height)?),
                 "!",
                 "rawvideoparse",
                 &format!("width={width}"),
@@ -4700,9 +4890,14 @@ impl Forwarder {
                 "-b:v",
                 &self.config.bitrate,
                 "-g",
-                &((self.config.fps * 2.0).round().max(1.0) as u32).to_string(),
+                &gop,
             ]);
-            cmd.args(encoder_output_options(&encoder, input, pix_fmt));
+            let options = encoder_output_options(&encoder, input, pix_fmt);
+            cmd.args(if is_recording(&self.config.output) {
+                recording_clock_options(options)
+            } else {
+                options
+            });
             if is_recording(&self.config.output) {
                 cmd.args(["-fps_mode", "vfr"]);
             } else {
@@ -4729,7 +4924,7 @@ impl Forwarder {
             Input::Frames(raw, jetson),
         )
     }
-    /// Record the source's own video from `tap`, as it arrives: FFmpeg
+    /// Record the source's own video from `tap`, as it arrives: `FFmpeg`
     /// reads it as MPEG-TS and only remuxes it.
     fn spawn_copy(&mut self, width: u32, height: u32, tap: Arc<copy::Tap>) -> Result<()> {
         let exe = executable()?;
@@ -4760,8 +4955,8 @@ impl Forwarder {
     }
     /// Start `cmd`, whose input options are set, writing to the output: its
     /// container's options, then the frames' writer, the encoded output's
-    /// reader and its log. A GStreamer `stage`, when there is one, reads
-    /// the frames and feeds FFmpeg.
+    /// reader and its log. A `GStreamer` `stage`, when there is one, reads
+    /// the frames and feeds `FFmpeg`.
     fn launch(
         &mut self,
         (exe, mut cmd, mut stage): (Arc<Executable>, Command, Option<Child>),
@@ -4866,7 +5061,7 @@ impl Forwarder {
         if let Input::Frames(raw, None) = &input {
             #[cfg(target_os = "linux")]
             {
-                use std::os::fd::AsRawFd;
+                use std::os::fd::AsRawFd as _;
                 pipes::enlarge(input_pipe.as_raw_fd(), raw.pipe_len(width, height)?);
             }
             #[cfg(not(target_os = "linux"))]
@@ -4881,7 +5076,7 @@ impl Forwarder {
                     // pages, which stay as they are until it has.
                     #[cfg(target_os = "linux")]
                     let mut splicer = (jetson.is_none() && !raw.converts()).then(|| {
-                        use std::os::fd::AsRawFd;
+                        use std::os::fd::AsRawFd as _;
                         Splicer::new(input_pipe.as_raw_fd())
                     });
                     #[cfg(not(target_os = "linux"))]
@@ -4992,12 +5187,12 @@ impl Forwarder {
         Ok(true)
     }
     /// Frames come from a source that can wait for them to be taken.
-    pub fn wait_for_writer(&mut self) {
+    pub(crate) const fn wait_for_writer(&mut self) {
         self.waits = true;
     }
     /// Queue a frame for encoding; it is owned so its buffer moves to the
     /// writer thread without a copy.
-    pub fn push(&mut self, frame: Frame) -> Result<bool> {
+    pub(crate) fn push(&mut self, frame: Frame) -> Result<bool> {
         // The output thread notes why the file ended before it fails the
         // queue, so a failure seen once the file has ended is that end.
         self.queue_frame(frame)
@@ -5053,7 +5248,7 @@ impl Forwarder {
             .queue
             .state
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .error
             .clone();
         if let Some(error) = stored_error {
@@ -5076,13 +5271,16 @@ impl Forwarder {
             (None, None) => {
                 let queue = &process.queue;
                 queue.accepted.fetch_add(1, Ordering::Relaxed);
-                let arrived = queue.epoch.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                let arrived = u64::try_from(queue.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
                 queue.arrived_ms.store(arrived, Ordering::Relaxed);
                 return Ok(true);
             }
         }
         let queue = &process.queue;
-        let mut state = queue.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = queue
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let deadline = Instant::now() + WAIT_FOR_WRITER;
         while self.waits
             && state.latest.is_some()
@@ -5096,7 +5294,7 @@ impl Forwarder {
             state = queue
                 .changed
                 .wait_timeout(state, left)
-                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
         }
         if let Some(error) = &state.error {
@@ -5108,7 +5306,7 @@ impl Forwarder {
         );
         let replaced = state.latest.replace(frame).is_some();
         queue.accepted.fetch_add(1, Ordering::Relaxed);
-        let arrived = queue.epoch.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let arrived = u64::try_from(queue.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
         queue.arrived_ms.store(arrived, Ordering::Relaxed);
         if replaced {
             queue.dropped.fetch_add(1, Ordering::Relaxed);
@@ -5123,7 +5321,7 @@ impl Forwarder {
     /// Why the recording must end for its file: it reached its maximum
     /// size ([`crate::storage::MaxSize`]), or its disk fell below the
     /// free-space floor (`storage_full`).
-    pub fn storage_end(&self) -> Option<anyhow::Error> {
+    pub(crate) fn storage_end(&self) -> Option<anyhow::Error> {
         let process = self.process.as_ref()?;
         if process.queue.full_size.load(Ordering::Acquire) {
             let limit = self.config.max_file_bytes.unwrap_or_default();
@@ -5131,31 +5329,32 @@ impl Forwarder {
         }
         process.alarm.as_ref()?.error()
     }
-    pub fn stats(&self) -> ForwardStats {
-        if let Some(p) = &self.process {
-            let lost = p.copied.as_ref().map_or(0, |(_, feed)| feed.dropped());
-            ForwardStats {
-                accepted: p.queue.accepted.load(Ordering::Relaxed),
-                written: p.queue.written.load(Ordering::Relaxed),
-                dropped: p.queue.dropped.load(Ordering::Relaxed) + lost,
-                late: p.queue.late.load(Ordering::Relaxed),
-                stalled: p.queue.stalled(),
-                encoder: p.encoder.clone(),
-                codec: self.config.codec.clone(),
-                error: p
-                    .queue
-                    .state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .error
-                    .clone(),
-                recording: None,
-            }
-        } else {
-            self.final_stats.clone()
-        }
+    pub(crate) fn stats(&self) -> ForwardStats {
+        self.process.as_ref().map_or_else(
+            || self.final_stats.clone(),
+            |p| {
+                let lost = p.copied.as_ref().map_or(0, |(_, feed)| feed.dropped());
+                ForwardStats {
+                    accepted: p.queue.accepted.load(Ordering::Relaxed),
+                    written: p.queue.written.load(Ordering::Relaxed),
+                    dropped: p.queue.dropped.load(Ordering::Relaxed) + lost,
+                    late: p.queue.late.load(Ordering::Relaxed),
+                    stalled: p.queue.stalled(),
+                    encoder: p.encoder.clone(),
+                    codec: self.config.codec.clone(),
+                    error: p
+                        .queue
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .error
+                        .clone(),
+                    recording: None,
+                }
+            },
+        )
     }
-    pub fn stop(&mut self) -> Result<()> {
+    pub(crate) fn stop(&mut self) -> Result<()> {
         self.final_stats = self.stats();
         // A recording that never got a frame leaves no empty file behind.
         if let Some(reserved) = self.reserved.take() {
@@ -5169,6 +5368,7 @@ impl Forwarder {
     }
     /// Keep or remove the recording of a finished encoder process, and say
     /// how it ended.
+    #[deny(clippy::let_underscore_must_use)]
     fn settle(&mut self, process: EncoderProcess, finished: Finished) -> Result<()> {
         let (status, recording, mut error) = finished;
         self.final_stats.written = process.queue.written.load(Ordering::Relaxed);
@@ -5195,7 +5395,9 @@ impl Forwarder {
                 error = output.error;
             }
             let valid = kept
-                || status.as_ref().is_some_and(|status| status.success())
+                || status
+                    .as_ref()
+                    .is_some_and(std::process::ExitStatus::success)
                     && error.is_none()
                     && output.storage.bytes_written() > 0;
             let path = output.storage.path().to_path_buf();
@@ -5205,10 +5407,11 @@ impl Forwarder {
             if valid
                 && cut.is_none()
                 && let Some(head) = &output.head
-            {
-                let _ = output
+                && let Err(failure) = output
                     .storage
-                    .amend(|file, room| mkv::finish(file, head, room));
+                    .amend(|file, room| mkv::finish(file, head, room))
+            {
+                error.get_or_insert_with(|| format!("recording finalization failed: {failure:#}"));
             }
             let result = if valid {
                 output.storage.finish().map(|bytes| {
@@ -5222,7 +5425,7 @@ impl Forwarder {
                         },
                         ended_ms: crate::scheduling::now_ms(),
                         codec: self.config.codec.clone(),
-                        encoder: process.encoder.clone(),
+                        encoder: process.encoder,
                         truncated: full_size,
                     };
                     self.final_stats.recording = Some(recorded);
@@ -5246,7 +5449,7 @@ impl Forwarder {
                 }
             };
         }
-        self.final_stats.error = error.clone();
+        self.final_stats.error.clone_from(&error);
         if let Some(error) = error {
             let log = process.log.text(&self.config.output);
             if log.trim().is_empty() {
@@ -5257,7 +5460,7 @@ impl Forwarder {
         Ok(())
     }
 }
-/// Copy FFmpeg's encoded `output` into the recording's `storage`, through
+/// Copy `FFmpeg`'s encoded `output` into the recording's `storage`, through
 /// a Matroska file's `start` rewriter when there is one, telling `wrote`
 /// the bytes written after each read.
 fn copy_recording(
@@ -5286,13 +5489,13 @@ fn copy_recording(
     }
     read
 }
-/// When a recording with a maximum size must end so that FFmpeg can
-/// finish its file within it. FFmpeg writes a container a part at a time
+/// When a recording with a maximum size must end so that `FFmpeg` can
+/// finish its file within it. `FFmpeg` writes a container a part at a time
 /// (an MP4 fragment, a key frame to the next; a Matroska cluster), so it is
 /// judged after each write: it ends once the file could not take another
 /// part as large as the largest burst of bytes so far, with a quarter more,
 /// nor a second more of its output, nor `NEAR_END_MIN`, which also cover
-/// the frames on their way through FFmpeg and its trailer. A file FFmpeg
+/// the frames on their way through `FFmpeg` and its trailer. A file `FFmpeg`
 /// still overruns is cut at the limit and reported as such
 /// (`RecordedFile::truncated`).
 struct NearEnd {
@@ -5302,12 +5505,12 @@ struct NearEnd {
     first: Option<Instant>,
     last: Option<(Instant, u64)>,
 }
-/// The least a recording with a maximum size keeps for FFmpeg to finish.
+/// The least a recording with a maximum size keeps for `FFmpeg` to finish.
 const NEAR_END_MIN: u64 = 256 * 1024;
 /// Writes this close together belong to one burst.
 const BURST_GAP: Duration = Duration::from_millis(20);
 impl NearEnd {
-    fn new(limit: u64) -> Self {
+    const fn new(limit: u64) -> Self {
         Self {
             limit,
             burst: 0,
@@ -5324,7 +5527,7 @@ impl NearEnd {
         let first = *self.first.get_or_insert(now);
         let added = match self.last {
             Some((at, before)) if now.duration_since(at) < BURST_GAP => {
-                self.burst + written.saturating_sub(before)
+                self.burst.saturating_add(written.saturating_sub(before))
             }
             Some((_, before)) => written.saturating_sub(before),
             None => written,
@@ -5333,9 +5536,13 @@ impl NearEnd {
         self.largest = self.largest.max(self.burst);
         self.last = Some((now, written));
         // Bytes a second, over at least one.
-        let per_second = written as f64 / now.duration_since(first).as_secs_f64().max(1.0);
-        let held = (self.largest + self.largest / 4)
-            .max(per_second as u64)
+        let elapsed = now.duration_since(first).as_nanos().max(1_000_000_000);
+        let per_second = u64::try_from(u128::from(written) * 1_000_000_000 / elapsed)
+            .expect("a rate over at least one second cannot exceed the bytes written");
+        let held = self
+            .largest
+            .saturating_add(self.largest / 4)
+            .max(per_second)
             .max(NEAR_END_MIN);
         written.saturating_add(held) >= self.limit
     }
@@ -5412,7 +5619,7 @@ fn finish(process: &mut EncoderProcess) -> Finished {
         .queue
         .state
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .error
         .clone()
         .or(shutdown_error);
@@ -5429,6 +5636,76 @@ impl Drop for Forwarder {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn log_collectors_retry_interruptions_and_stop_on_other_errors() {
+        for lines in [false, true] {
+            for kind in [
+                std::io::ErrorKind::Interrupted,
+                std::io::ErrorKind::PermissionDenied,
+            ] {
+                let log = Log::new();
+                let reader = crate::test_io::FaultReader::new(
+                    b"[error] first "
+                        .as_slice()
+                        .chain(b"message\n[error] last".as_slice()),
+                    kind,
+                );
+                let collector = if lines {
+                    log.collect_lines(reader)
+                } else {
+                    log.collect(reader)
+                };
+                collector.join().unwrap();
+                let expected = match (kind, lines) {
+                    (std::io::ErrorKind::Interrupted, true) => "first message\nlast\n",
+                    (std::io::ErrorKind::Interrupted, false) => {
+                        "[error] first message\n[error] last"
+                    }
+                    _ => "",
+                };
+                assert_eq!(log.text(""), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn log_description_survives_interrupted_reads() {
+        let log = Log::new();
+        let reader = crate::test_io::FaultReader::new(
+            b"[info] Output #0, rawvideo, to 'pipe:1':\n[info] Stream #0:0: Video: raw"
+                .as_slice()
+                .chain(b"video, gray, 33x17, 1 fps\n".as_slice()),
+            std::io::ErrorKind::Interrupted,
+        );
+        log.collect_lines(reader).join().unwrap();
+        let output = log
+            .wait_described(&AtomicBool::new(false), Duration::ZERO)
+            .unwrap();
+        assert_eq!((output.width, output.height), (33, 17));
+        assert!(log.output.lock().unwrap().1);
+    }
+
+    #[test]
+    fn ppm_comment_limits_are_checked_before_reading_the_whole_line() {
+        let mut exact = vec![b'#'];
+        exact.extend(std::iter::repeat_n(b'x', 4095));
+        exact.extend_from_slice(b"\nP6 1 1 255\n");
+        assert_eq!(
+            ppm_token(&mut BufReader::new(exact.as_slice())).unwrap(),
+            b"P6"
+        );
+        let mut excessive = vec![b'#'];
+        excessive.extend(std::iter::repeat_n(b'x', 16_384));
+        excessive.extend_from_slice(b"\nP6 1 1 255\n");
+        let mut reader = BufReader::with_capacity(32, std::io::Cursor::new(excessive));
+        let error = ppm_token(&mut reader).unwrap_err();
+        assert!(error.to_string().contains("PPM comment is too long"));
+        assert!(
+            reader.get_ref().position() <= 4_128,
+            "oversized comment read too far"
+        );
+    }
+
     use super::*;
 
     use crate::genicam::NodeMap;
@@ -5444,7 +5721,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         dir
     }
-    /// A stand-in for FFmpeg on this test thread: a shell script that can
+    /// A stand-in for `FFmpeg` on this test thread: a shell script that can
     /// keep notes in `$dir`.
     #[cfg(unix)]
     struct Fake {
@@ -5474,12 +5751,12 @@ mod tests {
                 }
             }
             LAUNCHER.get_or_init(|| {
-                use std::os::unix::fs::PermissionsExt;
+                use std::os::unix::fs::PermissionsExt as _;
                 let path = temp_dir("launcher").join("ffmpeg");
                 fs::write(&path, "#!/bin/sh\nexec /bin/sh \"${0%/*}/script\" \"$@\"\n").unwrap();
                 fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
                 // Its first run finds no script beside it and fails at once.
-                let _ = std::process::Command::new(&path)
+                let _ = Command::new(&path)
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status();
@@ -5518,7 +5795,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn ffmpeg_is_found_next_to_the_executable_then_on_path() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt as _;
         let base = temp_dir("installed");
         let [beside, unrelated, plain, bin] =
             ["beside", "unrelated", "plain", "bin"].map(|name| base.join(name));
@@ -5555,7 +5832,7 @@ mod tests {
         let error = overridden(Some("bin/ffmpeg".into())).unwrap_err();
         assert_eq!(crate::cli::error_code(&error), ("usage", 2), "{error:#}");
     }
-    /// An FFmpeg that cannot start is ffmpeg_missing whichever command
+    /// An `FFmpeg` that cannot start is `ffmpeg_missing` whichever command
     /// starts it: a recording's encoder tests and encoder too.
     #[test]
     #[cfg(unix)]
@@ -5783,7 +6060,7 @@ while :; do head -c 12 /dev/zero; sleep 0.05; done"#
         hwdec::SETTING.set(None);
     }
 
-    /// A probe whose FFmpeg never reads its input still ends at its
+    /// A probe whose `FFmpeg` never reads its input still ends at its
     /// deadline: the input is written beside the wait, not before it.
     #[test]
     #[cfg(unix)]
@@ -5797,7 +6074,7 @@ while :; do head -c 12 /dev/zero; sleep 0.05; done"#
         assert!(started.elapsed() < Duration::from_secs(5));
         drop(fake);
     }
-    /// Raw video is read at the size and format FFmpeg's log describes,
+    /// Raw video is read at the size and format `FFmpeg`'s log describes,
     /// one fixed number of bytes a frame.
     #[test]
     #[cfg(unix)]
@@ -6007,7 +6284,7 @@ esac"#,
         assert_eq!(longer_wait(Duration::from_secs(20)), Some(40_000));
         assert_eq!(longer_wait(Duration::from_secs(40)), Some(60_000));
         assert_eq!(longer_wait(Duration::from_secs(60)), None);
-        let (_, message) = network_failure(source, "", true, Duration::from_secs(60))
+        let ((), message) = network_failure(source, "", true, Duration::from_secs(60))
             .map(|error| ((), format!("{error:#}")))
             .unwrap();
         assert!(
@@ -6046,9 +6323,9 @@ esac"#,
 echo '[tcp @ 0x7b8820000] Connection to tcp://127.0.0.1:1?timeout=2000000 failed: Connection refused' >&2
 exit 1"#,
         );
-        let error = match open_url("rtsp://user:secret@127.0.0.1:1/x", Duration::from_secs(2)) {
-            Err(error) => error,
-            Ok(_) => panic!("a refused stream opened"),
+        let Err(error) = open_url("rtsp://user:secret@127.0.0.1:1/x", Duration::from_secs(2))
+        else {
+            panic!("a refused stream opened");
         };
         let message = format!("{error:#}");
         assert_eq!(
@@ -6069,27 +6346,27 @@ exit 1"#,
     fn reconnecting_stops_after_repeated_refusals() {
         let mut camera = native("rtsp://camera/live", Vec::new());
         camera.native = false;
-        let lost = camera.lost("media stream ended: 401 Unauthorized".into());
+        let lost = camera.lost("media stream ended: 401 Unauthorized");
         assert_eq!(stream_end(&lost), Some(StreamEnd::Lost));
         let refusal = "media stream ended: method DESCRIBE failed: 401 Unauthorized";
         for attempt in 2..=3 {
-            let waiting = camera.lost(refusal.into());
+            let waiting = camera.lost(refusal);
             assert_eq!(stream_end(&waiting), None);
             assert!(format!("{waiting}").contains(&format!("(attempt {attempt}): timed out")));
         }
         // An unrelated failure resets the count; backoff keeps doubling
         // up to its limit.
-        camera.lost("media stream ended: Connection refused".into());
+        camera.lost("media stream ended: Connection refused");
         let backoff = camera.reconnect.as_ref().unwrap().backoff;
         assert_eq!(backoff, Duration::from_secs(16));
         for _ in 1..MAX_REFUSED {
-            assert_eq!(stream_end(&camera.lost(refusal.into())), None);
+            assert_eq!(stream_end(&camera.lost(refusal)), None);
         }
         assert_eq!(
             camera.reconnect.as_ref().unwrap().backoff,
             RECONNECT_BACKOFF_MAX
         );
-        let abandoned = camera.lost(refusal.into());
+        let abandoned = camera.lost(refusal);
         assert_eq!(stream_end(&abandoned), Some(StreamEnd::Abandoned));
         assert!(
             format!("{abandoned}")
@@ -6097,10 +6374,10 @@ exit 1"#,
         );
         assert!(camera.reconnect.is_none());
         // A relay answers 404 while its camera is away: keep trying.
-        camera.lost("media stream ended: Connection refused".into());
+        camera.lost("media stream ended: Connection refused");
         for _ in 0..MAX_REFUSED * 4 {
             let missing = "media stream ended: method DESCRIBE failed: 404 Not Found";
-            assert_eq!(stream_end(&camera.lost(missing.into())), None);
+            assert_eq!(stream_end(&camera.lost(missing)), None);
         }
         assert_eq!(
             camera.reconnect.as_ref().unwrap().backoff,
@@ -6205,6 +6482,13 @@ exit 1"#,
             ),
             "ffconcat version 1.0\nfile 'rtsp://a:it'\\''s@cam/live'\noption probesize '500000'\noption rtsp_transport 'tcp+udp'\n"
         );
+        assert_eq!(
+            concat_script(
+                "",
+                ["--headers", "é'雪", "-empty", "", "-dangling"].into_iter()
+            ),
+            "ffconcat version 1.0\nfile ''\noption headers 'é'\\''雪'\noption empty ''\n"
+        );
         assert!(credentialed("rtsp://a:b@cam/live"));
         assert!(credentialed("http://cam/video.cgi?user=a&pass=b"));
         assert!(!credentialed("rtsp://cam/live"));
@@ -6213,13 +6497,13 @@ exit 1"#,
     fn a_stream_that_drops_again_soon_keeps_backing_off() {
         let mut camera = native("rtsp://camera/live", Vec::new());
         camera.native = false;
-        let first = camera.lost("media stream ended".into());
+        let first = camera.lost("media stream ended");
         assert_eq!(stream_end(&first), Some(StreamEnd::Lost));
         // One frame, then the stream ends again: reported, with the backoff
         // carried on instead of starting again from 1 s.
         camera.delivered();
         assert!(camera.reconnect.is_some());
-        let again = camera.lost("media stream ended".into());
+        let again = camera.lost("media stream ended");
         assert_eq!(stream_end(&again), Some(StreamEnd::Lost));
         assert!(
             format!("{again}").contains("(attempt 2): timed out"),
@@ -6233,7 +6517,7 @@ exit 1"#,
         camera.reconnect.as_mut().unwrap().resumed = Instant::now().checked_sub(STEADY);
         camera.delivered();
         assert!(camera.reconnect.is_none());
-        let fresh = camera.lost("media stream ended".into());
+        let fresh = camera.lost("media stream ended");
         assert!(
             format!("{fresh}").contains("(attempt 1): timed out"),
             "{fresh}"
@@ -6483,7 +6767,8 @@ for i in 1 2; do printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; done"#,
         assert_eq!(probe("busy", Some(false)), (Some(false), true));
         assert_eq!(probe("busy", Some(true)), (Some(false), false));
         with_probes(&exe, |probes| {
-            probes.encoders.get_mut("busy").unwrap().at_ms -= FAILURE_KEPT.as_millis() as u64;
+            probes.encoders.get_mut("busy").unwrap().at_ms -=
+                u64::try_from(FAILURE_KEPT.as_millis()).unwrap();
         });
         assert_eq!(probe("busy", Some(true)), (Some(true), true));
         fs::remove_dir_all(dir).unwrap();
@@ -6519,6 +6804,41 @@ for i in 1 2; do printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; done"#,
             output: path.to_string_lossy().into(),
             ..stream(encoder, 30.0)
         }
+    }
+    #[test]
+    #[cfg(unix)]
+    fn recording_amendment_errors_are_reported_without_removing_video() {
+        let fake = Fake::new(
+            "amendment-error",
+            r#"case "$*" in
+*-encoders*) printf ' V....D libx264 x264 (codec h264)\n' ;;
+*"-f null"*) ;;
+*) cat "$dir/piped.mkv"; cat >/dev/null ;;
+esac"#,
+        );
+        fs::write(fake.dir.join("piped.mkv"), mkv::tests::piped()).unwrap();
+        let path = fake.dir.join("recording.mkv");
+        let mut forward = Forwarder::new(recording(&path, "libx264")).unwrap();
+        forward.push(tiny(8, 4)).unwrap();
+        let mut process = forward.process.take().unwrap();
+        let mut finished = finish(&mut process);
+        let output = finished.1.as_mut().unwrap();
+        assert!(output.head.is_some());
+        // Reads and syncing still work; only the metadata amendment fails.
+        let readonly = fs::File::open(&path).unwrap();
+        readonly.sync_all().unwrap();
+        output
+            .storage
+            .amend(|file, _| {
+                *file = readonly;
+                Ok(())
+            })
+            .unwrap();
+        let error = forward.settle(process, finished).unwrap_err();
+        assert!(format!("{error:#}").contains("recording finalization failed"));
+        assert!(path.metadata().unwrap().len() > 0);
+        assert!(forward.stats().recording.is_some());
+        assert!(forward.stats().error.is_some());
     }
     #[test]
     #[cfg(unix)]
@@ -6560,7 +6880,7 @@ esac"#,
         assert!(!fake.read("argv").contains(" -r "));
     }
     /// A stream gets each new frame once while frames come, even slower
-    /// than its rate: FFmpeg repeats them to keep the rate.
+    /// than its rate: `FFmpeg` repeats them to keep the rate.
     #[test]
     #[cfg(unix)]
     fn streams_get_each_frame_once_and_ffmpeg_keeps_their_rate() {
@@ -6836,7 +7156,7 @@ esac"#
         }
         forward.stop().unwrap();
         // The failed encoder's bytes never reach the new file.
-        let written = forward.stats().written as usize;
+        let written = usize::try_from(forward.stats().written).unwrap();
         assert_eq!(fs::read(&output).unwrap().len(), written * 16 * 16 * 3);
         assert_eq!(
             fake.launches(&[&format!("-c:v {first}"), "-use_wallclock_as_timestamps"]),
@@ -6900,6 +7220,25 @@ esac"#
         );
     }
     #[test]
+    fn ppm_retries_interrupted_header_and_pixel_reads() {
+        let mut bytes = b"P6\n# header comment\n2 1\n255\n".to_vec();
+        bytes.extend([10, 32, 13, 0, 255, 1]);
+        bytes.extend(b"P6\n1 1\n255\n");
+        bytes.extend([1, 2, 3]);
+        for capacity in [1, 2, 3, 64] {
+            let mut reader = crate::test_io::FaultReader::new(
+                BufReader::with_capacity(capacity, bytes.as_slice()),
+                std::io::ErrorKind::Interrupted,
+            );
+            let pool = crate::framebuf::pool();
+            assert_eq!(
+                read_ppm(&mut reader, 1, pool).unwrap().data,
+                [10, 32, 13, 0, 255, 1]
+            );
+            assert_eq!(read_ppm(&mut reader, 2, pool).unwrap().data, [1, 2, 3]);
+        }
+    }
+    #[test]
     fn ppm_preserves_whitespace_pixels_and_multiple_frames() {
         let mut bytes = b"P6\n2 1\n255\n".to_vec();
         bytes.extend([10, 32, 13, 0, 255, 1]);
@@ -6936,7 +7275,7 @@ esac"#
             &b"P6\n1 1\n65535\n"[..],
             &b"P6\n1 1\n255\n\0"[..],
         ] {
-            assert!(read_ppm(&mut BufReader::new(bytes), 1, crate::framebuf::pool()).is_err());
+            read_ppm(&mut BufReader::new(bytes), 1, crate::framebuf::pool()).unwrap_err();
         }
     }
     #[test]
@@ -6959,9 +7298,9 @@ esac"#
             redact_url("rtmp://host/app/<redacted>"),
             "rtmp://host/app/<redacted>"
         );
-        assert!(info("rtsp://camera/live").is_ok());
-        assert!(info("concat:secret|other").is_err());
-        assert!(info("rtsp://camera/live\n-x").is_err());
+        info("rtsp://camera/live").unwrap();
+        info("concat:secret|other").unwrap_err();
+        info("rtsp://camera/live\n-x").unwrap_err();
         // Vendor and signed-URL credentials (Foscam pwd, Blue Iris pw,
         // authSig, API keys) never reach logs either.
         assert_eq!(
@@ -7026,6 +7365,23 @@ esac"#
     fn query_redaction_preserves_noncredential_parameters() {
         let url = "https://camera/stream?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20261018T120000Z&X-Amz-Expires=60&X-Goog-SignedHeaders=host&sv=2026-02-06&se=2026-10-19&sp=r&fps=30&format=h264&request_id=value%2fkept";
         assert_eq!(redact_url(url), url);
+        for (input, expected) in [
+            ("https://cam/live?", "https://cam/live?"),
+            (
+                "rtsp://u:p@cam/live?a=&password=&b=two=three&&#fragment",
+                "rtsp://<redacted>@cam/live?a&password=<redacted>&b=two=three&&#fragment",
+            ),
+            (
+                "https://cam/live?label=雪&x=&token=秘密&flag&&tail=",
+                "https://cam/live?label=雪&x&token=<redacted>&flag&&tail",
+            ),
+            (
+                "https://cam/live?token&bare",
+                "https://cam/live?token=<redacted>&bare",
+            ),
+        ] {
+            assert_eq!(redact_url(input), expected);
+        }
         for key in [
             "X-Amz-Date",
             "X-Goog-Algorithm",
@@ -7042,10 +7398,41 @@ esac"#
         }
     }
     #[test]
+    fn redaction_preserves_unicode_and_is_idempotent() {
+        for (url, expected) in [
+            (
+                "rtmp://利用者:密碼@cam/アプリ/秘密?fps=30&token=別",
+                "rtmp://<redacted>@cam/アプリ/<redacted>?fps=30&token=<redacted>",
+            ),
+            (
+                "rtmps://[::1]/app/密碼#fragment",
+                "rtmps://[::1]/app/<redacted>#fragment",
+            ),
+            ("rtmp://cam/app/", "rtmp://cam/app/"),
+            (
+                "RTMPS://<redacted>@cam/アプリ/<redacted>?token=<redacted>&fps=30",
+                "RTMPS://<redacted>@cam/アプリ/<redacted>?token=<redacted>&fps=30",
+            ),
+            (
+                "https://cam/画面?label=雪&fps=30",
+                "https://cam/画面?label=雪&fps=30",
+            ),
+        ] {
+            assert_eq!(redact_url(url), expected, "{url}");
+            assert_eq!(redact_url(expected), expected);
+            assert_eq!(credentialed(url), url != expected);
+        }
+    }
+    #[test]
     fn backend_urls_lowercase_only_the_scheme_and_keep_credentials_redacted() {
         let source = "RTSP://User:P%40ss@Camera.Example:554/Live/%aB?token=Secret%2f&Mode=TCP";
         let canonical = "rtsp://User:P%40ss@Camera.Example:554/Live/%aB?token=Secret%2f&Mode=TCP";
         assert_eq!(canonical_scheme(source), canonical);
+        assert_eq!(
+            canonical_scheme("HtTp://Camera/映像?label=É"),
+            "http://Camera/映像?label=É"
+        );
+        assert_eq!(canonical_scheme("rtsπ://Camera/映像"), "rtsπ://Camera/映像");
         assert_eq!(output_args(source).unwrap().last().unwrap(), canonical);
         assert_eq!(
             canonical_scheme(" C:\\My Captures\\record.mkv "),
@@ -7070,6 +7457,9 @@ esac"#
             "srt://[::1]:8890",
             "udp://@239.1.2.3:5000",
             "tcp://:5000?listen=1",
+            "UDP://@:5000",
+            "TcP://:5000?listen=1",
+            "SRT://:8890",
         ] {
             assert!(validate_source(source).is_ok(), "{source}");
         }
@@ -7106,8 +7496,8 @@ esac"#
             local_file_path("file:literal%20name.mkv").unwrap(),
             PathBuf::from("literal%20name.mkv")
         );
-        assert!(local_file_path("file:///tmp/clip%00.mkv").is_err());
-        assert!(local_file_path("file:///tmp/clip%QQ.mkv").is_err());
+        local_file_path("file:///tmp/clip%00.mkv").unwrap_err();
+        local_file_path("file:///tmp/clip%QQ.mkv").unwrap_err();
     }
     #[test]
     fn forwarding_output_selection() {
@@ -7120,25 +7510,67 @@ esac"#
                 .unwrap()
                 .contains(&"mpegts".into())
         );
-        assert!(output_args("record.m3u8").is_err());
-        assert!(recording_output("record.unknown").is_err());
+        output_args("record.m3u8").unwrap_err();
+        recording_output("record.unknown").unwrap_err();
         assert_eq!(
             recording_output("file:record.mp4").unwrap().unwrap().1,
             "mp4"
         );
     }
     #[test]
+    fn jetson_frame_sizes_are_checked_before_preparation() {
+        for input in [JetsonInput::I420, JetsonInput::Rgba] {
+            for (width, height) in [(0, 1), (1, 0), (u32::MAX, 1), (u32::MAX, u32::MAX)] {
+                assert!(
+                    input.frame_bytes(width, height).is_err(),
+                    "{input:?}: {width}x{height}"
+                );
+            }
+        }
+        let tallest = u32::try_from(MAX_FRAME / 4).unwrap();
+        assert_eq!(
+            JetsonInput::Rgba.frame_bytes(1, tallest).unwrap(),
+            MAX_FRAME
+        );
+        JetsonInput::Rgba.frame_bytes(1, tallest + 1).unwrap_err();
+        let mut frame = Frame {
+            id: 1,
+            width: 3,
+            height: 3,
+            pixel_format: crate::types::MONO8,
+            device_ts_ns: None,
+            wall_ms: 0,
+            data: vec![7; 8].into(),
+            jpeg: None,
+        };
+        let mut scratch = Scratch::default();
+        assert!(JetsonInput::I420.prepare(&frame, &mut scratch).is_err());
+        assert_eq!(scratch.chroma, [] as [u8; 0]);
+        frame.width = u32::MAX;
+        assert!(JetsonInput::I420.prepare(&frame, &mut scratch).is_err());
+        assert_eq!(scratch.chroma, [] as [u8; 0]);
+    }
+
+    #[test]
     fn jetson_inputs_and_bitrates() {
         for (fps, expected) in [
             (30.0, (30, 1)),
             (0.1, (1, 10)),
-            (30.12345, (602469, 20000)),
+            (30.12345, (602_469, 20000)),
             (30000.0 / 1001.0, (30000, 1001)),
             (240.0, (240, 1)),
+            (
+                2_147_483_647.0 / 1_073_741_824.0,
+                (2_147_483_647, 1_073_741_824),
+            ),
+            (
+                268_435_456.0 / 2_147_483_647.0,
+                (268_435_456, 2_147_483_647),
+            ),
         ] {
             let fraction = jetson_framerate(fps).unwrap();
             assert_eq!(fraction, expected);
-            assert_eq!(fraction.0 as f64 / fraction.1 as f64, fps);
+            assert_eq!(f64::from(fraction.0) / f64::from(fraction.1), fps);
         }
         let unrepresentable = f64::from_bits(30.0f64.to_bits() + 1);
         assert!(
@@ -7147,7 +7579,16 @@ esac"#
                 .to_string()
                 .contains("cannot be represented exactly")
         );
-        assert!(jetson_framerate(f64::NAN).is_err());
+        for fps in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,
+            0.1f64.next_down(),
+            240.0f64.next_up(),
+        ] {
+            assert!(jetson_framerate(fps).is_err(), "{fps}");
+        }
         assert_eq!(bits_per_second("4M").unwrap(), 4_000_000);
         assert_eq!(bits_per_second("2500k").unwrap(), 2_500_000);
         assert_eq!(bits_per_second("800000").unwrap(), 800_000);
@@ -7165,11 +7606,11 @@ esac"#
         // Luma plane, then 2x2 U and V planes for odd dimensions.
         let i420 = JetsonInput::I420.bytes(&gray).unwrap();
         assert_eq!(i420.len(), 9 + 2 * 4);
-        assert_eq!(i420.len(), JetsonInput::I420.frame_bytes(3, 3));
-        assert_eq!((&i420[..9], &i420[9..]), (&gray.data[..], &[128; 8][..]));
+        assert_eq!(i420.len(), JetsonInput::I420.frame_bytes(3, 3).unwrap());
+        assert_eq!((&i420[..9], &i420[9..]), ((&*gray.data), &[128; 8][..]));
         let rgba = JetsonInput::Rgba.bytes(&gray).unwrap();
         assert_eq!(&rgba[..8], [1, 1, 1, 255, 2, 2, 2, 255]);
-        assert_eq!(rgba.len(), JetsonInput::Rgba.frame_bytes(3, 3));
+        assert_eq!(rgba.len(), JetsonInput::Rgba.frame_bytes(3, 3).unwrap());
         // The luma plane of a Mono8 frame is the frame's own buffer.
         let mut scratch = Scratch::default();
         JetsonInput::I420.prepare(&gray, &mut scratch).unwrap();
@@ -7199,9 +7640,9 @@ esac"#
         );
         assert!(jetson_encoder("nvv4l2h264enc") && !jetson_encoder("h264_nvenc"));
     }
-    /// Frames converted on their way to FFmpeg anyway, packed or wide, are
+    /// Frames converted on their way to `FFmpeg` anyway, packed or wide, are
     /// narrowed to 8 bits in that pass for an 8-bit encoder, as stills
-    /// reduce them; FFV1 keeps every bit and frames FFmpeg reads as they
+    /// reduce them; FFV1 keeps every bit and frames `FFmpeg` reads as they
     /// are stay as they are.
     #[test]
     fn deep_frames_are_narrowed_for_eight_bit_encoders_in_their_one_pass() {
@@ -7232,11 +7673,7 @@ esac"#
                 .flat_map(|y| (0..width as usize).map(move |x| (y, x)))
                 .map(|(y, x)| (crate::frame::native_sample(&frame, x, y) >> shift).min(255) as u8)
                 .collect();
-            assert_eq!(
-                narrowed.bytes(frame.clone()).unwrap(),
-                expected,
-                "{format:x}"
-            );
+            assert_eq!(narrowed.bytes(&frame).unwrap(), expected, "{format:x}");
             // Once narrowed, another encoder starts from the frame again.
             assert_eq!(narrowed.for_encoder("ffv1"), raw);
         }
@@ -7247,19 +7684,43 @@ esac"#
             0x0110_0007,
             0x0110_002f,
             0x0108_0009,
-            crate::types::RGB8,
+            RGB8,
         ] {
             let raw = RawInput::for_format(format).unwrap();
             assert_eq!(raw.for_encoder("libx264"), raw, "{format:x}");
         }
         assert!(
-            !RawInput::for_format(0x010c_0059)
+            RawInput::for_format(0x010c_0059)
                 .unwrap()
                 .for_encoder("nvv4l2h264enc")
                 .narrow
-                .is_some()
+                .is_none()
         );
     }
+    #[test]
+    fn odd_yuv_pipe_sizes_validate_both_source_and_padding() {
+        for format in [0x0210_001f, 0x0210_0032] {
+            let raw = RawInput::for_format(format).unwrap();
+            assert_eq!(raw.pipe_len(3, 2).unwrap(), 16);
+            assert_eq!(raw.pipe_len(4, 2).unwrap(), 16);
+            for (width, height) in [
+                (1, 0),
+                (0, 1),
+                (u32::MAX, 1),
+                (1, u32::MAX),
+                (u32::MAX, u32::MAX),
+            ] {
+                assert!(
+                    raw.pipe_len(width, height).is_err(),
+                    "{format:x} {width}x{height}"
+                );
+            }
+            let tallest = u32::try_from(MAX_FRAME / 4).unwrap();
+            assert_eq!(raw.pipe_len(1, tallest).unwrap(), MAX_FRAME);
+            raw.pipe_len(1, tallest + 1).unwrap_err();
+        }
+    }
+
     #[test]
     fn raw_inputs_unpack_and_widen_what_ffmpeg_cannot_read() {
         let frame = |pixel_format, width, data| Frame {
@@ -7285,7 +7746,7 @@ esac"#
                 ("gray12le", 2, false)
             );
             assert_eq!(
-                raw.bytes(frame(format, 2, data.into())).unwrap(),
+                raw.bytes(&frame(format, 2, data.into())).unwrap(),
                 le(&[0xabc, 0x123])
             );
         }
@@ -7293,15 +7754,13 @@ esac"#
         let raw = RawInput::for_format(0x0110_0011).unwrap();
         assert_eq!(raw.ffmpeg, "bayer_rggb16le");
         let samples = frame(0x0110_0011, 2, le(&[0xfff, 0x001]).into());
-        assert_eq!(raw.bytes(samples).unwrap(), le(&[0xfff0, 0x0010]));
+        assert_eq!(raw.bytes(&samples).unwrap(), le(&[0xfff0, 0x0010]));
         let raw = RawInput::for_format(0x010c_0029).unwrap();
         assert_eq!(raw.ffmpeg, "bayer_bggr16le");
         let packed = frame(0x010c_0029, 2, vec![0x55, 0x21, 0xaa].into());
-        assert_eq!(raw.bytes(packed).unwrap(), le(&[0x155 << 6, 0x2aa << 6]));
-        assert!(
-            raw.bytes(frame(0x010c_0029, 2, vec![0x55, 0x21].into()))
-                .is_err()
-        );
+        assert_eq!(raw.bytes(&packed).unwrap(), le(&[0x155 << 6, 0x2aa << 6]));
+        raw.bytes(&frame(0x010c_0029, 2, vec![0x55, 0x21].into()))
+            .unwrap_err();
         for (format, ffmpeg) in [
             (0x0110_0025, "gray14le"),
             (0x0110_002e, "bayer_grbg16le"),
@@ -7312,7 +7771,7 @@ esac"#
         ] {
             let raw = RawInput::for_format(format).unwrap();
             assert_eq!((raw.ffmpeg, raw.yuv), (ffmpeg, None));
-            assert!(raw.color_options().is_empty());
+            assert_eq!(raw.color_options(), [] as [&str; 0]);
         }
         // YUV and YCbCr 4:2:2 go as they are, tagged full-range BT.601.
         for (format, ffmpeg) in [
@@ -7332,7 +7791,7 @@ esac"#
             );
             let pair = vec![1, 2, 3, 4, 5];
             assert_eq!(
-                raw.bytes(frame(format, 2, pair.into())).unwrap(),
+                raw.bytes(&frame(format, 2, pair.into())).unwrap(),
                 [1, 2, 3, 4]
             );
         }
@@ -7359,7 +7818,7 @@ esac"#
             .unwrap()
             .for_encoder("ffv1");
         assert_eq!(raw.input_pix_fmt("ffv1"), "gbrp12le");
-        let planes = raw.bytes(frame.clone()).unwrap();
+        let planes = raw.bytes(&frame).unwrap();
         let samples = planes
             .as_chunks::<2>()
             .0
@@ -7373,7 +7832,7 @@ esac"#
             .for_encoder("libx264");
         assert_eq!(eight.input_pix_fmt("libx264"), "rgb24");
         assert_eq!(
-            eight.bytes(frame).unwrap(),
+            eight.bytes(&frame).unwrap(),
             [0xff, 0x12, 0xab, 0x00, 0x80, 0xf0]
         );
         for (format, ffmpeg) in [
@@ -7381,7 +7840,7 @@ esac"#
             (0x021e_005c, "gbrp10le"),
             (0x0230_005e, "gbrp14le"),
             (0x0240_0064, "gbrp16le"),
-            (crate::types::RGB8, "rgb24"),
+            (RGB8, "rgb24"),
         ] {
             let raw = RawInput::for_format(format).unwrap().for_encoder("ffv1");
             assert_eq!(raw.input_pix_fmt("ffv1"), ffmpeg, "{format:x}");
@@ -7412,7 +7871,7 @@ esac"#
             (crate::types::MONO8, "gray"),
             (0x010e_0104, "gray14le"),
             (0x0110_0007, "gray16le"),
-            (crate::types::RGB8, "rgb24"),
+            (RGB8, "rgb24"),
         ] {
             let raw = RawInput::for_format(format).unwrap();
             assert_eq!(raw.input_pix_fmt("ffv1"), ffmpeg, "{format:x}");
@@ -7513,7 +7972,7 @@ esac"#
             ["-level", "3", "-g", "1"]
         );
         for (format, rgb) in [
-            (crate::types::RGB8, true),
+            (RGB8, true),
             (0x0218_0015, true),
             (0x0220_0016, true),
             (0x0108_0009, false),
@@ -7545,7 +8004,7 @@ esac"#
         let mono = RawInput::for_format(0x010e_0104).unwrap();
         assert_eq!(mono.ffmpeg, "gray14le");
         assert_eq!(
-            mono.bytes(frame(0x010e_0104, packed.clone().into()))
+            mono.bytes(&frame(0x010e_0104, packed.clone().into()))
                 .unwrap(),
             unpacked
         );
@@ -7559,7 +8018,7 @@ esac"#
                 let raw = RawInput::for_format(format).unwrap();
                 assert_eq!(raw.ffmpeg, ffmpeg);
                 assert_eq!(
-                    raw.bytes(frame(format, data.into())).unwrap(),
+                    raw.bytes(&frame(format, data.into())).unwrap(),
                     [0x48d0u16, 0xeaf0]
                         .into_iter()
                         .flat_map(u16::to_le_bytes)
@@ -7575,13 +8034,13 @@ esac"#
         let (width, height) = (frame.width as usize, frame.height as usize);
         let length = raw.frame_len(frame.width, frame.height)?;
         ensure!(frame.pixel_format == raw.pixel_format, "format changed");
-        let mut data = if raw.convert {
+        let mut data = if raw.preparation.decodes() {
             if raw.color {
                 crate::frame::rgb(frame)?
             } else {
                 crate::frame::gray8(frame)?.context("no gray conversion")?
             }
-        } else if raw.unpack {
+        } else if raw.preparation.unpacks() {
             crate::frame::unpacked(frame)?.data.to_vec()
         } else {
             frame.data.to_vec()
@@ -7606,7 +8065,7 @@ esac"#
         Ok(data)
     }
     /// The writer converts a frame when it takes it from the queue, once:
-    /// frames a newer one replaced while FFmpeg was busy are never
+    /// frames a newer one replaced while `FFmpeg` was busy are never
     /// converted, and a repeat writes the same conversion again.
     #[test]
     fn the_writer_converts_only_the_frames_it_writes() {
@@ -7618,8 +8077,8 @@ esac"#
         impl Write for Held {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
                 if let Some((writing, go)) = self.gate.take() {
-                    writing.send(()).unwrap();
-                    go.recv().unwrap();
+                    writing.send(()).map_err(std::io::Error::other)?;
+                    go.recv().map_err(std::io::Error::other)?;
                 }
                 self.bytes.extend_from_slice(bytes);
                 Ok(bytes.len())
@@ -7630,7 +8089,7 @@ esac"#
         }
         const MONO12P: u32 = 0x010c_0047;
         let raw = RawInput::for_format(MONO12P).unwrap();
-        assert!(raw.unpack);
+        assert!(raw.preparation.unpacks());
         let frames: Vec<Frame> = (1..=4u8)
             .map(|n| Frame {
                 id: n.into(),
@@ -7686,7 +8145,7 @@ esac"#
             queue.running.store(false, Ordering::Release);
             queue.changed.notify_all();
             let (bytes, taken) = writer.join().unwrap();
-            let written = queue.written.load(Ordering::Relaxed) as usize;
+            let written = usize::try_from(queue.written.load(Ordering::Relaxed)).unwrap();
             assert_eq!(taken, 2, "repeat {repeat}");
             assert!(written == 2 || repeat && written >= 5, "{written}");
             let first = reference_bytes(&raw, &frames[0]).unwrap();
@@ -7711,7 +8170,9 @@ esac"#
         for repeat in [Repeat::Always, Repeat::UntilStalled] {
             let mut queue = WriterQueue::new();
             // The newest frame arrived well over `STALL` ago.
-            queue.epoch = Instant::now() - STALL * 2;
+            queue.epoch = Instant::now()
+                .checked_sub(STALL * 2)
+                .expect("test clock can represent a stalled stream");
             assert!(queue.stalled());
             let queue = Arc::new(queue);
             queue.state.lock().unwrap().latest = Some(Frame {
@@ -7749,7 +8210,11 @@ esac"#
                 Repeat::Always => assert!(written >= 5, "{written}"),
                 _ => assert_eq!(written, 1),
             }
-            assert_eq!(pipe, vec![7; 8 * written as usize], "{repeat:?}");
+            assert_eq!(
+                pipe,
+                vec![7; 8 * usize::try_from(written).unwrap()],
+                "{repeat:?}"
+            );
         }
     }
     #[test]
@@ -7777,7 +8242,7 @@ esac"#
                 Ok(())
             }
         }
-        let rows: Vec<u8> = (0..2100 * 6).map(|i| i as u8).collect();
+        let rows: Vec<u8> = (0u32..2100 * 6).map(|i| i.to_le_bytes()[0]).collect();
         let parts = [&rows[..7], &[][..]];
         for payload in [
             Payload::Slice(&rows[..13]),
@@ -7814,7 +8279,7 @@ esac"#
         for family in [0x0100_0000u32, 0x0200_0000] {
             for bits in 1..=64u32 {
                 for id in 0..0x200u32 {
-                    let format = family | bits << 16 | id;
+                    let format = family | (bits << 16) | id;
                     if crate::frame::pixel_format_name(format) != "Unknown"
                         && RawInput::for_format(format).is_ok()
                     {
@@ -7833,18 +8298,18 @@ esac"#
                     width,
                     height,
                     pixel_format: format,
-                    data: (0..crate::frame::row_bytes(width, format) * height as usize)
-                        .map(|_| {
-                            seed ^= seed << 13;
-                            seed ^= seed >> 7;
-                            seed ^= seed << 17;
-                            seed as u8
-                        })
-                        .collect(),
+                    data: std::iter::repeat_with(|| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        seed.to_le_bytes()[0]
+                    })
+                    .take(crate::frame::row_bytes(width, format) * height as usize)
+                    .collect(),
                     ..Frame::default()
                 };
                 let reference = reference_bytes(&raw, &frame);
-                let bytes = raw.bytes(frame.clone());
+                let bytes = raw.bytes(&frame);
                 match (&reference, &bytes) {
                     (Ok(reference), Ok(bytes)) => {
                         assert_eq!(bytes, reference, "{format:#x} {width}x{height}");
@@ -7870,7 +8335,7 @@ esac"#
                 (raw.ffmpeg, raw.bytes_per_pixel, raw.color),
                 (ffmpeg, bytes_per_pixel, false)
             );
-            let data = (1..=3 * bytes_per_pixel as u8).collect::<Vec<_>>();
+            let data = (1..=3 * u8::try_from(bytes_per_pixel).unwrap()).collect::<Vec<_>>();
             let expected = data.clone();
             let buffer = data.as_ptr();
             let frame = Frame {
@@ -7884,7 +8349,7 @@ esac"#
                 panic!("{format:#x} is one slice");
             };
             assert_eq!(payload.as_ptr(), buffer, "the pipe reads the sensor buffer");
-            assert_eq!(raw.bytes(frame).unwrap(), expected, "{format:#x}");
+            assert_eq!(raw.bytes(&frame).unwrap(), expected, "{format:#x}");
         }
     }
     #[test]
@@ -7900,7 +8365,7 @@ esac"#
                     ..Frame::default()
                 };
                 assert!(
-                    raw.bytes(frame)
+                    raw.bytes(&frame)
                         .unwrap_err()
                         .to_string()
                         .contains("invalid forwarding dimensions"),
@@ -7909,18 +8374,18 @@ esac"#
             }
         }
         let rgba = RawInput::for_format(0x0220_0016).unwrap();
-        assert!(rgba.frame_len(8192, 8192).is_ok());
-        assert!(rgba.frame_len(8193, 8192).is_err());
+        rgba.frame_len(8192, 8192).unwrap();
+        rgba.frame_len(8193, 8192).unwrap_err();
         let gray = RawInput::for_format(crate::types::MONO8).unwrap();
         let frame = Frame {
             width: 1,
             height: 1,
-            pixel_format: crate::types::RGB8,
+            pixel_format: RGB8,
             data: vec![1, 2, 3].into(),
             ..Frame::default()
         };
         assert!(
-            gray.bytes(frame)
+            gray.bytes(&frame)
                 .unwrap_err()
                 .to_string()
                 .contains("pixel format changed")
@@ -7980,7 +8445,7 @@ esac"#
         ] {
             let raw = RawInput::for_format(format).unwrap();
             assert_eq!(raw.ffmpeg, ffmpeg, "{format:#x}");
-            assert!(raw.convert, "{format:#x}");
+            assert!(raw.preparation.decodes(), "{format:#x}");
             assert!(
                 raw.color_options().is_empty(),
                 "converted RGB has no YUV matrix tag"
@@ -7992,10 +8457,10 @@ esac"#
                 data: data.into(),
                 ..Frame::default()
             };
-            assert_eq!(raw.bytes(frame).unwrap(), expected, "{format:#x}");
+            assert_eq!(raw.bytes(&frame).unwrap(), expected, "{format:#x}");
         }
     }
-    /// Video-level 4:2:2 and the planar and semiplanar layouts FFmpeg
+    /// Video-level 4:2:2 and the planar and semiplanar layouts `FFmpeg`
     /// decodes to go to an encoder as they are, tagged with their range and
     /// matrix.
     #[test]
@@ -8010,13 +8475,17 @@ esac"#
             (0x8218_0003, "yuv444p", ["tv", "bt709"], 12),
         ] {
             let raw = RawInput::for_format(format).unwrap();
-            assert_eq!((raw.ffmpeg, raw.convert), (ffmpeg, false), "{format:#x}");
+            assert_eq!(
+                (raw.ffmpeg, raw.preparation.decodes()),
+                (ffmpeg, false),
+                "{format:#x}"
+            );
             assert_eq!(
                 raw.color_options(),
                 ["-color_range", color[0], "-colorspace", color[1]],
                 "{format:#x}"
             );
-            let data: Vec<u8> = (0..len as u8).collect();
+            let data: Vec<u8> = (0..u8::try_from(len).unwrap()).collect();
             let frame = Frame {
                 width: 2,
                 height: 2,
@@ -8024,7 +8493,7 @@ esac"#
                 data: data.clone().into(),
                 ..Frame::default()
             };
-            assert_eq!(raw.bytes(frame).unwrap(), data, "{format:#x}");
+            assert_eq!(raw.bytes(&frame).unwrap(), data, "{format:#x}");
         }
     }
     #[test]
@@ -8043,20 +8512,20 @@ esac"#
                 data,
                 jpeg: None,
             };
-            let padded = raw.bytes(frame(3, 2, (1..=13).collect())).unwrap();
+            let padded = raw.bytes(&frame(3, 2, (1..=13).collect())).unwrap();
             assert_eq!(
                 padded,
                 [1, 2, 3, 4, 5, 6, 128, 128, 7, 8, 9, 10, 11, 12, 128, 128],
                 "{format:x}"
             );
             assert_eq!(
-                raw.bytes(frame(1, 1, vec![9, 7].into())).unwrap(),
+                raw.bytes(&frame(1, 1, vec![9, 7].into())).unwrap(),
                 [9, 7, 128, 128]
             );
-            assert!(raw.bytes(frame(3, 2, vec![0; 11].into())).is_err());
+            raw.bytes(&frame(3, 2, vec![0; 11].into())).unwrap_err();
             // Even widths and other formats pass through unchanged.
             let even = (1..=8).collect::<Vec<u8>>();
-            assert_eq!(raw.bytes(frame(2, 2, even.clone().into())).unwrap(), even);
+            assert_eq!(raw.bytes(&frame(2, 2, even.clone().into())).unwrap(), even);
         }
         let mono = RawInput::for_format(crate::types::MONO8).unwrap();
         let odd = Frame {
@@ -8069,7 +8538,7 @@ esac"#
             data: vec![1, 2, 3].into(),
             jpeg: None,
         };
-        assert_eq!(mono.bytes(odd).unwrap(), [1, 2, 3]);
+        assert_eq!(mono.bytes(&odd).unwrap(), [1, 2, 3]);
     }
     #[test]
     #[ignore = "requires a bundled FFmpeg or CAPTUREFAB_FFMPEG executable"]
@@ -8082,9 +8551,14 @@ esac"#
             let raw = RawInput::for_format(format).unwrap();
             let data = (0..height)
                 .flat_map(|y| {
-                    let cb = 60 + 40 * y as u8;
+                    let cb = 60 + 40 * u8::try_from(y).unwrap();
                     (0..width).step_by(2).flat_map(move |x| {
-                        let pair = [40 + 30 * x as u8, cb, 55 + 30 * x as u8, 128];
+                        let pair = [
+                            40 + 30 * u8::try_from(x).unwrap(),
+                            cb,
+                            55 + 30 * u8::try_from(x).unwrap(),
+                            128,
+                        ];
                         let bytes = order.map(|i| pair[i]);
                         bytes.into_iter().take(if x + 1 < width { 4 } else { 2 })
                     })
@@ -8093,8 +8567,8 @@ esac"#
             assert_eq!(data.len(), width * height * 2);
             let frame = Frame {
                 id: 1,
-                width: width as u32,
-                height: height as u32,
+                width: u32::try_from(width).unwrap(),
+                height: u32::try_from(height).unwrap(),
                 pixel_format: format,
                 device_ts_ns: None,
                 wall_ms: 0,
@@ -8114,7 +8588,7 @@ esac"#
                 .spawn()
                 .unwrap();
             let mut stdin = child.stdin.take().unwrap();
-            let bytes = raw.bytes(frame).unwrap();
+            let bytes = raw.bytes(&frame).unwrap();
             let feeder = thread::spawn(move || stdin.write_all(&bytes));
             let output = child.wait_with_output().unwrap();
             feeder.join().unwrap().unwrap();
@@ -8138,11 +8612,19 @@ esac"#
         let rgb: Vec<[u8; 3]> = (0..width * height)
             .map(|i| {
                 let (x, y) = (i % width, i / width);
-                [(40 + 2 * x) as u8, (60 + 3 * y) as u8, (200 - x - y) as u8]
+                [
+                    u8::try_from(40 + 2 * x).unwrap(),
+                    u8::try_from(60 + 3 * y).unwrap(),
+                    u8::try_from(200 - x - y).unwrap(),
+                ]
             })
             .collect();
-        let luma =
-            |p: &[u8; 3]| ((p[0] as u32 * 54 + p[1] as u32 * 183 + p[2] as u32 * 19) >> 8) as u16;
+        let luma = |p: &[u8; 3]| {
+            u16::try_from(
+                (u32::from(p[0]) * 54 + u32::from(p[1]) * 183 + u32::from(p[2]) * 19) >> 8,
+            )
+            .unwrap()
+        };
         let wide = |shift: u16| -> Vec<u8> {
             rgb.iter()
                 .flat_map(|p| (luma(p) << shift).to_le_bytes())
@@ -8155,13 +8637,18 @@ esac"#
         let mosaic = |cfa| bayer(&rgb, width, cfa);
         let (gr, rg, gb, bg) = ([1, 0, 2, 1], [0, 1, 1, 2], [1, 2, 0, 1], [2, 1, 1, 0]);
         // JFIF Y'CbCr, the chroma of each pair averaged, in `order`.
+        #[expect(
+            clippy::cast_sign_loss,
+            clippy::cast_possible_truncation,
+            reason = "the independent YCbCr reference retains rounded, clamped float-to-byte conversion"
+        )]
         let yuv = |order: [usize; 4]| -> Vec<u8> {
             let ycbcr = |p: &[u8; 3]| {
                 let [r, g, b] = p.map(f64::from);
                 [
                     0.299 * r + 0.587 * g + 0.114 * b,
-                    -0.168736 * r - 0.331264 * g + 0.5 * b + 128.0,
-                    0.5 * r - 0.418688 * g - 0.081312 * b + 128.0,
+                    -0.168_736 * r - 0.331_264 * g + 0.5 * b + 128.0,
+                    0.5 * r - 0.418_688 * g - 0.081_312 * b + 128.0,
                 ]
             };
             rgb.as_chunks::<2>()
@@ -8169,7 +8656,7 @@ esac"#
                 .iter()
                 .flat_map(|[a, b]| {
                     let (a, b) = (ycbcr(a), ycbcr(b));
-                    let values = [a[0], (a[1] + b[1]) / 2.0, b[0], (a[2] + b[2]) / 2.0];
+                    let values = [a[0], a[1].midpoint(b[1]), b[0], a[2].midpoint(b[2])];
                     order.map(|i| values[i].round().clamp(0.0, 255.0) as u8)
                 })
                 .collect()
@@ -8177,13 +8664,13 @@ esac"#
         let formats: Vec<(u32, Vec<u8>)> = vec![
             (
                 crate::types::MONO8,
-                rgb.iter().map(|p| luma(p) as u8).collect(),
+                rgb.iter().map(|p| u8::try_from(luma(p)).unwrap()).collect(),
             ),
             (0x0110_0003, wide(2)),
             (0x0110_0005, wide(4)),
             (0x0110_0025, wide(6)),
             (0x0110_0007, wide(8)),
-            (crate::types::RGB8, rgb.iter().flatten().copied().collect()),
+            (RGB8, rgb.iter().flatten().copied().collect()),
             (
                 0x0218_0015,
                 rgb.iter().flat_map(|p| [p[2], p[1], p[0]]).collect(),
@@ -8224,7 +8711,7 @@ esac"#
         fn lsb(samples: &[u16], bits: usize) -> Vec<u8> {
             let mut out = vec![0u8; (samples.len() * bits).div_ceil(8)];
             for (i, &v) in samples.iter().enumerate() {
-                for b in (0..bits).filter(|b| v >> b & 1 == 1) {
+                for b in (0..bits).filter(|b| (v >> b) & 1 == 1) {
                     out[(i * bits + b) / 8] |= 1 << ((i * bits + b) % 8);
                 }
             }
@@ -8240,9 +8727,9 @@ esac"#
                 .iter()
                 .flat_map(|&[a, b]| {
                     [
-                        (a >> low) as u8,
-                        (a & mask | (b & mask) << 4) as u8,
-                        (b >> low) as u8,
+                        u8::try_from(a >> low).unwrap(),
+                        u8::try_from(a & mask | ((b & mask) << 4)).unwrap(),
+                        u8::try_from(b >> low).unwrap(),
                     ]
                 })
                 .collect()
@@ -8251,8 +8738,8 @@ esac"#
             let raw = RawInput::for_format(pixel_format).unwrap();
             let frame = Frame {
                 id: 1,
-                width: width as u32,
-                height: height as u32,
+                width: u32::try_from(width).unwrap(),
+                height: u32::try_from(height).unwrap(),
                 pixel_format,
                 device_ts_ns: None,
                 wall_ms: 0,
@@ -8278,7 +8765,7 @@ esac"#
                 .spawn()
                 .unwrap();
             let mut stdin = child.stdin.take().unwrap();
-            let bytes = raw.bytes(frame).unwrap();
+            let bytes = raw.bytes(&frame).unwrap();
             let feeder = thread::spawn(move || stdin.write_all(&bytes));
             let output = child.wait_with_output().unwrap();
             feeder.join().unwrap().unwrap();
@@ -8290,7 +8777,8 @@ esac"#
                 for x in 2..width - 2 {
                     for c in 0..3 {
                         let i = (y * width + x) * 3 + c;
-                        error += (output.stdout[i] as i64 - expected[i] as i64).unsigned_abs();
+                        error +=
+                            (i64::from(output.stdout[i]) - i64::from(expected[i])).unsigned_abs();
                         count += 1;
                     }
                 }
@@ -8300,7 +8788,7 @@ esac"#
         }
     }
     /// Frames decoded in their own format and converted by Capturefab look
-    /// as FFmpeg's own RGB24 conversion of them did, whatever the format,
+    /// as `FFmpeg`'s own RGB24 conversion of them did, whatever the format,
     /// color range and matrix.
     #[test]
     #[ignore = "requires a bundled FFmpeg or CAPTUREFAB_FFMPEG executable"]
@@ -8396,9 +8884,10 @@ esac"#
                 "-frames:v",
                 "4",
             ]
-            .map(str::to_string)
-            .to_vec();
-            args.extend(encode.iter().map(|arg| arg.to_string()));
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+            args.extend(encode.iter().map(ToString::to_string));
             args.push(path.to_string_lossy().into());
             let (success, log) = bounded_output(&exe, &args, Duration::from_secs(20)).unwrap();
             assert!(success, "{name}: {log}");
@@ -8407,8 +8896,8 @@ esac"#
                 let mut decoder =
                     Decoder::spawn_configured(&source, Duration::from_secs(10), &[], output)
                         .unwrap();
-                (0..4)
-                    .map(|_| decoder.next(Duration::from_secs(10)).unwrap())
+                std::iter::repeat_with(|| decoder.next(Duration::from_secs(10)).unwrap())
+                    .take(4)
                     .collect::<Vec<_>>()
             };
             let (rgb, native) = (frames(Output::Rgb), frames(Output::Native));
@@ -8478,9 +8967,10 @@ esac"#
                 "-frames:v",
                 "3",
             ]
-            .map(str::to_string)
-            .to_vec();
-            args.extend(encode.iter().map(|arg| arg.to_string()));
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+            args.extend(encode.iter().map(ToString::to_string));
             args.push(path.to_string_lossy().into());
             let (success, log) = bounded_output(&exe, &args, Duration::from_secs(20)).unwrap();
             assert!(success, "{name}: {log}");
@@ -8488,11 +8978,15 @@ esac"#
             camera.start(0).unwrap();
             let frame = camera.next_frame(Duration::from_secs(10)).unwrap();
             assert_eq!(frame.pixel_format, RGB8, "{name}");
-            assert_eq!(frame.data.len(), (width * height * 3) as usize, "{name}");
+            assert_eq!(
+                frame.data.len(),
+                usize::try_from(width * height * 3).unwrap(),
+                "{name}"
+            );
         }
         let _ = fs::remove_dir_all(dir);
     }
-    /// On a Mac, VideoToolbox decodes H.264 and HEVC files into NV12 frames
+    /// On a Mac, `VideoToolbox` decodes H.264 and HEVC files into NV12 frames
     /// that look as software decoding's do; a profile it lacks (H.264
     /// 4:4:4) is decoded in software and remembered.
     #[test]
@@ -8533,7 +9027,7 @@ esac"#
                 pix_fmt,
                 path.to_str().unwrap(),
             ]
-            .map(str::to_string);
+            .map(str::to_owned);
             let (success, log) = bounded_output(&exe, &args, Duration::from_secs(30)).unwrap();
             assert!(success, "{name}: {log}");
             let frame = |setting| {
@@ -8578,7 +9072,7 @@ esac"#
     /// A mosaic recorded to a 4:2:0 encoder is demosaicked once, to RGB24,
     /// and never widened to RGB48 on its way.
     /// A stream from a camera slower than its rate gets each frame once and
-    /// still carries the rate asked for: FFmpeg repeats the frames.
+    /// still carries the rate asked for: `FFmpeg` repeats the frames.
     #[test]
     #[cfg(unix)]
     #[ignore = "requires a bundled FFmpeg or CAPTUREFAB_FFMPEG executable"]
@@ -8592,7 +9086,7 @@ esac"#
         let receiver = command(&exe)
             .args(["-v", "error", "-i"])
             .arg(format!("udp://127.0.0.1:{port}?timeout=2000000"))
-            .args(["-f", "framemd5", "-"])
+            .args(["-fps_mode", "passthrough", "-f", "framemd5", "-"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -8607,7 +9101,7 @@ esac"#
         let mut pushed = 0u64;
         while started.elapsed() < Duration::from_secs(2) {
             let mut frame = tiny(64, 48);
-            frame.data = vec![(pushed * 8) as u8; 64 * 48 * 3].into();
+            frame.data = vec![(pushed * 8).to_le_bytes()[0]; 64 * 48 * 3].into();
             forward.push(frame).unwrap();
             pushed += 1;
             thread::sleep(Duration::from_millis(33));
@@ -8617,7 +9111,7 @@ esac"#
         let output = receiver.wait_with_output().unwrap();
         let received = String::from_utf8_lossy(&output.stdout)
             .lines()
-            .filter(|line| !line.starts_with('#'))
+            .filter(|line| line.starts_with("0,"))
             .count();
         // About 60 written and 120 received.
         assert!(stats.written <= pushed, "{stats:?}");
@@ -8628,22 +9122,30 @@ esac"#
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    /// The decoded frames of a video, as FFmpeg's framemd5 checksums them.
+    /// The decoded frames of a video, as `FFmpeg`'s framemd5 checksums them.
     fn decoded_checksums(exe: &Executable, path: &std::path::Path) -> Vec<String> {
         let output = command(exe)
             .args(["-hide_banner", "-v", "error", "-i"])
             .arg(path)
-            .args(["-map", "0:v:0", "-f", "framemd5", "-"])
+            .args([
+                "-map",
+                "0:v:0",
+                "-fps_mode",
+                "passthrough",
+                "-f",
+                "framemd5",
+                "-",
+            ])
             .output()
             .unwrap();
         assert!(
-            output.status.success(),
+            output.status.success() && output.stderr.is_empty(),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout)
             .lines()
-            .filter(|line| !line.starts_with('#'))
+            .filter(|line| line.starts_with("0,"))
             .map(|line| line.rsplit(',').next().unwrap().trim().to_owned())
             .collect()
     }
@@ -8653,12 +9155,12 @@ esac"#
         let pixels: Vec<u8> = (0..width * height * 3)
             .map(|i| {
                 let (pixel, channel) = (i / 3, i % 3);
-                ((pixel % width + index * 4) * (channel + 1) + pixel / width) as u8
+                ((pixel % width + index * 4) * (channel + 1) + pixel / width).to_le_bytes()[0]
             })
             .collect();
         turbojpeg::compress(
             turbojpeg::Image {
-                pixels: &pixels[..],
+                pixels: &*pixels,
                 width,
                 pitch: width * 3,
                 height,
@@ -8673,15 +9175,15 @@ esac"#
     /// A JPEG without an EOI, as webcams send, is read whole, and one that
     /// is not well formed is skipped like one that does not decode: the
     /// stream goes on. A source whose first JPEGs are all broken goes back
-    /// to FFmpeg's decoder.
+    /// to `FFmpeg`'s decoder.
     #[test]
     #[cfg(feature = "jpeg")]
     fn broken_motion_jpegs_are_skipped_and_open_ones_read_whole() {
         let jpegs: Vec<Vec<u8>> = (0..4).map(|i| moving_jpeg(32, 16, i)).collect();
         let open = &jpegs[1][..jpegs[1].len() - 2];
         let broken = [0xFF, 0xD8, 0x12, 0x34];
-        let stream = [&jpegs[0][..], open, &jpegs[2], &broken, &jpegs[3]].concat();
-        let mut reader = std::io::BufReader::with_capacity(64, &stream[..]);
+        let stream = [(&*jpegs[0]), open, &jpegs[2], &broken, &jpegs[3]].concat();
+        let mut reader = BufReader::with_capacity(64, &*stream);
         let pool = crate::framebuf::pool();
         let mut jpeg_reader = JpegReader::default();
         for (id, jpeg) in [&jpegs[0], &jpegs[1], &jpegs[2], &jpegs[3]]
@@ -8689,12 +9191,12 @@ esac"#
             .enumerate()
         {
             let frame = jpeg_reader.next(&mut reader, id as u64, pool).unwrap();
-            assert_eq!(frame.jpeg.as_deref(), Some(&jpeg[..]), "frame {id}");
+            assert_eq!(frame.jpeg.as_deref(), Some(&**jpeg), "frame {id}");
         }
         let ended = jpeg_reader.next(&mut reader, 4, pool).unwrap_err();
         assert!(!ended.is::<NeedsDecoding>(), "{ended:#}");
         let stream = [&broken[..], &broken, &broken, &jpegs[0]].concat();
-        let mut reader = std::io::BufReader::new(&stream[..]);
+        let mut reader = BufReader::new(&*stream);
         let error = JpegReader::default()
             .next(&mut reader, 1, pool)
             .unwrap_err();
@@ -8702,7 +9204,7 @@ esac"#
     }
     /// A Motion JPEG file, and a Motion JPEG stream over HTTP, are read as
     /// their own JPEGs: each frame keeps the one it was decoded from, and
-    /// decodes as FFmpeg decodes it.
+    /// decodes as `FFmpeg` decodes it.
     #[test]
     #[cfg(feature = "jpeg")]
     #[ignore = "requires a bundled FFmpeg or CAPTUREFAB_FFMPEG executable"]
@@ -8740,7 +9242,7 @@ esac"#
         camera.start(0).unwrap();
         for (index, jpeg) in jpegs.iter().enumerate().take(10) {
             let frame = camera.next_frame(Duration::from_secs(3)).unwrap();
-            assert_eq!(frame.jpeg.as_deref(), Some(&jpeg[..]), "frame {index}");
+            assert_eq!(frame.jpeg.as_deref(), Some(&**jpeg), "frame {index}");
             assert_eq!(
                 crate::frame::pixel_format_name(frame.pixel_format),
                 "YCbCr422_8_Planar"
@@ -8818,7 +9320,7 @@ esac"#
         assert!(
             jpegs
                 .iter()
-                .any(|jpeg| frame.jpeg.as_deref() == Some(&jpeg[..]))
+                .any(|jpeg| frame.jpeg.as_deref() == Some(&**jpeg))
         );
         camera.stop().unwrap();
         fs::remove_dir_all(dir).unwrap();
@@ -8949,7 +9451,7 @@ esac"#
                 // As a recording hands it over: BayerRG12p narrowed to 8
                 // bits, BayerRG16 read by FFmpeg as it is.
                 let raw = RawInput::for_format(format).unwrap().for_encoder(encoder);
-                let bytes = raw.bytes(frame.clone()).unwrap();
+                let bytes = raw.bytes(&frame).unwrap();
                 let pix_fmt = raw.input_pix_fmt(encoder);
                 assert_eq!(pix_fmt, expected);
                 let mut child = command(&exe)
@@ -9032,14 +9534,14 @@ esac"#
         ] {
             let raw = RawInput::for_format(format).unwrap().for_encoder("ffv1");
             let mut seed = format;
-            let data: Vec<u8> = (0..crate::frame::row_bytes(width, format) * height as usize)
-                .map(|_| {
-                    seed ^= seed << 13;
-                    seed ^= seed >> 17;
-                    seed ^= seed << 5;
-                    seed as u8
-                })
-                .collect();
+            let data: Vec<u8> = std::iter::repeat_with(|| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed.to_le_bytes()[0]
+            })
+            .take(crate::frame::row_bytes(width, format) * height as usize)
+            .collect();
             let frame = Frame {
                 width,
                 height,
@@ -9063,7 +9565,7 @@ esac"#
             } else {
                 frame
             };
-            let bytes = raw.bytes(frame).unwrap();
+            let bytes = raw.bytes(&frame).unwrap();
             let pix_fmt = raw.input_pix_fmt("ffv1");
             let path = dir.join(format!("{format:08x}.mkv"));
             let mut child = command(&exe)
@@ -9136,7 +9638,7 @@ esac"#
             "ffv1",
             input.to_str().unwrap(),
         ]
-        .map(str::to_string);
+        .map(str::to_owned);
         let (success, log) = bounded_output(&exe, &args, Duration::from_secs(5)).unwrap();
         assert!(success, "{log}");
         let mut camera = open_url(input.to_str().unwrap(), Duration::from_secs(3)).unwrap();
@@ -9178,22 +9680,112 @@ esac"#
         fs::remove_dir(dir).unwrap();
     }
     #[test]
+    #[ignore = "requires FFmpeg with libx264 and FFV1"]
+    fn ffmpeg_recording_clock_preserves_frames_received_in_bursts() {
+        let exe = executable().unwrap();
+        let dir = temp_dir("recording-clock");
+        for (encoder, frozen) in [
+            ("ffv1", false),
+            ("libx264", false),
+            ("ffv1", true),
+            ("libx264", true),
+        ] {
+            let path = dir.join(format!("{encoder}-{frozen}.mkv"));
+            let mut options =
+                recording_clock_options(encoder_output_options(encoder, EncoderInput::Yuv, "gray"));
+            if frozen {
+                // Model a clock whose value does not advance between frames.
+                for option in &mut options {
+                    *option = option.replace("RTCTIME-RTCSTART", "0");
+                }
+            }
+            let mut child = command(&exe)
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "gray",
+                    "-video_size",
+                    "64x48",
+                    "-framerate",
+                    "30",
+                    "-use_wallclock_as_timestamps",
+                    "1",
+                    "-i",
+                    "pipe:0",
+                    "-an",
+                    "-c:v",
+                    encoder,
+                ])
+                .args(options)
+                .args(["-fps_mode", "vfr"])
+                .arg(&path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut input = child.stdin.take().unwrap();
+            let feeder = thread::spawn(move || -> std::io::Result<()> {
+                for value in 0..10u8 {
+                    input.write_all(&vec![value; 64 * 48 * 3])?;
+                    if !frozen {
+                        thread::sleep(Duration::from_millis(100));
+                    }
+                }
+                Ok(())
+            });
+            let output = child.wait_with_output().unwrap();
+            let fed = feeder.join().unwrap();
+            assert!(
+                output.status.success(),
+                "{encoder}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            fed.unwrap();
+            let decoded = command(&exe)
+                .args(["-v", "error", "-i"])
+                .arg(&path)
+                .args(["-fps_mode", "passthrough", "-f", "framemd5", "-"])
+                .output()
+                .unwrap();
+            assert!(
+                decoded.status.success() && decoded.stderr.is_empty(),
+                "{}",
+                String::from_utf8_lossy(&decoded.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&decoded.stdout)
+                    .lines()
+                    .filter(|line| line.starts_with("0,"))
+                    .count(),
+                30,
+                "{encoder} frozen={frozen}"
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     #[ignore = "requires FFmpeg with libx264; loads every core for about 10 s"]
     fn ffmpeg_recording_lasts_as_long_as_the_wall_clock_under_load() {
         let dir = temp_dir("timeline");
         let output = dir.join("load.mkv");
         let busy = Arc::new(AtomicBool::new(true));
-        let hogs = (0..cores() * 2)
-            .map(|_| {
-                let busy = busy.clone();
-                thread::spawn(move || {
-                    let mut x = 1u64;
-                    while busy.load(Ordering::Relaxed) {
-                        x = std::hint::black_box(x.wrapping_mul(6364136223846793005) + 1);
-                    }
-                })
+        let hogs = std::iter::repeat_with(|| {
+            let busy = busy.clone();
+            thread::spawn(move || {
+                let mut x = 1u64;
+                while busy.load(Ordering::Relaxed) {
+                    x = std::hint::black_box(x.wrapping_mul(6_364_136_223_846_793_005) + 1);
+                }
             })
-            .collect::<Vec<_>>();
+        })
+        .take(cores() * 2)
+        .collect::<Vec<_>>();
         let mut forward = Forwarder::new(ForwardConfig {
             output: output.to_string_lossy().into(),
             codec: "h264".into(),
@@ -9209,7 +9801,11 @@ esac"#
         let pictures = (0..8u8)
             .map(|shift| {
                 (0..width * height * 3)
-                    .map(|i| (i / 3 % width) as u8 ^ (i / (3 * width)) as u8 ^ (shift * 32))
+                    .map(|i| {
+                        (i / 3 % width).to_le_bytes()[0]
+                            ^ (i / (3 * width)).to_le_bytes()[0]
+                            ^ (shift * 32)
+                    })
                     .collect::<Vec<u8>>()
             })
             .collect::<Vec<_>>();
@@ -9220,12 +9816,15 @@ esac"#
             forward
                 .push(Frame {
                     id,
-                    width: width as u32,
-                    height: height as u32,
+                    width: u32::try_from(width).unwrap(),
+                    height: u32::try_from(height).unwrap(),
                     pixel_format: RGB8,
                     device_ts_ns: None,
                     wall_ms: 0,
-                    data: pictures[id as usize % pictures.len()].clone().into(),
+                    data: pictures
+                        [usize::try_from(id % u64::try_from(pictures.len()).unwrap()).unwrap()]
+                    .clone()
+                    .into(),
                     jpeg: None,
                 })
                 .unwrap();
@@ -9263,7 +9862,7 @@ esac"#
         let args = ["-hide_banner", "-i", path.to_str().unwrap()]
             .into_iter()
             .chain(["-c", "copy", "-f", "framecrc", "-"])
-            .map(str::to_string)
+            .map(str::to_owned)
             .collect::<Vec<_>>();
         let (ok, log) = bounded_output(&exe, &args, Duration::from_secs(60)).unwrap();
         assert!(ok, "{log}");
@@ -9309,12 +9908,12 @@ esac"#
             forward
                 .push(Frame {
                     id,
-                    width: width as u32,
-                    height: height as u32,
+                    width: u32::try_from(width).unwrap(),
+                    height: u32::try_from(height).unwrap(),
                     pixel_format: RGB8,
                     device_ts_ns: None,
                     wall_ms: 0,
-                    data: vec![(id * 8) as u8; width * height * 3].into(),
+                    data: vec![(id * 8).to_le_bytes()[0]; width * height * 3].into(),
                     jpeg: None,
                 })
                 .unwrap();
@@ -9358,7 +9957,7 @@ esac"#
         });
         let start = Instant::now();
         let mut decoder = Decoder::spawn(&url, Duration::from_millis(150)).unwrap();
-        assert!(decoder.next(Duration::from_millis(150)).is_err());
+        decoder.next(Duration::from_millis(150)).unwrap_err();
         decoder.stop();
         assert!(start.elapsed() < Duration::from_secs(2));
         let _ = release.send(());
@@ -9388,14 +9987,14 @@ esac"#
         })
         .unwrap();
         let mut noise = 123u32;
-        let data = (0..640 * 480 * 3)
-            .map(|_| {
-                noise ^= noise << 13;
-                noise ^= noise >> 17;
-                noise ^= noise << 5;
-                noise as u8
-            })
-            .collect::<Vec<_>>();
+        let data = std::iter::repeat_with(|| {
+            noise ^= noise << 13;
+            noise ^= noise >> 17;
+            noise ^= noise << 5;
+            noise.to_le_bytes()[0]
+        })
+        .take(640 * 480 * 3)
+        .collect::<Vec<_>>();
         let frame = Frame {
             id: 1,
             width: 640,
@@ -9447,7 +10046,7 @@ esac"#
             data: vec![0; 64 * 48 * 3].into(),
             jpeg: None,
         };
-        let error = forward.push(frame.clone()).unwrap_err();
+        let error = forward.push(frame).unwrap_err();
         assert!(format!("{error:#}").contains("is unavailable in this FFmpeg build"));
         forward.stop().unwrap();
         assert!(!path.exists(), "invalid recordings must be removed");
@@ -9530,12 +10129,12 @@ esac"#
             if forward.stats().error.is_some() || Instant::now() >= deadline {
                 break;
             }
-            let data = (0..160 * 120 * 3)
-                .map(|_| {
-                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                    (seed >> 24) as u8
-                })
-                .collect();
+            let data = std::iter::repeat_with(|| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (seed >> 24) as u8
+            })
+            .take(160 * 120 * 3)
+            .collect();
             let frame = Frame {
                 id,
                 width: 160,
@@ -9560,7 +10159,7 @@ esac"#
             .stats()
             .recording
             .expect("the recording up to its limit is kept");
-        let bytes = std::fs::metadata(&path).unwrap().len();
+        let bytes = fs::metadata(&path).unwrap().len();
         assert!(bytes <= limit);
         assert_eq!(recorded.truncated, bytes == limit);
         assert_eq!(recorded.bytes, bytes);
@@ -9570,6 +10169,8 @@ esac"#
             "error",
             "-i",
             &path.to_string_lossy(),
+            "-fps_mode",
+            "passthrough",
             "-f",
             "framemd5",
             "-",
@@ -9578,9 +10179,20 @@ esac"#
         let (_, log) = bounded_output(&exe, &args, Duration::from_secs(30)).unwrap();
         let frames = log.lines().filter(|line| line.starts_with("0,")).count();
         assert!(frames > 0, "{log}");
-        std::fs::remove_file(&path).unwrap();
+        fs::remove_file(&path).unwrap();
     }
-    /// A recording with a maximum size ends while FFmpeg's next part, the
+    #[test]
+    fn recording_limit_counters_saturate_instead_of_wrapping() {
+        let now = Instant::now();
+        let mut near = NearEnd::new(u64::MAX);
+        assert!(near.reached_at(u64::MAX - 10, now));
+        assert!(near.reached_at(u64::MAX, now + Duration::from_millis(1)));
+        // Counter resets cannot make a later burst wrap below its limit.
+        assert!(near.reached_at(0, now + Duration::from_millis(2)));
+        assert!(near.reached_at(u64::MAX, now + Duration::from_millis(3)));
+    }
+
+    /// A recording with a maximum size ends while `FFmpeg`'s next part, the
     /// largest so far with a quarter more, and a second of its output
     /// still fit.
     #[test]
@@ -9632,7 +10244,7 @@ esac"#
             max_file_bytes: None,
             min_free: None,
         };
-        assert!(Forwarder::new(config.clone()).is_ok());
+        Forwarder::new(config.clone()).unwrap();
         let mut serialized = serde_json::to_value(&config).unwrap();
         serialized["bitarte"] = json!("8M");
         assert!(
@@ -9651,6 +10263,9 @@ esac"#
             "5G",
             "0.0000001M",
             "4294967296",
+            "1m",
+            "1g",
+            "1\u{212a}",
         ] {
             let mut invalid = config.clone();
             invalid.bitrate = bitrate.into();
@@ -9658,10 +10273,12 @@ esac"#
         }
         for (bitrate, expected) in [
             ("2.01k", 2010),
+            ("2500K", 2_500_000),
+            ("1G", 1_000_000_000),
             (".5M", 500_000),
             ("1.000000M", 1_000_000),
             ("0.000001M", 1),
-            ("4294967295", u32::MAX as u64),
+            ("4294967295", u64::from(u32::MAX)),
         ] {
             assert_eq!(bits_per_second(bitrate).unwrap(), expected, "{bitrate}");
         }
@@ -9670,7 +10287,7 @@ esac"#
             invalid.encoder = encoder.into();
             assert!(invalid.validate().is_err(), "{encoder}");
         }
-        assert!(validate_encoder("av1", "libaom-av1").is_ok());
+        validate_encoder("av1", "libaom-av1").unwrap();
         for output in [
             "https://",
             "rtsp://camera:70000/live",
@@ -9713,9 +10330,9 @@ esac"#
     #[test]
     fn explicit_encoders_must_be_installed_video_encoders_for_the_selected_codec() {
         let listing = " V....D libx264 H.264 (codec h264)\n V....D libaom-av1 AV1 (codec av1)\n A..... aac AAC\n V..... mjpeg Motion JPEG\n V....D custom New encoder (codec hevc)\n";
-        assert!(validate_encoder_listing(listing, "libx264", "h264").is_ok());
-        assert!(validate_encoder_listing(listing, "libaom-av1", "av1").is_ok());
-        assert!(validate_encoder_listing(listing, "custom", "hevc").is_ok());
+        validate_encoder_listing(listing, "libx264", "h264").unwrap();
+        validate_encoder_listing(listing, "libaom-av1", "av1").unwrap();
+        validate_encoder_listing(listing, "custom", "hevc").unwrap();
         for (encoder, family) in [
             ("libx264", "av1"),
             ("aac", "h264"),
@@ -9840,7 +10457,7 @@ while :; do printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; sleep 0.05; done"#,
         camera.stop().unwrap();
     }
     /// A recording copies a tapped H.264 stream from its last key frame,
-    /// through FFmpeg reading MPEG-TS, with no encoder; other codecs and
+    /// through `FFmpeg` reading MPEG-TS, with no encoder; other codecs and
     /// recordings that want frames are not tapped.
     #[test]
     #[cfg(unix)]
@@ -10180,7 +10797,7 @@ while :; do head -c 12 /dev/zero; sleep 0.02; done"#,
                 "yuyv422"
             ]
         );
-        let nodes = crate::genicam::NodeMap::parse(&camera.xml().unwrap()).unwrap();
+        let nodes = NodeMap::parse(&camera.xml().unwrap()).unwrap();
         assert_eq!(
             nodes.choices(&mut camera, "VideoMode").unwrap(),
             ["640x480", "1280x720", "1920x1080"]
@@ -10211,6 +10828,38 @@ while :; do head -c 12 /dev/zero; sleep 0.02; done"#,
         );
     }
     #[test]
+    fn dshow_intervals_reject_nonfinite_nonpositive_and_out_of_range_values() {
+        for value in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -1.0,
+            0.0,
+            0.99,
+            f64::from(u32::MAX) + 1.0,
+        ] {
+            assert_eq!(dshow_interval(value), None, "{value}");
+        }
+        assert_eq!(dshow_interval(1.99), Some(1));
+        assert_eq!(dshow_interval(f64::from(u32::MAX)), Some(u32::MAX));
+        for rate in [
+            "NaN",
+            "inf",
+            "-inf",
+            "0",
+            "-1",
+            "0.09",
+            "1e300",
+            "not a rate",
+        ] {
+            assert_eq!(dshow_intervals(rate), [] as [u32; 0], "{rate}");
+        }
+        assert_eq!(dshow_nominal(&[]), None);
+        assert_eq!(dshow_nominal(&[0]), None);
+        assert_eq!(dshow_nominal(&[0, 416_666]), Some(416_666));
+    }
+
+    #[test]
     fn dshow_rates_are_requested_as_the_listed_frame_intervals() {
         // A Blackmagic DeckLink listing from FFmpeg's capture wiki: each
         // capability has a single frame interval, which the requested rate
@@ -10224,17 +10873,17 @@ while :; do head -c 12 /dev/zero; sleep 0.02; done"#,
         assert_eq!(
             decklink.iter().map(|m| m.intervals).collect::<Vec<_>>(),
             [
-                Some((417083, 417083)),
-                Some((416666, 416666)),
-                Some((333667, 333667)),
-                Some((166666, 166666))
+                Some((417_083, 417_083)),
+                Some((416_666, 416_666)),
+                Some((333_667, 333_667)),
+                Some((166_666, 166_666))
             ]
         );
         let mut camera = native("dshow:video=Decklink Video Capture", decklink);
         for (fps, rate, interval) in [
-            (23.976, "23.976014395", 417083),
-            (24.0, "24.000009600", 416666),
-            (60.0, "60.000060000", 166666),
+            (23.976, "23.976014395", 417_083),
+            (24.0, "24.000009600", 416_666),
+            (60.0, "60.000060000", 166_666),
         ] {
             camera
                 .configure(NativeOptions {
@@ -10244,14 +10893,20 @@ while :; do head -c 12 /dev/zero; sleep 0.02; done"#,
                 .unwrap();
             assert_eq!(camera.input_options()[..2], ["-framerate", rate]);
             // FFmpeg floors 1e7 / rate into 100 ns units.
-            assert_eq!((1e7 / rate.parse::<f64>().unwrap()) as u32, interval);
+            #[expect(
+                clippy::cast_sign_loss,
+                clippy::cast_possible_truncation,
+                reason = "this reference mirrors FFmpeg's truncation of a positive floating-point frame interval"
+            )]
+            let actual = (1e7 / rate.parse::<f64>().unwrap()) as u32;
+            assert_eq!(actual, interval);
         }
         // A webcam whose fastest interval is 333334 rather than 333333:
         // asking for 30 fps would fall outside its range.
         let webcam = dshow_modes(
             "[dshow @ 000001b5e2a6c3c0]   pixel_format=yuyv422  min s=1280x720 fps=5 max s=1280x720 fps=29.9999\n",
         );
-        assert_eq!(webcam[0].intervals, Some((333335, 1999999)));
+        assert_eq!(webcam[0].intervals, Some((333_335, 1_999_999)));
         let mut camera = native("dshow:video=USB Camera", webcam);
         camera.configure(NativeOptions::default()).unwrap();
         assert_eq!(camera.input_options()[..2], ["-framerate", "29.999805001"]);
@@ -10292,7 +10947,7 @@ while :; do head -c 12 /dev/zero; sleep 0.02; done"#,
             camera.input_options(),
             ["-framerate", "30", "-video_size", "1280x720"]
         );
-        let nodes = crate::genicam::NodeMap::parse(&camera.xml().unwrap()).unwrap();
+        let nodes = NodeMap::parse(&camera.xml().unwrap()).unwrap();
         nodes.set(&mut camera, "Width", "640").unwrap();
         nodes.set(&mut camera, "Height", "480").unwrap();
         nodes
@@ -10508,18 +11163,18 @@ while :; do head -c 12 /dev/zero; sleep 0.02; done"#,
     }
     /// A stream found to send Motion JPEG is read again as its own JPEGs,
     /// decoded here, each frame keeping its JPEG; JPEGs that do not decode
-    /// send it back to FFmpeg's decoder. A webcam in its MJPEG mode is read
+    /// send it back to `FFmpeg`'s decoder. A webcam in its MJPEG mode is read
     /// that way from the start.
     #[test]
     #[cfg(all(unix, feature = "jpeg"))]
     fn motion_jpeg_sources_are_read_as_their_own_jpegs() {
         let (width, height) = (16usize, 8usize);
         let pixels: Vec<u8> = (0..width * height * 3)
-            .map(|i| (i * 3 % 256) as u8)
+            .map(|i| u8::try_from(i * 3 % 256).unwrap())
             .collect();
         let jpeg = turbojpeg::compress(
             turbojpeg::Image {
-                pixels: &pixels[..],
+                pixels: &*pixels,
                 width,
                 pitch: width * 3,
                 height,
@@ -10548,7 +11203,7 @@ while :; do head -c 256 /dev/zero; sleep 0.02; done"#,
         camera.start(0).unwrap();
         for _ in 0..3 {
             let frame = camera.next_frame(Duration::from_secs(2)).unwrap();
-            assert_eq!(frame.jpeg.as_deref(), Some(&jpeg[..]));
+            assert_eq!(frame.jpeg.as_deref(), Some(&*jpeg));
             assert_eq!(
                 crate::frame::pixel_format_name(frame.pixel_format),
                 "YCbCr422_8_Planar"
@@ -10565,7 +11220,7 @@ while :; do head -c 256 /dev/zero; sleep 0.02; done"#,
         let mut camera = open_url("rtsp://127.0.0.1:9/live", Duration::from_secs(5)).unwrap();
         camera.start(0).unwrap();
         let frame = camera.next_frame(Duration::from_secs(2)).unwrap();
-        assert_eq!(frame.jpeg.as_deref(), Some(&jpeg[..]));
+        assert_eq!(frame.jpeg.as_deref(), Some(&*jpeg));
         assert_eq!(fake.launches(&["-f rawvideo"]), 1);
         assert_eq!(fake.launches(&["-f mjpeg"]), 2);
         drop(camera);

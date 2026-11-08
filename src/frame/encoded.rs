@@ -4,6 +4,7 @@
 //! out (a JPEG's comment segment). Files and pipes take the parts with
 //! vectored writes, so neither the frame nor the encoder's output is copied
 //! to put them together.
+#![deny(clippy::missing_const_for_fn)]
 use std::io::{IoSlice, Write};
 
 /// The bulk of an encoded image.
@@ -89,7 +90,7 @@ pub struct Encoded<'a> {
 }
 
 impl<'a> Encoded<'a> {
-    pub(crate) fn new(body: Body<'a>) -> Self {
+    pub(crate) const fn new(body: Body<'a>) -> Self {
         Self {
             body,
             insert: None,
@@ -113,7 +114,7 @@ impl<'a> Encoded<'a> {
             ..self
         }
     }
-    pub fn passthrough(&self) -> bool {
+    pub const fn passthrough(&self) -> bool {
         self.passthrough
     }
     pub fn len(&self) -> usize {
@@ -132,6 +133,10 @@ impl<'a> Encoded<'a> {
         self.parts().concat()
     }
     /// Write every byte to `out`, gathered into as few writes as it takes.
+    ///
+    /// # Errors
+    /// Returns the writer's I/O error, including `WriteZero` if it stops
+    /// accepting bytes before the image is complete. Interrupted writes retry.
     pub fn write_to(&self, out: &mut impl Write) -> std::io::Result<()> {
         write_all_vectored(out, &mut self.parts().map(IoSlice::new))
     }

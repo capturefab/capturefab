@@ -1,7 +1,7 @@
 //! Where Capturefab keeps files: the runtime folder (session descriptors,
 //! camera locks, previews and other files needed only while processes run),
 //! the state folder (presets, saved sign-ins, sessions' jobs and logs, kept
-//! across reboots) and the cache (the extracted FFmpeg and GenICam XML, made
+//! across reboots) and the cache (the extracted `FFmpeg` and `GenICam` XML, made
 //! again when missing).
 //!
 //! Each is the first of its candidates that is, or can be made, a private
@@ -13,7 +13,7 @@
 //! once per process, the first time a command needs one: a command that
 //! needs none never looks, and one that finds none fails only where it
 //! needs it, with a typed error naming the variable that fixes it.
-#![allow(unsafe_code)]
+#![deny(clippy::panic_in_result_fn)]
 use crate::types::{Categorized, ErrorKind};
 use anyhow::Result;
 use serde::Serialize;
@@ -50,14 +50,14 @@ pub(crate) struct Candidate {
     pub explicit: bool,
 }
 impl Candidate {
-    fn new(path: PathBuf, from: &'static str) -> Self {
+    const fn new(path: PathBuf, from: &'static str) -> Self {
         Self {
             path,
             from,
             explicit: false,
         }
     }
-    fn explicit(path: PathBuf, from: &'static str) -> Self {
+    const fn explicit(path: PathBuf, from: &'static str) -> Self {
         Self {
             path,
             from,
@@ -111,7 +111,7 @@ impl Found {
             .flatten()
     }
     fn error(&self) -> anyhow::Error {
-        let refusal = self.refusal.clone().unwrap_or(Refusal {
+        let refusal = self.refusal.clone().unwrap_or_else(|| Refusal {
             kind: ErrorKind::PermissionDenied,
             message: "no folder".into(),
             hint: None,
@@ -174,8 +174,8 @@ pub(crate) fn state() -> Result<PathBuf> {
     found(Kind::State).path()
 }
 
-/// What can be made again: the extracted FFmpeg, its encoder probes and
-/// GenICam XML. None turns caching off.
+/// What can be made again: the extracted `FFmpeg`, its encoder probes and
+/// `GenICam` XML. None turns caching off.
 pub(crate) fn cache() -> Option<PathBuf> {
     found(Kind::Cache)
         .chosen
@@ -229,27 +229,29 @@ fn choose(kind: Kind, candidates: &[Candidate]) -> Found {
                     why: why(&error),
                 });
                 if candidate.explicit {
-                    let refusal = match error.downcast_ref::<std::io::Error>() {
-                        // A folder that cannot be made or written, as on a
-                        // read-only file system, is named with the reason.
-                        Some(io) => Refusal {
-                            kind: ErrorKind::PermissionDenied,
-                            message: format!(
-                                "cannot write in {}: {}",
-                                candidate.path.display(),
-                                io_why(io)
-                            ),
-                            hint: Some(variable_hint(kind)),
-                        },
-                        None => {
+                    let refusal = error.downcast_ref::<std::io::Error>().map_or_else(
+                        || {
                             let classified = crate::types::classify(&error);
                             Refusal {
                                 kind: classified.kind,
                                 message: format!("{error:#}"),
                                 hint: classified.hint.or_else(|| Some(variable_hint(kind))),
                             }
-                        }
-                    };
+                        },
+                        |io| {
+                            // A folder that cannot be made or written, as on a
+                            // read-only file system, is named with the reason.
+                            Refusal {
+                                kind: ErrorKind::PermissionDenied,
+                                message: format!(
+                                    "cannot write in {}: {}",
+                                    candidate.path.display(),
+                                    io_why(io)
+                                ),
+                                hint: Some(variable_hint(kind)),
+                            }
+                        },
+                    );
                     return Found {
                         chosen: None,
                         passed,
@@ -313,7 +315,7 @@ fn why(error: &anyhow::Error) -> String {
     ["belongs to another user", "group or others may enter it"]
         .into_iter()
         .find(|known| text.contains(known))
-        .map_or(text.clone(), str::to_owned)
+        .map_or(text, str::to_owned)
 }
 fn io_why(error: &std::io::Error) -> String {
     match error.kind() {
@@ -347,14 +349,14 @@ fn prepare(path: &Path, read_only: bool) -> Result<bool> {
 }
 
 /// Make a cache folder of this user's that others may enter private, such
-/// as one made with plain `mkdir`, as extracting FFmpeg there always did:
+/// as one made with plain `mkdir`, as extracting `FFmpeg` there always did:
 /// it holds nothing others could have read. A runtime or state folder is
 /// refused instead, with `chmod 700` as the fix: others may already have
 /// read the session tokens or sign-in index in it.
 fn make_private(path: &Path) {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         if let Ok(meta) = fs::symlink_metadata(path)
             && meta.is_dir()
             && meta.uid() == effective_uid()
@@ -372,7 +374,7 @@ fn create_private(path: &Path) -> std::io::Result<()> {
     builder.recursive(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::fs::DirBuilderExt as _;
         builder.mode(0o700);
     }
     builder.create(path)
@@ -384,7 +386,7 @@ fn create_private(path: &Path) -> std::io::Result<()> {
 pub(crate) fn writable(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::ffi::OsStrExt as _;
         let path = std::ffi::CString::new(dir.as_os_str().as_bytes())
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
         // SAFETY: `path` is a NUL-terminated string that outlives the call.
@@ -429,7 +431,7 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8], durable: bool) -> Result<
     options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
     let written = (|| {
@@ -491,7 +493,7 @@ pub(crate) fn check_private_dir(path: &Path) -> Result<()> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::fs::MetadataExt as _;
         if m.uid() != effective_uid() {
             return Err(refused(
                 format!("folder {} belongs to another user", path.display()),
@@ -520,6 +522,10 @@ pub(crate) fn effective_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 #[cfg(unix)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the shared platform interface returns None on hosts without Unix user IDs"
+)]
 fn uid() -> Option<u32> {
     Some(effective_uid())
 }
@@ -540,7 +546,7 @@ fn xdg(var: &impl Fn(&str) -> Option<PathBuf>, name: &str) -> Option<PathBuf> {
 }
 
 /// Unit tests never touch the user's sessions or saved state: without
-/// CAPTUREFAB_SESSION_DIR each test process gets its own private folder,
+/// `CAPTUREFAB_SESSION_DIR` each test process gets its own private folder,
 /// which its tests share as they would the real one.
 fn test_dir() -> PathBuf {
     static DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -582,14 +588,11 @@ fn temp_candidate(var: &impl Fn(&str) -> Option<PathBuf>, uid: Option<u32>) -> C
             PathBuf::from("/tmp")
         }
     });
-    let name = match uid {
-        Some(uid) => format!("capturefab-{uid}"),
-        None => "capturefab".into(),
-    };
+    let name = uid.map_or_else(|| "capturefab".into(), |uid| format!("capturefab-{uid}"));
     Candidate::new(temp.join(name), "temp")
 }
 
-/// The runtime folder's candidates: CAPTUREFAB_SESSION_DIR alone when
+/// The runtime folder's candidates: `CAPTUREFAB_SESSION_DIR` alone when
 /// set, else the defaults.
 fn runtime_candidates(
     var: &impl Fn(&str) -> Option<PathBuf>,
@@ -629,8 +632,8 @@ fn runtime_defaults(
     candidates
 }
 
-/// The state folder's candidates: CAPTUREFAB_STATE_DIR, else
-/// CAPTUREFAB_SESSION_DIR, alone when set; else the default.
+/// The state folder's candidates: `CAPTUREFAB_STATE_DIR`, else
+/// `CAPTUREFAB_SESSION_DIR`, alone when set; else the default.
 fn state_candidates(var: &impl Fn(&str) -> Option<PathBuf>, linux: bool) -> Vec<Candidate> {
     let session = var(SESSION_DIR_ENV);
     // A CAPTUREFAB_STATE_DIR exported in the shell, as for a service,
@@ -647,26 +650,24 @@ fn state_candidates(var: &impl Fn(&str) -> Option<PathBuf>, linux: bool) -> Vec<
     }
     state_default(var, linux).into_iter().collect()
 }
-/// XDG_STATE_HOME or `~/.local/state` on Linux, whose runtime folder is a
+/// `XDG_STATE_HOME` or `~/.local/state` on Linux, whose runtime folder is a
 /// RAM disk that logout clears, and the folder sessions keep on disk
 /// elsewhere. Nothing without a home: there is nowhere state would outlive
 /// a reboot.
 fn state_default(var: &impl Fn(&str) -> Option<PathBuf>, linux: bool) -> Option<Candidate> {
     if linux {
-        return match xdg(var, "XDG_STATE_HOME") {
-            Some(dir) => Some(Candidate::new(dir.join("capturefab"), "XDG_STATE_HOME")),
-            None => {
+        return xdg(var, "XDG_STATE_HOME")
+            .map(|dir| Candidate::new(dir.join("capturefab"), "XDG_STATE_HOME"))
+            .or_else(|| {
                 var("HOME").map(|home| Candidate::new(home.join(".local/state/capturefab"), "home"))
-            }
-        };
+            });
     }
-    match xdg(var, "XDG_RUNTIME_DIR") {
-        Some(dir) => Some(Candidate::new(dir.join("capturefab"), "XDG_RUNTIME_DIR")),
-        None => disk_session_dir(var).map(|dir| Candidate::new(dir, "home")),
-    }
+    xdg(var, "XDG_RUNTIME_DIR")
+        .map(|dir| Candidate::new(dir.join("capturefab"), "XDG_RUNTIME_DIR"))
+        .or_else(|| disk_session_dir(var).map(|dir| Candidate::new(dir, "home")))
 }
 
-/// The cache's candidates: CAPTUREFAB_CACHE_DIR alone when set, else the
+/// The cache's candidates: `CAPTUREFAB_CACHE_DIR` alone when set, else the
 /// platform's. `found` adds the runtime folder.
 fn cache_candidates(var: &impl Fn(&str) -> Option<PathBuf>) -> Vec<Candidate> {
     if let Some(dir) = var(CACHE_DIR_ENV) {
@@ -682,7 +683,7 @@ fn cache_candidates(var: &impl Fn(&str) -> Option<PathBuf>) -> Vec<Candidate> {
     cache_default(var).into_iter().collect()
 }
 /// ~/Library/Caches on macOS, %LOCALAPPDATA% on Windows, and
-/// $XDG_CACHE_HOME or ~/.cache elsewhere.
+/// $`XDG_CACHE_HOME` or ~/.cache elsewhere.
 fn cache_default(var: &impl Fn(&str) -> Option<PathBuf>) -> Option<Candidate> {
     if cfg!(target_os = "macos") {
         return var("HOME")
@@ -692,15 +693,14 @@ fn cache_default(var: &impl Fn(&str) -> Option<PathBuf>) -> Option<Candidate> {
         return var("LOCALAPPDATA")
             .map(|dir| Candidate::new(dir.join("capturefab").join("cache"), "home"));
     }
-    match xdg(var, "XDG_CACHE_HOME") {
-        Some(dir) => Some(Candidate::new(dir.join("capturefab"), "XDG_CACHE_HOME")),
-        None => {
+    xdg(var, "XDG_CACHE_HOME")
+        .map(|dir| Candidate::new(dir.join("capturefab"), "XDG_CACHE_HOME"))
+        .or_else(|| {
             var("HOME").map(|home| Candidate::new(home.join(".cache").join("capturefab"), "home"))
-        }
-    }
+        })
 }
 
-/// Whether a process without XDG_RUNTIME_DIR can keep its sessions in the
+/// Whether a process without `XDG_RUNTIME_DIR` can keep its sessions in the
 /// login's runtime folder, /run/user/<uid>, where logins look for them.
 #[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -734,13 +734,17 @@ fn login_runtime() -> Option<PathBuf> {
         .map(|(dir, _)| dir)
 }
 #[cfg(not(target_os = "linux"))]
-fn login_runtime() -> Option<PathBuf> {
+const fn login_runtime() -> Option<PathBuf> {
     None
 }
 /// The login's runtime folder and whether it is usable, decided once, so
 /// a process keeps its descriptor, locks and buffers in one place however
 /// logins come and go.
 #[cfg(target_os = "linux")]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the login-runtime interface also runs on test hosts without Linux login metadata"
+)]
 fn login_runtime_dir() -> Option<(PathBuf, LoginDir)> {
     static LOGIN: OnceLock<(PathBuf, LoginDir)> = OnceLock::new();
     let login = LOGIN.get_or_init(|| {
@@ -752,7 +756,7 @@ fn login_runtime_dir() -> Option<(PathBuf, LoginDir)> {
     Some(login.clone())
 }
 #[cfg(all(test, not(target_os = "linux")))]
-fn login_runtime_dir() -> Option<(PathBuf, LoginDir)> {
+const fn login_runtime_dir() -> Option<(PathBuf, LoginDir)> {
     None
 }
 /// Whether logind keeps `uid`'s runtime folder from boot to shutdown
@@ -766,10 +770,10 @@ fn lingers(uid: u32) -> bool {
 /// The name passwd gives `uid`.
 #[cfg(target_os = "linux")]
 fn user_name(uid: u32) -> Option<std::ffi::OsString> {
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::ffi::OsStrExt as _;
     let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
     let mut found = std::ptr::null_mut();
-    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+    let mut buffer: Vec<libc::c_char> = vec![0; 16 * 1024];
     // SAFETY: getpwuid_r fills `entry`, with strings stored in `buffer`, and
     // points `found` at it only when it found the user.
     let status = unsafe {
@@ -778,14 +782,16 @@ fn user_name(uid: u32) -> Option<std::ffi::OsString> {
             entry.as_mut_ptr(),
             buffer.as_mut_ptr(),
             buffer.len(),
-            &mut found,
+            &raw mut found,
         )
     };
     if status != 0 || found.is_null() {
         return None;
     }
+    // SAFETY: getpwuid_r succeeded and returned a non-null initialized entry.
+    let name = unsafe { (*found).pw_name };
     // SAFETY: pw_name is a NUL-terminated string in `buffer`, still alive.
-    let name = unsafe { std::ffi::CStr::from_ptr((*found).pw_name) };
+    let name = unsafe { std::ffi::CStr::from_ptr(name) };
     Some(std::ffi::OsStr::from_bytes(name.to_bytes()).to_owned())
 }
 /// The login runtime folder that the runtime folder passed over for one on
@@ -799,7 +805,7 @@ pub(crate) fn missed_runtime_dir() -> Option<(PathBuf, LoginDir)> {
     let logind = Path::new("/run/systemd/seats").is_dir() || Path::new("/run/user").is_dir();
     missed(login_runtime_dir(), logind)
 }
-/// In a login with XDG_RUNTIME_DIR, where a service started without it
+/// In a login with `XDG_RUNTIME_DIR`, where a service started without it
 /// keeps its sessions instead, with the login runtime folder it passes over
 /// and why. An SSH login on a line computer would otherwise see no sign of a
 /// service whose sessions it cannot find. The service's folder is the first
@@ -827,7 +833,7 @@ pub(crate) fn service_runtime_dir() -> Option<(PathBuf, PathBuf, LoginDir)> {
     let dir = fallbacks
         .iter()
         .find(|candidate| private(&candidate.path))
-        .or(fallbacks.first())?
+        .or_else(|| fallbacks.first())?
         .path
         .clone();
     Some((dir, login, why))
@@ -840,7 +846,7 @@ fn missed(login: Option<(PathBuf, LoginDir)>, logind: bool) -> Option<(PathBuf, 
 /// A real directory owned by `uid` with mode 0700.
 #[cfg(any(target_os = "linux", all(unix, test)))]
 fn owned_private(dir: &Path, uid: u32) -> bool {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::MetadataExt as _;
     fs::symlink_metadata(dir)
         .is_ok_and(|meta| meta.is_dir() && meta.uid() == uid && meta.mode() & 0o777 == 0o700)
 }
@@ -863,7 +869,7 @@ pub(crate) fn runtime_ends_at_logout() -> bool {
 /// Yocto-style root file system is.
 #[cfg(unix)]
 pub(crate) fn read_only_mount(path: &Path) -> Option<bool> {
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::ffi::OsStrExt as _;
     let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
     // SAFETY: statvfs fills `stats` for a NUL-terminated path and returns 0
@@ -873,8 +879,7 @@ pub(crate) fn read_only_mount(path: &Path) -> Option<bool> {
     }
     // SAFETY: statvfs succeeded, so `stats` is initialized.
     let flags = unsafe { stats.assume_init() }.f_flag;
-    #[allow(clippy::unnecessary_cast)]
-    Some(flags as u64 & libc::ST_RDONLY as u64 != 0)
+    Some(flags & libc::ST_RDONLY != 0)
 }
 #[cfg(not(unix))]
 pub(crate) fn read_only_mount(_: &Path) -> Option<bool> {
@@ -887,7 +892,7 @@ pub(crate) fn read_only_mount(_: &Path) -> Option<bool> {
 pub(crate) fn noexec_mount(path: &Path) -> bool {
     #[cfg(target_os = "linux")]
     {
-        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::ffi::OsStrExt as _;
         let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
             return false;
         };
@@ -899,15 +904,12 @@ pub(crate) fn noexec_mount(path: &Path) -> bool {
         }
         // SAFETY: statvfs succeeded, so `stats` is initialized.
         let flags = unsafe { stats.assume_init() }.f_flag;
-        #[allow(clippy::unnecessary_cast)]
-        {
-            flags as u64 & libc::ST_NOEXEC as u64 != 0
-        }
+        flags & libc::ST_NOEXEC != 0
     }
     // macOS's statvfs has no noexec flag; statfs does.
     #[cfg(target_os = "macos")]
     {
-        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::ffi::OsStrExt as _;
         let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
             return false;
         };
@@ -919,7 +921,7 @@ pub(crate) fn noexec_mount(path: &Path) -> bool {
         }
         // SAFETY: statfs succeeded, so `stats` is initialized.
         let flags = unsafe { stats.assume_init() }.f_flags;
-        flags & libc::MNT_NOEXEC as u32 != 0
+        flags & libc::MNT_NOEXEC.cast_unsigned() != 0
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -959,7 +961,7 @@ mod tests {
         }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
+            use std::os::unix::fs::PermissionsExt as _;
             let mode = fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
@@ -977,7 +979,7 @@ mod tests {
         fn drop(&mut self) {
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
+                use std::os::unix::fs::PermissionsExt as _;
                 for entry in walk(&self.0) {
                     let _ = fs::set_permissions(entry, fs::Permissions::from_mode(0o700));
                 }
@@ -1086,7 +1088,7 @@ mod tests {
         let found = choose(
             Kind::Runtime,
             &[
-                Candidate::explicit(file.clone(), SESSION_DIR_ENV),
+                Candidate::explicit(file, SESSION_DIR_ENV),
                 Candidate::new(dir.0.join("fallback"), "temp"),
             ],
         );
@@ -1101,7 +1103,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_read_only_folder_falls_back_to_the_next_candidate() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt as _;
         let dir = TestDir::new("fallback");
         let home = dir.0.join("home");
         fs::create_dir(&home).unwrap();
@@ -1118,7 +1120,7 @@ mod tests {
             Kind::Runtime,
             &[
                 Candidate::new(home.join(".cache/capturefab/sessions"), "home"),
-                Candidate::new(shared.clone(), "XDG_RUNTIME_DIR"),
+                Candidate::new(shared, "XDG_RUNTIME_DIR"),
                 Candidate::new(temp.clone(), "temp"),
             ],
         );
@@ -1160,7 +1162,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_shared_cache_of_this_user_is_made_private() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt as _;
         let dir = TestDir::new("shared-cache");
         let cache = dir.0.join("cache");
         fs::create_dir(&cache).unwrap();
@@ -1191,7 +1193,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_variable_naming_a_folder_that_cannot_be_made_says_which() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt as _;
         let dir = TestDir::new("unmakeable");
         let parent = dir.0.join("read-only");
         fs::create_dir(&parent).unwrap();
@@ -1220,7 +1222,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_read_only_state_folder_is_still_read() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt as _;
         let dir = TestDir::new("read-only-state");
         let state = dir.0.join("state");
         fs::create_dir(&state).unwrap();
@@ -1308,7 +1310,7 @@ mod tests {
             [PathBuf::from("/home/pi/.cache/capturefab/sessions")]
         );
         // Without HOME, nothing: commands that need state say so.
-        assert!(state_defaults(&env(&[]), true).is_empty());
+        assert_eq!(state_defaults(&env(&[]), true), [] as [PathBuf; 0]);
     }
     #[cfg(unix)]
     fn state_defaults(var: &impl Fn(&str) -> Option<PathBuf>, linux: bool) -> Vec<PathBuf> {
@@ -1344,7 +1346,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn only_a_private_runtime_folder_of_this_user_is_used() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt as _;
         let dir = TestDir::new("owned");
         let uid = effective_uid();
         let login = dir.0.join("1000");
@@ -1364,7 +1366,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_login_folder_is_used_only_for_a_lingering_user() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt as _;
         let dir = TestDir::new("login");
         let uid = effective_uid();
         let login = dir.0.join("1000");
@@ -1420,7 +1422,7 @@ mod tests {
         let dir = TestDir::new("foreign");
         ensure_private_dir(&dir.0.join("a/b")).unwrap();
         // A folder others may enter is refused with the command that fixes it.
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt as _;
         let shared = dir.0.join("shared folder");
         fs::create_dir(&shared).unwrap();
         fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();

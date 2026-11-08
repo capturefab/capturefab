@@ -2,7 +2,12 @@
 //! camera, and restoring it as one change that a failure rolls back. The
 //! coordinator loads named setups; the worker checks the camera's identity
 //! and node kinds itself, so CLI and RPC callers get the same checks.
-use super::*;
+#![deny(clippy::missing_const_for_fn)]
+use super::{
+    Address, AutoController, BTreeMap, BTreeSet, Camera, Configuration, Context as _, Duration,
+    Forwarder, Instant, Result, Scheduled, TooManyBanks, Value, WorkerHandle, addressed, addresses,
+    camera_mut, enter_auto, json, read_at, refresh, release_auto, text,
+};
 use crate::genicam::Availability;
 use crate::setup::{
     Bank, MAX_BANKS, MAX_SETUP_VALUES, MAX_STRING, Match, Reading, SETUP_ALL_BANKS, SavedAuto,
@@ -55,19 +60,28 @@ const MAX_REASON: usize = 240;
 /// A skip reason fit to store in a setup: one line without control
 /// characters, bounded on a char boundary.
 fn reason_text(reason: &str) -> String {
-    let line = reason
-        .split(|c: char| c.is_control() || c.is_whitespace())
-        .filter(|word| !word.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    if line.len() <= MAX_REASON {
-        return line;
+    let mut line = String::new();
+    let mut space = false;
+    for character in reason.chars() {
+        if character.is_control() || character.is_whitespace() {
+            space = !line.is_empty();
+            continue;
+        }
+        if space {
+            line.push(' ');
+            space = false;
+        }
+        line.push(character);
+        if line.len() > MAX_REASON {
+            while line.len() > MAX_REASON - '…'.len_utf8() {
+                line.pop();
+            }
+            line.truncate(line.trim_end().len());
+            line.push('…');
+            return line;
+        }
     }
-    let mut end = MAX_REASON - '…'.len_utf8();
-    while !line.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", line[..end].trim_end())
+    line
 }
 
 /// Why a value could not be read, without the camera's error text: that
@@ -114,7 +128,7 @@ enum BankRead {
 pub(super) fn read(
     h: &WorkerHandle,
     camera: &mut Camera,
-    auto: &Option<AutoController>,
+    auto: Option<&AutoController>,
 ) -> Result<Value> {
     let walked = camera.features();
     // A value read at every bank is listed even when it has no value at the
@@ -272,7 +286,7 @@ pub(super) fn read(
     }
     let reading = Reading {
         camera: SavedCamera::from_info(&camera.info),
-        auto: auto.as_ref().map(|_| SavedAuto::default()),
+        auto: auto.map(|_| SavedAuto::default()),
         values,
         skipped,
     };
@@ -290,7 +304,7 @@ pub(super) enum Status {
     Refused,
 }
 impl Status {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Same => "same",
             Self::Change => "change",
@@ -333,14 +347,14 @@ pub(super) enum AutoChange {
     Release,
 }
 impl AutoChange {
-    fn of(current: bool, saved: bool) -> Self {
+    const fn of(current: bool, saved: bool) -> Self {
         match (current, saved) {
             (false, true) => Self::Enter,
             (true, false) => Self::Release,
             _ => Self::None,
         }
     }
-    fn action(self) -> &'static str {
+    const fn action(self) -> &'static str {
         match self {
             Self::None => "none",
             Self::Enter => "enter",
@@ -348,7 +362,7 @@ impl AutoChange {
         }
     }
     /// The words a log line or result uses, if anything changes.
-    fn words(self) -> Option<&'static str> {
+    const fn words(self) -> Option<&'static str> {
         match self {
             Self::None => None,
             Self::Enter => Some("auto exposure on"),
@@ -372,7 +386,7 @@ impl Plan {
     pub(super) fn changes(&self) -> impl Iterator<Item = &Row> {
         self.rows.iter().filter(|row| row.status == Status::Change)
     }
-    pub(super) fn auto_change(&self) -> AutoChange {
+    pub(super) const fn auto_change(&self) -> AutoChange {
         AutoChange::of(self.auto.0, self.auto.1)
     }
     /// Refuse before any write: a blocked restart, or a strict setup with
@@ -412,7 +426,7 @@ impl Plan {
     }
 }
 
-fn number_kind(value: &Value) -> &'static str {
+const fn number_kind(value: &Value) -> &'static str {
     match value {
         Value::Bool(_) => "boolean",
         Value::Number(_) => "number",
@@ -446,7 +460,7 @@ const LATER: &str = "applies only if earlier changes in this preset enable it";
 
 fn row(
     camera: &mut Camera,
-    auto: &Option<AutoController>,
+    auto: Option<&AutoController>,
     setup: &Setup,
     value: &SetupValue,
 ) -> Row {
@@ -652,7 +666,7 @@ fn row(
         let below = bounds.min.is_some_and(|min| number < min);
         let above = bounds.max.is_some_and(|max| number > max);
         if below || above {
-            let limit = |limit: Option<f64>| limit.map_or("?".into(), |l| l.to_string());
+            let limit = |limit: Option<f64>| limit.map_or_else(|| "?".into(), |l| l.to_string());
             row.warning = Some(format!(
                 "outside the current limits ({}..{}); restoring fails and puts every value back unless earlier changes in this preset widen them",
                 limit(bounds.min),
@@ -666,7 +680,7 @@ fn row(
 /// What holds a running stream, in words: "recording", "forwarding",
 /// "scheduled captures". A geometry restore is refused while any does.
 pub(super) fn stream_holders(
-    forwarder: &Option<(Forwarder, f64)>,
+    forwarder: Option<&(Forwarder, f64)>,
     jobs: &[Scheduled],
 ) -> Vec<&'static str> {
     let mut holders = Vec::new();
@@ -687,7 +701,7 @@ pub(super) fn stream_holders(
 /// unless `allow_other_model`.
 pub(super) fn plan(
     camera: &mut Camera,
-    auto: &Option<AutoController>,
+    auto: Option<&AutoController>,
     holders: &[&str],
     setup: &Setup,
     allow_other_model: bool,
@@ -932,8 +946,8 @@ pub(super) fn restore_ordered(
         causes.clear();
         for (count, (address, target)) in pending.iter().map(|t| (&t.0, &t.1)).enumerate() {
             if Instant::now() >= deadline {
-                return Err(crate::types::Categorized::error(
-                    crate::types::ErrorKind::Timeout,
+                return Err(Categorized::error(
+                    ErrorKind::Timeout,
                     format!(
                         "preset restore exceeded {} s after {} of {total} values",
                         limit.as_secs(),
@@ -980,8 +994,7 @@ pub(super) fn restore_ordered(
                                 address.feature,
                                 failures
                                     .get(address)
-                                    .map(String::as_str)
-                                    .unwrap_or("did not keep the saved value")
+                                    .map_or("did not keep the saved value", String::as_str)
                             ),
                         ));
                         true
@@ -1033,10 +1046,10 @@ pub(super) fn restore_ordered(
             .filter(Value::is_object)
             .unwrap_or_else(|| json!({}));
         details["failures"] = json!(failures);
-        let mut error = crate::types::Categorized::new(
+        let mut error = Categorized::new(
             classified
                 .as_ref()
-                .map_or(crate::types::ErrorKind::OperationFailed, |c| c.kind),
+                .map_or(ErrorKind::OperationFailed, |c| c.kind),
             message,
         )
         .details(details);
@@ -1049,21 +1062,31 @@ pub(super) fn restore_ordered(
     })
 }
 
+/// A preset and the plan and strictness selected for this restoration.
+#[derive(Clone, Copy)]
+pub(super) struct Application<'a> {
+    pub(super) setup: &'a Setup,
+    pub(super) plan: &'a Plan,
+    pub(super) strict: bool,
+}
+
 /// Restore a setup: the dispatch of `apply_setup` inside `process`, which
 /// checkpoints before and rolls back after a failure. `checkpoint` records
 /// each bank before it is written.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn apply(
     h: &WorkerHandle,
     camera: &mut Option<Camera>,
-    forwarder: &Option<(Forwarder, f64)>,
+    forwarder: Option<&(Forwarder, f64)>,
     auto: &mut Option<AutoController>,
     jobs: &[Scheduled],
-    setup: &Setup,
-    plan: &Plan,
-    strict: bool,
+    application: Application<'_>,
     mut checkpoint: impl FnMut(&mut Camera, &Address) -> Result<()>,
 ) -> Result<Value> {
+    let Application {
+        setup,
+        plan,
+        strict,
+    } = application;
     // Every value that already matches is verified too, and written again
     // if an earlier write moved it.
     let targets = plan
@@ -1130,15 +1153,12 @@ pub(super) fn apply(
         ));
     }
     let mut result = outcome(plan, &c.info, &restored.unavailable);
-    match &setup.auto {
-        Some(_) => {
-            let entered = enter_auto(h, camera, auto, forwarder, jobs, None)?;
-            result["auto"] = entered["auto"].clone();
-        }
-        None => {
-            refresh(h, camera);
-            result["auto"] = Value::Null;
-        }
+    if setup.auto.is_some() {
+        let entered = enter_auto(h, camera, auto, forwarder, jobs, None)?;
+        result["auto"] = entered["auto"].clone();
+    } else {
+        refresh(h, camera.as_ref());
+        result["auto"] = Value::Null;
     }
     let applied = plan
         .rows
@@ -1170,7 +1190,14 @@ pub(super) fn apply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::setup::Setup;
+    use crate::engine::{CommandState, JobStream, process};
+    use crate::session::SessionCommand;
+    use crate::types::Frame;
+    use std::fmt::Write as _;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
 
     fn connected(selector: &str) -> WorkerHandle {
         let h = WorkerHandle::new();
@@ -1270,10 +1297,10 @@ mod tests {
             format: "png".into(),
             first_at_ms: crate::scheduling::now_ms() + 60_000,
             interval_ms: 0,
-            on_exists: Default::default(),
+            on_exists: crate::naming::OnExists::default(),
             manifest: None,
-            sync: Default::default(),
-            context: Default::default(),
+            sync: crate::storage::SyncMode::default(),
+            context: BTreeMap::new(),
             utc_offset_s: None,
             quality: None,
             job: None,
@@ -1283,10 +1310,10 @@ mod tests {
             inspect: false,
         })
         .unwrap();
-        let mut narrow = setup.clone();
+        let mut narrow = setup;
         for value in &mut narrow.values {
             if value.feature == "Width" {
-                value.value = crate::setup::Scalar::Number(256.into());
+                value.value = Scalar::Number(256.into());
             }
         }
         let blocked = diff(&h, &narrow).unwrap();
@@ -1314,7 +1341,7 @@ mod tests {
             Some("unsupported")
         );
         assert!(error.to_string().contains("allow_other_model"), "{error}");
-        assert!(apply(&h, &setup).is_err());
+        apply(&h, &setup).unwrap_err();
         let allowed = h
             .request(SessionCommand::SetupDiff {
                 name: None,
@@ -1338,19 +1365,19 @@ mod tests {
     fn missing_values_apply_the_rest_unless_strict() {
         let h = connected("sim:0");
         let mut setup = saved(&h, "bench");
-        setup.values.push(crate::setup::SetupValue {
+        setup.values.push(SetupValue {
             feature: "Scan3dOutputMode".into(),
-            value: crate::setup::Scalar::String("x".into()),
+            value: Scalar::String("x".into()),
             at: Vec::new(),
         });
-        setup.values.push(crate::setup::SetupValue {
+        setup.values.push(SetupValue {
             feature: "PixelFormat".into(),
-            value: crate::setup::Scalar::String("NotAFormat".into()),
+            value: Scalar::String("NotAFormat".into()),
             at: vec![],
         });
-        setup.values.retain(|v| {
-            !(v.feature == "PixelFormat" && v.value == crate::setup::Scalar::String("Mono8".into()))
-        });
+        setup
+            .values
+            .retain(|v| !(v.feature == "PixelFormat" && v.value == Scalar::String("Mono8".into())));
         set(&h, "Gain", "4");
         let strict = h
             .request(SessionCommand::ApplySetup {
@@ -1398,7 +1425,7 @@ mod tests {
         // Width is outside its limits: the plan warns, the write fails.
         for value in &mut setup.values {
             if value.feature == "Width" {
-                value.value = crate::setup::Scalar::Number(99_999.into());
+                value.value = Scalar::Number(99_999.into());
             }
         }
         let preview = diff(&h, &setup).unwrap();
@@ -1454,8 +1481,8 @@ mod tests {
         let mut gain = saved(&h, "bench");
         for value in &mut gain.values {
             match value.feature.as_str() {
-                "Width" => value.value = crate::setup::Scalar::Number(640.into()),
-                "Gain" => value.value = crate::setup::Scalar::Number(99_999.into()),
+                "Width" => value.value = Scalar::Number(640.into()),
+                "Gain" => value.value = Scalar::Number(99_999.into()),
                 _ => {}
             }
         }
@@ -1525,6 +1552,37 @@ mod tests {
     }
 
     #[test]
+    fn streaming_skip_reasons_match_full_normalization() {
+        fn reference(reason: &str) -> String {
+            let mut line = reason
+                .split(|c: char| c.is_control() || c.is_whitespace())
+                .filter(|word| !word.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if line.len() > MAX_REASON {
+                let mut end = MAX_REASON - '…'.len_utf8();
+                while !line.is_char_boundary(end) {
+                    end -= 1;
+                }
+                line.truncate(end);
+                line.truncate(line.trim_end().len());
+                line.push('…');
+            }
+            line
+        }
+        for token in ["a", "é", "三", "🦀", "a é 三 🦀", "\t\n\u{7}", "\u{a0}"] {
+            for count in 0..=260 {
+                let reason = format!(" \t{}\nlast word\r", token.repeat(count));
+                assert_eq!(
+                    reason_text(&reason),
+                    reference(&reason),
+                    "{token:?} × {count}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn skip_reasons_are_one_bounded_line() {
         let long = format!("timed out\nat {}\tend\u{7}", "€".repeat(400));
         let reason = reason_text(&long);
@@ -1566,14 +1624,14 @@ mod tests {
     fn floats_within_half_a_step_already_match() {
         assert!(close(&json!(5000.0), &json!(5000.1), Some(0.2)));
         assert!(!close(&json!(5000.0), &json!(5000.3), Some(0.2)));
-        assert!(close(&json!(0.30000000000000004), &json!(0.3), None));
+        assert!(close(&json!(0.300_000_000_000_000_04), &json!(0.3), None));
         assert!(!close(&json!(1.0), &json!(1.001), None));
         assert!(close(&json!(5), &json!(5), Some(1.0)));
         assert!(close(&json!(5), &json!(5.0), None));
         assert!(!close(&json!("On"), &json!("Off"), None));
     }
 
-    /// Gain at two GainSelector banks, a setting under a selector a setup
+    /// Gain at two `GainSelector` banks, a setting under a selector a setup
     /// does not enumerate, a trigger mode, a register and a command.
     struct Banked;
     impl crate::types::RegisterIo for Banked {
@@ -1641,12 +1699,14 @@ mod tests {
         fn run(&mut self, command: SessionCommand) -> Result<Value> {
             process(
                 &self.h,
-                &mut self.camera,
-                &mut self.forwarder,
-                &mut self.auto,
-                &mut self.jobs,
-                &mut 1,
-                &mut JobStream::default(),
+                CommandState {
+                    camera: &mut self.camera,
+                    forwarder: &mut self.forwarder,
+                    auto: &mut self.auto,
+                    jobs: &mut self.jobs,
+                    next_job: &mut 1,
+                    scheduled_stream: &mut JobStream::default(),
+                },
                 command.into(),
             )
         }
@@ -1668,15 +1728,14 @@ mod tests {
     #[test]
     fn every_gain_bank_round_trips_and_the_selection_is_kept() {
         let mut rig = Rig::new();
-        let reading: crate::setup::Reading =
+        let reading: Reading =
             serde_json::from_value(rig.run(SessionCommand::ReadSetup).unwrap()).unwrap();
         let gains = reading
             .values
             .iter()
             .filter(|v| v.feature == "Gain")
-            .map(|v| (v.at[0].value.clone(), v.value.clone()))
-            .collect::<Vec<_>>();
-        assert_eq!(gains.len(), 2, "{:?}", reading.values);
+            .count();
+        assert_eq!(gains, 2, "{:?}", reading.values);
         // A selector a setup does not enumerate is read at its bank only.
         let settings = reading
             .values
@@ -1697,10 +1756,10 @@ mod tests {
         rig.c().set("Gain", "40").unwrap();
         rig.c().set("TriggerMode", "On").unwrap();
         rig.c().set("GainSelector", "Red").unwrap();
-        let mut setup_on = setup.clone();
+        let mut setup_on = setup;
         for value in &mut setup_on.values {
             if value.feature == "GainSelector" {
-                value.value = crate::setup::Scalar::String("Red".into());
+                value.value = Scalar::String("Red".into());
             }
         }
         let preview = rig
@@ -1739,16 +1798,16 @@ mod tests {
     #[test]
     fn the_worker_refuses_registers_commands_and_managed_selectors() {
         let mut rig = Rig::new();
-        let reading: crate::setup::Reading =
+        let reading: Reading =
             serde_json::from_value(rig.run(SessionCommand::ReadSetup).unwrap()).unwrap();
         let mut setup = crate::setup::from_read("banks", None, reading).unwrap();
-        let value = |feature: &str, at: Vec<crate::setup::Bank>| crate::setup::SetupValue {
+        let value = |feature: &str, at: Vec<Bank>| SetupValue {
             feature: feature.into(),
-            value: crate::setup::Scalar::Number(1.into()),
+            value: Scalar::Number(1.into()),
             at,
         };
         let bank = |selector: &str| {
-            vec![crate::setup::Bank {
+            vec![Bank {
                 selector: selector.into(),
                 value: "A".into(),
             }]
@@ -1788,15 +1847,13 @@ mod tests {
         );
         // Strict refuses all of it before writing.
         rig.c().set("Gain", "33").unwrap();
-        assert!(
-            rig.run(SessionCommand::ApplySetup {
-                name: None,
-                setup: Some(setup),
-                allow_other_model: false,
-                strict: true,
-            })
-            .is_err()
-        );
+        rig.run(SessionCommand::ApplySetup {
+            name: None,
+            setup: Some(setup),
+            allow_other_model: false,
+            strict: true,
+        })
+        .unwrap_err();
         assert_eq!(rig.c().get("Gain").unwrap(), 33);
         rig.h.shutdown();
     }
@@ -1830,14 +1887,14 @@ mod tests {
     /// writes, the acquisition flag and injected read failures.
     #[derive(Clone, Default)]
     struct Wires {
-        memory: std::sync::Arc<std::sync::Mutex<BTreeMap<u64, Vec<u8>>>>,
-        writes: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
-        acquiring: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        memory: Arc<Mutex<BTreeMap<u64, Vec<u8>>>>,
+        writes: Arc<Mutex<Vec<u64>>>,
+        acquiring: Arc<AtomicBool>,
         /// Reads of Line2's source register fail.
-        fail_line2: std::sync::Arc<std::sync::atomic::AtomicBool>,
-        /// Reads of BlackLevel's register fail after this many more.
-        fail_black_after: std::sync::Arc<std::sync::Mutex<Option<usize>>>,
-        black_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        fail_line2: Arc<AtomicBool>,
+        /// Reads of `BlackLevel`'s register fail after this many more.
+        fail_black_after: Arc<Mutex<Option<usize>>>,
+        black_reads: Arc<std::sync::atomic::AtomicUsize>,
     }
     const LINE_SOURCE: [u64; 3] = [0x20, 0x24, 0x30];
     const LINE_MODE: [u64; 3] = [0x50, 0x54, 0x58];
@@ -1846,8 +1903,8 @@ mod tests {
     const BLACK_LEVEL: u64 = 0x40;
     /// Lines and their pIsAvailable-gated sources, triggers per selector, an
     /// ADC depth that unlocks Mono12, binning that rescales Width, firmware
-    /// exposure auto that locks ExposureTime, a value locked while acquiring,
-    /// a register-backed BlackLevel, a 300-bank counter and a stream-channel
+    /// exposure auto that locks `ExposureTime`, a value locked while acquiring,
+    /// a register-backed `BlackLevel`, a 300-bank counter and a stream-channel
     /// packet size.
     struct Rich(Wires);
     impl crate::types::RegisterIo for Rich {
@@ -1862,7 +1919,7 @@ mod tests {
                     .0
                     .fail_black_after
                     .lock()
-                    .unwrap()
+                    .map_err(|_| anyhow::anyhow!("test fixture lock is poisoned"))?
                     .is_some_and(|n| reads >= n)
                 {
                     anyhow::bail!("injected read failure at 0x{address:x}");
@@ -1871,15 +1928,29 @@ mod tests {
             let mut bytes = vec![0; length];
             if address == 0x10 {
                 bytes[0] = u8::from(self.0.acquiring.load(SeqCst));
-            } else if let Some(stored) = self.0.memory.lock().unwrap().get(&address) {
+            } else if let Some(stored) = self
+                .0
+                .memory
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test fixture lock is poisoned"))?
+                .get(&address)
+            {
                 bytes[..stored.len().min(length)]
                     .copy_from_slice(&stored[..stored.len().min(length)]);
             }
             Ok(bytes)
         }
         fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
-            self.0.writes.lock().unwrap().push(address);
-            self.0.memory.lock().unwrap().insert(address, data.to_vec());
+            self.0
+                .writes
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test fixture lock is poisoned"))?
+                .push(address);
+            self.0
+                .memory
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test fixture lock is poisoned"))?
+                .insert(address, data.to_vec());
             Ok(())
         }
     }
@@ -1891,18 +1962,19 @@ mod tests {
                 )
             };
             let entries = |names: &[&str]| {
-                names
-                    .iter()
-                    .enumerate()
-                    .map(|(i, name)| {
-                        format!("<EnumEntry Name='{name}'><Value>{i}</Value></EnumEntry>")
-                    })
-                    .collect::<String>()
+                let mut entries = String::new();
+                for (i, name) in names.iter().enumerate() {
+                    let _ = write!(
+                        entries,
+                        "<EnumEntry Name='{name}'><Value>{i}</Value></EnumEntry>"
+                    );
+                }
+                entries
             };
             let indexed = |name: &str, selector: &str, banks: &[(&str, u64)]| {
                 let mut xml = format!("<Integer Name='{name}'><pIndex>{selector}</pIndex>");
                 for (i, (bank, _)) in banks.iter().enumerate() {
-                    xml += &format!("<pValueIndexed Index='{i}'>{bank}</pValueIndexed>");
+                    let _ = write!(xml, "<pValueIndexed Index='{i}'>{bank}</pValueIndexed>");
                 }
                 xml += "</Integer>";
                 for (bank, address) in banks {
@@ -1976,18 +2048,14 @@ mod tests {
             .concat())
         }
         fn start(&mut self, _: usize) -> Result<()> {
-            self.0
-                .acquiring
-                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.0.acquiring.store(true, Ordering::SeqCst);
             Ok(())
         }
         fn next_frame(&mut self, _: Duration) -> Result<Frame> {
             anyhow::bail!("no frames")
         }
         fn stop(&mut self) -> Result<()> {
-            self.0
-                .acquiring
-                .store(false, std::sync::atomic::Ordering::SeqCst);
+            self.0.acquiring.store(false, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -2025,8 +2093,7 @@ mod tests {
             c.set(selector, bank).unwrap();
             let value = c
                 .get(feature)
-                .map(|v| text(&v))
-                .unwrap_or_else(|_| "unavailable".into());
+                .map_or_else(|_| "unavailable".into(), |v| text(&v).into_owned());
             c.set(selector, selected.as_str().unwrap()).unwrap();
             value
         }
@@ -2051,12 +2118,12 @@ mod tests {
             .find(|v| v.feature == feature && v.at.iter().any(|b| b.value == bank))
             .map(|v| &v.value)
     }
-    fn change<'a>(diff: &'a Value, feature: &str) -> Option<&'a Value> {
-        diff["changes"]
+    fn change<'a>(diff: &'a Value, feature: &str) -> Result<Option<&'a Value>> {
+        Ok(diff["changes"]
             .as_array()
-            .unwrap()
+            .ok_or_else(|| anyhow::anyhow!("fixture diff must contain a changes array"))?
             .iter()
-            .find(|c| c["feature"] == feature)
+            .find(|c| c["feature"] == feature))
     }
 
     #[test]
@@ -2132,7 +2199,7 @@ mod tests {
         rig.c().set("ADCBitDepth", "Bit8").unwrap();
         let preview = rig.diff(&setup);
         assert_eq!(preview["not_applied"], json!([]), "{preview}");
-        let source = change(&preview, "LineSource").unwrap();
+        let source = change(&preview, "LineSource").unwrap().unwrap();
         assert_eq!(source["deferred"], true);
         assert_eq!(source["current"], Value::Null);
         assert!(
@@ -2141,7 +2208,7 @@ mod tests {
                 .unwrap()
                 .contains("applies only if earlier changes in this preset enable it")
         );
-        let format = change(&preview, "PixelFormat").unwrap();
+        let format = change(&preview, "PixelFormat").unwrap().unwrap();
         assert_eq!(
             (&format["current"], &format["deferred"]),
             (&json!("Mono8"), &json!(true))
@@ -2179,7 +2246,10 @@ mod tests {
         // Beside another change it is tried after it, then reported.
         rig.c().set("BlackLevel", "9").unwrap();
         let preview = rig.diff(&setup);
-        assert_eq!(change(&preview, "LineSource").unwrap()["deferred"], true);
+        assert_eq!(
+            change(&preview, "LineSource").unwrap().unwrap()["deferred"],
+            true
+        );
         let strict = rig.apply_with(&setup, true).unwrap_err();
         assert_eq!(
             crate::types::error_transport_code(&strict),
@@ -2240,7 +2310,7 @@ mod tests {
         rig.c().set("Width", "640").unwrap();
         let preview = rig.diff(&setup);
         assert_eq!(preview["changes"].as_array().unwrap().len(), 1, "{preview}");
-        assert!(change(&preview, "BinningHorizontal").is_some());
+        assert!(change(&preview, "BinningHorizontal").unwrap().is_some());
         // Binning 1 doubles Width to 1280; the restore writes it again.
         let applied = rig.apply_with(&setup, false).unwrap();
         assert_eq!(rig.c().get("BinningHorizontal").unwrap(), 1);
@@ -2259,7 +2329,7 @@ mod tests {
         let preview = rig.diff(&setup);
         assert_eq!(preview["restarts_stream"], true, "{preview}");
         assert_eq!(
-            change(&preview, "DigitalShift").unwrap()["stream_locked"],
+            change(&preview, "DigitalShift").unwrap().unwrap()["stream_locked"],
             true
         );
         let applied = rig.apply_with(&setup, false).unwrap();
@@ -2275,7 +2345,7 @@ mod tests {
         let preview = rig.diff(&manual);
         assert_eq!(preview["restarts_stream"], false, "{preview}");
         assert_eq!(
-            change(&preview, "ExposureTime").unwrap()["stream_locked"],
+            change(&preview, "ExposureTime").unwrap().unwrap()["stream_locked"],
             false
         );
         let applied = rig.apply_with(&manual, false).unwrap();
@@ -2300,7 +2370,7 @@ mod tests {
             "{:?}",
             setup.skipped
         );
-        let mut by_hand = setup.clone();
+        let mut by_hand = setup;
         by_hand.values.push(SetupValue {
             feature: "ExposureTime".into(),
             value: Scalar::Number(serde_json::Number::from_f64(5000.0).unwrap()),
@@ -2322,9 +2392,7 @@ mod tests {
         let (mut rig, wires) = Rig::rich();
         rig.set_at("LineSelector", "Line2", "LineMode", "Output");
         let good = rig.save("good");
-        wires
-            .fail_line2
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        wires.fail_line2.store(true, Ordering::SeqCst);
         let setup = rig.save("partial");
         assert!(saved_at(&setup, "LineSource", "Line2").is_none());
         assert!(
@@ -2360,14 +2428,12 @@ mod tests {
             value: Scalar::Number(9000.into()),
             at: Vec::new(),
         });
-        assert!(
-            rig.run(SessionCommand::SetupDiff {
-                name: None,
-                setup: Some(packet),
-                allow_other_model: false,
-            })
-            .is_err()
-        );
+        rig.run(SessionCommand::SetupDiff {
+            name: None,
+            setup: Some(packet),
+            allow_other_model: false,
+        })
+        .unwrap_err();
         // A bank that cannot be read is not applied; the rest is.
         rig.c().set("BlackLevel", "7").unwrap();
         let applied = rig.apply_with(&good, false).unwrap();
@@ -2389,11 +2455,11 @@ mod tests {
         rig.c().set("BinningHorizontal", "2").unwrap();
         // The comparison reads BlackLevel this many times; the next read,
         // for the rollback checkpoint, fails.
-        let before = wires.black_reads.load(std::sync::atomic::Ordering::SeqCst);
+        let before = wires.black_reads.load(Ordering::SeqCst);
         rig.diff(&setup);
-        let plan_reads = wires.black_reads.load(std::sync::atomic::Ordering::SeqCst) - before;
+        let plan_reads = wires.black_reads.load(Ordering::SeqCst) - before;
         *wires.fail_black_after.lock().unwrap() =
-            Some(wires.black_reads.load(std::sync::atomic::Ordering::SeqCst) + plan_reads);
+            Some(wires.black_reads.load(Ordering::SeqCst) + plan_reads);
         let error = rig.apply_with(&setup, false).unwrap_err();
         assert!(
             format!("{error:#}").contains("apply_setup changed nothing"),
@@ -2419,7 +2485,10 @@ mod tests {
         // A per-bank value is a disruptive change, listed as one.
         rig.set_at("LineSelector", "Line0", "LineMode", "Output");
         let preview = rig.diff(&setup);
-        assert_eq!(change(&preview, "LineMode").unwrap()["risk"], "disruptive");
+        assert_eq!(
+            change(&preview, "LineMode").unwrap().unwrap()["risk"],
+            "disruptive"
+        );
         rig.h.shutdown();
     }
 
@@ -2497,16 +2566,16 @@ mod tests {
     impl crate::types::Backend for Many {
         fn xml(&mut self) -> Result<String> {
             let names = (0..MAX_SETUP_VALUES + 8).map(|i| format!("Value{i:03}"));
-            Ok(format!(
-                "<RegisterDescription><Category Name='Root'>{}</Category>{}</RegisterDescription>",
-                names
-                    .clone()
-                    .map(|n| format!("<pFeature>{n}</pFeature>"))
-                    .collect::<String>(),
-                names
-                    .map(|n| format!("<Integer Name='{n}'><Value>1</Value></Integer>"))
-                    .collect::<String>()
-            ))
+            let mut xml = String::from("<RegisterDescription><Category Name='Root'>");
+            for name in names.clone() {
+                let _ = write!(xml, "<pFeature>{name}</pFeature>");
+            }
+            xml.push_str("</Category>");
+            for name in names {
+                let _ = write!(xml, "<Integer Name='{name}'><Value>1</Value></Integer>");
+            }
+            xml.push_str("</RegisterDescription>");
+            Ok(xml)
         }
         fn start(&mut self, _: usize) -> Result<()> {
             Ok(())

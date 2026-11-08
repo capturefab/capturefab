@@ -1,5 +1,6 @@
 //! `capture` end to end on the simulator: shots, bursts, time lapses,
 //! names that never overwrite, stdout, sessions and interruption.
+#![deny(clippy::doc_markdown)]
 mod support;
 
 use serde_json::{Value, json};
@@ -59,8 +60,8 @@ fn time_names_are_the_frames_time() {
         let time = line["time"].as_str().unwrap();
         let stamp = format!(
             "{}-{}",
-            time[..10].replace('-', ""),
-            time[11..23].replace(':', "")
+            time.get(..10).unwrap().replace('-', ""),
+            time.get(11..23).unwrap().replace(':', "")
         );
         let file = Path::new(line["file"].as_str().unwrap());
         assert_eq!(
@@ -69,7 +70,7 @@ fn time_names_are_the_frames_time() {
             "{line}"
         );
         let folder = file.parent().unwrap().file_name().unwrap();
-        assert_eq!(folder.to_str().unwrap(), &time[..10], "{line}");
+        assert_eq!(folder.to_str().unwrap(), time.get(..10).unwrap(), "{line}");
     }
 }
 
@@ -440,7 +441,7 @@ fn stdout_takes_one_valid_image() {
     let run = home.run(&["capture", "-c", "sim:0", "-o", "-"]);
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert!(run.raw.starts_with(b"\x89PNG\r\n\x1a\n"));
-    let decoded = png::Decoder::new(std::io::Cursor::new(run.raw.clone()))
+    let decoded = png::Decoder::new(std::io::Cursor::new(run.raw))
         .read_info()
         .unwrap();
     assert_eq!(decoded.info().width, 640);
@@ -454,7 +455,7 @@ fn stdout_takes_one_valid_image() {
     // So does an error: stdout holds nothing but an image.
     let many = home.run(&["--json", "capture", "-c", "sim:0", "-o", "-", "-n", "2"]);
     assert_eq!(many.code, Some(2));
-    assert!(many.raw.is_empty());
+    assert_eq!(many.raw, [] as [u8; 0]);
     let error: Value = serde_json::from_str(many.stderr.trim()).unwrap();
     assert_eq!(error["error"]["code"], "usage");
     let triggered = home.run(&[
@@ -472,7 +473,7 @@ fn stdout_takes_one_valid_image() {
         "300ms",
     ]);
     assert_eq!(triggered.code, Some(4));
-    assert!(triggered.raw.is_empty());
+    assert_eq!(triggered.raw, [] as [u8; 0]);
     let error: Value = serde_json::from_str(triggered.stderr.trim()).unwrap();
     assert_eq!(error["error"]["code"], "trigger_timeout");
 }
@@ -482,7 +483,7 @@ fn a_session_writes_where_the_caller_asked() {
     let home = Home::new("caller-paths");
     let mut command = home.command();
     command.current_dir("/");
-    let _session = home.serve_in(&mut command, "rooted", &["sim:0"], &[]);
+    let _session = Home::serve_in(&mut command, "rooted", &["sim:0"], &[]);
     let shot = home.ok(&["capture", "-c", "sim:0", "-o", "frames/shot.png"]);
     assert_eq!(shot["files"][0], json!(home.real("frames/shot.png")));
     assert!(home.path("frames/shot.png").is_file());
@@ -503,7 +504,7 @@ fn a_session_never_opens_a_relative_source_from_its_own_folder() {
     }
     let mut command = home.command();
     command.current_dir(&away);
-    let _session = home.serve_in(&mut command, "src", &["sim:0"], &[]);
+    let _session = Home::serve_in(&mut command, "src", &["sim:0"], &[]);
     for camera in ["clip.mkv", "./clip.mkv"] {
         let missing = home.fails(
             3,
@@ -557,7 +558,7 @@ fn a_parent_after_a_symbolic_link_is_where_the_link_leads() {
     assert!(!home.path("a/shot.png").exists());
     let mut command = home.command();
     command.current_dir("/");
-    let _session = home.serve_in(&mut command, "linked", &["sim:0"], &[]);
+    let _session = Home::serve_in(&mut command, "linked", &["sim:0"], &[]);
     let manifest = home.ok(&[
         "--session",
         "linked",
@@ -698,11 +699,7 @@ fn a_signal_during_a_burst_exits_with_the_files_saved() {
             .spawn()
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while std::fs::read_dir(home.path("burst"))
-            .map(|files| files.count())
-            .unwrap_or(0)
-            < 2
-        {
+        while std::fs::read_dir(home.path("burst")).map_or(0, Iterator::count) < 2 {
             assert!(std::time::Instant::now() < deadline, "no frames saved");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
@@ -835,7 +832,7 @@ fn concurrent_captures_numbering_one_folder_never_overwrite() {
 /// SHA-256; later captures, and several cameras, append to it.
 #[test]
 fn a_manifest_lists_each_saved_file_with_its_hash() {
-    use sha2::{Digest, Sha256};
+    use sha2::{Digest as _, Sha256};
     let home = Home::new("manifest");
     let burst = home.ok(&[
         "capture",
@@ -879,17 +876,14 @@ fn a_manifest_lists_each_saved_file_with_its_hash() {
         .collect::<Vec<_>>();
     assert_eq!(listed[..3], saved[..3], "a burst's lines are in order");
     let sorted = |mut files: Vec<Value>| {
-        files.sort_by_key(|file| file.to_string());
+        files.sort_by_key(ToString::to_string);
         files
     };
     assert_eq!(sorted(listed), sorted(saved));
     for line in &lines {
         let bytes = std::fs::read(line["file"].as_str().unwrap()).unwrap();
         assert_eq!(line["bytes"], bytes.len(), "{line}");
-        let sha256 = Sha256::digest(&bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
         assert_eq!(line["sha256"], sha256, "{line}");
         assert!(line["time"].as_str().unwrap().ends_with('Z'), "{line}");
         assert_eq!(line["pixel_format"], "Mono8", "{line}");

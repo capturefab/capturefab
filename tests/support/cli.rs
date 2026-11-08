@@ -1,15 +1,18 @@
 //! Run the built binary with its own state folders, and read what it says.
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "each integration suite uses a different subset of these shared helpers"
+)]
 use serde_json::Value;
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::{BufRead as _, BufReader, Write as _},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-/// Spawned binaries keep their cache, such as the extracted FFmpeg, out of
+/// Spawned binaries keep their cache, such as the extracted `FFmpeg`, out of
 /// the user's.
 pub fn test_cache() -> PathBuf {
     std::env::temp_dir().join("capturefab-test-cache")
@@ -121,11 +124,10 @@ impl Home {
     /// `serve` with more arguments, such as `--live`.
     pub fn serve_with(&self, name: &str, cameras: &[&str], extra: &[&str]) -> Session {
         let mut command = self.command();
-        self.serve_in(&mut command, name, cameras, extra)
+        Self::serve_in(&mut command, name, cameras, extra)
     }
     /// `serve` from `command`, which may set its own folder and variables.
     pub fn serve_in(
-        &self,
         command: &mut Command,
         name: &str,
         cameras: &[&str],
@@ -204,11 +206,20 @@ impl Drop for Session {
     }
 }
 
+/// A positive native process ID, checked before a test can signal it.
+pub fn process_id(value: i64) -> i32 {
+    i32::try_from(value)
+        .ok()
+        .filter(|&pid| pid > 0)
+        .unwrap_or_else(|| panic!("invalid child process ID: {value}"))
+}
+
 /// Send `signal` to `child` and wait up to 30 s for it to exit.
 #[cfg(unix)]
 pub fn signal_and_wait(child: &mut Child, signal: i32) -> std::process::ExitStatus {
+    let pid = process_id(i64::from(child.id()));
     // SAFETY: kill only sends a signal to the child this test spawned.
-    assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+    assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -223,6 +234,7 @@ pub fn signal_and_wait(child: &mut Child, signal: i32) -> std::process::ExitStat
 /// parent to reap it.
 #[cfg(unix)]
 pub fn process_lives(pid: i32) -> bool {
+    assert!(pid > 0, "process liveness requires a positive PID");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         // SAFETY: signal 0 only checks that the process exists.
@@ -236,20 +248,31 @@ pub fn process_lives(pid: i32) -> bool {
     }
 }
 
-/// The FFmpeg tests decode with: CAPTUREFAB_FFMPEG, else one on PATH.
+/// The `FFmpeg` tests decode with: `CAPTUREFAB_FFMPEG`, else one on PATH.
 pub fn ffmpeg() -> String {
     std::env::var("CAPTUREFAB_FFMPEG").unwrap_or_else(|_| "ffmpeg".into())
 }
 
-/// Whether FFmpeg decodes `path` without an error.
+/// Whether `FFmpeg` decodes `path` without an error.
 pub fn decodes(path: &Path) -> bool {
     let decoded = Command::new(ffmpeg())
         .args(["-v", "error", "-i"])
         .arg(path)
-        .args(["-f", "null", "-"])
+        // The default null-output encoder rounds VFR timestamps to its
+        // nominal clock and can invent duplicate DTS.
+        .args(["-fps_mode", "passthrough", "-f", "framemd5", "-"])
         .output()
         .unwrap();
-    decoded.status.success() && decoded.stderr.is_empty()
+    let clean = decoded.status.success() && decoded.stderr.is_empty();
+    if !clean {
+        eprintln!(
+            "FFmpeg decode check for {} exited with {}: {}",
+            path.display(),
+            decoded.status,
+            String::from_utf8_lossy(&decoded.stderr)
+        );
+    }
+    clean
 }
 
 /// What one run printed and how it exited.

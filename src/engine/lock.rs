@@ -5,15 +5,16 @@
 use crate::types::{CameraInfo, Categorized, ErrorKind, Transport};
 use anyhow::Result;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+use sha2::{Digest as _, Sha256};
 use std::{
-    io::{Read, Seek, Write},
+    io::{Read, Seek as _, Write as _},
     path::PathBuf,
     time::{Duration, Instant},
 };
 
 /// The lock of an open camera, released when dropped or when its worker
 /// exits however it exits.
+#[must_use = "retain the lock while this worker owns the camera"]
 pub(crate) struct CameraLock {
     _file: std::fs::File,
 }
@@ -56,16 +57,14 @@ pub(crate) fn acquire(info: &CameraInfo, session: &str) -> Result<Option<CameraL
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
     let Ok(mut file) = options.open(&path) else {
         return Ok(None);
     };
     if !try_lock(&file) {
-        let mut owner = String::new();
-        let _ = file.read_to_string(&mut owner);
-        return Err(busy(info, serde_json::from_str(&owner).unwrap_or_default()));
+        return Err(busy(info, read_owner(&mut file)));
     }
     let owner = json!({"pid": std::process::id(), "session": session});
     let _ = file.set_len(0);
@@ -73,6 +72,18 @@ pub(crate) fn acquire(info: &CameraInfo, session: &str) -> Result<Option<CameraL
     let _ = file.write_all(owner.to_string().as_bytes());
     let _ = file.flush();
     Ok(Some(CameraLock { _file: file }))
+}
+
+/// Owner metadata is only a small diagnostic, even when the lock file is damaged.
+#[deny(clippy::arithmetic_side_effects)]
+fn read_owner(reader: impl Read) -> Value {
+    let mut owner = String::new();
+    let _ = reader.take(4097).read_to_string(&mut owner);
+    if owner.len() > 4096 {
+        Value::Null
+    } else {
+        serde_json::from_str(&owner).unwrap_or_default()
+    }
 }
 
 /// Take `file`'s lock for this process: false when another holds it. The
@@ -87,7 +98,7 @@ fn try_lock(file: &std::fs::File) -> bool {
 /// file, as an older Capturefab takes, overlaps it all the same.
 #[cfg(windows)]
 fn try_lock(file: &std::fs::File) -> bool {
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::{
         Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx},
         System::IO::OVERLAPPED,
@@ -104,7 +115,7 @@ fn try_lock(file: &std::fs::File) -> bool {
             0,
             1,
             0,
-            &mut at,
+            &raw mut at,
         ) != 0
     }
 }
@@ -118,26 +129,22 @@ fn busy(info: &CameraInfo, mut owner: Value) -> anyhow::Error {
         .as_str()
         .filter(|session| *session != crate::session::DIRECT)
         .map(str::to_owned);
-    let left = session
+    let left_secs = session
         .as_deref()
-        .and_then(|session| crate::ipc::idle_left(session, &info.id));
-    if let (Some(left), Some(owner)) = (left, owner.as_object_mut()) {
-        owner.insert(
-            "idle_releases_in_s".into(),
-            json!(left.as_millis().div_ceil(1000)),
-        );
+        .and_then(|session| crate::ipc::idle_left(session, &info.id))
+        .map(|left| u64::try_from(left.as_millis().div_ceil(1000)).unwrap_or(u64::MAX));
+    if let (Some(left), Some(owner)) = (left_secs, owner.as_object_mut()) {
+        owner.insert("idle_releases_in_s".into(), json!(left));
     }
     let pid = owner["pid"]
         .as_u64()
         .map(|pid| format!(" (process {pid})"))
         .unwrap_or_default();
-    let releases = left
+    let releases = left_secs
         .map(|left| {
             format!(
                 ", which lets it go after {} unused",
-                crate::types::duration_text(Duration::from_secs(
-                    left.as_millis().div_ceil(1000) as u64
-                ))
+                crate::types::duration_text(Duration::from_secs(left))
             )
         })
         .unwrap_or_default();
@@ -166,7 +173,7 @@ fn busy(info: &CameraInfo, mut owner: Value) -> anyhow::Error {
     error.into()
 }
 
-/// Open a GigE camera whose control privilege may still be held by a worker
+/// Open a `GigE` camera whose control privilege may still be held by a worker
 /// of this program that just died: nothing holds its lock, so retry until the
 /// camera's heartbeat timeout has passed, plus half a second. `open` is the
 /// attempt; `beat` keeps the caller counted as alive while it waits.
@@ -204,6 +211,21 @@ pub(crate) fn open_released<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lock_owner_metadata_is_bounded_before_parsing() {
+        let expected = json!({"pid": 42, "session": "camera-像"});
+        let mut bytes = serde_json::to_vec(&expected).unwrap();
+        bytes.resize(4096, b' ');
+        assert_eq!(read_owner(&*bytes), expected);
+        bytes.resize(16 * 1024, b' ');
+        let mut reader = std::io::Cursor::new(bytes);
+        assert_eq!(read_owner(&mut reader), Value::Null);
+        assert_eq!(reader.position(), 4097);
+        for invalid in [&b"{"[..], &b"invalid"[..], &b"\xff"[..]] {
+            assert_eq!(read_owner(invalid), Value::Null);
+        }
+    }
 
     #[test]
     fn device_cameras_are_locked_to_one_owner_who_is_named() {

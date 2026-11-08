@@ -2,16 +2,17 @@
 use super::{Client, Global, args::CameraArg, output::Report};
 use crate::session::{SessionCommand, SessionHandle};
 use crate::types::Usage;
-use anyhow::{Context, Result};
+use anyhow::{Context as _, Result};
 use clap::Subcommand;
 use serde_json::json;
-use std::io::{Read, Write};
+use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
 
 #[derive(Debug, Subcommand)]
-pub enum DebugCommand {
-    /// Print a camera's GenICam XML, or write it to a file
+pub(crate) enum DebugCommand {
+    /// Print a camera's `GenICam` XML, or write it to a file
     #[command(
+        about = "Print a camera's GenICam XML, or write it to a file",
         after_help = "Examples:\n  capturefab debug xml -c sim:0 > camera.xml\n  capturefab debug xml -c gige:00c0df123456 -o camera.xml"
     )]
     Xml {
@@ -59,12 +60,9 @@ pub enum DebugCommand {
 }
 
 fn parse_address(s: &str) -> std::result::Result<u64, String> {
-    if let Some(v) = s.strip_prefix("0x") {
-        u64::from_str_radix(v, 16)
-    } else {
-        s.parse()
-    }
-    .map_err(|e| e.to_string())
+    s.strip_prefix("0x")
+        .map_or_else(|| s.parse(), |v| u64::from_str_radix(v, 16))
+        .map_err(|e| e.to_string())
 }
 
 pub(super) fn hex(s: &str) -> Result<Vec<u8>> {
@@ -82,7 +80,7 @@ pub(super) fn hex(s: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-pub fn run(global: &Global, command: DebugCommand) -> Result<Option<Report>> {
+pub(super) fn run(global: &Global, command: DebugCommand) -> Result<Option<Report>> {
     Ok(Some(match command {
         DebugCommand::Xml { camera, output } => {
             if output
@@ -208,8 +206,8 @@ mod tests {
     #[test]
     fn hex_and_addresses_parse() {
         assert_eq!(hex("00aaff").unwrap(), vec![0, 170, 255]);
-        assert!(hex("0").is_err());
-        assert!(hex("💡").is_err());
+        hex("0").unwrap_err();
+        hex("💡").unwrap_err();
         assert_eq!(parse_address("0x100").unwrap(), 256);
     }
 }

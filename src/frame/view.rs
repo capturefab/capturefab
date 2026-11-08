@@ -1,4 +1,6 @@
 //! A frame, or a rectangle of one, read where its bytes lie.
+#![forbid(unsafe_code)]
+#![deny(clippy::missing_const_for_fn)]
 use crate::types::Frame;
 
 /// A rectangle of a frame's pixels, read in place: pixel (x, y) of the view
@@ -7,7 +9,7 @@ use crate::types::Frame;
 /// A Bayer region starts on even coordinates (`inspect::crop_rect` makes
 /// it so), so it keeps the frame's color filter phase.
 #[derive(Clone, Copy, Debug)]
-pub struct FrameRef<'a> {
+pub(crate) struct FrameRef<'a> {
     pub frame: &'a Frame,
     pub x0: usize,
     pub y0: usize,
@@ -16,7 +18,7 @@ pub struct FrameRef<'a> {
 }
 
 impl<'a> FrameRef<'a> {
-    pub fn whole(frame: &'a Frame) -> Self {
+    pub(crate) const fn whole(frame: &'a Frame) -> Self {
         Self {
             frame,
             x0: 0,
@@ -26,7 +28,7 @@ impl<'a> FrameRef<'a> {
         }
     }
     /// The `[x, y, width, height]` rectangle of `frame`, clamped to it.
-    pub fn region(frame: &'a Frame, [x, y, width, height]: [u32; 4]) -> Self {
+    pub(crate) fn region(frame: &'a Frame, [x, y, width, height]: [u32; 4]) -> Self {
         let (x, y) = (x.min(frame.width), y.min(frame.height));
         Self {
             frame,
@@ -36,15 +38,15 @@ impl<'a> FrameRef<'a> {
             height: height.min(frame.height - y) as usize,
         }
     }
-    pub fn pixel_format(&self) -> u32 {
+    pub(crate) const fn pixel_format(&self) -> u32 {
         self.frame.pixel_format
     }
     /// Whether the view covers its whole frame.
-    pub fn is_whole(&self) -> bool {
+    pub(crate) fn is_whole(&self) -> bool {
         (self.x0, self.y0, self.width, self.height)
             == (0, 0, self.frame.width as usize, self.frame.height as usize)
     }
-    pub fn pixels(&self) -> usize {
+    pub(crate) const fn pixels(&self) -> usize {
         self.width * self.height
     }
 }

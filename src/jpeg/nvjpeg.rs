@@ -12,18 +12,24 @@
 //! the first time one is: a discrete GPU copies such a frame in one DMA,
 //! and an integrated one (Jetson) reads it in place through its device
 //! address. Other formats are converted once, from their rows, into
-//! page-locked JFIF Y'CbCr 4:2:0 planes (or 8-bit gray), which nvJPEG
+//! page-locked JFIF `Y'CbCr` 4:2:0 planes (or 8-bit gray), which nvJPEG
 //! encodes without a color conversion of its own. The JPEG is retrieved
 //! straight into the worker's output segment.
-#![allow(unsafe_code)]
-#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
-
+#![deny(clippy::missing_const_for_fn)]
+#![cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "the Linux encoder and its fake CUDA API are compiled on other Unix hosts for tests"
+    )
+)]
+#![deny(clippy::panic_in_result_fn)]
 use super::{
     backend::Unsupported,
     helper::{Encoder, Hello, Library, Opened},
 };
 use crate::{framebuf::shared::Segment, types::Frame};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context as _, Result, bail, ensure};
 use std::{
     collections::{HashMap, HashSet},
     ffi::{c_int, c_uint, c_void},
@@ -84,7 +90,7 @@ const MAJOR_VERSION: c_int = 0;
 const MINOR_VERSION: c_int = 1;
 const PATCH_LEVEL: c_int = 2;
 
-/// nvjpegImage_t: up to four planes and their pitches.
+/// `nvjpegImage_t`: up to four planes and their pitches.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct Image {
@@ -138,7 +144,7 @@ pub(crate) struct Api {
     ) -> Status,
     retrieve: unsafe extern "C" fn(Handle, Handle, *mut u8, *mut usize, *mut c_void) -> Status,
     /// Kept loaded while the entry points are used.
-    _libraries: Vec<Library>,
+    _libraries: Option<[Library; 2]>,
 }
 
 /// Matching CUDA runtime and nvJPEG names, newest major first.
@@ -189,39 +195,58 @@ impl Api {
     }
 
     fn bind(cudart: Library, nvjpeg: Library) -> Result<Self> {
-        // SAFETY: each type is the CUDA runtime's or nvjpeg.h's C prototype
-        // (handles are opaque pointers, enums C ints, size_t usize).
-        unsafe {
-            Ok(Self {
-                malloc: cudart.symbol(c"cudaMalloc")?,
-                free: cudart.symbol(c"cudaFree")?,
-                host_alloc: cudart.symbol(c"cudaHostAlloc")?,
-                free_host: cudart.symbol(c"cudaFreeHost")?,
-                memcpy: cudart.symbol(c"cudaMemcpy")?,
-                synchronize: cudart.symbol(c"cudaStreamSynchronize")?,
-                host_register: cudart.symbol(c"cudaHostRegister")?,
-                host_unregister: cudart.symbol(c"cudaHostUnregister")?,
-                host_device_pointer: cudart.symbol(c"cudaHostGetDevicePointer")?,
-                get_device: cudart.symbol(c"cudaGetDevice")?,
-                device_attribute: cudart.symbol(c"cudaDeviceGetAttribute")?,
-                runtime_version: cudart.symbol(c"cudaRuntimeGetVersion")?,
-                get_property: nvjpeg.symbol(c"nvjpegGetProperty")?,
-                create: nvjpeg
-                    .symbol(c"nvjpegCreateSimple")
-                    .context("this libnvjpeg is not CUDA's nvJPEG")?,
-                destroy: nvjpeg.symbol(c"nvjpegDestroy")?,
-                state_create: nvjpeg.symbol(c"nvjpegEncoderStateCreate")?,
-                state_destroy: nvjpeg.symbol(c"nvjpegEncoderStateDestroy")?,
-                params_create: nvjpeg.symbol(c"nvjpegEncoderParamsCreate")?,
-                params_destroy: nvjpeg.symbol(c"nvjpegEncoderParamsDestroy")?,
-                set_quality: nvjpeg.symbol(c"nvjpegEncoderParamsSetQuality")?,
-                set_sampling: nvjpeg.symbol(c"nvjpegEncoderParamsSetSamplingFactors")?,
-                encode_image: nvjpeg.symbol(c"nvjpegEncodeImage")?,
-                encode_yuv: nvjpeg.symbol(c"nvjpegEncodeYUV")?,
-                retrieve: nvjpeg.symbol(c"nvjpegEncodeRetrieveBitstream")?,
-                _libraries: vec![cudart, nvjpeg],
-            })
-        }
+        Ok(Self {
+            // SAFETY: the field type matches cudaMalloc in the CUDA runtime or nvjpeg.h C API.
+            malloc: unsafe { cudart.symbol(c"cudaMalloc") }?,
+            // SAFETY: the field type matches cudaFree in the CUDA runtime or nvjpeg.h C API.
+            free: unsafe { cudart.symbol(c"cudaFree") }?,
+            // SAFETY: the field type matches cudaHostAlloc in the CUDA runtime or nvjpeg.h C API.
+            host_alloc: unsafe { cudart.symbol(c"cudaHostAlloc") }?,
+            // SAFETY: the field type matches cudaFreeHost in the CUDA runtime or nvjpeg.h C API.
+            free_host: unsafe { cudart.symbol(c"cudaFreeHost") }?,
+            // SAFETY: the field type matches cudaMemcpy in the CUDA runtime or nvjpeg.h C API.
+            memcpy: unsafe { cudart.symbol(c"cudaMemcpy") }?,
+            // SAFETY: the field type matches cudaStreamSynchronize in the CUDA runtime or nvjpeg.h C API.
+            synchronize: unsafe { cudart.symbol(c"cudaStreamSynchronize") }?,
+            // SAFETY: the field type matches cudaHostRegister in the CUDA runtime or nvjpeg.h C API.
+            host_register: unsafe { cudart.symbol(c"cudaHostRegister") }?,
+            // SAFETY: the field type matches cudaHostUnregister in the CUDA runtime or nvjpeg.h C API.
+            host_unregister: unsafe { cudart.symbol(c"cudaHostUnregister") }?,
+            // SAFETY: the field type matches cudaHostGetDevicePointer in the CUDA runtime or nvjpeg.h C API.
+            host_device_pointer: unsafe { cudart.symbol(c"cudaHostGetDevicePointer") }?,
+            // SAFETY: the field type matches cudaGetDevice in the CUDA runtime or nvjpeg.h C API.
+            get_device: unsafe { cudart.symbol(c"cudaGetDevice") }?,
+            // SAFETY: the field type matches cudaDeviceGetAttribute in the CUDA runtime or nvjpeg.h C API.
+            device_attribute: unsafe { cudart.symbol(c"cudaDeviceGetAttribute") }?,
+            // SAFETY: the field type matches cudaRuntimeGetVersion in the CUDA runtime or nvjpeg.h C API.
+            runtime_version: unsafe { cudart.symbol(c"cudaRuntimeGetVersion") }?,
+            // SAFETY: the field type matches nvjpegGetProperty in the CUDA runtime or nvjpeg.h C API.
+            get_property: unsafe { nvjpeg.symbol(c"nvjpegGetProperty") }?,
+            // SAFETY: the field type matches nvjpegCreateSimple in the CUDA runtime or nvjpeg.h C API.
+            create: unsafe { nvjpeg.symbol(c"nvjpegCreateSimple") }
+                .context("this libnvjpeg is not CUDA's nvJPEG")?,
+            // SAFETY: the field type matches nvjpegDestroy in the CUDA runtime or nvjpeg.h C API.
+            destroy: unsafe { nvjpeg.symbol(c"nvjpegDestroy") }?,
+            // SAFETY: the field type matches nvjpegEncoderStateCreate in the CUDA runtime or nvjpeg.h C API.
+            state_create: unsafe { nvjpeg.symbol(c"nvjpegEncoderStateCreate") }?,
+            // SAFETY: the field type matches nvjpegEncoderStateDestroy in the CUDA runtime or nvjpeg.h C API.
+            state_destroy: unsafe { nvjpeg.symbol(c"nvjpegEncoderStateDestroy") }?,
+            // SAFETY: the field type matches nvjpegEncoderParamsCreate in the CUDA runtime or nvjpeg.h C API.
+            params_create: unsafe { nvjpeg.symbol(c"nvjpegEncoderParamsCreate") }?,
+            // SAFETY: the field type matches nvjpegEncoderParamsDestroy in the CUDA runtime or nvjpeg.h C API.
+            params_destroy: unsafe { nvjpeg.symbol(c"nvjpegEncoderParamsDestroy") }?,
+            // SAFETY: the field type matches nvjpegEncoderParamsSetQuality in the CUDA runtime or nvjpeg.h C API.
+            set_quality: unsafe { nvjpeg.symbol(c"nvjpegEncoderParamsSetQuality") }?,
+            // SAFETY: the field type matches nvjpegEncoderParamsSetSamplingFactors in the CUDA runtime or nvjpeg.h C API.
+            set_sampling: unsafe { nvjpeg.symbol(c"nvjpegEncoderParamsSetSamplingFactors") }?,
+            // SAFETY: the field type matches nvjpegEncodeImage in the CUDA runtime or nvjpeg.h C API.
+            encode_image: unsafe { nvjpeg.symbol(c"nvjpegEncodeImage") }?,
+            // SAFETY: the field type matches nvjpegEncodeYUV in the CUDA runtime or nvjpeg.h C API.
+            encode_yuv: unsafe { nvjpeg.symbol(c"nvjpegEncodeYUV") }?,
+            // SAFETY: the field type matches nvjpegEncodeRetrieveBitstream in the CUDA runtime or nvjpeg.h C API.
+            retrieve: unsafe { nvjpeg.symbol(c"nvjpegEncodeRetrieveBitstream") }?,
+            _libraries: Some([cudart, nvjpeg]),
+        })
     }
 }
 
@@ -306,29 +331,28 @@ impl Gpu {
             staging: None,
         };
         let api = &gpu.api;
-        // SAFETY: out-pointers are fields and locals; what is created is
-        // released by Drop, also after a later step fails.
-        unsafe {
-            check("nvjpegCreateSimple", (api.create)(&mut gpu.handle))?;
-            check(
-                "nvjpegEncoderStateCreate",
-                (api.state_create)(gpu.handle, &mut gpu.state, STREAM),
-            )?;
-            check(
-                "nvjpegEncoderParamsCreate",
-                (api.params_create)(gpu.handle, &mut gpu.params, STREAM),
-            )?;
-            let (mut device, mut integrated, mut mappable) = (0, 0, 0);
-            gpu.integrated = (api.get_device)(&mut device) == 0
-                && (api.device_attribute)(&mut integrated, CUDA_ATTRIBUTE_INTEGRATED, device) == 0
-                && (api.device_attribute)(
-                    &mut mappable,
+        // SAFETY: the output field is initialized; Drop releases any handle created here.
+        let status = unsafe { (api.create)(&raw mut gpu.handle) };
+        check("nvjpegCreateSimple", status)?;
+        // SAFETY: the handle is live; Drop owns the initialized state output field.
+        let status = unsafe { (api.state_create)(gpu.handle, &raw mut gpu.state, STREAM) };
+        check("nvjpegEncoderStateCreate", status)?;
+        // SAFETY: the handle is live; Drop owns the initialized parameter output field.
+        let status = unsafe { (api.params_create)(gpu.handle, &raw mut gpu.params, STREAM) };
+        check("nvjpegEncoderParamsCreate", status)?;
+        let (mut device, mut integrated, mut mappable) = (0, 0, 0);
+        // SAFETY: CUDA writes the current device ID to an initialized local.
+        gpu.integrated = unsafe { (api.get_device)(&raw mut device) } == 0
+            // SAFETY: the queried device is valid; the output is an initialized local.
+            && unsafe { (api.device_attribute)(&raw mut integrated, CUDA_ATTRIBUTE_INTEGRATED, device) } == 0
+            // SAFETY: the same valid device and a separate initialized output local.
+            && unsafe { (api.device_attribute)(
+                    &raw mut mappable,
                     CUDA_ATTRIBUTE_CAN_MAP_HOST_MEMORY,
                     device,
-                ) == 0
+                ) } == 0
                 && integrated == 1
                 && mappable == 1;
-        }
         Ok(gpu)
     }
 
@@ -336,13 +360,14 @@ impl Gpu {
     fn about(&self) -> serde_json::Map<String, serde_json::Value> {
         let api = &self.api;
         let (mut major, mut minor, mut patch, mut cuda) = (0, 0, 0, 0);
-        // SAFETY: out-pointers to locals.
-        unsafe {
-            (api.get_property)(MAJOR_VERSION, &mut major);
-            (api.get_property)(MINOR_VERSION, &mut minor);
-            (api.get_property)(PATCH_LEVEL, &mut patch);
-            (api.runtime_version)(&mut cuda);
-        }
+        // SAFETY: nvJPEG writes the major version to an initialized local.
+        unsafe { (api.get_property)(MAJOR_VERSION, &raw mut major) };
+        // SAFETY: nvJPEG writes the minor version to an initialized local.
+        unsafe { (api.get_property)(MINOR_VERSION, &raw mut minor) };
+        // SAFETY: nvJPEG writes the patch version to an initialized local.
+        unsafe { (api.get_property)(PATCH_LEVEL, &raw mut patch) };
+        // SAFETY: CUDA writes its runtime version to an initialized local.
+        unsafe { (api.runtime_version)(&raw mut cuda) };
         let upload = if self.integrated { "in-place" } else { "dma" };
         serde_json::json!({
             "version": format!("nvJPEG {major}.{minor}.{patch}, CUDA {}.{}", cuda / 1000, cuda % 1000 / 10),
@@ -363,7 +388,9 @@ impl Gpu {
         unsafe { std::slice::from_raw_parts_mut(staging.host, width * height) }
             .iter_mut()
             .enumerate()
-            .for_each(|(i, value)| *value = (i % width * 4) as u8);
+            .for_each(|(i, value)| {
+                *value = u8::try_from(i % width * 4).expect("the 64-pixel probe gradient fits u8");
+            });
         let source = self.device_view(staging.host, width * height, staging.device)?;
         let mut out = vec![0; 64 * 1024];
         let image = Image {
@@ -393,7 +420,7 @@ impl Gpu {
         {
             return Ok(*staging);
         }
-        self.free_staging();
+        self.free_staging()?;
         let api = &self.api;
         let flags = if self.integrated {
             CUDA_HOST_ALLOC_MAPPED
@@ -402,13 +429,16 @@ impl Gpu {
         };
         let mut host = std::ptr::null_mut();
         let mut device = std::ptr::null_mut();
-        // SAFETY: out-pointers to locals; the memory is freed by
-        // `free_staging`.
-        unsafe {
-            check("cudaHostAlloc", (api.host_alloc)(&mut host, len, flags))?;
-            if self.integrated && (api.host_device_pointer)(&mut device, host, 0) != 0 {
-                device = std::ptr::null_mut();
-            }
+        // SAFETY: CUDA writes an allocation into initialized pointer storage;
+        // the allocation is retained in `self.staging` and released by `free_staging`.
+        check("cudaHostAlloc", unsafe {
+            (api.host_alloc)(&raw mut host, len, flags)
+        })?;
+        if self.integrated
+            // SAFETY: host is a live CUDA allocation and device is initialized output storage.
+            && unsafe { (api.host_device_pointer)(&raw mut device, host, 0) } != 0
+        {
+            device = std::ptr::null_mut();
         }
         let staging = Staging {
             host: host.cast(),
@@ -419,11 +449,14 @@ impl Gpu {
         Ok(staging)
     }
 
-    fn free_staging(&mut self) {
+    fn free_staging(&mut self) -> Result<()> {
         if let Some(staging) = self.staging.take() {
             // SAFETY: allocated by `staging`, freed once.
-            unsafe { (self.api.free_host)(staging.host.cast()) };
+            check("cudaFreeHost", unsafe {
+                (self.api.free_host)(staging.host.cast())
+            })?;
         }
+        Ok(())
     }
 
     /// Page-lock `segment` the first time a frame is read from it, within
@@ -446,9 +479,10 @@ impl Gpu {
             let registered = unsafe { (api.host_register)(base.cast(), segment.len(), flags) } == 0;
             if registered {
                 let mut device = std::ptr::null_mut();
-                // SAFETY: a registered range and an out-pointer.
                 if self.integrated
-                    && unsafe { (api.host_device_pointer)(&mut device, base.cast(), 0) } != 0
+                    // SAFETY: base is the live registered segment mapping;
+                    // device is writable storage for the returned pointer.
+                    && unsafe { (api.host_device_pointer)(&raw mut device, base.cast(), 0) } != 0
                 {
                     device = std::ptr::null_mut();
                 }
@@ -475,23 +509,24 @@ impl Gpu {
             return Ok(device.cast());
         }
         let api = &self.api;
-        // SAFETY: the device buffer is (re)allocated to hold `len` bytes
-        // before `len` bytes are copied into it from live host memory.
-        unsafe {
-            if self.device.1 < len {
-                if !self.device.0.is_null() {
-                    (api.free)(self.device.0);
-                    self.device = (std::ptr::null_mut(), 0);
-                }
-                let mut buffer = std::ptr::null_mut();
-                check("cudaMalloc", (api.malloc)(&mut buffer, len))?;
-                self.device = (buffer, len);
+        if self.device.1 < len {
+            if !self.device.0.is_null() {
+                // A CUDA error can report an earlier asynchronous failure;
+                // relinquish the old address before freeing so Drop cannot retry it.
+                let (old, _) = std::mem::replace(&mut self.device, (std::ptr::null_mut(), 0));
+                // SAFETY: `old` is the device allocation owned by this encoder.
+                check("cudaFree", unsafe { (api.free)(old) })?;
             }
-            check(
-                "cudaMemcpy",
-                (api.memcpy)(self.device.0, host.cast(), len, CUDA_MEMCPY_HOST_TO_DEVICE),
-            )?;
+            let mut buffer = std::ptr::null_mut();
+            // SAFETY: CUDA writes a new allocation into initialized pointer storage.
+            check("cudaMalloc", unsafe { (api.malloc)(&raw mut buffer, len) })?;
+            self.device = (buffer, len);
         }
+        // SAFETY: the device allocation holds `len` bytes, and the caller's
+        // host buffer remains live for the synchronous copy.
+        check("cudaMemcpy", unsafe {
+            (api.memcpy)(self.device.0, host.cast(), len, CUDA_MEMCPY_HOST_TO_DEVICE)
+        })?;
         Ok(self.device.0.cast())
     }
 
@@ -506,30 +541,29 @@ impl Gpu {
         out: &mut [u8],
     ) -> Result<usize> {
         let api = &self.api;
-        let (w, h) = (width as c_int, height as c_int);
-        // SAFETY: `image` points at device-readable memory holding the
-        // frame's planes at their pitches; everything runs on the default
-        // stream, synchronized before the bitstream is read back into `out`,
-        // within its length.
-        unsafe {
-            if self.quality != quality {
-                check(
-                    "nvjpegEncoderParamsSetQuality",
-                    (api.set_quality)(self.params, quality, STREAM),
-                )?;
-                self.quality = quality;
-            }
-            let sampling = match layout {
-                Layout::Gray => NVJPEG_CSS_GRAY,
-                _ => NVJPEG_CSS_420,
-            };
-            check(
-                "nvjpegEncoderParamsSetSamplingFactors",
-                (api.set_sampling)(self.params, sampling, STREAM),
-            )?;
-            match layout {
-                Layout::Interleaved(format) => check(
-                    "nvjpegEncodeImage",
+        let w = c_int::try_from(width).context("JPEG width exceeds encoder range")?;
+        let h = c_int::try_from(height).context("JPEG height exceeds encoder range")?;
+        if self.quality != quality {
+            // SAFETY: the parameter object is live and the default stream is valid.
+            check("nvjpegEncoderParamsSetQuality", unsafe {
+                (api.set_quality)(self.params, quality, STREAM)
+            })?;
+            self.quality = quality;
+        }
+        let sampling = match layout {
+            Layout::Gray => NVJPEG_CSS_GRAY,
+            _ => NVJPEG_CSS_420,
+        };
+        // SAFETY: the live parameter object receives a supported sampling mode.
+        check("nvjpegEncoderParamsSetSamplingFactors", unsafe {
+            (api.set_sampling)(self.params, sampling, STREAM)
+        })?;
+        match layout {
+            Layout::Interleaved(format) => check(
+                "nvjpegEncodeImage",
+                // SAFETY: the handles are live; `image` describes the device-readable
+                // frame at its pitches, with dimensions checked to fit the API.
+                unsafe {
                     (api.encode_image)(
                         self.handle,
                         self.state,
@@ -539,10 +573,14 @@ impl Gpu {
                         w,
                         h,
                         STREAM,
-                    ),
-                )?,
-                Layout::Gray | Layout::Yuv420 => check(
-                    "nvjpegEncodeYUV",
+                    )
+                },
+            )?,
+            Layout::Gray | Layout::Yuv420 => check(
+                "nvjpegEncodeYUV",
+                // SAFETY: the live handles encode device-readable planes at their
+                // supplied pitches and checked dimensions on the default stream.
+                unsafe {
                     (api.encode_yuv)(
                         self.handle,
                         self.state,
@@ -552,40 +590,54 @@ impl Gpu {
                         w,
                         h,
                         STREAM,
-                    ),
-                )?,
-            }
-            check("cudaStreamSynchronize", (api.synchronize)(STREAM))?;
-            let mut length = 0usize;
-            check(
-                "nvjpegEncodeRetrieveBitstream",
+                    )
+                },
+            )?,
+        }
+        // SAFETY: the default stream is valid; wait before retrieving its output.
+        check("cudaStreamSynchronize", unsafe {
+            (api.synchronize)(STREAM)
+        })?;
+        let mut length = 0usize;
+        check(
+            "nvjpegEncodeRetrieveBitstream",
+            // SAFETY: the live state writes only its required size to initialized
+            // length storage when given a null destination.
+            unsafe {
                 (api.retrieve)(
                     self.handle,
                     self.state,
                     std::ptr::null_mut(),
-                    &mut length,
+                    &raw mut length,
                     STREAM,
-                ),
-            )?;
-            if length > out.len() {
-                return Err(Unsupported(format!(
-                    "its {length}-byte JPEG is longer than the room for it"
-                ))
-                .into());
-            }
-            check(
-                "nvjpegEncodeRetrieveBitstream",
+                )
+            },
+        )?;
+        if length > out.len() {
+            return Err(Unsupported(format!(
+                "its {length}-byte JPEG is longer than the room for it"
+            ))
+            .into());
+        }
+        check(
+            "nvjpegEncodeRetrieveBitstream",
+            // SAFETY: the required length fits `out`, and the live state writes
+            // within that supplied capacity; both outputs outlive synchronization.
+            unsafe {
                 (api.retrieve)(
                     self.handle,
                     self.state,
                     out.as_mut_ptr(),
-                    &mut length,
+                    &raw mut length,
                     STREAM,
-                ),
-            )?;
-            check("cudaStreamSynchronize", (api.synchronize)(STREAM))?;
-            Ok(length)
-        }
+                )
+            },
+        )?;
+        // SAFETY: wait for the default stream before returning borrowed output storage.
+        check("cudaStreamSynchronize", unsafe {
+            (api.synchronize)(STREAM)
+        })?;
+        Ok(length)
     }
 }
 
@@ -595,7 +647,7 @@ enum Layout {
     /// Interleaved RGB or BGR, which nvJPEG converts to 4:2:0 itself.
     Interleaved(c_int),
     Gray,
-    /// JFIF Y'CbCr 4:2:0 planes.
+    /// JFIF `Y'CbCr` 4:2:0 planes.
     Yuv420,
 }
 
@@ -665,12 +717,11 @@ impl Encoder for Gpu {
             planes.write(crate::frame::FrameRef::whole(frame), buffer);
             crate::copies::record(crate::copies::Site::StillTransform, planes.len());
             let base = self.device_view(staging.host, planes.len(), staging.device)?;
-            // SAFETY: offsets within the planes' length.
-            unsafe {
-                image.channel[0] = base;
-                image.channel[1] = base.add(planes.luma_len());
-                image.channel[2] = base.add(planes.luma_len() + planes.chroma_len());
-            }
+            image.channel[0] = base;
+            // SAFETY: the first chroma plane follows luma within the staging allocation.
+            image.channel[1] = unsafe { base.add(planes.luma_len()) };
+            // SAFETY: the second chroma plane follows the first within the same allocation.
+            image.channel[2] = unsafe { base.add(planes.luma_len() + planes.chroma_len()) };
             image.pitch[..3].copy_from_slice(&[
                 planes.luma_width,
                 planes.chroma_width(),
@@ -683,26 +734,29 @@ impl Encoder for Gpu {
 
 impl Drop for Gpu {
     fn drop(&mut self) {
-        self.free_staging();
+        // Destruction cannot report driver errors; the allocation is removed
+        // before release, so an ambiguous failure is never retried.
+        let _ = self.free_staging();
         let api = &self.api;
-        // SAFETY: each object was created by this encoder and is released
-        // once; registered segments are still mapped.
-        unsafe {
-            for locked in self.locked.values() {
-                (api.host_unregister)(locked.base.cast());
-            }
-            if !self.device.0.is_null() {
-                (api.free)(self.device.0);
-            }
-            if !self.params.is_null() {
-                (api.params_destroy)(self.params);
-            }
-            if !self.state.is_null() {
-                (api.state_destroy)(self.state);
-            }
-            if !self.handle.is_null() {
-                (api.destroy)(self.handle);
-            }
+        for locked in self.locked.values() {
+            // SAFETY: this registered segment remains mapped during encoder destruction.
+            unsafe { (api.host_unregister)(locked.base.cast()) };
+        }
+        if !self.device.0.is_null() {
+            // SAFETY: this encoder owns the non-null device allocation.
+            unsafe { (api.free)(self.device.0) };
+        }
+        if !self.params.is_null() {
+            // SAFETY: these parameters were created here and have not been destroyed.
+            unsafe { (api.params_destroy)(self.params) };
+        }
+        if !self.state.is_null() {
+            // SAFETY: this state was created here and has not been destroyed.
+            unsafe { (api.state_destroy)(self.state) };
+        }
+        if !self.handle.is_null() {
+            // SAFETY: all dependent objects were released before this owned handle.
+            unsafe { (api.destroy)(self.handle) };
         }
     }
 }
@@ -729,13 +783,14 @@ mod tests {
         aliases: Vec<(usize, usize, usize)>,
         /// Host-to-device copies: (destination, source, length).
         copies: Vec<(usize, usize, usize)>,
-        /// Encodes: whether through EncodeImage, the input format or
+        /// Encodes: whether through `EncodeImage`, the input format or
         /// sampling, the first channel and pitch.
         encodes: Vec<(bool, c_int, usize, usize)>,
         bitstream: Vec<u8>,
         quality: c_int,
         sampling: c_int,
         allocations: HashMap<usize, Vec<u8>>,
+        released: Vec<&'static str>,
     }
 
     static FAKE: Mutex<Option<Fake>> = Mutex::new(None);
@@ -745,7 +800,7 @@ mod tests {
     fn fake<R>(f: impl FnOnce(&mut Fake) -> R) -> R {
         f(FAKE
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get_or_insert_with(Fake::default))
     }
 
@@ -763,7 +818,7 @@ mod tests {
     }
 
     /// A device address that is not the host's: the top bit flipped.
-    fn alias(host: usize) -> usize {
+    const fn alias(host: usize) -> usize {
         host ^ (1 << (usize::BITS - 1))
     }
 
@@ -771,6 +826,7 @@ mod tests {
         let mut buffer = vec![0u8; len];
         let address = buffer.as_mut_ptr();
         fake(|fake| fake.allocations.insert(address as usize, buffer));
+        // SAFETY: The caller supplies writable pointer storage; the Vec remains owned by FAKE.
         unsafe { *out = address.cast() };
         0
     }
@@ -779,6 +835,7 @@ mod tests {
         0
     }
     unsafe extern "C" fn host_alloc(out: *mut *mut c_void, len: usize, _: c_uint) -> c_int {
+        // SAFETY: Forward the caller's valid output pointer and allocation length.
         unsafe { malloc(out, len) }
     }
     unsafe extern "C" fn host_device_pointer(
@@ -801,13 +858,11 @@ mod tests {
             fake.aliases.push((device, host as usize, len));
             Some(device)
         });
-        match device {
-            Some(device) => {
-                unsafe { *out = device as *mut c_void };
-                0
-            }
-            None => 1,
-        }
+        device.map_or(1, |device| {
+            // SAFETY: The API caller supplies writable storage for the device pointer.
+            unsafe { *out = device as *mut c_void };
+            0
+        })
     }
     unsafe extern "C" fn memcpy(
         to: *mut c_void,
@@ -817,10 +872,11 @@ mod tests {
     ) -> c_int {
         assert_eq!(kind, CUDA_MEMCPY_HOST_TO_DEVICE);
         fake(|fake| fake.copies.push((to as usize, from as usize, len)));
+        // SAFETY: The encoder supplies distinct live host and device buffers of at least len bytes.
         unsafe { std::ptr::copy_nonoverlapping(from.cast::<u8>(), to.cast::<u8>(), len) };
         0
     }
-    unsafe extern "C" fn synchronize(_: *mut c_void) -> c_int {
+    const unsafe extern "C" fn synchronize(_: *mut c_void) -> c_int {
         0
     }
     unsafe extern "C" fn host_register(host: *mut c_void, len: usize, flags: c_uint) -> c_int {
@@ -832,11 +888,13 @@ mod tests {
         0
     }
     unsafe extern "C" fn get_device(device: *mut c_int) -> c_int {
+        // SAFETY: The caller supplies writable storage for one device ordinal.
         unsafe { *device = 0 };
         0
     }
     unsafe extern "C" fn device_attribute(value: *mut c_int, attribute: c_int, _: c_int) -> c_int {
         let integrated = fake(|fake| fake.integrated);
+        // SAFETY: The caller supplies writable storage for one attribute value.
         unsafe {
             *value = match attribute {
                 CUDA_ATTRIBUTE_INTEGRATED => integrated.into(),
@@ -847,21 +905,25 @@ mod tests {
         0
     }
     unsafe extern "C" fn runtime_version(version: *mut c_int) -> c_int {
+        // SAFETY: The caller supplies writable storage for one runtime version.
         unsafe { *version = 12040 };
         0
     }
     unsafe extern "C" fn get_property(kind: c_int, value: *mut c_int) -> c_int {
-        unsafe { *value = [12, 3, 1][kind as usize] };
+        // SAFETY: The caller supplies writable storage for one property value.
+        unsafe { *value = [12, 3, 1][usize::try_from(kind).expect("nonnegative property index")] };
         0
     }
     unsafe extern "C" fn create(handle: *mut Handle) -> c_int {
+        // SAFETY: The caller supplies writable handle storage; this sentinel is never dereferenced.
         unsafe { *handle = std::ptr::dangling_mut() };
         0
     }
-    unsafe extern "C" fn destroy(_: Handle) -> c_int {
+    const unsafe extern "C" fn destroy(_: Handle) -> c_int {
         0
     }
     unsafe extern "C" fn object_create(_: Handle, object: *mut Handle, _: *mut c_void) -> c_int {
+        // SAFETY: The caller supplies writable handle storage; this sentinel is never dereferenced.
         unsafe { *object = std::ptr::without_provenance_mut(2) };
         0
     }
@@ -885,9 +947,14 @@ mod tests {
         height: c_int,
         _: *mut c_void,
     ) -> c_int {
+        // SAFETY: The encoder passes a live initialized Image for this synchronous call.
         let image = unsafe { *image };
-        let (width, height) = (width as usize, height as usize);
+        let (width, height) = (
+            usize::try_from(width).expect("nonnegative image width"),
+            usize::try_from(height).expect("nonnegative image height"),
+        );
         let source = host(image.channel[0]);
+        // SAFETY: host resolves the registered alias to live storage covering pitch times height.
         let pixels = unsafe { std::slice::from_raw_parts(source, image.pitch[0] * height) };
         let input = format;
         let format = match input {
@@ -925,14 +992,19 @@ mod tests {
         height: c_int,
         _: *mut c_void,
     ) -> c_int {
+        // SAFETY: The encoder passes a live initialized Image for this synchronous call.
         let image = unsafe { *image };
-        let (width, height) = (width as usize, height as usize);
+        let (width, height) = (
+            usize::try_from(width).expect("nonnegative image width"),
+            usize::try_from(height).expect("nonnegative image height"),
+        );
         let quality = fake(|fake| fake.quality);
         let mut compressor = turbojpeg::Compressor::new().unwrap();
         compressor.set_quality(quality).unwrap();
         let jpeg = match sampling {
             NVJPEG_CSS_GRAY => {
                 compressor.set_subsamp(turbojpeg::Subsamp::Gray).unwrap();
+                // SAFETY: The encoder supplies a live grayscale plane covering pitch times height.
                 let pixels = unsafe {
                     std::slice::from_raw_parts(host(image.channel[0]), image.pitch[0] * height)
                 };
@@ -948,6 +1020,7 @@ mod tests {
             }
             NVJPEG_CSS_420 => {
                 let rows = height.next_multiple_of(2);
+                // SAFETY: The encoder supplies padded live YUV planes with these pitches and row counts.
                 let plane = |i: usize, rows: usize| unsafe {
                     std::slice::from_raw_parts(host(image.channel[i]), image.pitch[i] * rows)
                 };
@@ -982,12 +1055,21 @@ mod tests {
         length: *mut usize,
         _: *mut c_void,
     ) -> c_int {
-        fake(|fake| unsafe {
+        fake(|fake| {
             if !data.is_null() {
-                assert!(*length >= fake.bitstream.len());
-                std::ptr::copy_nonoverlapping(fake.bitstream.as_ptr(), data, fake.bitstream.len());
+                // SAFETY: the caller supplies initialized length storage.
+                assert!(unsafe { *length } >= fake.bitstream.len());
+                // SAFETY: the distinct output buffer has the checked capacity.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        fake.bitstream.as_ptr(),
+                        data,
+                        fake.bitstream.len(),
+                    );
+                };
             }
-            *length = fake.bitstream.len();
+            // SAFETY: the caller supplies writable length storage.
+            unsafe { *length = fake.bitstream.len() };
         });
         0
     }
@@ -1018,15 +1100,19 @@ mod tests {
             encode_image,
             encode_yuv,
             retrieve,
-            _libraries: Vec::new(),
+            _libraries: None,
         }
     }
 
     /// A GPU, integrated or not, on the fake; the GPU is dropped before
     /// the turn ends.
     fn gpu(integrated: bool) -> (MutexGuard<'static, ()>, Gpu) {
-        let turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
-        *FAKE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Fake {
+        let turn = TURN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *FAKE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Fake {
             integrated,
             ..Fake::default()
         });
@@ -1155,7 +1241,7 @@ mod tests {
                     }
                 );
                 assert_eq!(channel, staging, "the staging planes in place");
-                assert!(fake.copies.is_empty());
+                assert_eq!(fake.copies, [] as [(usize, usize, usize); 0]);
             });
             // As the CPU writes it from the same planes.
             assert_eq!(
@@ -1167,13 +1253,102 @@ mod tests {
     }
 
     #[test]
+    fn partial_initialization_releases_only_created_objects_in_dependency_order() {
+        const unsafe extern "C" fn fail(_: Handle, _: *mut Handle, _: *mut c_void) -> c_int {
+            1
+        }
+        unsafe extern "C" fn release_handle(_: Handle) -> c_int {
+            fake(|fake| fake.released.push("handle"));
+            0
+        }
+        unsafe extern "C" fn release_state(_: Handle) -> c_int {
+            fake(|fake| fake.released.push("state"));
+            0
+        }
+        unsafe extern "C" fn release_params(_: Handle) -> c_int {
+            fake(|fake| fake.released.push("params"));
+            0
+        }
+        let _turn = TURN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cases: [(bool, &[&str]); 2] = [(true, &["handle"]), (false, &["state", "handle"])];
+        for (state_fails, expected) in cases {
+            fake(|fake| *fake = Fake::default());
+            let mut api = api();
+            api.destroy = release_handle;
+            api.state_destroy = release_state;
+            api.params_destroy = release_params;
+            if state_fails {
+                api.state_create = fail;
+            } else {
+                api.params_create = fail;
+            }
+            let error = Gpu::new(api).err().unwrap();
+            let call = if state_fails {
+                "nvjpegEncoderStateCreate"
+            } else {
+                "nvjpegEncoderParamsCreate"
+            };
+            assert!(error.to_string().contains(call), "{error:#}");
+            fake(|fake| assert_eq!(fake.released, expected));
+        }
+    }
+
+    #[test]
+    fn failed_host_free_stops_growth_without_retaining_the_old_pointer() {
+        unsafe extern "C" fn free_then_fail(address: *mut c_void) -> c_int {
+            // SAFETY: the encoder passes its owned host allocation.
+            unsafe { free(address) };
+            1
+        }
+        let (_turn, mut gpu) = gpu(false);
+        let old = gpu.staging.unwrap();
+        let count = fake(|fake| fake.allocations.len());
+        gpu.api.free_host = free_then_fail;
+        let error = gpu.staging(old.len + 1).err().unwrap();
+        assert!(
+            error.to_string().contains("cudaFreeHost failed"),
+            "{error:#}"
+        );
+        assert!(gpu.staging.is_none());
+        fake(|fake| {
+            assert!(!fake.allocations.contains_key(&(old.host as usize)));
+            assert_eq!(fake.allocations.len(), count - 1);
+        });
+    }
+
+    #[test]
+    fn failed_device_free_stops_growth_without_retaining_the_old_pointer() {
+        unsafe extern "C" fn free_then_fail(address: *mut c_void) -> c_int {
+            // SAFETY: the encoder passes its owned device allocation.
+            unsafe { free(address) };
+            1
+        }
+        let (_turn, mut gpu) = gpu(false);
+        let old = gpu.device.0;
+        let host = vec![0u8; gpu.device.1 + 1];
+        gpu.api.free = free_then_fail;
+        let error = gpu
+            .device_view(host.as_ptr(), host.len(), std::ptr::null_mut())
+            .unwrap_err();
+        assert!(error.to_string().contains("cudaFree failed"), "{error:#}");
+        assert!(gpu.device.0.is_null());
+        assert_eq!(gpu.device.1, 0);
+        fake(|fake| {
+            assert!(!fake.allocations.contains_key(&(old as usize)));
+            assert_eq!(fake.copies, [] as [(usize, usize, usize); 0]);
+        });
+    }
+
+    #[test]
     fn segments_past_the_lock_limit_are_copied_from_pageable_memory() {
         let (_turn, mut gpu) = gpu(true);
         gpu.lock_limit = 0;
         let (frame, segment) = in_segment(RGB8, 32, 16);
         encode(&mut gpu, &frame, &segment, QUALITY);
         fake(|fake| {
-            assert!(fake.registered.is_empty());
+            assert_eq!(fake.registered, [] as [(usize, usize, u32); 0]);
             assert_eq!(fake.copies.len(), 1);
             assert_eq!(fake.copies[0].1, segment.as_ptr() as usize);
         });

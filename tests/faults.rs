@@ -1,5 +1,7 @@
 //! Faults: camera workers that are killed, stopped or panic, clients that
 //! are interrupted or killed, and clients that race to connect a camera.
+#![deny(clippy::doc_markdown)]
+#![deny(clippy::cast_precision_loss)]
 mod support;
 
 #[cfg(unix)]
@@ -10,6 +12,25 @@ use std::time::{Duration, Instant};
 use std::{path::Path, process::Stdio};
 use support::cli::Home;
 
+#[test]
+fn process_ids_reject_nonpositive_or_out_of_range_values_before_os_calls() {
+    assert_eq!(support::cli::process_id(1), 1);
+    assert_eq!(support::cli::process_id(i64::from(i32::MAX)), i32::MAX);
+    for value in [
+        i64::MIN,
+        -1,
+        0,
+        i64::from(i32::MAX) + 1,
+        i64::from(u32::MAX) + 2,
+        i64::MAX,
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| support::cli::process_id(value)).is_err(),
+            "{value}"
+        );
+    }
+}
+
 /// The pid of the worker of session `name`'s only camera.
 #[cfg(unix)]
 fn worker_pid(home: &Home, name: &str) -> i32 {
@@ -19,7 +40,7 @@ fn worker_pid(home: &Home, name: &str) -> i32 {
             &["--json", "--session", name, "debug", "rpc"],
         )
         .success();
-    state["cameras"][0]["worker_pid"].as_i64().unwrap() as i32
+    support::cli::process_id(state["cameras"][0]["worker_pid"].as_i64().unwrap())
 }
 
 /// Files in `dir`, sorted.
@@ -61,6 +82,7 @@ fn document(output: &std::process::Output) -> Value {
 
 #[cfg(unix)]
 fn send(pid: i32, signal: i32) {
+    assert!(pid > 0, "signals require a positive PID");
     // SAFETY: kill only sends a signal to a process this test started.
     assert_eq!(unsafe { libc::kill(pid, signal) }, 0);
 }
@@ -68,12 +90,16 @@ fn send(pid: i32, signal: i32) {
 /// Whether any process is left in process group `group`.
 #[cfg(unix)]
 fn group_lives(group: i32) -> bool {
+    assert!(
+        group > 0,
+        "process group checks require a positive group ID"
+    );
     // SAFETY: signal 0 only checks whether the group has members.
     unsafe { libc::kill(-group, 0) == 0 }
 }
 
 /// A worker killed under a blocking capture fails that capture as
-/// worker_crashed; the next command on the camera starts another worker.
+/// `worker_crashed`; the next command on the camera starts another worker.
 #[cfg(unix)]
 #[test]
 fn a_killed_worker_fails_the_command_in_flight_and_the_next_reconnects() {
@@ -269,19 +295,18 @@ fn a_killed_client_leaves_no_job_running() {
 #[test]
 fn concurrent_connects_to_one_camera_share_a_worker() {
     let home = Home::new("fault-race");
-    let _session = home.serve("race", &[]);
+    let session = home.serve("race", &[]);
     for round in 0..3 {
         let camera = format!("sim:race{round}");
         let results = std::thread::scope(|scope| {
-            let threads = (0..4)
-                .map(|_| {
-                    let camera = camera.clone();
-                    let home = &home;
-                    scope.spawn(move || {
-                        home.run(&["--json", "--session", "race", "get", "-c", &camera, "Width"])
-                    })
-                })
-                .collect::<Vec<_>>();
+            let mut threads = Vec::with_capacity(4);
+            for _ in 0..4 {
+                let camera = &camera;
+                let home = &home;
+                threads.push(scope.spawn(move || {
+                    home.run(&["--json", "--session", "race", "get", "-c", camera, "Width"])
+                }));
+            }
             threads
                 .into_iter()
                 .map(|thread| thread.join().unwrap())
@@ -302,13 +327,14 @@ fn concurrent_connects_to_one_camera_share_a_worker() {
         #[cfg(unix)]
         {
             let children = std::process::Command::new("pgrep")
-                .args(["-P", &_session.child.id().to_string()])
+                .args(["-P", &session.child.id().to_string()])
                 .output()
                 .unwrap();
             let workers = String::from_utf8_lossy(&children.stdout).lines().count();
             assert_eq!(workers, round + 1, "{status}");
         }
     }
+    drop(session);
 }
 
 /// A worker that panics is reported as crashed, with what it printed; a
@@ -344,7 +370,7 @@ fn a_panicking_worker_is_reported_with_its_last_words() {
     // stays in error.
     let mut command = home.command();
     command.env("CAPTUREFAB_TEST_HOOKS", "1");
-    let _session = home.serve_in(&mut command, "panic", &["sim:0?panic=after:3"], &[]);
+    let _session = Home::serve_in(&mut command, "panic", &["sim:0?panic=after:3"], &[]);
     for _ in 0..3 {
         let crashed = crash(&[
             "capture",
@@ -389,7 +415,7 @@ fn a_session_stops_while_a_camera_connects() {
     let home = Home::new("fault-late");
     let mut command = home.command();
     command.env("CAPTUREFAB_TEST_HOOKS", "1");
-    let mut session = home.serve_in(&mut command, "late", &["sim:1"], &[]);
+    let mut session = Home::serve_in(&mut command, "late", &["sim:1"], &[]);
     let stuck = worker_pid(&home, "late");
     let connecting = home
         .command()
@@ -409,7 +435,7 @@ fn a_session_stops_while_a_camera_connects() {
         .unwrap();
     std::thread::sleep(Duration::from_millis(700));
     send(stuck, libc::SIGSTOP);
-    send(session.child.id() as i32, libc::SIGTERM);
+    send(i32::try_from(session.child.id()).unwrap(), libc::SIGTERM);
     let output = connecting.wait_with_output().unwrap();
     let error = &document(&output)["error"];
     assert_eq!(output.status.code(), Some(3), "{error}");
@@ -538,9 +564,7 @@ fn an_interrupted_session_capture_to_stdout_frees_the_camera() {
     );
     assert!(asked.elapsed() < Duration::from_secs(5));
     let out = home.sessions.join("out");
-    let left = std::fs::read_dir(&out)
-        .map(|entries| entries.count())
-        .unwrap_or(0);
+    let left = std::fs::read_dir(&out).map_or(0, Iterator::count);
     assert_eq!(left, 0, "the private file is deleted");
 }
 
@@ -580,7 +604,7 @@ fn a_second_signal_ends_the_workers_at_once() {
         std::thread::sleep(Duration::from_millis(20));
     };
     std::thread::sleep(Duration::from_millis(500));
-    send(child.id() as i32, libc::SIGINT);
+    send(i32::try_from(child.id()).unwrap(), libc::SIGINT);
     std::thread::sleep(Duration::from_millis(200));
     let status = support::cli::signal_and_wait(&mut child, libc::SIGINT);
     assert_eq!(status.code(), Some(130));
@@ -622,7 +646,7 @@ fn a_capture_on_more_cameras_than_long_waits_saves_every_frame() {
 fn a_dead_sessions_jobs_read_as_lost() {
     let home = Home::new("fault-lost");
     let started = home.ok(&["session", "start", "--name", "doomed", "-c", "sim:0"]);
-    let pid = started["pid"].as_i64().unwrap() as i32;
+    let pid = support::cli::process_id(started["pid"].as_i64().unwrap());
     let job = home.ok(&[
         "capture",
         "-c",

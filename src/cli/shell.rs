@@ -10,6 +10,7 @@
 //! holds them or the warm `auto` one, which the shell keeps from ending
 //! while it runs; with sessions off (`--keep 0`, `--no-session`, no
 //! writable runtime folder) in workers of the shell's own.
+#![deny(clippy::missing_const_for_fn)]
 use super::{
     Cli, Client, Command, Global, Route,
     args::KeepArg,
@@ -22,12 +23,12 @@ use crate::{
     types::{Categorized, ErrorKind, Usage},
 };
 use anyhow::Result;
-use clap::{Args, CommandFactory, FromArgMatches, parser::ValueSource};
+use clap::{Args, CommandFactory as _, FromArgMatches as _, parser::ValueSource};
 use serde_json::json;
 use std::{
     collections::BTreeSet,
     fmt::Write as _,
-    io::{self, BufRead, Write},
+    io::{self, BufRead as _, Write as _},
     path::PathBuf,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
@@ -40,7 +41,7 @@ use std::{
 mod complete;
 
 #[derive(Debug, Args)]
-pub struct ShellArgs {
+pub(crate) struct ShellArgs {
     /// Cameras to connect now and keep connected, repeatable; the first is the camera of commands without -c
     #[arg(
         short = 'c',
@@ -92,7 +93,7 @@ const NO_DEFAULT_CAMERA: &[&str] = &["session start", "serve", "network", "shell
 const SIGINT: i32 = 2;
 
 /// Run the shell; its exit code.
-pub fn main(global: Global, args: ShellArgs, matches: &clap::ArgMatches) -> i32 {
+pub(super) fn main(global: Global, args: ShellArgs, matches: &clap::ArgMatches) -> i32 {
     let out = global.output();
     let typed = |id: &str| {
         matches
@@ -138,7 +139,7 @@ pub fn main(global: Global, args: ShellArgs, matches: &clap::ArgMatches) -> i32 
         interactive,
         known: Mutex::default(),
     });
-    let mut shell = Shell {
+    let shell = Shell {
         global,
         session_typed,
         keep,
@@ -156,7 +157,7 @@ pub fn main(global: Global, args: ShellArgs, matches: &clap::ArgMatches) -> i32 
     }
     shell.shared.known().default = cameras.first().cloned();
     for camera in cameras {
-        shell.shared.connect(camera);
+        shell.shared.connect(&camera);
     }
     keep_sessions(&shell.shared);
     let exit = if script {
@@ -185,7 +186,7 @@ enum Step {
 
 struct Shell {
     global: Global,
-    /// The shell's --session was typed, not taken from CAPTUREFAB_SESSION.
+    /// The shell's --session was typed, not taken from `CAPTUREFAB_SESSION`.
     session_typed: bool,
     /// The shell's --keep as typed: commands that do not type their own
     /// take it.
@@ -342,18 +343,18 @@ impl Shared {
     }
     /// Connect `selector` in the background, where commands will use it;
     /// a camera already connected or connecting is left alone.
-    fn connect(self: &Arc<Self>, selector: String) {
+    fn connect(self: &Arc<Self>, selector: &str) {
         {
             let mut known = self.known();
             if known
-                .held(&selector)
+                .held(selector)
                 .is_some_and(|held| !matches!(held.state, Connection::Failed(_)))
             {
                 return;
             }
             known.cameras.retain(|held| held.selector != selector);
             known.cameras.push(Held {
-                selector: selector.clone(),
+                selector: selector.to_owned(),
                 state: Connection::Connecting,
                 told: false,
                 session: None,
@@ -363,7 +364,7 @@ impl Shared {
             });
         }
         let shared = self.clone();
-        let thread_selector = selector.clone();
+        let thread_selector = selector.to_owned();
         let spawned = std::thread::Builder::new()
             .name("capturefab-connect".into())
             .spawn(move || {
@@ -379,7 +380,7 @@ impl Shared {
             });
         if let Err(error) = spawned {
             crate::eprintln!("capturefab: cannot connect in the background: {error}");
-            self.fail(&selector, &format!("cannot start connecting: {error}"));
+            self.fail(selector, &format!("cannot start connecting: {error}"));
         }
     }
     /// Mark `selector`, still connecting, as failed with `message`.
@@ -402,7 +403,7 @@ impl Shared {
             match opened {
                 Ok(client) => {
                     held.state = Connection::Ready;
-                    held.session = client.session.clone();
+                    held.session = client.session().map(str::to_owned);
                     held.keep = client.keep;
                     if self.interactive {
                         known.notice(format!(
@@ -455,11 +456,7 @@ impl Shared {
         if letter.is_none() {
             cache.partial = list.get("truncated").is_some();
         }
-        for row in rows {
-            if !cache.features.iter().any(|known| known.name == row.name) {
-                cache.features.push(row);
-            }
-        }
+        cache.extend(rows);
     }
     /// Ask for the features of `selector` starting with `letter` in the
     /// background, once, when the first list did not hold them all.
@@ -490,13 +487,22 @@ impl Shared {
     }
     /// What completion needs now.
     #[cfg(feature = "shell")]
+    #[deny(clippy::significant_drop_tightening)]
     fn hints(&self) -> complete::Hints {
-        let known = self.known();
-        let default = known
-            .default
-            .as_deref()
-            .and_then(|selector| known.cameras.iter().find(|held| held.selector == selector));
-        let mut cameras = known.offered();
+        let (mut cameras, features, camera) = {
+            let known = self.known();
+            let default = known
+                .default
+                .as_deref()
+                .and_then(|selector| known.cameras.iter().find(|held| held.selector == selector));
+            (
+                known.offered(),
+                default
+                    .map(|held| held.completion.features.clone())
+                    .unwrap_or_default(),
+                default.map(|held| held.selector.clone()),
+            )
+        };
         for session in crate::ipc::sessions() {
             cameras.extend(session.cameras.into_iter().map(|camera| camera.id));
         }
@@ -504,10 +510,8 @@ impl Shared {
         cameras.dedup();
         complete::Hints {
             cameras,
-            features: default
-                .map(|held| held.completion.features.clone())
-                .unwrap_or_default(),
-            camera: default.map(|held| held.selector.clone()),
+            features,
+            camera,
         }
     }
 }
@@ -554,7 +558,7 @@ impl Shell {
     /// Run `lines` in order: the first failure ends the run unless
     /// --keep-going, and its exit code is the shell's; a signal ends it
     /// with the signal's.
-    fn batch(&mut self, lines: impl Iterator<Item = io::Result<String>>) -> i32 {
+    fn batch(&self, lines: impl Iterator<Item = io::Result<String>>) -> i32 {
         let mut failed = None;
         for line in lines {
             let line = match line {
@@ -594,9 +598,9 @@ impl Shell {
     }
 
     /// A prompt until `exit` or Ctrl-D.
-    fn interactive(&mut self) -> i32 {
+    fn interactive(&self) -> i32 {
         let out = self.global.output();
-        let mut reader = match editor::open(self.shared.clone(), history_path()) {
+        let mut reader = match editor::Reader::open(self.shared.clone(), history_path()) {
             Ok(reader) => reader,
             Err(error) => return out.print_error(&error),
         };
@@ -656,7 +660,7 @@ impl Shell {
     }
 
     /// Run one line.
-    fn execute(&mut self, line: &str) -> Step {
+    fn execute(&self, line: &str) -> Step {
         let out = self.global.output();
         let mut words = match split(line) {
             Ok(words) => words,
@@ -762,7 +766,7 @@ impl Shell {
         cli.global.verbose |= self.global.verbose;
         if !line_session && !cli.global.no_session {
             if self.global.session.is_some() {
-                cli.global.session = self.global.session.clone();
+                cli.global.session.clone_from(&self.global.session);
                 cli.global.session_from_env = !self.session_typed;
             } else if self.global.no_session {
                 cli.global.no_session = true;
@@ -804,7 +808,7 @@ impl Shell {
     /// Run a parsed command on a thread of its own, in a signal scope of
     /// its own: its exit code once it ends, or once a signal leaves it
     /// behind.
-    fn run(&mut self, cli: Cli, label: String) -> i32 {
+    fn run(&self, cli: Cli, label: String) -> i32 {
         let out = cli.global.output();
         // -q on the line silences the status line, as it would alone.
         term::hush(cli.global.quiet);
@@ -859,7 +863,7 @@ impl Shell {
     }
 
     /// `use [CAM|none]`.
-    fn use_camera(&mut self, args: &[String]) -> i32 {
+    fn use_camera(&self, args: &[String]) -> i32 {
         let out = self.global.output();
         let chosen = match args {
             [] => self.shared.known().default.clone(),
@@ -871,7 +875,7 @@ impl Shell {
                 Ok(selector) => {
                     let selector = self.shared.known().named(selector);
                     self.shared.known().default = Some(selector.clone());
-                    self.shared.connect(selector.clone());
+                    self.shared.connect(&selector);
                     Some(selector)
                 }
                 Err(error) => return out.print_error(&error),
@@ -880,15 +884,17 @@ impl Shell {
                 return out.print_error(&Usage("use takes one camera, or none".into()).into());
             }
         };
-        let report = match chosen {
-            Some(camera) => {
+        let report = chosen.map_or_else(
+            || {
+                Report::json(json!({}))
+                    .text("No default camera; commands without -c find theirs.\n")
+            },
+            |camera| {
                 let shown = crate::media::redact_url(&camera);
                 Report::json(json!({ "camera": shown }))
                     .text(format!("Commands without -c use {shown}.\n"))
-            }
-            None => Report::json(json!({}))
-                .text("No default camera; commands without -c find theirs.\n"),
-        };
+            },
+        );
         out.print(report)
     }
 
@@ -974,12 +980,11 @@ impl Shell {
             text
         } else {
             let path = words.iter().map(String::as_str).collect::<Vec<_>>();
-            match subcommand(&tree, &path) {
-                Some(command) => command.clone().render_long_help().to_string(),
-                None => {
-                    let error = Usage(format!("no command '{}'", words.join(" ")));
-                    return out.print_error(&error.into());
-                }
+            if let Some(command) = subcommand(&tree, &path) {
+                command.clone().render_long_help().to_string()
+            } else {
+                let error = Usage(format!("no command '{}'", words.join(" ")));
+                return out.print_error(&error.into());
             }
         };
         out.print(Report::json(json!({ "help": text })).text(text))
@@ -1046,7 +1051,7 @@ fn history_path() -> Option<PathBuf> {
     options.create(true).append(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
     options.open(&path).ok()?;
@@ -1117,15 +1122,23 @@ pub(super) fn split(line: &str) -> std::result::Result<Vec<String>, String> {
     Ok(words)
 }
 
-fn escapable(c: char) -> bool {
+const fn escapable(c: char) -> bool {
     c.is_whitespace() || matches!(c, '\'' | '"' | '\\' | '#')
+}
+
+/// A command-line reader; editing backends may also maintain history.
+trait LineReader: Sized {
+    fn open(shared: Arc<Shared>, history: Option<PathBuf>) -> Result<Self>;
+    fn read(&mut self, prompt: &str) -> Result<Read>;
+    fn remember(&mut self, _: &str) {}
+    fn save(&mut self) {}
 }
 
 #[cfg(feature = "shell")]
 mod editor {
     //! The prompt at a terminal: rustyline's line editing, history and
     //! completion.
-    use super::{Read, Shared, complete::complete, plain::Plain};
+    use super::{Read, Shared, complete::complete, plain};
     use anyhow::Result;
     use rustyline::{
         Context, Editor, completion::Completer, error::ReadlineError, highlight::Highlighter,
@@ -1140,39 +1153,39 @@ mod editor {
         },
         /// Typing at a terminal while stdout goes elsewhere: line editing
         /// would write there, so plain lines.
-        Plain(Plain),
+        Plain,
     }
 
-    pub(super) fn open(shared: Arc<Shared>, history: Option<PathBuf>) -> Result<Reader> {
-        if !super::term::stdout_is_tty() {
-            return Ok(Reader::Plain(Plain));
+    impl super::LineReader for Reader {
+        fn open(shared: Arc<Shared>, history: Option<PathBuf>) -> Result<Self> {
+            if !super::term::stdout_is_tty() {
+                return Ok(Self::Plain);
+            }
+            let config = rustyline::Config::builder()
+                .auto_add_history(false)
+                .history_ignore_space(true)
+                .history_ignore_dups(true)?
+                .max_history_size(1000)?
+                .completion_type(rustyline::CompletionType::List)
+                .build();
+            let mut editor = Editor::with_config(config)?;
+            editor.set_helper(Some(Helper {
+                tree: super::Cli::tree(),
+                shared,
+            }));
+            if let Some(path) = &history {
+                let _ = editor.load_history(path);
+            }
+            Ok(Self::Edit {
+                editor: Box::new(editor),
+                history,
+            })
         }
-        let config = rustyline::Config::builder()
-            .auto_add_history(false)
-            .history_ignore_space(true)
-            .history_ignore_dups(true)?
-            .max_history_size(1000)?
-            .completion_type(rustyline::CompletionType::List)
-            .build();
-        let mut editor = Editor::with_config(config)?;
-        editor.set_helper(Some(Helper {
-            tree: super::Cli::tree(),
-            shared,
-        }));
-        if let Some(path) = &history {
-            let _ = editor.load_history(path);
-        }
-        Ok(Reader::Edit {
-            editor: Box::new(editor),
-            history,
-        })
-    }
 
-    impl Reader {
-        pub(super) fn read(&mut self, prompt: &str) -> Result<Read> {
+        fn read(&mut self, prompt: &str) -> Result<Read> {
             let editor = match self {
                 Self::Edit { editor, .. } => editor,
-                Self::Plain(plain) => return plain.read(prompt),
+                Self::Plain => return plain::read(prompt),
             };
             match editor.readline(prompt) {
                 Ok(line) => Ok(Read::Line(line)),
@@ -1182,14 +1195,14 @@ mod editor {
             }
         }
         /// Keep `line` in the history, with any password in it removed.
-        pub(super) fn remember(&mut self, line: &str) {
+        fn remember(&mut self, line: &str) {
             if let Self::Edit { editor, .. } = self
                 && !line.trim().is_empty()
             {
                 let _ = editor.add_history_entry(crate::scrub::redact_urls(line));
             }
         }
-        pub(super) fn save(&mut self) {
+        fn save(&mut self) {
             if let Self::Edit {
                 editor,
                 history: Some(path),
@@ -1212,16 +1225,17 @@ mod editor {
             pos: usize,
             _: &Context<'_>,
         ) -> rustyline::Result<(usize, Vec<String>)> {
+            let Some(before) = line.get(..pos) else {
+                return Ok((line.len(), Vec::new()));
+            };
             let hints = self.shared.hints();
-            let before = &line[..pos];
             let (start, candidates) = complete(&self.tree, before, &hints);
             // Features beyond the first list come by first letter.
             if let (Some(camera), Some(letter)) = (
                 &hints.camera,
-                before[start..]
-                    .trim_start_matches(['\'', '"'])
-                    .chars()
-                    .next()
+                before
+                    .get(start..)
+                    .and_then(|tail| tail.trim_start_matches(['\'', '"']).chars().next())
                     .filter(char::is_ascii_alphabetic),
             ) {
                 self.shared.want_letter(camera, letter);
@@ -1235,6 +1249,32 @@ mod editor {
     impl Highlighter for Helper {}
     impl Validator for Helper {}
     impl rustyline::Helper for Helper {}
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn invalid_cursor_positions_do_not_panic_or_offer_candidates() {
+            let helper = Helper {
+                tree: super::super::super::Cli::tree(),
+                shared: Arc::new(Shared {
+                    global: super::super::super::Global::default(),
+                    route: super::super::super::Route::default(),
+                    interactive: false,
+                    known: std::sync::Mutex::default(),
+                }),
+            };
+            let history = DefaultHistory::new();
+            let context = Context::new(&history);
+            for pos in [1, 4, usize::MAX] {
+                assert_eq!(
+                    helper.complete("雪", pos, &context).unwrap(),
+                    (3, Vec::<String>::new())
+                );
+            }
+        }
+    }
 }
 
 #[cfg(not(feature = "shell"))]
@@ -1244,17 +1284,15 @@ mod editor {
     use anyhow::Result;
     use std::{path::PathBuf, sync::Arc};
 
-    pub(super) struct Reader(super::plain::Plain);
+    pub(super) struct Reader;
 
-    pub(super) fn open(_: Arc<Shared>, _: Option<PathBuf>) -> Result<Reader> {
-        Ok(Reader(super::plain::Plain))
-    }
-    impl Reader {
-        pub(super) fn read(&mut self, prompt: &str) -> Result<Read> {
-            self.0.read(prompt)
+    impl super::LineReader for Reader {
+        fn open(_: Arc<Shared>, _: Option<PathBuf>) -> Result<Self> {
+            Ok(Self)
         }
-        pub(super) fn remember(&mut self, _: &str) {}
-        pub(super) fn save(&mut self) {}
+        fn read(&mut self, prompt: &str) -> Result<Read> {
+            super::plain::read(prompt)
+        }
     }
 }
 
@@ -1271,23 +1309,22 @@ mod plain {
     //! A prompt on stderr and lines from stdin, without editing.
     use super::Read;
     use anyhow::Result;
-    use std::io::{BufRead, Write};
+    use std::io::{BufRead as _, Write as _};
 
-    pub(super) struct Plain;
-    impl Plain {
-        pub(super) fn read(&mut self, prompt: &str) -> Result<Read> {
-            let mut err = std::io::stderr().lock();
-            let _ = write!(err, "{prompt}").and_then(|()| err.flush());
-            drop(err);
-            let mut line = String::new();
-            match std::io::stdin().lock().read_line(&mut line) {
-                Ok(0) => Ok(Read::End),
-                Ok(_) => Ok(Read::Line(line.trim_end_matches(['\n', '\r']).to_owned())),
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
-                    Ok(Read::Interrupted)
-                }
-                Err(error) => Err(error.into()),
+    pub(super) fn read(prompt: &str) -> Result<Read> {
+        let mut err = std::io::stderr().lock();
+        let _ = write!(err, "{prompt}").and_then(|()| err.flush());
+        drop(err);
+        let mut line = String::new();
+        let read = std::io::stdin().lock().read_line(&mut line);
+        match read {
+            Ok(0) => Ok(Read::End),
+            Ok(_) => {
+                line.truncate(line.trim_end_matches(['\n', '\r']).len());
+                Ok(Read::Line(line))
             }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => Ok(Read::Interrupted),
+            Err(error) => Err(error.into()),
         }
     }
 }
@@ -1301,9 +1338,11 @@ mod platform {
     static SAVED: OnceLock<libc::termios> = OnceLock::new();
 
     pub(super) fn save_terminal() {
-        // SAFETY: tcgetattr writes one termios into the local.
+        // SAFETY: termios contains integer fields, for which zero is valid.
         let mut saved: libc::termios = unsafe { std::mem::zeroed() };
-        if unsafe { libc::tcgetattr(0, &mut saved) } == 0 {
+        // SAFETY: saved is writable storage for one termios; tcgetattr
+        // reports an error if stdin is not a terminal.
+        if unsafe { libc::tcgetattr(0, &raw mut saved) } == 0 {
             let _ = SAVED.set(saved);
         }
     }
@@ -1319,8 +1358,8 @@ mod platform {
 
 #[cfg(not(unix))]
 mod platform {
-    pub(super) fn save_terminal() {}
-    pub(super) fn restore_terminal() {}
+    pub(super) const fn save_terminal() {}
+    pub(super) const fn restore_terminal() {}
 }
 
 #[cfg(test)]
@@ -1348,9 +1387,9 @@ mod tests {
         );
         assert_eq!(words(r#"set "Name=a \"b\"""#), ["set", r#"Name=a "b""#]);
         assert_eq!(words("get ''"), ["get", ""]);
-        assert!(words("   ").is_empty());
-        assert!(split("get 'Width").is_err());
-        assert!(split("get \"Width").is_err());
+        assert_eq!(words("   "), [] as [String; 0]);
+        split("get 'Width").unwrap_err();
+        split("get \"Width").unwrap_err();
     }
 
     #[test]

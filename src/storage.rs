@@ -8,7 +8,7 @@
 //! name: the second gets [`OutputExists`], which naming answers with the
 //! next free name. File systems that cannot publish without replacing
 //! (exFAT, some network shares) get the still created under its name
-//! instead. A recording streams from FFmpeg into a new file under its name,
+//! instead. A recording streams from `FFmpeg` into a new file under its name,
 //! up to its size limit. The folders a job or command published in are
 //! synced once when it ends ([`Folders`]), and a folder a write creates is
 //! synced into its parent as it is created, so the names survive a power
@@ -18,10 +18,11 @@
 //! (`CAPTUREFAB_MIN_FREE` where it runs, else 1% of the disk), or the
 //! higher one the command that asked for the file set, which a session's
 //! worker, running with the session's environment, gets with the request.
+#![deny(clippy::cast_precision_loss)]
 use crate::types::{Categorized, ErrorKind, Usage, hex, human_bytes};
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context as _, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest as _, Sha256};
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
@@ -33,7 +34,7 @@ use std::{
 
 /// Overrides the free-space floor: bytes, or a size such as `2G`; `0`
 /// turns it off.
-pub const MIN_FREE_ENV: &str = "CAPTUREFAB_MIN_FREE";
+pub(crate) const MIN_FREE_ENV: &str = "CAPTUREFAB_MIN_FREE";
 /// The floor is 1% of the disk, within these bounds: enough for the system
 /// to keep working on a small card, and no more than a big array needs.
 const FLOOR_MIN: u64 = 512 << 20;
@@ -46,7 +47,7 @@ const LOOK_EVERY: Duration = Duration::from_secs(1);
 /// The output path is already taken. Callers that pick names retry with the
 /// next free one when this is in the error chain; nothing is ever replaced.
 #[derive(Debug)]
-pub struct OutputExists(pub PathBuf);
+pub(crate) struct OutputExists(pub PathBuf);
 impl std::fmt::Display for OutputExists {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -60,7 +61,7 @@ impl std::error::Error for OutputExists {}
 
 /// A recording reached the size it was given, which ends it as asked.
 #[derive(Debug)]
-pub struct MaxSize(pub u64);
+pub(crate) struct MaxSize(pub u64);
 impl std::fmt::Display for MaxSize {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let size = human_bytes(self.0);
@@ -83,6 +84,11 @@ pub enum SyncMode {
     Off,
 }
 impl SyncMode {
+    #[must_use]
+    #[allow(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "Serde skip_serializing_if requires a predicate taking a borrowed field"
+    )]
     pub fn is_file(&self) -> bool {
         *self == Self::File
     }
@@ -97,14 +103,14 @@ pub struct Stored {
 
 /// Free and total bytes for unprivileged writes on one disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Space {
+pub(crate) struct Space {
     pub free: u64,
     pub total: u64,
 }
 
 /// The disk holding `path`, or its nearest existing parent, as its file
 /// system reports it; None when it does not, as some network ones do not.
-pub fn space(path: &Path) -> Option<Space> {
+pub(crate) fn space(path: &Path) -> Option<Space> {
     let path = std::path::absolute(path).ok()?;
     let existing = path.ancestors().find(|dir| dir.exists())?;
     #[cfg(test)]
@@ -120,12 +126,12 @@ pub fn space(path: &Path) -> Option<Space> {
 
 /// The free space writes leave on a disk of `total` bytes: 1% of it, at
 /// least 512 MiB and at most 20 GiB, or `CAPTUREFAB_MIN_FREE`.
-pub fn floor(total: u64) -> Result<u64> {
+pub(crate) fn floor(total: u64) -> Result<u64> {
     floor_with(std::env::var_os(MIN_FREE_ENV).as_deref(), total)
 }
 /// The `CAPTUREFAB_MIN_FREE` this process was given, in bytes, when it
 /// was: what a command sends with the writes it asks a camera worker for.
-pub fn min_free() -> Result<Option<u64>> {
+pub(crate) fn min_free() -> Result<Option<u64>> {
     min_free_with(std::env::var_os(MIN_FREE_ENV).as_deref())
 }
 fn min_free_with(setting: Option<&std::ffi::OsStr>) -> Result<Option<u64>> {
@@ -279,12 +285,12 @@ fn partial(path: &Path) -> Result<PathBuf> {
         end -= 1;
     }
     let (pid, random) = (std::process::id(), crate::types::random_hex(6)?);
-    let partial = format!(".{}.{pid}-{random}.partial", &name[..end]);
+    let partial = format!(".{}.{pid}-{random}.partial", name.split_at(end).0);
     Ok(path.with_file_name(partial))
 }
 
 /// Whether a file name is a still being written: numbering skips these.
-pub fn is_partial(name: &str) -> bool {
+pub(crate) fn is_partial(name: &str) -> bool {
     name.starts_with('.') && name.ends_with(".partial")
 }
 
@@ -303,10 +309,16 @@ fn direct(dir: &Path, remember: bool) -> bool {
     known.iter().any(|known| known == dir)
 }
 
-/// Save encoded bytes as a new file at `path`, never replacing anything
-/// there, leaving the floor free with the command's own `min_free` (see
-/// [`floor_for`]), with its SHA-256 when `hash`. A failure leaves nothing
-/// behind.
+/// Save encoded bytes as a new file at `path`, never replacing anything there.
+///
+/// Leave the greater of this process's free-space floor and the command's
+/// `min_free` available. Include its SHA-256 when `hash`. A failure leaves
+/// nothing behind.
+///
+/// # Errors
+/// Returns an error for an invalid destination or free-space policy, an
+/// existing file, an overflowing output length, insufficient free space, or a
+/// file-system write, sync or publication failure. The partially written file is cleaned up on failure.
 pub fn save(
     bytes: &[u8],
     path: &Path,
@@ -320,28 +332,32 @@ pub fn save(
 /// `save` for a file made of `parts` in order, written together, without
 /// putting them in one buffer first: an encoded still's header or metadata
 /// and the frame's own bytes.
-pub fn save_parts(
+#[deny(clippy::arithmetic_side_effects)]
+pub(crate) fn save_parts(
     parts: &[&[u8]],
     path: &Path,
     sync: SyncMode,
     min_free: Option<u64>,
     hash: bool,
 ) -> Result<Stored> {
-    let length: usize = parts.iter().map(|part| part.len()).sum();
-    let dir = folder(path, length as u64, sync, min_free)?;
+    let length = checked_byte_length(parts.iter().map(|part| part.len()))?;
+    let bytes = u64::try_from(length).context("output length exceeds storage counter range")?;
+    let dir = folder(path, bytes, sync, min_free)?;
     crate::naming::check_free(path)?;
     let stored = Stored {
-        bytes: length as u64,
+        bytes,
         sha256: hash.then(|| {
             let mut digest = Sha256::new();
-            parts.iter().for_each(|part| digest.update(part));
+            for part in parts {
+                digest.update(part);
+            }
             hex(digest.finalize())
         }),
     };
     let taken = |error| failed(path, error);
     if !direct(&dir, false) {
         let partial = partial(path)?;
-        write_new(&partial, parts, sync).map_err(taken)?;
+        write_new(&partial, parts, length, sync).map_err(taken)?;
         #[cfg(test)]
         if let Some(race) = tests::RACE.get() {
             race(path);
@@ -355,13 +371,13 @@ pub fn save_parts(
             }
         }
     }
-    write_new(path, parts, sync).map_err(taken)?;
+    write_new(path, parts, length, sync).map_err(taken)?;
     Ok(stored)
 }
 
 /// Save one file a command writes on its own, such as a preview or an
 /// exported preset, as [`save`] does, with its folder synced too.
-pub fn save_one(bytes: &[u8], path: &Path, min_free: Option<u64>) -> Result<Stored> {
+pub(crate) fn save_one(bytes: &[u8], path: &Path, min_free: Option<u64>) -> Result<Stored> {
     let stored = save(bytes, path, SyncMode::File, min_free, false)?;
     Folders::of(path).sync()?;
     Ok(stored)
@@ -379,15 +395,27 @@ fn failed(path: &Path, error: io::Error) -> anyhow::Error {
     anyhow::Error::from(error).context(format!("cannot write {}", path.display()))
 }
 
+/// Validate the whole output size before making any destination files.
+#[deny(clippy::arithmetic_side_effects)]
+fn checked_byte_length(lengths: impl IntoIterator<Item = usize>) -> io::Result<usize> {
+    lengths.into_iter().try_fold(0usize, |total, length| {
+        total.checked_add(length).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "combined output length exceeds host address size",
+            )
+        })
+    })
+}
+
 /// Create `path`, which must not exist, holding `parts` in order; removed
 /// again when writing them fails.
-fn write_new(path: &Path, parts: &[&[u8]], sync: SyncMode) -> io::Result<()> {
+#[deny(clippy::arithmetic_side_effects)]
+fn write_new(path: &Path, parts: &[&[u8]], length: usize, sync: SyncMode) -> io::Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    let mut slices: Vec<io::IoSlice> = parts.iter().map(|part| io::IoSlice::new(part)).collect();
-    crate::copies::record(
-        crate::copies::Site::FileWrite,
-        parts.iter().map(|part| part.len()).sum(),
-    );
+    let mut slices: Vec<io::IoSlice<'_>> =
+        parts.iter().map(|part| io::IoSlice::new(part)).collect();
+    crate::copies::record(crate::copies::Site::FileWrite, length);
     let mut written = crate::frame::write_all_vectored(&mut file, &mut slices);
     if sync.is_file() {
         written = written.and_then(|()| file.sync_data());
@@ -419,8 +447,8 @@ fn publish(from: &Path, to: &Path) -> io::Result<bool> {
 }
 
 /// A file system that lacks the operation, rather than one that refused it:
-/// vfat answers link() with EPERM, Linux renameat2 flags a file system
-/// lacks are EINVAL, and macOS volumes without RENAME_EXCL say ENOTSUP.
+/// vfat answers `link()` with EPERM, Linux renameat2 flags a file system
+/// lacks are EINVAL, and macOS volumes without `RENAME_EXCL` say ENOTSUP.
 fn unsupported(error: &io::Error) -> bool {
     #[cfg(unix)]
     let lacking = {
@@ -437,7 +465,7 @@ fn unsupported(error: &io::Error) -> bool {
 
 #[cfg(unix)]
 fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::ffi::OsStrExt as _;
     std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))
 }
@@ -468,12 +496,12 @@ fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
 
 /// `path` as the NUL-terminated wide string a Windows call takes. From
 /// 248 units with its NUL, where std stops passing paths as they are (some
-/// calls take less than MAX_PATH), it is made absolute and normal and
+/// calls take less than `MAX_PATH`), it is made absolute and normal and
 /// given its `\\?\` form, which has no such limit, as std does: a still
 /// whose partial file std wrote beside a long name is published under it.
 #[cfg(windows)]
 fn wide(path: &Path) -> io::Result<Vec<u16>> {
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::OsStrExt as _;
     let plain: Vec<u16> = path.as_os_str().encode_wide().collect();
     let wide = if plain.len() + 1 < 248 {
         plain
@@ -496,7 +524,7 @@ fn verbatim(full: &[u16]) -> Vec<u16> {
     let prefix = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
     let (head, rest) = match full {
         [_, COLON, SEP, ..] => (prefix(r"\\?\"), full),
-        [SEP, SEP, QUERY, SEP, ..] | [SEP, QUERY, QUERY, SEP, ..] => (Vec::new(), full),
+        [SEP, SEP | QUERY, QUERY, SEP, ..] => (Vec::new(), full),
         [SEP, SEP, DOT, SEP, rest @ ..] => (prefix(r"\\?\"), rest),
         [SEP, SEP, rest @ ..] => (prefix(r"\\?\UNC\"), rest),
         _ => (Vec::new(), full),
@@ -519,7 +547,7 @@ fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
             return Ok(());
         }
         let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(ERROR_SHARING_VIOLATION as i32)
+        if error.raw_os_error() != Some(ERROR_SHARING_VIOLATION.cast_signed())
             || Instant::now() >= deadline
         {
             return Err(error);
@@ -540,7 +568,14 @@ fn rename_noreplace(_: &Path, _: &Path) -> io::Result<()> {
 
 /// Make the names published in `dir` durable. Folders that cannot be
 /// synced, as on some network shares, are skipped.
-pub fn sync_dir(dir: &Path) -> io::Result<()> {
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "the shared directory durability interface propagates Unix filesystem errors"
+    )
+)]
+pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
     #[cfg(test)]
     tests::SYNCED.with_borrow_mut(|synced| synced.push(dir.to_path_buf()));
     // NTFS journals its folders, and std cannot open one as a file.
@@ -556,23 +591,23 @@ pub fn sync_dir(dir: &Path) -> io::Result<()> {
 /// The folders a job or command published files in, synced once when it
 /// ends rather than after every file.
 #[derive(Debug, Default)]
-pub struct Folders(BTreeSet<PathBuf>);
+pub(crate) struct Folders(BTreeSet<PathBuf>);
 impl Folders {
     /// The folder of one published file.
-    pub fn of(file: &Path) -> Self {
+    pub(crate) fn of(file: &Path) -> Self {
         let mut folders = Self::default();
         folders.add(file);
         folders
     }
     /// Note the folder of a published file.
-    pub fn add(&mut self, file: &Path) {
+    pub(crate) fn add(&mut self, file: &Path) {
         let dir = file.parent().filter(|dir| !dir.as_os_str().is_empty());
         self.0
             .insert(dir.unwrap_or_else(|| Path::new(".")).to_owned());
     }
     /// Sync each folder noted since the last call: the first failure, after
     /// trying them all.
-    pub fn sync(&mut self) -> Result<()> {
+    pub(crate) fn sync(&mut self) -> Result<()> {
         let synced = std::mem::take(&mut self.0)
             .into_iter()
             .map(|dir| sync_dir(&dir).with_context(|| format!("cannot sync {}", dir.display())));
@@ -582,7 +617,7 @@ impl Folders {
 
 /// Why a recording's file took no more bytes before it was finished.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Cut {
+pub(crate) enum Cut {
     /// It reached the size it was given: a normal end.
     MaxSize,
     /// A write failed, as on a full disk; the bytes before it stand.
@@ -592,7 +627,7 @@ pub enum Cut {
 /// What a recording found about its disk, for whoever stops the
 /// recording, which a disk below its floor or full must do.
 #[derive(Debug)]
-pub struct Alarm {
+pub(crate) struct Alarm {
     path: PathBuf,
     /// Why the disk has no room, once it has none.
     no_room: Mutex<Option<NoRoom>>,
@@ -600,7 +635,7 @@ pub struct Alarm {
 impl Alarm {
     /// The `storage_full` error to stop the recording with, once its disk
     /// is below the floor or refused a write for want of room.
-    pub fn error(&self) -> Option<anyhow::Error> {
+    pub(crate) fn error(&self) -> Option<anyhow::Error> {
         let no_room = self.no_room.lock().unwrap_or_else(PoisonError::into_inner);
         no_room.clone().map(|no_room| full(&self.path, no_room))
     }
@@ -614,7 +649,7 @@ impl Alarm {
 /// second; below the floor its [`Alarm`] goes off while it keeps taking
 /// bytes, so the recording can be finished properly. A write the full disk
 /// refuses sets it off too.
-pub struct Recording {
+pub(crate) struct Recording {
     file: Option<File>,
     path: PathBuf,
     limit: Option<u64>,
@@ -626,15 +661,16 @@ pub struct Recording {
     alarm: Arc<Alarm>,
     cut: Option<Cut>,
 }
+#[deny(unused_results, let_underscore_drop)]
 impl Recording {
     /// Create `path`, which must not exist, for at most `limit` bytes,
     /// leaving the floor free with the command's own `min_free`.
-    pub fn create(path: &Path, limit: Option<u64>, min_free: Option<u64>) -> Result<Self> {
+    pub(crate) fn create(path: &Path, limit: Option<u64>, min_free: Option<u64>) -> Result<Self> {
         ensure!(
             limit != Some(0),
             "a recording's maximum size must be positive"
         );
-        folder(path, 0, SyncMode::File, min_free)?;
+        drop(folder(path, 0, SyncMode::File, min_free)?);
         // Read too, so its container can be finished in place (`amend`).
         let file = OpenOptions::new()
             .read(true)
@@ -656,23 +692,24 @@ impl Recording {
             cut: None,
         })
     }
-    pub fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
-    pub fn bytes_written(&self) -> u64 {
+    pub(crate) const fn bytes_written(&self) -> u64 {
         self.written
     }
     /// Why it stopped taking bytes, if it did.
-    pub fn cut(&self) -> Option<Cut> {
+    pub(crate) const fn cut(&self) -> Option<Cut> {
         self.cut
     }
-    pub fn alarm(&self) -> Arc<Alarm> {
+    pub(crate) fn alarm(&self) -> Arc<Alarm> {
         self.alarm.clone()
     }
     /// Look at the free space, after enough bytes or time.
+    #[deny(clippy::arithmetic_side_effects)]
     fn look(&mut self) {
         let (bytes, at) = self.looked;
-        if self.written - bytes < LOOK_BYTES && at.elapsed() < LOOK_EVERY {
+        if self.written.saturating_sub(bytes) < LOOK_BYTES && at.elapsed() < LOOK_EVERY {
             return;
         }
         self.looked = (self.written, Instant::now());
@@ -685,13 +722,25 @@ impl Recording {
             self.alarm.raise(NoRoom::Floor { free, floor, own });
         }
     }
+    /// Room in both the requested file limit and the byte counter.
+    #[deny(clippy::arithmetic_side_effects)]
+    const fn remaining(&self) -> u64 {
+        let maximum = match self.limit {
+            Some(limit) => limit,
+            None => u64::MAX,
+        };
+        maximum.saturating_sub(self.written)
+    }
     /// Read and change the bytes written so far before the file is
     /// finished, as a container's index and length written after its video:
     /// `edit` gets the file and the bytes it may still grow by, and leaves
     /// its position anywhere.
-    pub fn amend<T>(&mut self, edit: impl FnOnce(&mut File, u64) -> io::Result<T>) -> Result<T> {
+    pub(crate) fn amend<T>(
+        &mut self,
+        edit: impl FnOnce(&mut File, u64) -> io::Result<T>,
+    ) -> Result<T> {
+        let room = self.remaining();
         let file = self.file.as_mut().context("recording already finished")?;
-        let room = self.limit.map_or(u64::MAX, |limit| limit - self.written);
         let cannot = || format!("cannot finish recording {}", self.path.display());
         let result = edit(file, room).with_context(cannot);
         // Its size, whatever the edit managed.
@@ -707,7 +756,7 @@ impl Recording {
     /// Close the file with its bytes on disk, and its folder: its size. A
     /// file cut short keeps the bytes before the cut, as every recording
     /// container plays up to its last complete part.
-    pub fn finish(mut self) -> Result<u64> {
+    pub(crate) fn finish(mut self) -> Result<u64> {
         let file = self.file.take().context("recording already finished")?;
         let cannot = || format!("cannot flush recording {}", self.path.display());
         file.sync_all().with_context(cannot)?;
@@ -715,8 +764,8 @@ impl Recording {
         Ok(self.written)
     }
     /// Remove a recording that holds no video.
-    pub fn abort(mut self) -> Result<()> {
-        self.file.take();
+    pub(crate) fn abort(mut self) -> Result<()> {
+        drop(self.file.take());
         match fs::remove_file(&self.path) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => {
                 Err(error).with_context(|| format!("cannot remove {}", self.path.display()))
@@ -726,8 +775,9 @@ impl Recording {
     }
 }
 impl Write for Recording {
+    #[deny(clippy::arithmetic_side_effects)]
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let room = self.limit.map_or(u64::MAX, |limit| limit - self.written);
+        let room = self.remaining();
         if room == 0 {
             self.cut = Some(Cut::MaxSize);
         }
@@ -745,7 +795,7 @@ impl Write for Recording {
             .file
             .as_mut()
             .ok_or_else(|| io::Error::other("finished"))?;
-        let count = file.write(bytes).map_err(|error| {
+        let count = write_retrying(file, bytes).map_err(|error| {
             // A failed write wrote nothing, so the bytes before it stand.
             self.cut = Some(Cut::Failed);
             if no_room(&error) {
@@ -754,12 +804,23 @@ impl Write for Recording {
             let message = format!("cannot write recording {}: {error}", self.path.display());
             io::Error::new(error.kind(), message)
         })?;
-        self.written += count as u64;
+        // The slice above is bounded by remaining(), so this stays exact.
+        self.written = self.written.saturating_add(count as u64);
         self.look();
         Ok(count)
     }
     fn flush(&mut self) -> io::Result<()> {
         self.file.as_mut().map_or(Ok(()), Write::flush)
+    }
+}
+
+/// Write one part, preserving short writes and retrying signal interruptions.
+fn write_retrying(output: &mut impl Write, bytes: &[u8]) -> io::Result<usize> {
+    loop {
+        match output.write(bytes) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            result => return result,
+        }
     }
 }
 
@@ -810,6 +871,42 @@ mod tests {
     }
 
     #[test]
+    fn recording_writes_retry_interruptions_without_hiding_short_writes_or_errors() {
+        struct Writer {
+            error: Option<io::ErrorKind>,
+            bytes: Vec<u8>,
+        }
+        impl Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if let Some(error) = self.error.take() {
+                    return Err(error.into());
+                }
+                let count = bytes.len().min(2);
+                self.bytes.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = Writer {
+            error: Some(io::ErrorKind::Interrupted),
+            bytes: Vec::new(),
+        };
+        assert_eq!(write_retrying(&mut writer, b"abcd").unwrap(), 2);
+        assert_eq!(writer.bytes, b"ab");
+        assert_eq!(write_retrying(&mut writer, b"cd").unwrap(), 2);
+        assert_eq!(writer.bytes, b"abcd");
+        writer.error = Some(io::ErrorKind::StorageFull);
+        assert_eq!(
+            write_retrying(&mut writer, b"ef").unwrap_err().kind(),
+            io::ErrorKind::StorageFull
+        );
+        assert_eq!(writer.bytes, b"abcd");
+        assert_eq!(write_retrying(&mut writer, b"").unwrap(), 0);
+    }
+
+    #[test]
     fn a_name_taken_before_publishing_is_never_replaced_and_numbering_moves_on() {
         use crate::naming::{NameInput, Namer, OnExists, Plan};
         let temp = Temp::new("publish-race");
@@ -821,7 +918,10 @@ mod tests {
         }));
         let template = temp.path("shot-{seq}.png");
         let plan = Plan::new(template.to_str().unwrap(), 2, "png");
-        let (camera, context) = (Default::default(), Default::default());
+        let (camera, context) = (
+            crate::naming::CameraName::default(),
+            std::collections::BTreeMap::new(),
+        );
         let input = NameInput {
             camera: &camera,
             now: crate::naming::clock(None),
@@ -856,6 +956,61 @@ mod tests {
         assert_eq!(reason(&error), ErrorKind::Exists);
         assert_eq!(fs::read(temp.path("fixed.png")).unwrap(), b"theirs");
         assert!(temp.partials().is_empty(), "{:?}", temp.partials());
+    }
+
+    #[test]
+    fn multipart_lengths_reject_overflow_without_allocating_the_payload() {
+        assert_eq!(checked_byte_length([]).unwrap(), 0);
+        assert_eq!(checked_byte_length([1, 0, 7, 9]).unwrap(), 17);
+        assert_eq!(checked_byte_length([usize::MAX, 0]).unwrap(), usize::MAX);
+        assert_eq!(
+            checked_byte_length([usize::MAX, 1]).unwrap_err().kind(),
+            io::ErrorKind::FileTooLarge
+        );
+    }
+
+    #[test]
+    fn recording_byte_counters_never_wrap_without_a_requested_limit() {
+        let temp = Temp::new("counter-limit");
+        let path = temp.path("clip.mkv");
+        let mut recording = Recording::create(&path, None, None).unwrap();
+        recording.written = u64::MAX - 1;
+        recording.looked = (recording.written, Instant::now());
+        assert_eq!(recording.write(&[7, 9]).unwrap(), 1);
+        assert_eq!(recording.written, u64::MAX);
+        assert_eq!(
+            recording.write(&[9]).unwrap_err().kind(),
+            io::ErrorKind::FileTooLarge
+        );
+        assert_eq!(fs::read(&path).unwrap(), [7]);
+        recording.abort().unwrap();
+    }
+
+    #[test]
+    fn writes_after_an_oversized_amendment_fail_without_underflow() {
+        let temp = Temp::new("amend-over-limit");
+        let mut recording = Recording::create(&temp.path("clip.mkv"), Some(10), None).unwrap();
+        assert!(recording.amend(|file, _| file.write_all(&[7; 11])).is_err());
+        assert_eq!(recording.written, 11);
+        assert_eq!(
+            recording.write(&[9]).unwrap_err().kind(),
+            io::ErrorKind::FileTooLarge
+        );
+        recording.abort().unwrap();
+    }
+
+    #[test]
+    fn writes_after_a_shrinking_amendment_keep_free_space_accounting_valid() {
+        let temp = Temp::new("amend-shrink");
+        let path = temp.path("clip.mkv");
+        let mut recording = Recording::create(&path, Some(10), None).unwrap();
+        recording.write_all(&[7; 8]).unwrap();
+        recording.looked = (recording.written, Instant::now());
+        recording.amend(|file, _| file.set_len(1)).unwrap();
+        recording.write_all(&[9]).unwrap();
+        assert_eq!(recording.written, 2);
+        assert_eq!(fs::read(&path).unwrap(), [7, 9]);
+        recording.abort().unwrap();
     }
 
     #[test]
@@ -1173,7 +1328,7 @@ mod tests {
     /// recording's size, which counts them.
     #[test]
     fn a_recording_is_amended_in_place_within_its_size() {
-        use std::io::{Read, Seek, SeekFrom};
+        use std::io::{Read as _, Seek as _, SeekFrom};
         let temp = Temp::new("recording-amend");
         let path = temp.path("clip.mkv");
         let mut recording = Recording::create(&path, Some(16), None).unwrap();

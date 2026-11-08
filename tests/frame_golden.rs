@@ -8,6 +8,9 @@
 //! between C libraries, so they compare within ±1 per sample.
 //!
 //! `CAPTUREFAB_BLESS=1 cargo test --test frame_golden` rewrites the file.
+#![deny(clippy::doc_markdown)]
+#![deny(clippy::missing_const_for_fn)]
+#![deny(clippy::cast_precision_loss)]
 use capturefab::testing::{
     camera::Camera,
     camera_profile::CameraKind,
@@ -49,18 +52,18 @@ fn fnv1a64(bytes: &[u8]) -> String {
 }
 
 /// RGB8 and BGR8 carry three samples per pixel; everything else one.
-fn channels(format: u32) -> u32 {
+const fn channels(format: u32) -> u32 {
     if matches!(format, RGB8 | BGR8) { 3 } else { 1 }
 }
 /// Bytes per sample: the 16-bit formats (and the unknown test code) two.
-fn sample_bytes(format: u32) -> usize {
+const fn sample_bytes(format: u32) -> usize {
     match format {
         MONO10 | MONO12 | MONO16 | COORD3D_C16 | CONFIDENCE16 | UNKNOWN16 => 2,
         COORD3D_C32F => 4,
         _ => 1,
     }
 }
-fn full_scale(format: u32) -> u32 {
+const fn full_scale(format: u32) -> u32 {
     match format {
         MONO10 => 1023,
         MONO12 | UNKNOWN16 => 4095,
@@ -73,27 +76,39 @@ fn full_scale(format: u32) -> u32 {
 fn generate(generator: &Value, format: u32, width: u32, height: u32) -> Vec<u8> {
     let kind = generator["kind"].as_str().unwrap();
     let (channels, bytes) = (channels(format), sample_bytes(format));
-    let len = (width * height * channels) as usize * bytes;
+    let len = usize::try_from(width)
+        .unwrap()
+        .checked_mul(usize::try_from(height).unwrap())
+        .and_then(|pixels| pixels.checked_mul(usize::try_from(channels).unwrap()))
+        .and_then(|samples| samples.checked_mul(bytes))
+        .unwrap();
     let mut data = match kind {
         "bytes" => (0..generator["hex"].as_str().unwrap().len() / 2)
             .map(|i| {
-                u8::from_str_radix(&generator["hex"].as_str().unwrap()[2 * i..2 * i + 2], 16)
-                    .unwrap()
+                u8::from_str_radix(
+                    generator["hex"]
+                        .as_str()
+                        .unwrap()
+                        .get(2 * i..2 * i + 2)
+                        .unwrap(),
+                    16,
+                )
+                .unwrap()
             })
             .collect(),
         "noise" => {
             // inspect.rs' xorshift32 test noise, one byte per step.
             let mut state = 0x2545_f491_u32;
-            let mut data: Vec<u8> = (0..len)
-                .map(|_| {
-                    state ^= state << 13;
-                    state ^= state >> 17;
-                    state ^= state << 5;
-                    state as u8
-                })
-                .collect();
+            let mut data: Vec<u8> = std::iter::repeat_with(|| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state.to_le_bytes()[0]
+            })
+            .take(len)
+            .collect();
             if bytes == 2 {
-                let top = (full_scale(format) >> 8) as u8;
+                let top = u8::try_from(full_scale(format) >> 8).unwrap();
                 for high in data.iter_mut().skip(1).step_by(2) {
                     *high &= top;
                 }
@@ -107,7 +122,12 @@ fn generate(generator: &Value, format: u32, width: u32, height: u32) -> Vec<u8> 
                 for x in 0..width {
                     for c in 0..channels {
                         let value = match kind {
-                            "solid" => generator["value"][c as usize].as_u64().unwrap() as u32,
+                            "solid" => u32::try_from(
+                                generator["value"][usize::try_from(c).unwrap()]
+                                    .as_u64()
+                                    .unwrap(),
+                            )
+                            .unwrap(),
                             "ramp" => {
                                 let level = x * max / (width - 1).max(1);
                                 let level = if x % 8 < 2 { level / 2 } else { level };
@@ -118,7 +138,8 @@ fn generate(generator: &Value, format: u32, width: u32, height: u32) -> Vec<u8> 
                                 }
                             }
                             "checker" => {
-                                let cell = generator["cell"].as_u64().unwrap() as u32;
+                                let cell =
+                                    u32::try_from(generator["cell"].as_u64().unwrap()).unwrap();
                                 let on = (x / cell + y / cell) % 2 == 1;
                                 match (on, c) {
                                     (true, 1) => max / 2,
@@ -128,7 +149,8 @@ fn generate(generator: &Value, format: u32, width: u32, height: u32) -> Vec<u8> 
                                 }
                             }
                             "stripes" => {
-                                let period = generator["period"].as_u64().unwrap() as u32;
+                                let period =
+                                    u32::try_from(generator["period"].as_u64().unwrap()).unwrap();
                                 let on = (x / period) % 2 == 1;
                                 let value = if on { max * 200 / 255 } else { max * 40 / 255 };
                                 if c == 2 { value / 2 } else { value }
@@ -136,8 +158,12 @@ fn generate(generator: &Value, format: u32, width: u32, height: u32) -> Vec<u8> 
                             other => panic!("unknown generator {other}"),
                         };
                         match bytes {
-                            1 => data.push(value as u8),
-                            2 => data.extend_from_slice(&(value as u16).to_le_bytes()),
+                            1 => data.push(u8::try_from(value).unwrap()),
+                            2 => {
+                                data.extend_from_slice(
+                                    &u16::try_from(value).unwrap().to_le_bytes(),
+                                );
+                            }
                             _ => data.extend_from_slice(&value.to_le_bytes()),
                         }
                     }
@@ -147,12 +173,12 @@ fn generate(generator: &Value, format: u32, width: u32, height: u32) -> Vec<u8> 
         }
     };
     if let Some(length) = generator.get("length").and_then(Value::as_u64) {
-        data.truncate(length as usize);
+        data.truncate(usize::try_from(length).unwrap());
     }
     data
 }
 
-fn kind_name(kind: CameraKind) -> &'static str {
+const fn kind_name(kind: CameraKind) -> &'static str {
     match kind {
         CameraKind::Unknown => "unknown",
         CameraKind::AreaScan => "area_scan",
@@ -175,10 +201,10 @@ fn frame_case(
     name: &str,
     format: u32,
     (width, height): (u32, u32),
-    generator: Value,
+    generator: &Value,
     kinds: &[CameraKind],
 ) -> Value {
-    let data = generate(&generator, format, width, height);
+    let data = generate(generator, format, width, height);
     let frame = Frame {
         id: 7,
         width,
@@ -308,7 +334,13 @@ fn frames() -> Vec<Value> {
                     format_label(format),
                     generator["kind"].as_str().unwrap()
                 );
-                cases.push(frame_case(&name, format, (width, height), generator, &area));
+                cases.push(frame_case(
+                    &name,
+                    format,
+                    (width, height),
+                    &generator,
+                    &area,
+                ));
             }
         }
     }
@@ -316,7 +348,13 @@ fn frames() -> Vec<Value> {
         for format in main {
             let name = format!("{}-noise-{width}x{height}", format_label(format));
             let generator = json!({"kind": "noise"});
-            cases.push(frame_case(&name, format, (width, height), generator, &area));
+            cases.push(frame_case(
+                &name,
+                format,
+                (width, height),
+                &generator,
+                &area,
+            ));
         }
     }
     for format in main {
@@ -326,7 +364,7 @@ fn frames() -> Vec<Value> {
                 format_label(format),
                 generator["kind"].as_str().unwrap()
             );
-            cases.push(frame_case(&name, format, (1280, 720), generator, &area));
+            cases.push(frame_case(&name, format, (1280, 720), &generator, &area));
         }
     }
     for format in [
@@ -348,7 +386,7 @@ fn frames() -> Vec<Value> {
             &name,
             format,
             (33, 17),
-            json!({"kind": "noise"}),
+            &json!({"kind": "noise"}),
             &area,
         ));
     }
@@ -357,21 +395,21 @@ fn frames() -> Vec<Value> {
         "RGB8-example-4x1",
         RGB8,
         (4, 1),
-        json!({"kind": "bytes", "hex": "000000ffffff808080ff0000"}),
+        &json!({"kind": "bytes", "hex": "000000ffffff808080ff0000"}),
         &area,
     ));
     cases.push(frame_case(
         "Mono8-truncated-8x8",
         MONO8,
         (8, 8),
-        json!({"kind": "noise", "length": 10}),
+        &json!({"kind": "noise", "length": 10}),
         &area,
     ));
     cases.push(frame_case(
         "Mono8-ramp-kinds-128x64",
         MONO8,
         (128, 64),
-        json!({"kind": "ramp"}),
+        &json!({"kind": "ramp"}),
         &[
             CameraKind::Unknown,
             CameraKind::AreaScan,
@@ -389,30 +427,39 @@ fn frames() -> Vec<Value> {
         0x021e, 0x0220, 0x0224, 0x0228, 0x0230, 0x0240,
     ]
     .into_iter()
-    .flat_map(|prefix| (0..=0x12e).map(move |id| prefix << 16 | id))
+    .flat_map(|prefix| (0..=0x12e).map(move |id| (prefix << 16) | id))
     {
         if !frame::convertible(format) {
             continue;
         }
         let mut seed = format ^ 0x2545_f491;
-        let bytes: Vec<u8> = (0..frame::row_bytes(12, format) * 8)
-            .map(|_| {
-                seed ^= seed << 13;
-                seed ^= seed >> 17;
-                seed ^= seed << 5;
-                seed as u8
-            })
-            .collect();
-        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let bytes: Vec<u8> = std::iter::repeat_with(|| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed.to_le_bytes()[0]
+        })
+        .take(frame::row_bytes(12, format) * 8)
+        .collect();
+        let hex = hex(&bytes);
         cases.push(frame_case(
             &format!("{}-layout-12x8", format_label(format)),
             format,
             (12, 8),
-            json!({"kind": "bytes", "hex": hex}),
+            &json!({"kind": "bytes", "hex": hex}),
             &area,
         ));
     }
     cases
+}
+
+fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
 }
 
 fn png_chunks(bytes: &[u8]) -> Vec<Value> {
@@ -420,13 +467,13 @@ fn png_chunks(bytes: &[u8]) -> Vec<Value> {
     let mut chunks = Vec::new();
     let mut at = 8;
     while at < bytes.len() {
-        let length = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        let length =
+            usize::try_from(u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap())).unwrap();
         let kind = std::str::from_utf8(&bytes[at + 4..at + 8])
             .unwrap()
-            .to_string();
+            .to_owned();
         let whole = &bytes[at..at + 12 + length];
-        let hex: Option<String> =
-            (kind != "IDAT").then(|| whole.iter().map(|b| format!("{b:02x}")).collect());
+        let hex: Option<String> = (kind != "IDAT").then(|| hex(whole));
         chunks.push(json!({ "type": kind, "hex": hex }));
         at += 12 + length;
     }
@@ -511,7 +558,6 @@ fn pngs() -> Vec<Value> {
 }
 
 fn jpegs() -> Vec<Value> {
-    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     let mut cases = Vec::new();
     for (jpeg, payload) in [
         (
@@ -726,15 +772,22 @@ fn sim() -> Value {
             if ![0, 1, 10].contains(&index) {
                 continue;
             }
-            let bytes = (frame.data.len() / (frame.width * frame.height) as usize).max(1);
+            let pixels = usize::try_from(frame.width)
+                .unwrap()
+                .checked_mul(usize::try_from(frame.height).unwrap())
+                .unwrap();
+            let bytes = (frame.data.len() / pixels).max(1);
             let samples: Vec<Value> = sample_points(frame.width, frame.height)
                 .into_iter()
                 .map(|[x, y]| {
-                    let at = (y * frame.width + x) as usize * bytes;
+                    let at = usize::try_from(u64::from(y) * u64::from(frame.width) + u64::from(x))
+                        .unwrap()
+                        .checked_mul(bytes)
+                        .unwrap();
                     let pixel = &frame.data[at..at + bytes];
                     if frame.pixel_format == MONO12 {
                         // The 8-bit level, then the texture nibble.
-                        let v = u16::from_le_bytes([pixel[0], pixel[1]]);
+                        let v = u16::from_le_bytes(*pixel.first_chunk::<2>().unwrap());
                         json!([x, y, [v >> 4, v & 15]])
                     } else {
                         json!([x, y, pixel])

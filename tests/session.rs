@@ -1,11 +1,61 @@
 //! Sessions: started in the background or served in the foreground, found
 //! by the cameras they hold, kept by --keep, running --background jobs, and
 //! ended by `session stop`, idle time or signals.
+#![deny(clippy::doc_markdown)]
+#![deny(clippy::cast_precision_loss)]
 mod support;
 
 use serde_json::json;
 use std::time::{Duration, Instant};
 use support::cli::Home;
+
+#[cfg(unix)]
+#[test]
+fn malformed_session_readiness_does_not_wait_for_the_child_to_exit() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let home = Home::new("malformed-ready");
+    let executable = home.work.join("malformed-ready");
+    std::fs::write(
+        &executable,
+        b"#!/bin/sh\nfor argument do ready=$argument; done\nprintf '%s\\n' \"$CAPTUREFAB_TEST_READY\" > /dev/fd/\"$ready\"\nexec sleep 4\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for (ready, message) in [
+        ("invalid json", "before it was ready"),
+        ("null", "the session could not start"),
+        ("[]", "the session could not start"),
+        ("{}", "the session could not start"),
+        (r#"{"error":null}"#, "the session could not start"),
+    ] {
+        let start = Instant::now();
+        let output = home
+            .command()
+            .env("CAPTUREFAB_EXECUTABLE", &executable)
+            .env("CAPTUREFAB_TEST_READY", ready)
+            .args([
+                "--json", "session", "start", "--name", "broken", "-c", "sim:0",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{ready}; stdout={}; log={}",
+            String::from_utf8_lossy(&output.stdout),
+            std::fs::read_to_string(home.sessions.join("sessions/broken.log")).unwrap_or_default()
+        );
+        assert_eq!(output.status.code(), Some(1), "{ready}");
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(message),
+            "{value}"
+        );
+    }
+}
 
 /// A started session gets its cameras on stdin: an address can hold a
 /// password, and a process's arguments are for every user to read.
@@ -40,6 +90,56 @@ fn a_started_session_keeps_its_cameras_out_of_its_arguments() {
     );
     assert!(!args.contains("sim:3"), "{args}");
     home.ok(&["session", "stop", "quiet"]);
+}
+
+#[test]
+fn exhausted_job_numbers_fail_without_stopping_the_session() {
+    let home = Home::new("exhausted-jobs");
+    let start = ["session", "start", "--name", "exhausted", "-c", "sim:0"];
+    home.ok(&start);
+    home.ok(&["session", "stop", "exhausted"]);
+    let jobs_dir = home.sessions.join("jobs");
+    std::fs::create_dir_all(&jobs_dir).unwrap();
+    let file = jobs_dir.join("exhausted.json");
+    std::fs::write(
+        &file,
+        serde_json::to_vec(&json!({"next": u64::MAX, "jobs": []})).unwrap(),
+    )
+    .unwrap();
+    home.ok(&start);
+    let error = home.fails(
+        1,
+        &[
+            "--session",
+            "exhausted",
+            "capture",
+            "-c",
+            "sim:0",
+            "-n",
+            "2",
+            "--background",
+            "-o",
+            "images/",
+        ],
+    );
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("no unused job numbers")
+    );
+    assert_eq!(
+        home.ok(&["session", "status", "exhausted"])["session"],
+        "exhausted"
+    );
+    assert_eq!(
+        home.ok(&["--session", "exhausted", "jobs"])["jobs"],
+        json!([])
+    );
+    home.ok(&["session", "stop", "exhausted"]);
+    let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+    assert_eq!(saved["next"], u64::MAX);
+    assert_eq!(saved["jobs"], json!([]));
 }
 
 #[test]
@@ -89,23 +189,25 @@ fn a_session_starts_answers_and_stops() {
     let stopped = home.ok(&["session", "stop", "bench"]);
     assert_eq!(stopped["stopped"], true);
     #[cfg(unix)]
-    assert!(!support::cli::process_lives(pid as i32));
-    assert!(
+    assert!(!support::cli::process_lives(support::cli::process_id(pid)));
+    assert_eq!(
         home.ok(&["session", "list"])["sessions"]
             .as_array()
             .unwrap()
-            .is_empty()
+            .as_slice(),
+        [] as [serde_json::Value; 0]
     );
     let gone = home.fails(3, &["session", "stop", "bench"]);
     assert_eq!(gone["code"], "session_not_found");
     // A camera that cannot connect stops the session before it is ready.
     let failed = home.fails(3, &["session", "start", "--name", "broken", "-c", "sim9"]);
     assert_eq!(failed["code"], "camera_not_found");
-    assert!(
+    assert_eq!(
         home.ok(&["session", "list"])["sessions"]
             .as_array()
             .unwrap()
-            .is_empty()
+            .as_slice(),
+        [] as [serde_json::Value; 0]
     );
 }
 
@@ -127,7 +229,7 @@ fn an_idle_session_ends_on_its_own() {
         std::thread::sleep(Duration::from_millis(200));
     }
     #[cfg(unix)]
-    assert!(!support::cli::process_lives(pid as i32));
+    assert!(!support::cli::process_lives(support::cli::process_id(pid)));
     let _ = pid;
 }
 
@@ -303,9 +405,10 @@ fn serve_shuts_down_cleanly_on_sigterm_and_sighup() {
             &["--json", "--session", name, "debug", "rpc"],
         );
         let state = state.success();
-        let worker = state["cameras"][0]["worker_pid"].as_i64().unwrap() as i32;
+        let worker = support::cli::process_id(state["cameras"][0]["worker_pid"].as_i64().unwrap());
         assert!(support::cli::process_lives(worker));
         // Camera workers have their own process groups, outside terminal signals.
+        // SAFETY: getpgid takes a process ID and does not access Rust memory.
         assert_eq!(unsafe { libc::getpgid(worker) }, worker);
         let shot = home.ok(&["capture", "-o", "saved.png"]);
         let saved = std::fs::read(shot["files"][0].as_str().unwrap()).unwrap();
@@ -328,20 +431,21 @@ fn serve_shuts_down_cleanly_on_sigterm_and_sighup() {
 #[cfg(unix)]
 #[test]
 fn serve_under_nohup_ignores_sighup() {
-    use std::os::unix::process::CommandExt;
+    use std::os::unix::process::CommandExt as _;
     let home = Home::new("nohup");
     let mut command = home.command();
+    let ignore_hangup = || {
+        // SAFETY: ignoring a valid signal requires no handler pointer.
+        unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+        Ok(())
+    };
     // SAFETY: signal is async-signal-safe, as pre_exec requires.
-    unsafe {
-        command.pre_exec(|| {
-            libc::signal(libc::SIGHUP, libc::SIG_IGN);
-            Ok(())
-        });
-    }
-    let mut serve = home.serve_in(&mut command, "nohup", &[], &[]);
+    unsafe { command.pre_exec(ignore_hangup) };
+    let mut serve = Home::serve_in(&mut command, "nohup", &[], &[]);
     // SAFETY: kill only sends a signal to the child this test spawned.
     assert_eq!(
-        unsafe { libc::kill(serve.child.id() as i32, libc::SIGHUP) },
+        // SAFETY: this is the child spawned above; SIGHUP is a valid signal.
+        unsafe { libc::kill(i32::try_from(serve.child.id()).unwrap(), libc::SIGHUP) },
         0
     );
     std::thread::sleep(Duration::from_millis(500));
@@ -422,7 +526,7 @@ fn a_dead_worker_fails_its_jobs() {
             &["--json", "--session", "dead", "debug", "rpc"],
         )
         .success();
-    let worker = state["cameras"][0]["worker_pid"].as_i64().unwrap() as i32;
+    let worker = support::cli::process_id(state["cameras"][0]["worker_pid"].as_i64().unwrap());
     // SAFETY: kill only sends a signal to the worker this test's session runs.
     assert_eq!(unsafe { libc::kill(worker, libc::SIGKILL) }, 0);
     let failed = home.fails(3, &["jobs", "wait", &id, "--timeout", "10s"]);
@@ -448,7 +552,7 @@ fn a_dead_worker_fails_its_jobs() {
 fn a_killed_sessions_descriptor_does_not_hold_its_name() {
     let home = Home::new("stale");
     let started = home.ok(&["session", "start", "--name", "stale", "-c", "sim:0"]);
-    let pid = started["pid"].as_i64().unwrap() as i32;
+    let pid = support::cli::process_id(started["pid"].as_i64().unwrap());
     // SAFETY: kill only sends a signal to the session this test started.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
     assert!(!support::cli::process_lives(pid));
@@ -458,7 +562,7 @@ fn a_killed_sessions_descriptor_does_not_hold_its_name() {
         serde_json::from_slice(&std::fs::read(&descriptor).unwrap()).unwrap();
     stale["pid"] = json!(1);
     let leave = || {
-        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        use std::{io::Write as _, os::unix::fs::OpenOptionsExt as _};
         std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -536,10 +640,10 @@ fn a_session_keeps_its_own_cameras_and_lets_kept_ones_go() {
 #[cfg(unix)]
 #[test]
 fn a_program_on_a_killed_sessions_port_is_sent_nothing() {
-    use std::io::Read;
+    use std::io::Read as _;
     let home = Home::new("squat");
     let started = home.ok(&["session", "start", "--name", "lab", "-c", "sim:0"]);
-    let pid = started["pid"].as_i64().unwrap() as i32;
+    let pid = support::cli::process_id(started["pid"].as_i64().unwrap());
     let descriptor: serde_json::Value =
         serde_json::from_slice(&std::fs::read(home.sessions.join("lab.json")).unwrap()).unwrap();
     // SAFETY: kill only sends a signal to the session this test started.

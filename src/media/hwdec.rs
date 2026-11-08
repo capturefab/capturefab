@@ -5,12 +5,12 @@
 //! A method is used only once a probe has proved it decodes on this host: a
 //! 64x64 H.264 frame decoded into device memory and downloaded
 //! (`hwdownload` accepts only hardware frames, so success is proof), cached
-//! for the boot. FFmpeg then downloads every frame once, into the native
+//! for the boot. `FFmpeg` then downloads every frame once, into the native
 //! format the decoder reads (NV12), with no conversion. A source the method
 //! cannot decode (a profile or size it lacks) is decoded in software by
-//! FFmpeg itself, which shows as 8-bit frames that are not NV12; that codec
+//! `FFmpeg` itself, which shows as 8-bit frames that are not NV12; that codec
 //! and size class is then left to software for the rest of the boot, and a
-//! launch whose FFmpeg exits before its first frame is tried again without
+//! launch whose `FFmpeg` exits before its first frame is tried again without
 //! it.
 //!
 //! Setting up a decoder session costs about 70-100 ms on Apple silicon,
@@ -22,6 +22,7 @@
 //! and repays the setup within a second of video; a command's own worker
 //! (`--no-session`) and every file decode in software, which delivers one
 //! frame sooner.
+#![deny(clippy::missing_const_for_fn)]
 use super::{Executable, Found, probed, remember, timed_output, with_probes};
 use crate::types::{Categorized, ErrorKind};
 use anyhow::Result;
@@ -29,7 +30,7 @@ use std::time::Duration;
 
 pub(crate) const ENV: &str = "CAPTUREFAB_HWDEC";
 
-/// Every method Capturefab knows how to ask FFmpeg for, with the hardware
+/// Every method Capturefab knows how to ask `FFmpeg` for, with the hardware
 /// pixel format its frames have in device memory, which the probe keeps
 /// them in. `v4l2m2m` is a decoder per codec rather than a `-hwaccel`.
 const METHODS: [(&str, &str); 8] = [
@@ -44,8 +45,8 @@ const METHODS: [(&str, &str); 8] = [
 ];
 
 /// The methods `auto` tries on this platform, in order: those the bundled
-/// FFmpeg builds for it (`scripts/build-ffmpeg.sh`). Others, such as VA-API
-/// in an FFmpeg of one's own, can be named.
+/// `FFmpeg` builds for it (`scripts/build-ffmpeg.sh`). Others, such as VA-API
+/// in an `FFmpeg` of one's own, can be named.
 pub(crate) fn candidates() -> &'static [&'static str] {
     match std::env::consts::OS {
         "macos" => &["videotoolbox"],
@@ -65,12 +66,13 @@ pub(crate) enum Setting {
 
 impl Setting {
     pub(crate) fn parse(value: Option<&str>) -> Result<Self> {
-        Ok(match value.map(str::trim).unwrap_or("") {
-            "" | "auto" => Setting::Auto,
-            "none" => Setting::None,
-            name => match METHODS.iter().find(|(method, _)| *method == name) {
-                Some((method, _)) => Setting::Named(method),
-                None => {
+        Ok(match value.map_or("", str::trim) {
+            "" | "auto" => Self::Auto,
+            "none" => Self::None,
+            name => {
+                if let Some((method, _)) = METHODS.iter().find(|(method, _)| *method == name) {
+                    Self::Named(method)
+                } else {
                     let known: Vec<&str> = METHODS.iter().map(|(method, _)| *method).collect();
                     return Err(Categorized::error(
                         ErrorKind::Usage,
@@ -80,14 +82,14 @@ impl Setting {
                         ),
                     ));
                 }
-            },
+            }
         })
     }
-    pub(crate) fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
-            Setting::Auto => "auto",
-            Setting::None => "none",
-            Setting::Named(method) => method,
+            Self::Auto => "auto",
+            Self::None => "none",
+            Self::Named(method) => method,
         }
     }
 }
@@ -137,14 +139,14 @@ fn listing(exe: &Executable) -> Result<String> {
     if let Some(listing) = with_probes(exe, |probes| probes.hwaccels.clone()) {
         return Ok(listing);
     }
-    let args = ["-hide_banner", "-hwaccels"].map(str::to_string);
+    let args = ["-hide_banner", "-hwaccels"].map(str::to_owned);
     let (success, listing, _) = timed_output(exe, &args, &[], super::PROBE_TIMEOUT)?;
     anyhow::ensure!(success, "FFmpeg could not list its hardware decoders");
     remember(exe, |probes| probes.hwaccels = Some(listing.clone()));
     Ok(listing)
 }
 
-/// Whether this FFmpeg has `method`: in its `-hwaccels` list, or for
+/// Whether this `FFmpeg` has `method`: in its `-hwaccels` list, or for
 /// `v4l2m2m`, its V4L2 memory-to-memory H.264 decoder.
 fn built(exe: &Executable, method: &str) -> Result<bool> {
     if method == "v4l2m2m" {
@@ -158,7 +160,7 @@ fn decoders(exe: &Executable) -> Result<String> {
     if let Some(listing) = with_probes(exe, |probes| probes.decoder_listing.clone()) {
         return Ok(listing);
     }
-    let args = ["-hide_banner", "-decoders"].map(str::to_string);
+    let args = ["-hide_banner", "-decoders"].map(str::to_owned);
     let (success, listing, _) = timed_output(exe, &args, &[], super::PROBE_TIMEOUT)?;
     anyhow::ensure!(success, "FFmpeg could not list its decoders");
     remember(exe, |probes| probes.decoder_listing = Some(listing.clone()));
@@ -178,12 +180,13 @@ const CLIP: [u8; 65] = [
 /// the hardware decodes it.
 fn probe_args(method: &str) -> Vec<String> {
     let mut args = ["-nostdin", "-hide_banner", "-loglevel", "error"]
-        .map(str::to_string)
-        .to_vec();
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
     match METHODS.iter().find(|(name, _)| *name == method) {
         Some(("v4l2m2m", _)) => {
-            args.extend(["-c:v", "h264_v4l2m2m", "-f", "h264", "-i", "pipe:0"].map(str::to_string));
-            args.extend(["-f", "null", "-"].map(str::to_string));
+            args.extend(["-c:v", "h264_v4l2m2m", "-f", "h264", "-i", "pipe:0"].map(str::to_owned));
+            args.extend(["-f", "null", "-"].map(str::to_owned));
         }
         Some((_, device_format)) => {
             args.extend(
@@ -204,7 +207,7 @@ fn probe_args(method: &str) -> Vec<String> {
                     "null",
                     "-",
                 ]
-                .map(str::to_string),
+                .map(str::to_owned),
             );
         }
         None => {}
@@ -281,7 +284,7 @@ thread_local! {
 /// `auto` the first candidate that works here, for live sources in a
 /// session's worker. `known` is the codec key and size class of the
 /// source's last launch, when one told; a method that decoded those in
-/// software is not used for them again. A named method this FFmpeg lacks,
+/// software is not used for them again. A named method this `FFmpeg` lacks,
 /// or that fails its probe, is the unavailable error.
 pub(super) fn choose(
     exe: &Executable,
@@ -321,12 +324,12 @@ pub(super) fn choose(
     }
 }
 
-/// The input options that decode with `method`: `-hwaccel` (FFmpeg
+/// The input options that decode with `method`: `-hwaccel` (`FFmpeg`
 /// downloads each frame into its software format), or for `v4l2m2m` the
 /// codec's V4L2 decoder, when the codec is known. Once the method has
 /// decoded the source's codec in hardware (`proven`), on one decoder
 /// thread, since frame threads only add latency to a hardware decoder; until
-/// then on FFmpeg's usual threads, which a codec it leaves to software
+/// then on `FFmpeg`'s usual threads, which a codec it leaves to software
 /// keeps for the life of the decoder.
 pub(super) fn options(method: &str, codec: Option<&str>, proven: bool) -> Option<Vec<String>> {
     let mut options = match method {
@@ -352,8 +355,8 @@ pub(super) fn decoded_in_hardware(pix_fmt: &str) -> bool {
 }
 
 /// `doctor`'s `hwdec` object: what `CAPTUREFAB_HWDEC` selects and each
-/// method of this platform, whether this FFmpeg has it and whether it
-/// decodes here (probed, so a first `doctor` runs FFmpeg once for each).
+/// method of this platform, whether this `FFmpeg` has it and whether it
+/// decodes here (probed, so a first `doctor` runs `FFmpeg` once for each).
 pub(crate) fn report() -> serde_json::Value {
     let selected = match setting() {
         Ok(setting) => serde_json::json!(setting.name()),

@@ -3,6 +3,7 @@
 //! numbered across the session's cameras and followed only by the workers'
 //! events. Ended jobs are kept a while, and the book is saved so the jobs of
 //! a session that died still read, as lost.
+#![deny(clippy::missing_const_for_fn)]
 use super::protocol::{JobStatus, Output};
 use crate::scheduling::rfc3339;
 use serde::{Deserialize, Serialize};
@@ -50,7 +51,7 @@ pub(crate) enum JobState {
     Lost,
 }
 impl JobState {
-    pub(crate) fn ended(self) -> bool {
+    pub(crate) const fn ended(self) -> bool {
         !matches!(self, Self::Armed | Self::Running | Self::Stopping)
     }
 }
@@ -63,10 +64,6 @@ impl From<JobStatus> for JobState {
             JobStatus::Interrupted => Self::Interrupted,
         }
     }
-}
-
-fn is_zero(count: &u64) -> bool {
-    *count == 0
 }
 
 /// One job, as the session follows it.
@@ -88,7 +85,7 @@ pub(crate) struct Job {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
     /// Files that are the JPEG the source sent, as it was.
-    #[serde(default, skip_serializing_if = "is_zero")]
+    #[serde(default, skip_serializing_if = "crate::types::is_default")]
     pub passed_through: u64,
     pub started_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -209,7 +206,7 @@ impl Job {
         }
         detail
     }
-    fn touch(&mut self) {
+    const fn touch(&mut self) {
         self.seq += 1;
     }
     /// Its state from a capture job's account: armed until its first frame
@@ -278,6 +275,12 @@ struct Saved {
     jobs: Vec<Job>,
 }
 
+#[derive(Serialize)]
+struct SavedView<'a> {
+    next: u64,
+    jobs: &'a VecDeque<Job>,
+}
+
 /// What session `name` saved, as it was when it last saved it. `None`
 /// when a saved book exists but cannot be read (for example its
 /// permissions changed): its numbers are unknown, so it must not be
@@ -293,14 +296,14 @@ fn load(name: &str) -> Option<Saved> {
         }
         Err(_) => return None,
     };
-    Some(match serde_json::from_slice::<Value>(&data) {
-        Ok(file) => parse(file),
+    Some(serde_json::from_slice::<Value>(&data).map_or_else(
         // A file cut short or damaged keeps the numbers it shows.
-        Err(_) => Saved {
+        |_| Saved {
             next: numbers_in(&String::from_utf8_lossy(&data)),
             jobs: Vec::new(),
         },
-    })
+        parse,
+    ))
 }
 
 /// The highest number `text`, a saved book that is no longer JSON, still
@@ -309,13 +312,13 @@ fn load(name: &str) -> Option<Saved> {
 fn numbers_in(text: &str) -> u64 {
     ["\"next\"", "\"number\""]
         .into_iter()
-        .flat_map(|key| text.match_indices(key).map(move |(at, _)| at + key.len()))
+        .flat_map(|key| text.split(key).skip(1))
         .filter_map(|after| {
-            let value = text[after..].trim_start().strip_prefix(':')?.trim_start();
-            let end = value
-                .find(|c: char| !c.is_ascii_digit())
-                .unwrap_or(value.len());
-            value[..end].parse::<u64>().ok()
+            let value = after.trim_start().strip_prefix(':')?.trim_start();
+            let number = value
+                .split_once(|c: char| !c.is_ascii_digit())
+                .map_or(value, |(number, _)| number);
+            number.parse::<u64>().ok()
         })
         .max()
         .unwrap_or(0)
@@ -443,11 +446,17 @@ impl JobBook {
     fn lock(&self) -> std::sync::MutexGuard<'_, Book> {
         self.book.lock().unwrap_or_else(PoisonError::into_inner)
     }
-    /// A new job's number, before its worker is asked to run it.
-    pub(super) fn start(&self, kind: JobKind, key: &str, planned: Option<u64>, lease: bool) -> u64 {
+    /// A new job's number, before its worker is asked to run it; None when exhausted.
+    pub(super) fn start(
+        &self,
+        kind: JobKind,
+        key: &str,
+        planned: Option<u64>,
+        lease: bool,
+    ) -> Option<u64> {
         let mut book = self.lock();
-        book.next += 1;
-        let number = book.next;
+        let number = book.next.checked_add(1)?;
+        book.next = number;
         book.jobs.push_back(Job {
             number,
             camera: crate::media::redact_url(key),
@@ -473,7 +482,7 @@ impl JobBook {
         book.prune();
         book.dirty = true;
         book.save(true);
-        number
+        Some(number)
     }
     /// The worker took job `number`: what its reply says of it.
     pub(super) fn accepted(&self, number: u64, detail: Value) {
@@ -558,7 +567,7 @@ impl JobBook {
                 }
                 job.follow(summary.clone());
                 job.state = (*status).into();
-                job.error = error.clone();
+                job.error.clone_from(error);
                 job.ended_ms = Some(crate::scheduling::now_ms());
                 job.lease = None;
                 job.touch();
@@ -678,7 +687,7 @@ impl JobBook {
         let mut book = self.lock();
         let now = Instant::now();
         let mut gone = Vec::new();
-        for job in book.jobs.iter_mut() {
+        for job in &mut book.jobs {
             if let Some(lease) = &job.lease
                 && lease.waiters == 0
                 && now >= lease.until
@@ -725,11 +734,20 @@ impl Book {
                     .ended_ms
                     .is_none_or(|ended| now.saturating_sub(ended) < KEPT_MS)
         });
-        while self.jobs.iter().filter(|job| job.state.ended()).count() > KEPT {
-            if let Some(index) = self.jobs.iter().position(|job| job.state.ended()) {
-                self.jobs.remove(index);
+        let mut excess = self
+            .jobs
+            .iter()
+            .filter(|job| job.state.ended())
+            .count()
+            .saturating_sub(KEPT);
+        self.jobs.retain(|job| {
+            if job.state.ended() && excess > 0 {
+                excess -= 1;
+                false
+            } else {
+                true
             }
-        }
+        });
     }
     /// Write the book, now or once `SAVE_EVERY` passed since the last write.
     /// Best effort: a session whose state folder is unwritable still runs.
@@ -742,8 +760,10 @@ impl Book {
         }
         self.dirty = false;
         self.saved_at = Instant::now();
-        let jobs = self.jobs.iter().collect::<Vec<_>>();
-        let Ok(data) = serde_json::to_vec(&json!({"next": self.next, "jobs": jobs})) else {
+        let Ok(data) = serde_json::to_vec(&SavedView {
+            next: self.next,
+            jobs: &self.jobs,
+        }) else {
             return;
         };
         let write = || -> anyhow::Result<()> {
@@ -765,6 +785,25 @@ mod tests {
     use super::*;
     use crate::engine::saved::{SavedFile, SavedItem};
 
+    #[test]
+    fn damaged_books_recover_only_ascii_numbers_after_known_keys() {
+        for (text, expected) in [
+            ("", 0),
+            (r#"{"next":12,"jobs":[{"number":19},{"number":3}]"#, 19),
+            ("\"next\"\u{a0}:\t42unfinished", 42),
+            (r#""next":7"next":9"number":8"#, 9),
+            (r#""next""next":5"#, 5),
+            (r#""other":99,"next":4"#, 4),
+            (r#""next":-7,"number":+8"#, 0),
+            (r#""next":９９,"number":4"#, 4),
+            (r#""next":18446744073709551616,"number":6"#, 6),
+            (r#""next":18446744073709551615"#, u64::MAX),
+            (r#""number":12.5"#, 12),
+        ] {
+            assert_eq!(numbers_in(text), expected, "{text:?}");
+        }
+    }
+
     fn saved(job: u64, path: &str) -> Output {
         Output::Saved {
             job: Some(job),
@@ -773,7 +812,7 @@ mod tests {
                 path: path.into(),
                 bytes: 10,
                 sha256: None,
-                context: Default::default(),
+                context: std::collections::BTreeMap::new(),
                 item: SavedItem::Recording,
             },
         }
@@ -782,7 +821,9 @@ mod tests {
     #[test]
     fn jobs_follow_their_events_and_end_once() {
         let book = JobBook::new("bench");
-        let number = book.start(JobKind::Capture, "rtsp://u:secret@cam/x", Some(2), false);
+        let number = book
+            .start(JobKind::Capture, "rtsp://u:secret@cam/x", Some(2), false)
+            .unwrap();
         assert_eq!(number, 1);
         book.accepted(
             number,
@@ -816,7 +857,7 @@ mod tests {
     #[test]
     fn a_reply_after_its_jobs_first_lines_adds_what_only_it_says() {
         let book = JobBook::new("bench");
-        let number = book.start(JobKind::Record, "sim:0", None, false);
+        let number = book.start(JobKind::Record, "sim:0", None, false).unwrap();
         book.event(&Output::Progress {
             job: number,
             progress: json!({"written": 3}),
@@ -836,7 +877,7 @@ mod tests {
     #[test]
     fn waits_return_on_a_change_or_the_end_and_keep_the_lease() {
         let book = std::sync::Arc::new(JobBook::new("bench"));
-        let number = book.start(JobKind::Record, "sim:0", None, true);
+        let number = book.start(JobKind::Record, "sim:0", None, true).unwrap();
         let here = || false;
         let (seq, job) = book
             .wait(number, 0, Duration::from_millis(10), &here)
@@ -865,7 +906,9 @@ mod tests {
     #[test]
     fn a_wait_whose_client_left_ends_and_starts_the_lease() {
         let book = std::sync::Arc::new(JobBook::new("bench"));
-        let number = book.start(JobKind::Capture, "sim:0", Some(1), true);
+        let number = book
+            .start(JobKind::Capture, "sim:0", Some(1), true)
+            .unwrap();
         let left = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let waiter = {
             let (book, left) = (book.clone(), left.clone());
@@ -893,7 +936,13 @@ mod tests {
         let mut book = book.lock();
         let lease = book.find(number).unwrap().lease.clone().unwrap();
         assert_eq!(lease.waiters, 0);
-        assert!(lease.until > Instant::now() + LEASE - Duration::from_secs(1));
+        assert!(
+            lease.until
+                > Instant::now()
+                    + LEASE
+                        .checked_sub(Duration::from_secs(1))
+                        .expect("lease is longer than one second")
+        );
     }
 
     /// A recording's file of `bytes` bytes in a folder of its own.
@@ -914,7 +963,7 @@ mod tests {
     fn a_running_recording_shows_its_file_and_size() {
         let (dir, path) = recording("running", 1234);
         let book = JobBook::new("bench");
-        let number = book.start(JobKind::Record, "sim:1", None, false);
+        let number = book.start(JobKind::Record, "sim:1", None, false).unwrap();
         book.accepted(number, json!({"path": path, "since_ms": 1}));
         book.event(&Output::Progress {
             job: number,
@@ -935,7 +984,7 @@ mod tests {
     fn a_recording_whose_worker_died_names_the_file_it_left() {
         let (dir, path) = recording("crashed", 4321);
         let book = JobBook::new("bench");
-        let number = book.start(JobKind::Record, "sim:2", None, false);
+        let number = book.start(JobKind::Record, "sim:2", None, false).unwrap();
         book.accepted(number, json!({"path": path, "since_ms": 1}));
         let error = crate::types::Categorized::error(
             crate::types::ErrorKind::WorkerCrashed,
@@ -955,12 +1004,113 @@ mod tests {
     /// Job `number`, which ended two hours ago, past `KEPT_MS`.
     fn forgotten(number: u64) -> Job {
         let book = JobBook::new("old");
-        book.start(JobKind::Capture, "sim:0", Some(1), false);
+        book.start(JobKind::Capture, "sim:0", Some(1), false)
+            .unwrap();
         let mut job = book.all().remove(0);
         let ended = crate::scheduling::now_ms() - 2 * KEPT_MS;
         (job.number, job.state, job.started_ms, job.ended_ms) =
             (number, JobState::Done, ended, Some(ended));
         job
+    }
+
+    #[test]
+    fn exhausted_job_numbers_leave_the_book_unchanged() {
+        let book = JobBook::with("exhausted", None, VecDeque::new(), u64::MAX);
+        assert!(
+            book.start(JobKind::Capture, "sim:0", Some(1), false)
+                .is_none()
+        );
+        assert!(book.all().is_empty());
+        assert_eq!(book.lock().next, u64::MAX);
+        assert!(!book.lock().dirty);
+
+        let book = JobBook::with("last", None, VecDeque::new(), u64::MAX - 1);
+        assert_eq!(
+            book.start(JobKind::Capture, "sim:0", Some(1), false),
+            Some(u64::MAX)
+        );
+        assert!(book.start(JobKind::Auto, "sim:0", None, false).is_none());
+        assert_eq!(book.all().len(), 1);
+        assert_eq!(book.all()[0].number, u64::MAX);
+        assert_eq!(book.lock().next, u64::MAX);
+    }
+
+    #[test]
+    fn saving_borrows_jobs_without_changing_the_document() {
+        let mut job = forgotten(7);
+        job.key = "rtsp://private:password@camera/stream".into();
+        job.files = vec!["one.png".into(), "two.png".into()];
+        job.last_file = Some("two.png".into());
+        job.bytes = Some(1024);
+        job.passed_through = 2;
+        job.error = Some(json!({"code": "failed", "message": "stopped"}));
+        job.detail = json!({"captured": 2, "nested": {"value": "é"}});
+        let jobs = VecDeque::from([job, forgotten(8)]);
+        let data = serde_json::to_vec(&SavedView {
+            next: 12,
+            jobs: &jobs,
+        })
+        .unwrap();
+        let actual: Value = serde_json::from_slice(&data).unwrap();
+        let expected = json!({"next": 12, "jobs": jobs.iter().collect::<Vec<_>>()});
+        assert_eq!(actual, expected);
+        assert!(!String::from_utf8(data).unwrap().contains("password"));
+        let loaded = parse(actual);
+        assert_eq!(loaded.next, 12);
+        assert_eq!(
+            loaded.jobs.iter().map(|job| job.number).collect::<Vec<_>>(),
+            [7, 8]
+        );
+    }
+
+    #[test]
+    fn pruning_preserves_active_jobs_and_the_newest_unexpired_history() {
+        let now = crate::scheduling::now_ms();
+        let base = forgotten(1);
+        for count in [0, KEPT - 1, KEPT, KEPT + 1, KEPT * 4] {
+            let jobs = (0..count)
+                .map(|index| {
+                    let mut job = base.clone();
+                    job.number = u64::try_from(index + 1).unwrap();
+                    job.state = match index % 8 {
+                        0 => JobState::Armed,
+                        1 => JobState::Running,
+                        2 => JobState::Stopping,
+                        3 => JobState::Done,
+                        4 => JobState::Failed,
+                        5 => JobState::Cancelled,
+                        6 => JobState::Interrupted,
+                        _ => JobState::Lost,
+                    };
+                    job.ended_ms = match index % 7 {
+                        0 => Some(now - 2 * KEPT_MS),
+                        1 => None,
+                        _ => Some(now),
+                    };
+                    job
+                })
+                .collect::<VecDeque<_>>();
+            let mut newest = Vec::new();
+            let mut ended = 0;
+            for job in jobs.iter().rev() {
+                if job.state.ended() {
+                    if job.ended_ms.is_some_and(|time| time < now) || ended == KEPT {
+                        continue;
+                    }
+                    ended += 1;
+                }
+                newest.push(job.number);
+            }
+            newest.reverse();
+            let book = JobBook::with("prune", None, jobs, u64::try_from(count).unwrap());
+            book.lock().prune();
+            assert_eq!(
+                book.all().iter().map(|job| job.number).collect::<Vec<_>>(),
+                newest,
+                "{count} jobs"
+            );
+            assert_eq!(book.lock().next, u64::try_from(count).unwrap());
+        }
     }
 
     #[test]
@@ -977,7 +1127,8 @@ mod tests {
             "an hour after its end a job is forgotten"
         );
         assert_eq!(
-            book.start(JobKind::Capture, "sim:0", Some(1), false),
+            book.start(JobKind::Capture, "sim:0", Some(1), false)
+                .unwrap(),
             43,
             "bench-42 named another job"
         );
@@ -993,7 +1144,10 @@ mod tests {
         assert_eq!(saved["next"], 43, "{saved}");
         let again = JobBook::saved(&name);
         assert!(again.all().is_empty());
-        assert_eq!(again.start(JobKind::Record, "sim:0", None, false), 44);
+        assert_eq!(
+            again.start(JobKind::Record, "sim:0", None, false).unwrap(),
+            44
+        );
         // A kept job's number counts too, past the saved one.
         let mut kept = forgotten(60);
         kept.ended_ms = Some(crate::scheduling::now_ms());
@@ -1004,7 +1158,7 @@ mod tests {
         .unwrap();
         let book = JobBook::saved(&name);
         assert_eq!(book.all().len(), 1);
-        assert_eq!(book.start(JobKind::Auto, "sim:0", None, false), 61);
+        assert_eq!(book.start(JobKind::Auto, "sim:0", None, false).unwrap(), 61);
         std::fs::remove_file(file).unwrap();
     }
 
@@ -1031,26 +1185,34 @@ mod tests {
             [3],
             "the jobs it can read stay"
         );
-        assert_eq!(book.start(JobKind::Capture, "sim:0", Some(1), false), 91);
+        assert_eq!(
+            book.start(JobKind::Capture, "sim:0", Some(1), false)
+                .unwrap(),
+            91
+        );
         let saved: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         assert_eq!(saved["next"], 91, "{saved}");
         // The saved number alone, when no job reads.
         write(json!({"next": 70, "jobs": [{"number": 5, "kind": "timelapse"}]})).unwrap();
         assert_eq!(
-            JobBook::saved(&name).start(JobKind::Record, "sim:0", None, false),
+            JobBook::saved(&name)
+                .start(JobKind::Record, "sim:0", None, false)
+                .unwrap(),
             71
         );
         // A job list that is not one keeps the number too.
         write(json!({"next": 70, "jobs": {"number": 99}})).unwrap();
         assert_eq!(
-            JobBook::saved(&name).start(JobKind::Record, "sim:0", None, false),
+            JobBook::saved(&name)
+                .start(JobKind::Record, "sim:0", None, false)
+                .unwrap(),
             71
         );
         // A file of an earlier version, which holds the jobs alone.
         write(json!([kept, {"number": 12, "kind": "timelapse"}])).unwrap();
         let book = JobBook::saved(&name);
         assert_eq!(book.all().len(), 1);
-        assert_eq!(book.start(JobKind::Auto, "sim:0", None, false), 13);
+        assert_eq!(book.start(JobKind::Auto, "sim:0", None, false).unwrap(), 13);
         // A file cut short, no longer JSON, keeps the numbers it shows.
         std::fs::write(
             &file,
@@ -1059,7 +1221,11 @@ mod tests {
         .unwrap();
         let book = JobBook::saved(&name);
         assert!(book.all().is_empty());
-        assert_eq!(book.start(JobKind::Capture, "sim:0", Some(1), false), 76);
+        assert_eq!(
+            book.start(JobKind::Capture, "sim:0", Some(1), false)
+                .unwrap(),
+            76
+        );
         std::fs::remove_file(file).unwrap();
     }
 
@@ -1068,7 +1234,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_saved_book_is_left_alone() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt as _;
         let name = format!("locked-{}", std::process::id());
         let file = path(&name).unwrap();
         crate::dirs::ensure_private_dir(file.parent().unwrap()).unwrap();
@@ -1081,7 +1247,8 @@ mod tests {
             return;
         }
         let book = JobBook::saved(&name);
-        book.start(JobKind::Capture, "sim:0", Some(1), false);
+        book.start(JobKind::Capture, "sim:0", Some(1), false)
+            .unwrap();
         book.lock().save(true);
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
         let saved: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
@@ -1092,8 +1259,12 @@ mod tests {
     #[test]
     fn a_crashed_worker_fails_its_jobs_and_a_dead_session_loses_them() {
         let book = JobBook::new("bench");
-        let first = book.start(JobKind::Capture, "sim:0", Some(5), false);
-        let other = book.start(JobKind::Capture, "sim:1", Some(5), false);
+        let first = book
+            .start(JobKind::Capture, "sim:0", Some(5), false)
+            .unwrap();
+        let other = book
+            .start(JobKind::Capture, "sim:1", Some(5), false)
+            .unwrap();
         let error = crate::types::Categorized::error(
             crate::types::ErrorKind::WorkerCrashed,
             "camera worker exited",

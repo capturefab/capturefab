@@ -15,17 +15,22 @@
 //! - `necessary`: a user-space copy with a stated reason it stays;
 //! - `transform`: a real decode, encode or conversion its consumer needs;
 //! - `avoidable`: a copy that should not happen.
-#![allow(unsafe_code)]
 // Without the feature only the recording calls remain; the names and
 // classes are for the report.
-#![cfg_attr(not(feature = "copy-audit"), allow(dead_code))]
+#![cfg_attr(
+    not(feature = "copy-audit"),
+    allow(
+        dead_code,
+        reason = "copy sites are recorded in every build; classification and reports are used only with copy-audit"
+    )
+)]
 
 /// A place a frame's bytes are copied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Site {
     /// A GVSP datagram received from the socket.
     GvspReceive,
-    /// A frame read from FFmpeg's output pipe.
+    /// A frame read from `FFmpeg`'s output pipe.
     PipeRead,
     /// A frame written into an encoder's input pipe.
     PipeWrite,
@@ -36,7 +41,7 @@ pub(crate) enum Site {
     FileWrite,
     /// An image written to the capture command's standard output.
     StdoutWrite,
-    /// A source's compressed frame passed, as it was sent, from its FFmpeg
+    /// A source's compressed frame passed, as it was sent, from its `FFmpeg`
     /// to a recording's that copies it.
     StreamCopy,
     /// A USB3 Vision payload transfer copied into its frame: transfers
@@ -48,7 +53,7 @@ pub(crate) enum Site {
     GvspFallback,
     /// A padded GVSP row moved to close up the camera's row padding.
     GigeRowCompact,
-    /// Packed or wide samples unpacked, or a layout FFmpeg cannot read
+    /// Packed or wide samples unpacked, or a layout `FFmpeg` cannot read
     /// converted, for an encoder's input pipe.
     FfmpegUnpack,
     /// A frame converted to the samples a still's encoder reads.
@@ -94,99 +99,99 @@ pub(crate) enum Class {
 }
 
 impl Site {
-    pub(crate) const ALL: [Site; 25] = [
-        Site::GvspReceive,
-        Site::PipeRead,
-        Site::PipeWrite,
-        Site::PipeSplice,
-        Site::FileWrite,
-        Site::StdoutWrite,
-        Site::StreamCopy,
-        Site::UsbAssemble,
-        Site::GvspFallback,
-        Site::GigeRowCompact,
-        Site::FfmpegUnpack,
-        Site::StillTransform,
-        Site::PreviewTransform,
-        Site::JetsonInput,
-        Site::GpuUpload,
-        Site::PngEncode,
-        Site::JpegEncode,
-        Site::FrameClone,
-        Site::FrameCow,
-        Site::ZeroFill,
-        Site::GvspAssemble,
-        Site::Intermediate,
-        Site::Crop,
-        Site::StillCopy,
-        Site::OutputCopy,
+    pub(crate) const ALL: [Self; 25] = [
+        Self::GvspReceive,
+        Self::PipeRead,
+        Self::PipeWrite,
+        Self::PipeSplice,
+        Self::FileWrite,
+        Self::StdoutWrite,
+        Self::StreamCopy,
+        Self::UsbAssemble,
+        Self::GvspFallback,
+        Self::GigeRowCompact,
+        Self::FfmpegUnpack,
+        Self::StillTransform,
+        Self::PreviewTransform,
+        Self::JetsonInput,
+        Self::GpuUpload,
+        Self::PngEncode,
+        Self::JpegEncode,
+        Self::FrameClone,
+        Self::FrameCow,
+        Self::ZeroFill,
+        Self::GvspAssemble,
+        Self::Intermediate,
+        Self::Crop,
+        Self::StillCopy,
+        Self::OutputCopy,
     ];
-    pub(crate) fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
-            Site::GvspReceive => "gvsp_receive",
-            Site::PipeRead => "pipe_read",
-            Site::PipeWrite => "pipe_write",
-            Site::PipeSplice => "pipe_splice",
-            Site::FileWrite => "file_write",
-            Site::StdoutWrite => "stdout_write",
-            Site::StreamCopy => "stream_copy",
-            Site::UsbAssemble => "usb_assemble",
-            Site::GvspFallback => "gvsp_fallback",
-            Site::GigeRowCompact => "gige_row_compact",
-            Site::FfmpegUnpack => "ffmpeg_unpack",
-            Site::StillTransform => "still_transform",
-            Site::PreviewTransform => "preview_transform",
-            Site::JetsonInput => "jetson_input",
-            Site::GpuUpload => "gpu_upload",
-            Site::PngEncode => "png_encode",
-            Site::JpegEncode => "jpeg_encode",
-            Site::FrameClone => "frame_clone",
-            Site::FrameCow => "frame_cow",
-            Site::ZeroFill => "zero_fill",
-            Site::GvspAssemble => "gvsp_assemble",
-            Site::Intermediate => "intermediate",
-            Site::Crop => "crop",
-            Site::StillCopy => "still_copy",
-            Site::OutputCopy => "output_copy",
+            Self::GvspReceive => "gvsp_receive",
+            Self::PipeRead => "pipe_read",
+            Self::PipeWrite => "pipe_write",
+            Self::PipeSplice => "pipe_splice",
+            Self::FileWrite => "file_write",
+            Self::StdoutWrite => "stdout_write",
+            Self::StreamCopy => "stream_copy",
+            Self::UsbAssemble => "usb_assemble",
+            Self::GvspFallback => "gvsp_fallback",
+            Self::GigeRowCompact => "gige_row_compact",
+            Self::FfmpegUnpack => "ffmpeg_unpack",
+            Self::StillTransform => "still_transform",
+            Self::PreviewTransform => "preview_transform",
+            Self::JetsonInput => "jetson_input",
+            Self::GpuUpload => "gpu_upload",
+            Self::PngEncode => "png_encode",
+            Self::JpegEncode => "jpeg_encode",
+            Self::FrameClone => "frame_clone",
+            Self::FrameCow => "frame_cow",
+            Self::ZeroFill => "zero_fill",
+            Self::GvspAssemble => "gvsp_assemble",
+            Self::Intermediate => "intermediate",
+            Self::Crop => "crop",
+            Self::StillCopy => "still_copy",
+            Self::OutputCopy => "output_copy",
         }
     }
-    pub(crate) fn class(self) -> Class {
+    pub(crate) const fn class(self) -> Class {
         match self {
-            Site::GvspReceive
-            | Site::PipeRead
-            | Site::PipeWrite
-            | Site::PipeSplice
-            | Site::FileWrite
-            | Site::StdoutWrite
-            | Site::StreamCopy => Class::Boundary,
-            Site::UsbAssemble | Site::GvspFallback | Site::GigeRowCompact | Site::GpuUpload => {
+            Self::GvspReceive
+            | Self::PipeRead
+            | Self::PipeWrite
+            | Self::PipeSplice
+            | Self::FileWrite
+            | Self::StdoutWrite
+            | Self::StreamCopy => Class::Boundary,
+            Self::UsbAssemble | Self::GvspFallback | Self::GigeRowCompact | Self::GpuUpload => {
                 Class::Necessary
             }
-            Site::FfmpegUnpack
-            | Site::StillTransform
-            | Site::PreviewTransform
-            | Site::JetsonInput
-            | Site::PngEncode
-            | Site::JpegEncode => Class::Transform,
-            Site::FrameClone
-            | Site::FrameCow
-            | Site::ZeroFill
-            | Site::GvspAssemble
-            | Site::Intermediate
-            | Site::Crop
-            | Site::StillCopy
-            | Site::OutputCopy => Class::Avoidable,
+            Self::FfmpegUnpack
+            | Self::StillTransform
+            | Self::PreviewTransform
+            | Self::JetsonInput
+            | Self::PngEncode
+            | Self::JpegEncode => Class::Transform,
+            Self::FrameClone
+            | Self::FrameCow
+            | Self::ZeroFill
+            | Self::GvspAssemble
+            | Self::Intermediate
+            | Self::Crop
+            | Self::StillCopy
+            | Self::OutputCopy => Class::Avoidable,
         }
     }
 }
 
 impl Class {
-    pub(crate) fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
-            Class::Boundary => "boundary",
-            Class::Necessary => "necessary",
-            Class::Transform => "transform",
-            Class::Avoidable => "avoidable",
+            Self::Boundary => "boundary",
+            Self::Necessary => "necessary",
+            Self::Transform => "transform",
+            Self::Avoidable => "avoidable",
         }
     }
 }
@@ -230,6 +235,7 @@ mod audit {
     pub(super) static FRAMES: AtomicU64 = AtomicU64::new(0);
     static CALLS: [AtomicU64; Site::ALL.len()] = [const { AtomicU64::new(0) }; Site::ALL.len()];
     static BYTES: [AtomicU64; Site::ALL.len()] = [const { AtomicU64::new(0) }; Site::ALL.len()];
+    static REPORT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     pub(super) fn record(site: Site, bytes: usize) {
         CALLS[site as usize].fetch_add(1, Ordering::Relaxed);
@@ -269,14 +275,54 @@ mod audit {
         };
         let path =
             std::path::Path::new(&folder).join(format!("{role}-{}.json", std::process::id()));
+        if let Err(error) = write_report(&path) {
+            crate::eprintln!("capturefab: copy report {}: {error}", path.display());
+        }
+    }
+
+    #[deny(clippy::panic_in_result_fn)]
+    fn write_report(path: &std::path::Path) -> std::io::Result<()> {
+        // Replies and job completions can report on different threads. Hold
+        // the lock through snapshot and publication so their shared temporary
+        // path cannot collide or publish an older snapshot after a newer one.
+        let _report = REPORT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // A reader never sees half a report: it is renamed into place.
         let partial = path.with_extension("json.partial");
-        let written = serde_json::to_vec(&counts())
-            .map_err(std::io::Error::from)
-            .and_then(|bytes| std::fs::write(&partial, bytes))
-            .and_then(|()| std::fs::rename(&partial, &path));
-        if let Err(error) = written {
-            crate::eprintln!("capturefab: copy report {}: {error}", path.display());
+        let bytes = serde_json::to_vec(&counts())?;
+        std::fs::write(&partial, bytes)?;
+        std::fs::rename(&partial, path)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn concurrent_reports_publish_complete_json_without_losing_the_partial_file() {
+            let folder = std::env::temp_dir().join(format!(
+                "capturefab-report-race-{}-{}",
+                std::process::id(),
+                crate::types::random_hex(8).unwrap()
+            ));
+            std::fs::create_dir(&folder).unwrap();
+            let path = folder.join("worker.json");
+            let start = std::sync::Barrier::new(8);
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    scope.spawn(|| {
+                        start.wait();
+                        for _ in 0..32 {
+                            write_report(&path).unwrap();
+                            let report: Value =
+                                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                            assert!(report["sites"].is_object());
+                        }
+                    });
+                }
+            });
+            std::fs::remove_dir_all(folder).unwrap();
         }
     }
 }
@@ -304,7 +350,10 @@ const SIZE_CLASSES: usize = 24;
 #[cfg(feature = "copy-audit")]
 fn size_class(size: usize) -> usize {
     let first = LARGE.trailing_zeros();
-    (size.next_power_of_two().trailing_zeros() - first).min(SIZE_CLASSES as u32 - 1) as usize
+    let power = usize::BITS - (size - 1).leading_zeros();
+    usize::try_from(power - first)
+        .expect("a logarithmic size class fits usize")
+        .min(SIZE_CLASSES - 1)
 }
 
 /// The large allocations so far: how many, their bytes, the largest, and
@@ -319,7 +368,8 @@ pub(crate) fn large_allocations() -> serde_json::Value {
         .enumerate()
         .map(|(class, count)| {
             (
-                (LARGE << class).to_string(),
+                (u64::try_from(LARGE).expect("the large-allocation threshold fits u64") << class)
+                    .to_string(),
                 count.load(Ordering::Relaxed).into(),
             )
         })
@@ -335,7 +385,7 @@ pub(crate) fn large_allocations() -> serde_json::Value {
 /// The system allocator, counting the allocations and reallocations of at
 /// least [`LARGE`] bytes.
 #[cfg(feature = "copy-audit")]
-pub struct Counting;
+pub(crate) struct Counting;
 
 #[cfg(feature = "copy-audit")]
 impl Counting {
@@ -381,6 +431,26 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "copy-audit")]
+    #[test]
+    fn allocation_classes_cover_boundaries_without_rounding_overflow() {
+        for (size, class) in [
+            (LARGE, 0),
+            (LARGE + 1, 1),
+            (2 * LARGE, 1),
+            (2 * LARGE + 1, 2),
+        ] {
+            assert_eq!(size_class(size), class, "size {size}");
+        }
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(size_class(usize::MAX), SIZE_CLASSES - 1);
+        #[cfg(target_pointer_width = "32")]
+        assert_eq!(size_class(usize::MAX), 14);
+        // Report labels cover all configured classes even on 32-bit hosts.
+        let report = large_allocations();
+        assert!(report["sizes"].get((1u64 << 41).to_string()).is_some());
+    }
     #[test]
     fn every_site_has_one_name_and_class() {
         let mut names: Vec<_> = Site::ALL.iter().map(|site| site.name()).collect();

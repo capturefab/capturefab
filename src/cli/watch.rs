@@ -22,7 +22,7 @@ use std::{
 };
 
 #[derive(Debug, Args)]
-pub struct WatchArgs {
+pub(crate) struct WatchArgs {
     #[command(flatten)]
     pub camera: CameraArg,
     /// Time between measurements, 50ms or more
@@ -52,7 +52,7 @@ const SETTINGS_EVERY: Duration = Duration::from_secs(1);
 /// Rows the measurements take above a picture, and below it.
 const TEXT_ROWS: u16 = 5;
 
-pub fn run(global: &Global, args: WatchArgs) -> Result<Option<Report>> {
+pub(super) fn run(global: &Global, args: &WatchArgs) -> Result<Option<Report>> {
     if args.every < MIN_EVERY {
         return Err(Usage("--every is at least 50ms".into()).into());
     }
@@ -93,7 +93,7 @@ pub fn run(global: &Global, args: WatchArgs) -> Result<Option<Report>> {
     let mut paused = None;
     let watched = Watch {
         client: &client,
-        args: &args,
+        args,
         live,
         graphics,
         sender,
@@ -213,8 +213,8 @@ impl Watch<'_> {
                 Ok(_) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
-        if let Some(view) = view {
-            view.finish();
+        if view.is_some() {
+            let _ = std::io::stdout().flush();
         }
         Ok(())
     }
@@ -364,9 +364,6 @@ impl View {
         self.rows = drawn;
         block
     }
-    fn finish(self) {
-        let _ = std::io::stdout().flush();
-    }
 }
 
 /// The measurements as a person reads them.
@@ -446,7 +443,7 @@ fn exposure_text(us: f64) -> String {
 }
 
 /// Fields of each line, for `schema`.
-pub const FIELDS: &[(&str, &str)] = &[
+pub(super) const FIELDS: &[(&str, &str)] = &[
     (
         "t",
         "float — seconds since watching began; one JSON line each --every (a terminal shows them redrawn instead)",

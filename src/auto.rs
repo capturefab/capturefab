@@ -1,18 +1,21 @@
+#![forbid(unsafe_code)]
+#![deny(clippy::missing_const_for_fn)]
 use crate::controls::has_choice;
 use crate::{
     camera::Camera,
     genicam::Bounds,
     types::{Frame, Transport, TransportStats},
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, VecDeque},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AutoChange {
     pub time: String,
     pub feature: String,
@@ -74,13 +77,23 @@ pub struct Meter {
 }
 
 #[cfg(any(test, feature = "testing"))]
+#[must_use]
 pub fn meter(frame: &Frame) -> Option<Meter> {
     meter_in(crate::frame::FrameRef::whole(frame))
+}
+
+/// Round a native peak to an eight-bit histogram bin. `max` is the
+/// positive full scale of an eight- to sixteen-bit component.
+#[deny(clippy::cast_precision_loss)]
+fn peak_bin(peak: u16, max: u32) -> u8 {
+    u8::try_from((u32::from(peak).min(max) * 255 + max / 2) / max)
+        .expect("normalized peak fits eight bits")
 }
 
 /// `meter` of a view. A meter only reads its sampling grid: packed mono and
 /// Bayer samples, wide color components and other layouts are decoded
 /// there, where they lie, without a full-sized temporary image.
+#[deny(clippy::cast_precision_loss)]
 pub(crate) fn meter_in(view: crate::frame::FrameRef<'_>) -> Option<Meter> {
     use crate::frame::{Pixels, native_sample};
     let frame = view.frame;
@@ -118,9 +131,10 @@ pub(crate) fn meter_in(view: crate::frame::FrameRef<'_>) -> Option<Meter> {
     if gw == 0 || gh == 0 {
         return None;
     }
-    let scale = ((1u32 << bits) - 1) as f64;
+    let max = (1u32 << bits) - 1;
+    let scale = f64::from(max);
     let (x0, y0) = (view.x0, view.y0);
-    let sample = |x: usize, y: usize| f64::from(native_sample(frame, x0 + x, y0 + y));
+    let sample = |x: usize, y: usize| native_sample(frame, x0 + x, y0 + y);
     let (mut sum, mut count, mut histogram) = (0.0, 0u32, [0u32; 256]);
     for i in crate::frame::sample_indices(gw * gh, 16_384) {
         let (x, y) = (i % gw, i / gw);
@@ -133,42 +147,45 @@ pub(crate) fn meter_in(view: crate::frame::FrameRef<'_>) -> Option<Meter> {
                 sample(x + 1, y + 1),
             ];
             (
-                q.iter().sum::<f64>() / 4.0,
-                q.into_iter().fold(0.0, f64::max),
+                f64::from(q.into_iter().map(u32::from).sum::<u32>()) / 4.0,
+                q.into_iter().fold(0, u16::max),
             )
         } else if bytes == 3 {
             let [r, g, b] = if color_bits.is_some() {
-                pixels.native_color(x, y)?.0.map(f64::from)
+                pixels.native_color(x, y)?.0
             } else if decoded {
-                pixels.at(x, y).map(f64::from)
+                pixels.at(x, y).map(u16::from)
             } else {
                 let i = 3 * ((y0 + y) * frame.width as usize + x0 + x);
-                [frame.data[i], frame.data[i + 1], frame.data[i + 2]].map(f64::from)
+                [frame.data[i], frame.data[i + 1], frame.data[i + 2]].map(u16::from)
             };
-            ((r + 2.0 * g + b) / 4.0, r.max(g).max(b))
+            (
+                f64::from(u32::from(r) + 2 * u32::from(g) + u32::from(b)) / 4.0,
+                r.max(g).max(b),
+            )
         } else {
             let v = if decoded {
-                f64::from(pixels.at(x, y)[0])
+                u16::from(pixels.at(x, y)[0])
             } else {
                 sample(x, y)
             };
-            (v, v)
+            (f64::from(v), v)
         };
         sum += (luma / scale).min(1.0);
         count += 1;
-        histogram[((peak / scale).min(1.0) * 255.0).round() as usize] += 1;
+        histogram[usize::from(peak_bin(peak, max))] += 1;
     }
     let mut seen = 0;
     let p99 = histogram
         .iter()
         .position(|n| {
             seen += n;
-            seen as f64 >= 0.99 * count as f64
+            f64::from(seen) >= 0.99 * f64::from(count)
         })
         .unwrap_or(255);
     Some(Meter {
-        mean: (sum / count as f64).max(1.0 / 1024.0),
-        p99: p99 as f64 / 255.0,
+        mean: (sum / f64::from(count)).max(1.0 / 1024.0),
+        p99: f64::from(u8::try_from(p99).expect("a 256-bin histogram index fits u8")) / 255.0,
     })
 }
 
@@ -181,7 +198,7 @@ pub(crate) fn error(m: Meter) -> f64 {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct Caps {
+pub(crate) struct Caps {
     pub exposure: Option<&'static str>,
     pub exposure_bounds: Bounds,
     pub exposure_floor: Option<f64>,
@@ -218,34 +235,37 @@ pub struct Caps {
 impl Caps {
     /// A gain reading in dB.
     fn gain_db(&self, raw: f64) -> f64 {
-        match self.gain_linear {
-            true => 20.0 * raw.log10(),
-            false => raw,
+        if self.gain_linear {
+            20.0 * raw.log10()
+        } else {
+            raw
         }
     }
     /// The camera's gain value for `db`.
     fn gain_raw(&self, db: f64) -> f64 {
-        match self.gain_linear {
-            true => 10f64.powf(db / 20.0),
-            false => db,
+        if self.gain_linear {
+            10f64.powf(db / 20.0)
+        } else {
+            db
         }
     }
     /// Gain bounds in dB. A multiplier's step has no fixed size in dB.
     fn gain_bounds_db(&self, camera: &mut Camera) -> Bounds {
         let b = bounds(camera, self.gain);
-        match self.gain_linear {
-            true => Bounds {
+        if self.gain_linear {
+            Bounds {
                 min: b.min.map(|v| self.gain_db(v)).and_then(finite),
                 max: b.max.map(|v| self.gain_db(v)).and_then(finite),
                 inc: None,
-            },
-            false => b,
+            }
+        } else {
+            b
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct Policy {
+pub(crate) struct Policy {
     pub fps_max: f64,
     pub fps_floor: f64,
     pub fps_target: Option<f64>,
@@ -259,7 +279,7 @@ fn margin(period: f64) -> f64 {
     (0.02 * period).max(100.0)
 }
 
-pub fn policy(caps: &Caps, balance: f64) -> Policy {
+pub(crate) fn policy(caps: &Caps, balance: f64) -> Policy {
     let fps_link = match (caps.link, caps.payload) {
         (Some(c), Some(p)) if c.is_finite() && c > 0.0 && p.is_finite() && p > 0.0 => {
             0.92 * c / (1.05 * p)
@@ -300,12 +320,18 @@ pub fn policy(caps: &Caps, balance: f64) -> Policy {
     }
 }
 
-pub fn mode_score(pixels: f64, fps: f64, pixels_max: f64, fps_max: f64, balance: f64) -> f64 {
+pub(crate) fn mode_score(
+    pixels: f64,
+    fps: f64,
+    pixels_max: f64,
+    fps_max: f64,
+    balance: f64,
+) -> f64 {
     (1.0 - balance) * (pixels / pixels_max).log2() + balance * (fps / fps_max).log2()
 }
 
 #[derive(Debug, Clone)]
-pub struct Aimd {
+pub(crate) struct Aimd {
     pub limit: f64,
     pub floor: f64,
     pub cap: f64,
@@ -318,7 +344,7 @@ pub struct Aimd {
 }
 
 impl Aimd {
-    pub fn new(limit: f64, floor: f64, cap: f64, step: f64, jitter: f64) -> Self {
+    pub(crate) fn new(limit: f64, floor: f64, cap: f64, step: f64, jitter: f64) -> Self {
         Self {
             limit,
             floor,
@@ -331,10 +357,16 @@ impl Aimd {
             last_loss: None,
         }
     }
-    pub fn holding(&self, now: Instant) -> bool {
+    pub(crate) fn holding(&self, now: Instant) -> bool {
         self.hold_until.is_some_and(|t| now < t)
     }
-    pub fn step(&mut self, now: Instant, usage: f64, loss: bool, probe: bool) -> Option<f64> {
+    pub(crate) fn step(
+        &mut self,
+        now: Instant,
+        usage: f64,
+        loss: bool,
+        probe: bool,
+    ) -> Option<f64> {
         let since_loss = self.last_loss.map(|t| now.saturating_duration_since(t));
         if since_loss.is_some_and(|d| d >= 300 * SECOND) {
             self.hold = 10 * SECOND;
@@ -395,7 +427,7 @@ struct WhiteBalance {
 }
 
 #[derive(Clone, Default)]
-pub struct AutoController {
+pub(crate) struct AutoController {
     status: AutoStatus,
     /// Image quality (0) against frame rate (1): `BALANCE`.
     balance: f64,
@@ -442,7 +474,7 @@ pub struct AutoController {
 }
 
 impl AutoController {
-    pub fn enter(camera: &mut Camera) -> Result<Self> {
+    pub(crate) fn enter(camera: &mut Camera) -> Result<Self> {
         Self::enter_with(camera, BALANCE)
     }
     /// `enter`, weighing image quality (0) against frame rate (1) as
@@ -468,7 +500,7 @@ impl AutoController {
                 ..Default::default()
             },
             balance,
-            jitter: (hash % 1000) as f64 / 4000.0,
+            jitter: f64::from(hash % 1000) / 4000.0,
             ..Default::default()
         };
         controller
@@ -490,7 +522,7 @@ impl AutoController {
     /// Meter only `region` of the frame, and keep exposure at most
     /// `max_exposure` microseconds, raising gain instead, as against motion
     /// blur.
-    pub fn set_limits(
+    pub(crate) fn set_limits(
         &mut self,
         camera: &mut Camera,
         region: Option<[f64; 4]>,
@@ -508,7 +540,7 @@ impl AutoController {
         }
         Ok(())
     }
-    pub fn set_forward_fps(&mut self, fps: Option<f64>) -> Result<()> {
+    pub(crate) fn set_forward_fps(&mut self, fps: Option<f64>) -> Result<()> {
         ensure!(
             fps.is_none_or(|fps| fps.is_finite() && fps > 0.0),
             "forwarding frame rate must be a finite number greater than zero"
@@ -519,7 +551,7 @@ impl AutoController {
         }
         Ok(())
     }
-    pub fn observe(&mut self, frame: &Frame, now: Instant) {
+    pub(crate) fn observe(&mut self, frame: &Frame, now: Instant) {
         if let Some(last) = self.last_frame {
             let dt = now.saturating_duration_since(last).as_secs_f64();
             self.period = Some(self.period.map_or(dt, |p| 0.9 * p + 0.1 * dt));
@@ -537,13 +569,13 @@ impl AutoController {
         }
         self.last_meter = Some(now);
         // A region is metered where it lies, as `inspect` measures it.
-        let view = match self.region {
-            Some(region) => {
+        let view = self.region.map_or_else(
+            || crate::frame::FrameRef::whole(frame),
+            |region| {
                 let px = crate::inspect::region_pixels(region, frame.width, frame.height);
                 crate::frame::FrameRef::region(frame, crate::inspect::crop_rect(frame, px))
-            }
-            None => crate::frame::FrameRef::whole(frame),
-        };
+            },
+        );
         let Some(m) = meter_in(view) else {
             self.unmetered = true;
             return;
@@ -566,7 +598,7 @@ impl AutoController {
         self.p99 = m.p99;
         self.status.brightness = finite(m.mean);
     }
-    pub fn tick(&mut self, camera: &mut Camera, now: Instant) -> bool {
+    pub(crate) fn tick(&mut self, camera: &mut Camera, now: Instant) -> bool {
         let stall = Duration::from_secs_f64(3.0 * self.period.unwrap_or(0.0))
             .max(Duration::from_millis(250));
         // A stopped camera is ticked rarely and has no measurements to spoil.
@@ -615,23 +647,23 @@ impl AutoController {
         }
         false
     }
-    pub fn invalidate(&mut self) {
+    pub(crate) const fn invalidate(&mut self) {
         self.stale = true;
         self.reprobe = true;
     }
-    pub fn manages(&self, feature: &str) -> bool {
+    pub(crate) fn manages(&self, feature: &str) -> bool {
         self.status.managed.iter().any(|f| f == feature)
     }
-    pub fn converged(&self) -> bool {
+    pub(crate) fn converged(&self) -> bool {
         self.unmetered || matches!(self.status.state.as_str(), "stable" | "limited")
     }
-    pub fn status(&self) -> &AutoStatus {
+    pub(crate) const fn status(&self) -> &AutoStatus {
         &self.status
     }
-    pub fn values(&self) -> &BTreeMap<String, Value> {
+    pub(crate) const fn values(&self) -> &BTreeMap<String, Value> {
         &self.values
     }
-    pub fn choose_video_mode(&mut self, camera: &mut Camera) {
+    pub(crate) fn choose_video_mode(&mut self, camera: &mut Camera) {
         if !self.caps.video_mode {
             return;
         }
@@ -662,7 +694,7 @@ impl AutoController {
                 .context("camera lists no video modes")?;
             self.set_mode(
                 camera,
-                json!(best.0),
+                &json!(best.0),
                 Some("video mode for image quality and frame rate"),
             )
         });
@@ -671,7 +703,7 @@ impl AutoController {
             Err(e) => self.note("video-mode", format!("video mode unchanged: {e:#}")),
         }
     }
-    pub fn release(mut self, camera: &mut Camera, revert: bool) -> Result<()> {
+    pub(crate) fn release(mut self, camera: &mut Camera, revert: bool) -> Result<()> {
         if !revert {
             return hold(camera);
         }
@@ -816,13 +848,13 @@ impl AutoController {
             self.caps.gain_auto,
             self.caps.white_auto,
         ] = AUTOS.map(|f| {
-            self.find(camera, &[[f]])
+            self.find(camera, std::iter::once([f]))
                 .map(|[f]| f)
                 .filter(|f| has_choice(camera, f, "Continuous"))
         });
         self.caps.exposure_limits = self.find(
             camera,
-            &[
+            [
                 ["AutoExposureTimeLowerLimit", "AutoExposureTimeUpperLimit"],
                 [
                     "AutoExposureTimeAbsLowerLimit",
@@ -834,7 +866,8 @@ impl AutoController {
                 ],
                 ["ExposureAutoMin", "ExposureAutoMax"],
                 ["AutoExposureTimeMin", "AutoExposureTimeMax"],
-            ],
+            ]
+            .into_iter(),
         );
         self.caps.exposure_floor = self
             .caps
@@ -842,12 +875,13 @@ impl AutoController {
             .and_then(|[f, _]| camera.bounds(f).ok()?.min);
         self.caps.gain_limits = self.find(
             camera,
-            &[
+            [
                 ["AutoGainLowerLimit", "AutoGainUpperLimit"],
                 ["AutoExposureGainLowerLimit", "AutoExposureGainUpperLimit"],
                 ["GainAutoMin", "GainAutoMax"],
                 ["AutoGainMin", "AutoGainMax"],
-            ],
+            ]
+            .into_iter(),
         );
         self.caps.profile = [
             ["AutoFunctionProfile", "MinimizeGain"],
@@ -874,11 +908,12 @@ impl AutoController {
             self.caps.frame_rate_enable = self
                 .find(
                     camera,
-                    &[
+                    [
                         ["AcquisitionFrameRateEnable"],
                         ["AcquisitionFrameRateEnabled"],
                         ["AcquisitionFrameRateMode"],
-                    ],
+                    ]
+                    .into_iter(),
                 )
                 .map(|[f]| f);
             // Point Grey cameras before the Blackfly S drive the rate
@@ -902,7 +937,7 @@ impl AutoController {
             .and_then(|f| camera.bounds(f).ok()?.max);
         self.caps.sensor_fps = read_any(camera, &["SensorReadoutTime", "ReadoutTimeAbs"])
             .and_then(|(_, v)| (v > 0.0).then(|| 1e6 / v))
-            .or(rate_max.filter(|m| *m <= 10_000.0));
+            .or_else(|| rate_max.filter(|m| *m <= 10_000.0));
         self.caps.resulting_fps = [
             "BslResultingAcquisitionFrameRate",
             "ResultingFrameRate",
@@ -915,7 +950,7 @@ impl AutoController {
         self.caps.throughput = self
             .find(
                 camera,
-                &[["DeviceLinkThroughputLimit"], ["StreamBytesPerSecond"]],
+                [["DeviceLinkThroughputLimit"], ["StreamBytesPerSecond"]].into_iter(),
             )
             .map(|[f]| f);
         // Allied Vision paces by StreamBytesPerSecond only in this mode or
@@ -974,8 +1009,8 @@ impl AutoController {
         Ok(())
     }
     /// The first of `options` that is writable, or that the camera locks
-    /// only until one of `releases` is written, such as ExposureTime while
-    /// ExposureAuto runs or AcquisitionFrameRate while its enable is off.
+    /// only until one of `releases` is written, such as `ExposureTime` while
+    /// `ExposureAuto` runs or `AcquisitionFrameRate` while its enable is off.
     fn find_unlockable(
         &mut self,
         camera: &mut Camera,
@@ -986,22 +1021,18 @@ impl AutoController {
             .iter()
             .copied()
             .find(|f| camera.has(f) && (camera.is_writable(f) || unlockable(camera, f, releases)));
-        found.or_else(|| {
-            let options: Vec<_> = options.iter().map(|f| [*f]).collect();
-            self.find(camera, &options).map(|[f]| f)
-        })
+        found.or_else(|| self.find(camera, options.iter().map(|f| [*f])).map(|[f]| f))
     }
     fn find<const N: usize>(
         &mut self,
         camera: &mut Camera,
-        options: &[[&'static str; N]],
+        mut options: impl Iterator<Item = [&'static str; N]> + Clone,
     ) -> Option<[&'static str; N]> {
         let found = options
-            .iter()
-            .copied()
+            .clone()
             .find(|o| o.iter().all(|f| camera.has(f) && camera.is_writable(f)));
         if found.is_none()
-            && let Some(o) = options.iter().find(|o| o.iter().all(|f| camera.has(f)))
+            && let Some(o) = options.find(|o| o.iter().all(|f| camera.has(f)))
         {
             self.note(
                 o[0],
@@ -1061,7 +1092,7 @@ impl AutoController {
         }
         self.plan_bandwidth(camera, &c, p);
         for (feature, value, reason) in std::mem::take(&mut self.failed) {
-            if let Err(e) = self.write(camera, &feature, value, Some(reason)) {
+            if let Err(e) = self.write(camera, &feature, &value, Some(reason)) {
                 self.reject(&feature, &e);
             }
         }
@@ -1069,8 +1100,10 @@ impl AutoController {
             "video-mode" => video_mode_fps(camera),
             _ => p.fps_target.and_then(finite),
         };
-        self.status.exposure_limits_us = c.exposure.and(range(p.exposure_lower, p.exposure_cap));
-        self.status.gain_limits_db = c.gain.and(range(p.gain_min, p.gain_cap));
+        self.status.exposure_limits_us = c
+            .exposure
+            .and_then(|_| range(p.exposure_lower, p.exposure_cap));
+        self.status.gain_limits_db = c.gain.and_then(|_| range(p.gain_min, p.gain_cap));
         match c.forward_fps {
             Some(f) if p.fps_max < f => self.note(
                 "forward",
@@ -1129,9 +1162,10 @@ impl AutoController {
                     if let Some(auto) = auto {
                         self.apply(camera, auto, json!("Off"), "Capturefab steps gain");
                     }
-                    let start = match self.planned {
-                        true => self.status.gain_db.unwrap_or(p.gain_min),
-                        false => p.gain_min,
+                    let start = if self.planned {
+                        self.status.gain_db.unwrap_or(p.gain_min)
+                    } else {
+                        p.gain_min
                     };
                     let start = start.min(p.gain_cap).max(p.gain_min);
                     self.apply(
@@ -1154,7 +1188,7 @@ impl AutoController {
                 && let Err(e) = self.write(
                     camera,
                     auto,
-                    json!("Off"),
+                    &json!("Off"),
                     Some("hold white balance while reading its original values"),
                 )
             {
@@ -1320,7 +1354,7 @@ impl AutoController {
         });
     }
     /// Switch the frame-rate limiter on before writing a rate: SFNC
-    /// cameras keep AcquisitionFrameRate read-only while it is off.
+    /// cameras keep `AcquisitionFrameRate` read-only while it is off.
     fn rate_on(&mut self, camera: &mut Camera, c: &Caps, reason: &'static str) {
         if let Some(auto) = c.frame_rate_auto {
             self.apply(camera, auto, json!("Off"), reason);
@@ -1337,10 +1371,7 @@ impl AutoController {
         reason: &'static str,
     ) {
         self.own(feature);
-        if self
-            .write(camera, feature, value.clone(), Some(reason))
-            .is_err()
-        {
+        if self.write(camera, feature, &value, Some(reason)).is_err() {
             self.failed.push((feature.into(), value, reason));
         }
     }
@@ -1360,7 +1391,7 @@ impl AutoController {
         &mut self,
         camera: &mut Camera,
         feature: &str,
-        target: Value,
+        target: &Value,
         reason: Option<&str>,
     ) -> Result<Value> {
         self.own(feature);
@@ -1378,7 +1409,7 @@ impl AutoController {
             && self.values.get(auto).is_none_or(|v| v != "Off")
         {
             let why = reason.unwrap_or("Capturefab sets the value itself");
-            self.write(camera, auto, json!("Off"), Some(why))?;
+            self.write(camera, auto, &json!("Off"), Some(why))?;
         }
         let current = camera.get(feature)?;
         let integer = current.is_i64() || current.is_u64();
@@ -1386,27 +1417,27 @@ impl AutoController {
             let value = match target.as_f64() {
                 Some(v) => {
                     let mut b = camera.bounds(feature).unwrap_or_default();
-                    b.inc = b.inc.or(integer.then_some(1.0));
+                    b.inc = b.inc.or_else(|| integer.then_some(1.0));
                     let q = quantize(v, b, f64::round);
                     let same = |c: f64| (c - q).abs() <= 1e-9 * q.abs().max(1.0);
                     if current.as_f64().is_some_and(same) {
                         self.record(feature, current.clone());
                         return Ok(current);
                     }
-                    json!(q)
+                    Cow::Owned(json!(q))
                 }
-                None if current == target => {
+                None if &current == target => {
                     self.record(feature, current.clone());
                     return Ok(current);
                 }
-                None => target.clone(),
+                None => Cow::Borrowed(target),
             };
             if !self.originals.iter().any(|(f, _)| f == feature) {
                 self.originals.push((feature.into(), current.clone()));
             }
             match camera.set(feature, &text(&value)) {
                 Ok(()) => break,
-                Err(e) if attempt == 0 && retryable(&e) => continue,
+                Err(e) if attempt == 0 && retryable(&e) => {}
                 Err(e) => return Err(e),
             }
         }
@@ -1445,19 +1476,19 @@ impl AutoController {
     }
     fn restore(&mut self, camera: &mut Camera, feature: &str, value: &Value) -> Result<Value> {
         match feature {
-            "VideoMode" => self.set_mode(camera, value.clone(), None),
-            _ => self.write(camera, feature, value.clone(), None),
+            "VideoMode" => self.set_mode(camera, value, None),
+            _ => self.write(camera, feature, value, None),
         }
     }
     fn set_mode(
         &mut self,
         camera: &mut Camera,
-        mode: Value,
+        mode: &Value,
         reason: Option<&str>,
     ) -> Result<Value> {
         self.own("VideoMode");
         let old = camera.get("VideoMode")?;
-        if old == mode {
+        if &old == mode {
             return Ok(old);
         }
         let streaming = camera.is_streaming();
@@ -1566,7 +1597,7 @@ impl AutoController {
         if self.samples.len() < 3 {
             return Ok(());
         }
-        let mut sorted: Vec<f64> = self.samples.iter().copied().collect();
+        let mut sorted = [self.samples[0], self.samples[1], self.samples[2]];
         sorted.sort_by(f64::total_cmp);
         let e = sorted[1];
         if e.abs() < settle || !(self.correcting || e.abs() > correct) {
@@ -1641,7 +1672,7 @@ impl AutoController {
             self.write(
                 camera,
                 f,
-                json!(self.caps.gain_raw(value)),
+                &json!(self.caps.gain_raw(value)),
                 Some("gain adjusted for brightness"),
             )?;
         }
@@ -1669,19 +1700,19 @@ impl AutoController {
                 .and_then(Value::as_f64)
                 .is_some_and(|fps| fps > 1e6 / value)
         {
-            self.write(camera, r, json!(1e6 / value), None)?;
+            self.write(camera, r, &json!(1e6 / value), None)?;
         }
         self.write(
             camera,
             f,
-            json!(value),
+            &json!(value),
             Some("exposure adjusted for brightness"),
         )?;
         if let Some(r) = rate
             && value < old
             && let Some(max) = bounds(camera, Some(r)).max
         {
-            self.write(camera, r, json!(max), None)?;
+            self.write(camera, r, &json!(max), None)?;
         }
         Ok(())
     }
@@ -1770,7 +1801,7 @@ impl AutoController {
                 self.status.exposure_limits_us = range(p.exposure_lower, self.policy.exposure_cap);
                 let cap = json!(self.policy.exposure_cap);
                 let why = "exposure limit fitted to the measured frame time";
-                return self.write(camera, upper, cap, Some(why)).map(drop);
+                return self.write(camera, upper, &cap, Some(why)).map(drop);
             }
         }
         let stepped = self.caps.gain.filter(|_| self.caps.profile.is_none());
@@ -1783,7 +1814,7 @@ impl AutoController {
                 .write(
                     camera,
                     f,
-                    raised,
+                    &raised,
                     Some("gain raised: exposure is at its limit"),
                 )
                 .map(drop);
@@ -1797,7 +1828,7 @@ impl AutoController {
                 .write(
                     camera,
                     f,
-                    lowered,
+                    &lowered,
                     Some("gain lowered: exposure has headroom"),
                 )
                 .map(drop);
@@ -1814,7 +1845,7 @@ impl AutoController {
             {
                 self.fw.lowered = true;
                 let why = "exposure lower limit at the camera minimum";
-                return self.write(camera, lower, json!(min), Some(why)).map(drop);
+                return self.write(camera, lower, &json!(min), Some(why)).map(drop);
             }
             self.limit("bright", BRIGHT);
             return Ok(());
@@ -1843,7 +1874,7 @@ impl AutoController {
             self.write(
                 camera,
                 f,
-                json!("Off"),
+                &json!("Off"),
                 Some("camera auto exposure stalled"),
             )?;
         }
@@ -1880,13 +1911,13 @@ impl AutoController {
                 || starved);
         let fps = self.period.filter(|p| *p > 0.0).map_or(0.0, |p| 1.0 / p);
         let bytes = 1.05 * self.caps.payload.unwrap_or(0.0);
-        let usage = match bw.fps {
-            true => fps,
-            false => self
-                .caps
+        let usage = if bw.fps {
+            fps
+        } else {
+            self.caps
                 .current_throughput
                 .and_then(|f| camera.get(f).ok()?.as_f64())
-                .unwrap_or(fps * bytes),
+                .unwrap_or(fps * bytes)
         };
         let bound = usage >= 0.85 * bw.aimd.limit;
         let settled = matches!(self.status.state.as_str(), "stable" | "limited");
@@ -1916,13 +1947,14 @@ impl AutoController {
         let Some(limit) = change else {
             return Ok(());
         };
-        let why = match loss {
-            true => "bandwidth reduced after frame loss",
-            false => "bandwidth raised: no frame loss",
+        let why = if loss {
+            "bandwidth reduced after frame loss"
+        } else {
+            "bandwidth raised: no frame loss"
         };
         if !limiter {
             return self
-                .write(camera, feature, json!(limit), Some(why))
+                .write(camera, feature, &json!(limit), Some(why))
                 .map(drop);
         }
         let enable = self
@@ -1932,14 +1964,14 @@ impl AutoController {
         let on = limit < cap || camera.network_budget_bytes_per_second().is_some();
         if !on {
             return self
-                .write(camera, enable, switch(enable, false), Some(why))
+                .write(camera, enable, &switch(enable, false), Some(why))
                 .map(drop);
         }
         if let Some(auto) = self.caps.frame_rate_auto {
-            self.write(camera, auto, json!("Off"), Some(why))?;
+            self.write(camera, auto, &json!("Off"), Some(why))?;
         }
-        self.write(camera, enable, switch(enable, true), Some(why))?;
-        self.write(camera, feature, json!(limit), Some(why))
+        self.write(camera, enable, &switch(enable, true), Some(why))?;
+        self.write(camera, feature, &json!(limit), Some(why))
             .map(drop)
     }
     fn limit(&mut self, key: &str, text: &str) {
@@ -1997,13 +2029,16 @@ impl AutoController {
     }
 }
 
-pub fn hold(camera: &mut Camera) -> Result<()> {
+pub(crate) fn hold(camera: &mut Camera) -> Result<()> {
     let mut result = Ok(());
     for f in AUTOS {
         if camera.has(f) && camera.is_writable(f) {
-            let off = camera.get(f).and_then(|v| match v == "Off" {
-                true => Ok(()),
-                false => camera.set(f, "Off"),
+            let off = camera.get(f).and_then(|v| {
+                if v == "Off" {
+                    Ok(())
+                } else {
+                    camera.set(f, "Off")
+                }
             });
             result = result.and(off);
         }
@@ -2011,10 +2046,10 @@ pub fn hold(camera: &mut Camera) -> Result<()> {
     result
 }
 
-/// Whether frames wait for a trigger: the FrameStart trigger, or a camera's
+/// Whether frames wait for a trigger: the `FrameStart` trigger, or a camera's
 /// only trigger, is On with a source other than the camera's own timing.
-/// Allied Vision cameras ship with TriggerMode On and TriggerSource Freerun,
-/// or FixedRate to run at AcquisitionFrameRateAbs.
+/// Allied Vision cameras ship with `TriggerMode` On and `TriggerSource` Freerun,
+/// or `FixedRate` to run at `AcquisitionFrameRateAbs`.
 pub(crate) fn frame_triggered(camera: &mut Camera) -> bool {
     let on = |camera: &mut Camera| {
         camera.get("TriggerMode").is_ok_and(|v| v == "On")
@@ -2124,6 +2159,7 @@ fn retryable(e: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
     use crate::types::{Backend, CameraInfo, MONO8, RGB8, RegisterIo};
+    use std::fmt::Write as _;
     use std::sync::{Arc, Mutex};
 
     fn frame(pixel_format: u32, width: u32, height: u32, data: Vec<u8>) -> Frame {
@@ -2156,6 +2192,19 @@ mod tests {
         }
         auto.set_forward_fps(None).unwrap();
         assert_eq!(auto.caps.forward_fps, None);
+    }
+
+    #[test]
+    fn integer_peak_bins_preserve_float_quantization_at_every_depth() {
+        for bits in [8, 10, 12, 14, 16] {
+            let max = (1u32 << bits) - 1;
+            for peak in 0..=u16::MAX {
+                let rounded = ((f64::from(peak) / f64::from(max)).min(1.0) * 255.0).round();
+                let expected =
+                    u8::try_from(crate::types::integral_float(rounded).unwrap()).unwrap();
+                assert_eq!(peak_bin(peak, max), expected, "{bits} bits, peak {peak}");
+            }
+        }
     }
 
     #[test]
@@ -2216,7 +2265,7 @@ mod tests {
                     for (x, &sample) in row.iter().enumerate() {
                         for bit in 0..bits {
                             packed[(x * bits + bit) / 8] |=
-                                ((sample >> bit) as u8 & 1) << ((x * bits + bit) % 8);
+                                (u8::from(sample & (1 << bit) != 0)) << ((x * bits + bit) % 8);
                         }
                     }
                     packed
@@ -2234,7 +2283,7 @@ mod tests {
             // Odd-width rows end inside a byte, and every sample retains
             // low bits that an 8-bit display conversion would discard.
             let samples: Vec<u16> = (0..20)
-                .map(|i| ((i * 317 + 179) & ((1 << bits) - 1)) as u16)
+                .map(|i| u16::try_from((i * 317 + 179) & ((1 << bits) - 1)).unwrap())
                 .collect();
             let mut source = frame(packed, 5, 4, pack(&samples, 5, bits));
             let whole = frame(
@@ -2277,8 +2326,13 @@ mod tests {
                             std::iter::repeat_n(value, channels)
                         })
                         .collect();
-                    let measured =
-                        meter(&frame(format, width as u32, height as u32, data)).unwrap();
+                    let measured = meter(&frame(
+                        format,
+                        u32::try_from(width).unwrap(),
+                        u32::try_from(height).unwrap(),
+                        data,
+                    ))
+                    .unwrap();
                     assert!(
                         (measured.mean - 0.5).abs() < 0.02,
                         "{format:08x}, pattern {pattern}, phase {phase}: {measured:?}"
@@ -2311,7 +2365,7 @@ mod tests {
             };
             let data = samples
                 .iter()
-                .flat_map(|&v| (v as u16).to_le_bytes())
+                .flat_map(|&v| u16::try_from(v).unwrap().to_le_bytes())
                 .collect();
             let actual = meter(&frame(format, 2, 1, data)).unwrap();
             let mean = f64::from(rgb[0] + 2 * rgb[1] + rgb[2]) / 4.0 / f64::from(max);
@@ -2356,7 +2410,7 @@ mod tests {
         let forwarding = policy(
             &Caps {
                 forward_fps: Some(5.0),
-                ..caps.clone()
+                ..caps
             },
             1.0,
         );
@@ -2464,12 +2518,12 @@ mod tests {
             )
         };
         let enumeration = |n: &str, a: u64, entries: &[(&str, u32)]| {
-            let entries: String = entries
-                .iter()
-                .map(|(e, v)| format!("<EnumEntry Name='{e}'><Value>{v}</Value></EnumEntry>"))
-                .collect();
+            let mut body = String::new();
+            for (e, v) in entries {
+                let _ = write!(body, "<EnumEntry Name='{e}'><Value>{v}</Value></EnumEntry>");
+            }
             format!(
-                "<Enumeration Name='{n}'>{entries}<pValue>{n}Reg</pValue></Enumeration><IntReg Name='{n}Reg'><Address>{a}</Address><Length>4</Length><AccessMode>RW</AccessMode></IntReg>"
+                "<Enumeration Name='{n}'>{body}<pValue>{n}Reg</pValue></Enumeration><IntReg Name='{n}Reg'><Address>{a}</Address><Length>4</Length><AccessMode>RW</AccessMode></IntReg>"
             )
         };
         let autos = [("Off", 0), ("Once", 1), ("Continuous", 2)];
@@ -2554,25 +2608,27 @@ mod tests {
                 model: "ace 2".into(),
                 serial: "12345678".into(),
                 address: None,
-                profile: Default::default(),
+                profile: crate::camera_profile::CameraProfile::default(),
             };
             Camera::from_backend(info, Box::new(self.clone())).unwrap()
         }
         fn f64(&self, a: u64) -> f64 {
+            let a = usize::try_from(a).unwrap();
             let m = self.memory.lock().unwrap();
-            f64::from_le_bytes(m[a as usize..a as usize + 8].try_into().unwrap())
+            f64::from_le_bytes(m[a..a + 8].try_into().unwrap())
         }
         fn u32(&self, a: u64) -> u32 {
+            let a = usize::try_from(a).unwrap();
             let m = self.memory.lock().unwrap();
-            u32::from_le_bytes(m[a as usize..a as usize + 4].try_into().unwrap())
+            u32::from_le_bytes(m[a..a + 4].try_into().unwrap())
         }
         fn set_f64(&self, a: u64, v: f64) {
-            self.memory.lock().unwrap()[a as usize..a as usize + 8]
-                .copy_from_slice(&v.to_le_bytes());
+            let a = usize::try_from(a).unwrap();
+            self.memory.lock().unwrap()[a..a + 8].copy_from_slice(&v.to_le_bytes());
         }
         fn set_u32(&self, a: u64, v: u32) {
-            self.memory.lock().unwrap()[a as usize..a as usize + 4]
-                .copy_from_slice(&v.to_le_bytes());
+            let a = usize::try_from(a).unwrap();
+            self.memory.lock().unwrap()[a..a + 4].copy_from_slice(&v.to_le_bytes());
         }
         fn set_lost(&self, lost_frames: u64) {
             *self.stats.lock().unwrap() = Some(TransportStats {
@@ -2583,11 +2639,23 @@ mod tests {
     }
     impl RegisterIo for Fake {
         fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
-            Ok(self.memory.lock().unwrap()[address as usize..address as usize + length].to_vec())
+            let at = usize::try_from(address).context("fixture address exceeds usize")?;
+            Ok(self
+                .memory
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test fixture lock is poisoned"))?[at..at + length]
+                .to_vec())
         }
         fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
-            self.writes.lock().unwrap().push(address);
-            self.memory.lock().unwrap()[address as usize..address as usize + data.len()]
+            let at = usize::try_from(address).context("fixture address exceeds usize")?;
+            self.writes
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test fixture lock is poisoned"))?
+                .push(address);
+            self.memory
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test fixture lock is poisoned"))?
+                [at..at + data.len()]
                 .copy_from_slice(data);
             Ok(())
         }
@@ -2617,7 +2685,13 @@ mod tests {
         seconds: f64,
         level: u8,
     ) {
-        for i in 0..(seconds * 50.0) as u64 {
+        #[expect(
+            clippy::cast_sign_loss,
+            clippy::cast_possible_truncation,
+            reason = "the reference schedule retains truncating, saturating conversion of nonnegative test seconds"
+        )]
+        let steps = (seconds * 50.0) as u64;
+        for i in 0..steps {
             *now += Duration::from_millis(20);
             let mut f = frame(MONO8, 16, 16, vec![level; 256]);
             f.id = (65_530 + i) % 65_535 + 1;
@@ -2692,7 +2766,7 @@ mod tests {
         for (low, high) in [(50_000.0, 60_000.0), (100.0, 200.0)] {
             fake.writes.lock().unwrap().clear();
             auto.write_pair(&mut camera, pair, low, high, "test");
-            assert!(auto.failed.is_empty());
+            assert_eq!(auto.failed, [] as [(String, Value, &str); 0]);
             assert_eq!((fake.f64(LOWER), fake.f64(UPPER)), (low, high));
             let first = if low > 1000.0 { UPPER } else { LOWER };
             assert_eq!(fake.writes.lock().unwrap()[0], first);
@@ -2710,16 +2784,16 @@ mod tests {
         fake.set_f64(GAIN, 15.0);
         drive(&mut auto, &mut camera, &mut now, 3.5, 20);
         assert_eq!(auto.status().state, "limited");
-        assert!(auto.status().notes.contains(&DARK.to_string()));
+        assert!(auto.status().notes.contains(&DARK.to_owned()));
         fake.set_f64(EXPOSURE, 19.0);
         fake.set_f64(GAIN, 0.0);
         drive(&mut auto, &mut camera, &mut now, 3.0, 255);
         assert_eq!(auto.status().state, "limited");
-        assert!(auto.status().notes.contains(&BRIGHT.to_string()));
+        assert!(auto.status().notes.contains(&BRIGHT.to_owned()));
         fake.set_f64(EXPOSURE, 5000.0);
         drive(&mut auto, &mut camera, &mut now, 2.5, 120);
         assert_eq!(auto.status().state, "stable");
-        assert!(auto.status().notes.is_empty());
+        assert_eq!(auto.status().notes, [] as [String; 0]);
         assert!(auto.converged());
     }
 
@@ -2807,8 +2881,8 @@ mod tests {
         fake.set_f64(GAIN, 6.0);
         auto.release(&mut camera, true).unwrap();
         assert_eq!(
-            &fake.memory.lock().unwrap()[..ACQUISITION as usize],
-            &before[..ACQUISITION as usize]
+            &fake.memory.lock().unwrap()[..usize::try_from(ACQUISITION).unwrap()],
+            &before[..usize::try_from(ACQUISITION).unwrap()]
         );
 
         let fake = Fake::new(true);
@@ -2866,25 +2940,23 @@ mod tests {
         };
         let entry =
             |e: &str, v: u32| format!("<EnumEntry Name='{e}'><Value>{v}</Value></EnumEntry>");
-        let nodes = [
+        let mut nodes = [
             format!(
                 "<Enumeration Name='TriggerSelector'>{}{}<pValue>SelectorReg</pValue></Enumeration><IntReg Name='SelectorReg'><Address>192</Address><Length>4</Length><AccessMode>RW</AccessMode></IntReg>",
                 entry("FrameStart", 0),
                 entry("AcquisitionStart", 1)
             ),
             "<IntSwissKnife Name='TriggerOffset'><pVariable Name='S'>TriggerSelector</pVariable><Formula>S*4</Formula></IntSwissKnife>".into(),
-            indexed("TriggerMode", 176, &(entry("Off", 0) + &entry("On", 1))),
+            indexed("TriggerMode", 176, &format!("{}{}", entry("Off", 0), entry("On", 1))),
             indexed(
                 "TriggerSource",
                 200,
-                &(entry("Freerun", 0) + &entry("Line1", 1) + &entry("FixedRate", 2)),
+                &format!("{}{}{}", entry("Freerun", 0), entry("Line1", 1), entry("FixedRate", 2)),
             ),
         ]
         .concat();
-        fake.xml = fake.xml.replace(
-            "</RegisterDescription>",
-            &(nodes + "</RegisterDescription>"),
-        );
+        nodes.push_str("</RegisterDescription>");
+        fake.xml = fake.xml.replace("</RegisterDescription>", &nodes);
         fake.set_u32(192, 1);
         fake.set_u32(176, 1);
         fake.set_u32(200, 1);
@@ -2901,7 +2973,7 @@ mod tests {
         assert!(!frame_triggered(&mut camera));
     }
 
-    /// Lock ExposureTime and Gain while their autos run and the frame rate
+    /// Lock `ExposureTime` and Gain while their autos run and the frame rate
     /// while its enable is off, as a Blackfly S does.
     fn locked_by_autos(fake: &mut Fake) {
         for (feature, register, formula) in [
@@ -2941,7 +3013,7 @@ mod tests {
                 Some("AcquisitionFrameRate")
             )
         );
-        assert!(auto.failed.is_empty());
+        assert_eq!(auto.failed, [] as [(String, Value, &str); 0]);
         assert_eq!(fake.u32(ENABLE), 1);
         assert!(fake.f64(RATE) > 1.0);
         auto.invalidate();
@@ -2950,8 +3022,8 @@ mod tests {
         assert_eq!(auto.caps.exposure, Some("ExposureTime"));
         auto.release(&mut camera, true).unwrap();
         assert_eq!(
-            &fake.memory.lock().unwrap()[..ACQUISITION as usize],
-            &before[..ACQUISITION as usize]
+            &fake.memory.lock().unwrap()[..usize::try_from(ACQUISITION).unwrap()],
+            &before[..usize::try_from(ACQUISITION).unwrap()]
         );
 
         let mut fake = Fake::new(false);
