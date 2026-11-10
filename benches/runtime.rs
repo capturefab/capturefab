@@ -566,9 +566,16 @@ fn main() {
         ("RGB8", RGB8, 4096, 3000),
     ] {
         let suffix = format!("{name}/{width}x{height}");
-        if !["encode/jpeg/", "encode/png/", "inspect/", "auto/meter/"]
-            .iter()
-            .any(|prefix| b.selected(&format!("{prefix}{suffix}")))
+        if ![
+            "encode/jpeg/",
+            "encode/jpeg-rgb/",
+            "encode/jpeg-videotoolbox/",
+            "encode/png/",
+            "inspect/",
+            "auto/meter/",
+        ]
+        .iter()
+        .any(|prefix| b.selected(&format!("{prefix}{suffix}")))
         {
             continue;
         }
@@ -586,17 +593,21 @@ fn main() {
         // Apple's JPEG engine, where this Mac has one.
         #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
         {
-            // SAFETY: as above.
-            unsafe { std::env::set_var("CAPTUREFAB_JPEG", "videotoolbox") };
-            if frame::encode_parts(&f, "jpeg", None, None).is_ok() {
-                b.run(
-                    &format!("encode/jpeg-videotoolbox/{suffix}"),
-                    f.data.len(),
-                    || frame::encode_parts(&f, "jpeg", None, Some(&meta)).unwrap(),
-                );
+            let label = format!("encode/jpeg-videotoolbox/{suffix}");
+            if b.selected(&label) {
+                // SAFETY: as above.
+                unsafe { std::env::set_var("CAPTUREFAB_JPEG", "videotoolbox") };
+                match frame::encode_parts(&f, "jpeg", None, None) {
+                    Ok(_) => {
+                        b.run(&label, f.data.len(), || {
+                            frame::encode_parts(&f, "jpeg", None, Some(&meta)).unwrap()
+                        });
+                    }
+                    Err(error) => eprintln!("{label}: skipped: {error:#}"),
+                }
+                // SAFETY: as above.
+                unsafe { std::env::set_var("CAPTUREFAB_JPEG", "cpu") };
             }
-            // SAFETY: as above.
-            unsafe { std::env::set_var("CAPTUREFAB_JPEG", "cpu") };
         }
         b.run(&format!("encode/png/{suffix}"), f.data.len(), || {
             frame::encode_parts(&f, "png", None, Some(&meta)).unwrap()

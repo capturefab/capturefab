@@ -1410,7 +1410,35 @@ pub fn sharpness(frame: &Frame, region: [u32; 4]) -> Result<Sharpness> {
     }
     let (w, h) = (frame.width as usize, frame.height as usize);
     ensure!(w >= 3 && h >= 3, "frame is too small to measure sharpness");
+    // Focus reads nine neighbours per sample. Select these common layouts
+    // once, rather than dispatching through Pixels for every neighbour.
+    match frame.pixel_format {
+        MONO8 => {
+            return Ok(sharpness_over((w, h), region, |x, y| {
+                f64::from(frame.data[y * w + x])
+            }));
+        }
+        RGB8 | 0x0218_0015 => {
+            let bgr = frame.pixel_format != RGB8;
+            return Ok(sharpness_over((w, h), region, |x, y| {
+                let at = (y * w + x) * 3;
+                let pixel = &frame.data[at..at + 3];
+                let rgb = if bgr {
+                    [pixel[2], pixel[1], pixel[0]]
+                } else {
+                    [pixel[0], pixel[1], pixel[2]]
+                };
+                f64::from(luma(rgb))
+            }));
+        }
+        _ => {}
+    }
     let pixels = Pixels::new(FrameRef::whole(frame));
+    if let Read::Layout(decoder) = pixels.read {
+        return Ok(sharpness_over((w, h), region, |x, y| {
+            f64::from(luma(decoder.rgb(x, y)))
+        }));
+    }
     Ok(sharpness_over((w, h), region, |x, y| {
         f64::from(pixels.luma(x, y))
     }))
@@ -1748,6 +1776,38 @@ mod tests {
     }
 
     use super::*;
+    #[test]
+    fn focus_layouts_match_generic_pixels() {
+        for (width, height) in [(3, 3), (64, 48), (641, 479)] {
+            for format in [
+                MONO8,
+                RGB8,
+                0x0218_0015,
+                0x820c_0002,
+                0x820c_0011,
+                0x0210_0044,
+            ] {
+                let frame = sized(
+                    format,
+                    width,
+                    height,
+                    (0..frame_len(format, width, height).unwrap())
+                        .map(|i| (i * 173 + i / 17).to_le_bytes()[0])
+                        .collect(),
+                );
+                let pixels = Pixels::new(FrameRef::whole(&frame));
+                for region in [[0, 0, width, height], [1, 1, width / 2, height / 2]] {
+                    let reference =
+                        sharpness_over((width as usize, height as usize), region, |x, y| {
+                            f64::from(pixels.luma(x, y))
+                        });
+                    let actual = sharpness(&frame, region).unwrap();
+                    assert_eq!(actual, reference, "{format:x} {region:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn raw_stills_borrow_the_frame() {
         let frame = |pixel_format, bytes: usize| Frame {

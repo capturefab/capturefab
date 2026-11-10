@@ -258,6 +258,10 @@ const MOST_DOUBT: u32 = 8;
 /// Frames are told apart by size, format and quality.
 type Key = (u32, u32, u32, i32);
 
+/// A warm camera can change geometry, format and quality indefinitely.
+/// Evicted combinations are checked again before using the engine.
+const MAX_VERDICTS: usize = 256;
+
 enum State {
     /// Not opened yet.
     Closed(Option<Opener>),
@@ -428,6 +432,18 @@ fn run(
 }
 
 impl Shared {
+    fn remember(&self, key: Key, verdict: Verdict) {
+        let mut verdicts = self.verdicts.lock().unwrap_or_else(PoisonError::into_inner);
+        if verdicts.len() >= MAX_VERDICTS && !verdicts.contains_key(&key) {
+            // Any entry may be evicted: missing verdicts always require a
+            // fresh check, including previously rejected combinations.
+            if let Some(old) = verdicts.keys().next().copied() {
+                verdicts.remove(&old);
+            }
+        }
+        verdicts.insert(key, verdict);
+    }
+
     /// The state, opened on first use within `open_wait`.
     fn opened(self: &Arc<Self>) -> MutexGuard<'_, State> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -624,10 +640,7 @@ impl Shared {
             }
             Err(Fault::Unready(_)) => Verdict::Doubtful { failures, since: 0 },
         };
-        self.verdicts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(key, verdict);
+        self.remember(key, verdict);
     }
 }
 
@@ -829,11 +842,7 @@ impl Engine {
             // checked on it by a thread of its own, which holds the engine
             // until it is done: no capture waits for a check.
             Plan::Check { failures } => {
-                shared
-                    .verdicts
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(key, Verdict::Checking { failures });
+                shared.remember(key, Verdict::Checking { failures });
                 let (checking, checked) = (shared.clone(), frame.clone());
                 let _ = std::thread::Builder::new()
                     .name(format!("jpeg-{}-check", self.kind().name()))
@@ -1330,6 +1339,45 @@ mod tests {
         let mut engine = Engine::new(Kind::Fake, move || Ok(Fake(scenario, counter)));
         engine.any_size = true;
         (engine, calls)
+    }
+
+    #[test]
+    fn changing_geometry_keeps_validation_memory_bounded() {
+        let (engine, calls) = engine(Scenario::Echo(Arc::default()));
+        let shared = &engine.shared;
+        for width in 1..=1024 {
+            let key = (width, 64, crate::types::RGB8, QUALITY);
+            shared.remember(key, Verdict::Checking { failures: 0 });
+            shared.settle(key, &Ok(true), 0);
+            let verdicts = shared.verdicts.lock().unwrap();
+            assert!(verdicts.len() <= MAX_VERDICTS);
+            assert!(matches!(
+                verdicts.get(&key),
+                Some(Verdict::Accurate { faster: true })
+            ));
+            drop(verdicts);
+        }
+        // Updating an existing combination must not evict another one.
+        let key = (1024, 64, crate::types::RGB8, QUALITY);
+        shared.settle(key, &Err(Fault::Declined("unsupported size".into())), 0);
+        assert_eq!(shared.verdicts.lock().unwrap().len(), MAX_VERDICTS);
+        let width = (128..1024)
+            .find(|&width| {
+                !shared.verdicts.lock().unwrap().contains_key(&(
+                    width,
+                    64,
+                    crate::types::RGB8,
+                    QUALITY,
+                ))
+            })
+            .unwrap();
+        let frame = gradient(width, 64);
+        let jpeg = engine.encode(&frame, QUALITY, true).unwrap();
+        assert!(super::super::well_formed(&jpeg, width, 64));
+        // A fresh check encodes twice; trusting an old verdict encodes once.
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(engine.verified(), Some(true));
+        assert_eq!(shared.verdicts.lock().unwrap().len(), MAX_VERDICTS);
     }
 
     /// A smooth frame in `format`: the RGB gradient, or a mosaic or gray
