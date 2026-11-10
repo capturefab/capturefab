@@ -14,7 +14,7 @@ pub(crate) const PASSWORD_ENV: &str = "CAPTUREFAB_CAMERA_PASSWORD";
 pub(crate) enum LoginCommand {
     /// Check a camera sign-in, then save it in the OS credential store
     #[command(
-        after_help = "Examples:\n  printf '%s\\n' \"$PASS\" | capturefab login add rtsp://cam.local/stream --user admin --password-stdin\n  CAPTUREFAB_CAMERA_PASSWORD=secret capturefab login add onvif://cam.local --user admin"
+        after_help = "Examples:\n  printf '%s\\n' \"$PASS\" | capturefab login add rtsp://cam.local/stream --user admin --password-stdin\n  printf '%s\\n' \"$PASS\" | capturefab login add onvif://cam.local --user admin --password-stdin"
     )]
     Add {
         /// A credential-free `rtsp://`, `rtsps://`, `onvif:http://…` or `onvif://HOST` address

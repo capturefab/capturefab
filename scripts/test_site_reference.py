@@ -50,14 +50,16 @@ Examples:
 def snapshot():
     schema = dict(contract_version=1, commands=dict(capture=['file_write', 'Save frames'], frobnicate=['read', 'Something new']), effect_with={},
                   conventions=dict(json='--json: one document', results='snake_case keys', credentials='never printed', describe='capturefab schema COMMAND',
-                                   globals='--json, -q', camera='-c/--camera CAM', routing='--session NAME', jobs='--background prints a job'),
+                                   globals='--json, -q', camera='-c/--camera CAM', routing='--session NAME', jobs='--background prints a job',
+                                   streams='`watch --json` emits NDJSON'),
                   errors=dict(usage=[2, 'fix the command'], exists=[1, 'never overwritten <ever>']),
                   exit_codes={'0': 'ok', '130': 'interrupted', '2': 'usage'},
                   grammars=dict(duration='250ms, 2s', template='{seq} {time}'))
-    capture = dict(command='capture', summary='Save frames', effect='file_write', contract_version=1, errors=['usage', 'exists'],
+    capture = dict(command='capture', summary='Save frames', effect='file_write', effect_with={'--set': 'camera_write'}, contract_version=1, errors=['usage', 'exists'],
                    args=[dict(name='cameras', long='--camera', short='-c', value_name='CAM', type='camera', help='Camera, repeatable', env='CAPTUREFAB_CAMERA', repeatable=True, required=False),
                          dict(name='dry_run', long='--dry-run', type='flag', default='false', help='Capture nothing', repeatable=False, required=False),
                          dict(name='format', long='--format', short='-f', value_name='FORMAT', type='choice', choices=['png', 'jpg'], default='png', help='Format', repeatable=False, required=False),
+                         dict(name='settings', long='--set', value_name='NAME=VALUE', type='assignment', help='Apply a setting', repeatable=True, required=False),
                          dict(name='names', value_name='NAME', type='name', help='Features', repeatable=True, required=True)],
                    result={'files': '[string] — absolute paths', 'count': 'int — frames saved'}, examples=['capturefab capture -c sim:0 -o shot.png'], notes=['Never overwrites.'], aliases=['shoot'])
     frobnicate = dict(command='frobnicate', summary='Something new', effect='read', contract_version=1, errors=[], args=[], examples=[], notes=[])
@@ -101,6 +103,8 @@ class RenderTests(unittest.TestCase):
         self.assertIn('<code>files</code>', self.page)
         self.assertIn('<a href="#error-exists"><code>exists</code></a>', self.page)
         self.assertIn('Alias: <code>shoot</code>', self.page)
+        self.assertIn('<code>watch --json</code> emits NDJSON', self.page)
+        self.assertIn('<code>--set</code> NAME=VALUE</td><td>Apply a setting</td><td>repeatable; effect <code>camera_write</code>', self.page)
 
     def test_examples_quote_bracketed_names_for_zsh(self):
         self.assertEqual(reference.shell_safe('capturefab set -c sim:0 TriggerMode[FrameStart]=On trigger=off'),
@@ -149,14 +153,17 @@ class CommandLineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             temp = Path(temp)
             bare = snapshot()['schema']
-            bare['commands'] = dict(list=['read', 'List cameras'])
+            bare['commands'] = {'list': ['read', 'List cameras'], 'login rm': ['file_write', 'Forget a sign-in']}
             detail = dict(command='list', summary='List cameras', effect='read', contract_version=1, errors=[], args=[])
+            remove = dict(detail, command='login rm', summary='Forget a sign-in', effect='file_write')
             fake = temp / 'capturefab'
             fake.write_text('#!/bin/sh\n'
                             'if [ -n "$CAPTUREFAB_CAMERA" ]; then echo leaked >&2; exit 9; fi\n'
                             f'if [ "$1" = schema ] && [ $# = 1 ]; then cat <<\'JSON\'\n{json.dumps(bare)}\nJSON\nexit 0; fi\n'
+                            f'if [ "$1 $2 $3" = "schema login rm" ]; then cat <<\'JSON\'\n{json.dumps(remove)}\nJSON\nexit 0; fi\n'
                             f'if [ "$1" = schema ]; then cat <<\'JSON\'\n{json.dumps(detail)}\nJSON\nexit 0; fi\n'
                             f'if [ "$1" = -h ]; then cat <<\'HELP\'\n{TOP}HELP\nexit 0; fi\n'
+                            'if [ "$1 $2" = "login -h" ]; then printf "Sign-ins\\n\\nCommands:\\n  rm  Forget a sign-in [alias: remove]\\n"; exit 0; fi\n'
                             'printf "List cameras\\n\\nExamples:\\n  capturefab list --kind sim\\n"\n')
             fake.chmod(0o755)
             env = dict(os.environ, CAPTUREFAB_CAMERA='sim:0')
@@ -166,6 +173,8 @@ class CommandLineTests(unittest.TestCase):
             recorded = json.loads((temp / 's.json').read_text())
             self.assertEqual(recorded['commands']['list']['examples'], ['capturefab list --kind sim'])
             self.assertEqual(recorded['commands']['list']['aliases'], ['ls'])
+            self.assertEqual(recorded['commands']['login rm']['aliases'], ['remove'])
+            self.assertIn('Alias: <code>login remove</code>', (temp / 'r.html').read_text())
             self.assertEqual(recorded['global_options'][0]['long'], '--json')
             check = subprocess.run([sys.executable, '-B', str(SCRIPTS / 'site-reference.py'), '--check', '--binary', str(fake), '--snapshot', str(temp / 's.json'), '--page', str(temp / 'r.html')],
                                    capture_output=True, text=True)

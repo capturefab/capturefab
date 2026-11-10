@@ -2,73 +2,71 @@
 
 # Simulated cameras
 
-Capturefab has simulated cameras built in, so every command can be tried, scripted and tested
-without hardware. They run in a camera worker like any other camera, so sessions, `--keep`,
-background jobs, captures, recordings and `inspect` behave as they do with a real one.
+Use a built-in simulator to try Capturefab without a camera. You can test captures,
+recordings, measurements, sessions and background jobs.
 
 | Selector | Camera |
 | --- | --- |
-| `sim:0`, `sim:1`, … `sim:NAME` | A moving pattern area-scan camera with a GenICam feature tree: `ExposureTime`, `Gain`, `ExposureAuto`, `AcquisitionFrameRate`, `Width`, `Height`, `PixelFormat` (Mono8, Mono12, Mono12p, Mono14p, Mono16, RGB8, RGB12, BayerRG8, BayerRG12, BayerRG12p) and a `TriggerSelector` bank with `TriggerMode`, `TriggerSource`, `TriggerActivation` and `TriggerSoftware` |
-| `sim:line` | A line-scan camera that delivers blocks of lines |
-| `sim:depth` | A depth camera with calibrated 16-bit `Coord3D_C16` samples and `Scan3d…` features |
-| `sim:microscope` | A microscope camera with focus, magnification and illumination features |
+| `sim:0`, `sim:1`, or `sim:NAME` | An area-scan camera with a moving pattern, GenICam controls and software or line triggers |
+| `sim:line` | A line-scan camera that returns blocks of lines |
+| `sim:depth` | A depth camera with 16-bit `Coord3D_C16` samples and calibration features |
+| `sim:microscope` | A microscope camera with focus, magnification and illumination controls |
 | `sim:thermal` | A thermal camera with 16-bit samples and temperature features |
-| `sim:replay:PATH` | Replays a video file, an image, or a folder of images and videos |
+| `sim:replay:PATH` | A camera that replays a local video, an image or a folder of media |
 
-Each name is its own camera: `sim:0` and `sim:1` can be captured together
-(`capture -c sim:0 -c sim:1`). `list` shows simulators only with `--kind sim`, and a command
-without `-c` never picks one, so a real camera is never mistaken for a simulated one.
+Pass the selector with `-c`. Each simulator name identifies a separate camera, so one
+command can capture from both `sim:0` and `sim:1`. Use `list --kind sim` to list the
+default simulator, `sim:0`.
 
 ```sh
 capturefab list --kind sim
 capturefab info -c sim:0
 capturefab set -c sim:0 exposure=20ms PixelFormat=BayerRG8
-capturefab inspect -c sim:0 --set exposure=40ms            # verdict: clipped_high, bright
-capturefab capture -c sim:0 --set trigger=software -o triggered.png   # capture fires the trigger
-capturefab set -c sim:0 trigger=off PixelFormat=Mono8      # back to free running, as it started
+capturefab inspect -c sim:0 --set exposure=40ms
+capturefab capture -c sim:0 --set trigger=software -o triggered.png
+capturefab set -c sim:0 trigger=off PixelFormat=Mono8
 capturefab capture -c sim:line -o line-block.png
 capturefab get -c sim:depth PixelFormat Scan3dCoordinateScale Scan3dCoordinateOffset
-capturefab capture -c sim:depth -o depth.raw               # the 16-bit samples as they are
+capturefab capture -c sim:depth -o depth.raw
 ```
 
-A simulator keeps the settings you give it, as a real camera keeps its own until it powers off:
-Capturefab saves them in the runtime folder, so a `set` holds for the commands that follow until
-that folder is cleared (for example by a reboot). Commands also keep the camera open for 60
-seconds between them (the `auto` session), and `capture --set exposure=5ms` changes settings and
-captures in one call.
+The simulator saves its settings in the runtime folder. A setting stays in effect for
+later commands until you change it or clear that folder. By default the `auto` session
+also keeps the camera open for 60 seconds after the last use. Use `capture --set` to
+change a setting and capture in one command.
 
 ## Frame loss and hardware triggers
 
-Options after a `?` make an area-scan simulator lose frames, as a busy network does, or fire its
-trigger input, as a sensor wired to a real camera does:
+Add options after `?` to simulate frame loss or a signal on the `Line0` input. Quote the
+selector in the shell.
 
 ```sh
-capturefab capture -c 'sim:0?drop=0.1' -n 20 -o lossy/        # dropped, incomplete, gaps
+capturefab capture --json -c 'sim:0?drop=0.1' -n 20 -o lossy/
 capturefab set -c 'sim:0?line0=every:500ms' trigger=line0:rising
 capturefab capture -c 'sim:0?line0=every:500ms' -n 5 -o 'part-{seq}.png'
 capturefab set -c 'sim:0?line0=every:500ms' trigger=off
 ```
 
-- `drop=D`, from 0 to 0.5: that share of frames goes bad, half lost on the way and half arriving
-  incomplete and discarded. A capture still saves the frames it asked for; its result counts the
-  bad ones (`dropped`, `incomplete`) and, for a burst, the block IDs missing between its first and
-  last frame (`gaps`), and `session status` counts them too (`lost`, `incomplete`). `drop=0.5`
-  delivers about half the frames.
-- `line0=every:DUR`: the Line0 input fires every DUR, so with `trigger=line0:rising` each capture
-  takes the next frame it starts. Without this option Line0 never fires, and Line1 never does: a
-  capture waiting for either ends at `--timeout` with exit 4 `trigger_timeout`.
+- Use `drop=D` with a value from 0 to 0.5. For example, `drop=0.1` simulates about 10%
+  frame loss. Capturefab counts lost frames in `dropped` and discarded partial frames in
+  `incomplete`. When available for a burst, `gaps` counts missing frame IDs between the
+  first and last saved frames.
+- Use `line0=every:DUR` with an interval of at least 1 ms. With `trigger=line0:rising`,
+  each pulse starts a frame. Without the option, `Line0` stays quiet. `Line1` stays quiet
+  in all cases. A capture that times out waiting for a trigger returns exit code `4` and
+  the error code `trigger_timeout`.
 
-`TriggerSource` also offers `Freerun` and `FixedRate`, sources some cameras name for their own
-timing under `TriggerMode=On`: frames run at `AcquisitionFrameRate` as with the trigger off, so
-captures, recordings and `auto` treat the camera as free-running.
+Use `&` to combine options, as in `'sim:0?drop=0.02&line0=every:500ms'`. The options
+change the connection. Saved settings belong to the base selector, such as `sim:0`.
+Use the full selector throughout a sequence to keep the same connection options.
 
-Join them with `&`, as in `'sim:0?drop=0.02&line0=every:500ms'`, and quote the selector in the
-shell. A selector with options is a camera of its own that starts from the settings its base
-(`sim:0`) saved, so use the same selector for every command of a sequence.
+The simulator's `Freerun` and `FixedRate` trigger sources use the camera's own timing.
+They run at `AcquisitionFrameRate` even with `TriggerMode=On`.
 
 ## Replay test data
 
-`sim:replay:PATH` turns recorded data into a camera:
+Replay uses FFmpeg to read local media files. Replace the sample paths with your own.
+Quote the full selector if a path contains spaces.
 
 ```sh
 capturefab capture -c sim:replay:/data/clip.mp4 -n 100 -o replay-frames/
@@ -76,30 +74,34 @@ capturefab capture -c sim:replay:/data/frames --set Width=1280 --set Height=720 
 capturefab record -c sim:replay:/data/frames -o replayed.mp4 --for 30s
 ```
 
-A replay camera delivers RGB8 frames at 640 × 480 and 30 fps by default; `Width` (64–1920),
-`Height` (64–1080) and `AcquisitionFrameRate` (1–120) change that while it is not acquiring.
-Frames are scaled to fit, with black borders that keep their aspect ratio. Videos are resampled
-to the frame rate; each still image supplies one frame.
+Replay delivers RGB8 at 640 × 480 and 30 frames per second by default. Set `Width` to
+64–1920 pixels, `Height` to 64–1080 pixels and `AcquisitionFrameRate` to 1–120 Hz.
+Replay scales frames to fit and adds black borders to keep their aspect ratio.
 
-A folder is read once, **only at its top level**: subdirectories, symlinks and unsupported files
-are ignored. Files play in filename order, case-sensitively, so `10.png` sorts before `2.png`;
-use zero-padded names (`0001.png`) for numeric sequences. The playlist repeats without end, and
-frame IDs and timestamps continue across files and loops. Restart the camera to pick up added
-files. An empty folder, a missing path or a corrupt file is an error.
+Replay reads supported regular files at the top level of a folder in case-sensitive
+filename order. Use zero-padded names such as `0001.png` and `0002.png` for numbered
+sequences. Each still image supplies one frame per loop. Replay resamples videos to
+the selected frame rate. The playlist loops while the camera runs, and frame IDs and
+timestamps continue across loops. To pick up new files, reopen the camera.
 
-Images: PNG, JPEG, BMP, TIFF, WebP and PNM (PPM, PGM, PBM). Videos: MP4, M4V, MOV, MKV, WebM, AVI,
-MPEG, TS and similar containers, as far as the FFmpeg in use decodes them. Replay reads local
-files only; for a network stream, pass its URL to `-c` instead.
+Use PNG, JPEG, BMP, TIFF, WebP or PNM for images. Video formats include MP4, M4V, MOV,
+MKV, WebM, AVI, MPEG and TS. A missing source, a folder with no supported files or a
+file FFmpeg cannot decode causes an error. For a network stream, pass its URL directly
+to `-c`.
 
 ## Use simulators in tests
 
-Point the state and cache folders at temporary directories, so a test never touches the user's
-sessions, presets or sign-ins:
+Use a private temporary directory for sessions, state and cache. This keeps a test
+separate from your usual presets, jobs and cached files.
 
 ```sh
-export CAPTUREFAB_SESSION_DIR=$(mktemp -d) CAPTUREFAB_CACHE_DIR=$(mktemp -d)
-capturefab capture --json -c sim:0 -n 3 -o "$CAPTUREFAB_SESSION_DIR/frames/"
+scratch=$(mktemp -d)
+export CAPTUREFAB_SESSION_DIR="$scratch/session"
+export CAPTUREFAB_STATE_DIR="$scratch/state"
+export CAPTUREFAB_CACHE_DIR="$scratch/cache"
+capturefab capture --json --no-session -c sim:0 -n 3 -o "$scratch/frames/"
 ```
 
-The simulators are for exercising commands and pipelines; they do not model a particular camera's
-timing, noise or firmware behavior.
+For tests with background jobs, stop the sessions you started before removing the
+temporary directory. Use a real camera to validate its timing, noise and firmware
+behavior.

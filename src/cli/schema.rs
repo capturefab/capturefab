@@ -558,21 +558,21 @@ fn overview() -> Value {
         "commands": commands,
         "effect_with": widened,
         "conventions": {
-            "json": "--json (or CAPTUREFAB_JSON=1): one line on stdout, the result on exit 0, else {\"error\":{code,message,hint?,details?}}: code is the reason (see errors), the exit code its category. No nulls; warnings ≤10",
-            "globals": "--json, -q/--quiet, -v/--verbose, --session NAME (CAPTUREFAB_SESSION), --no-session (overrides it); before or after the command",
-            "camera": "-c/--camera CAM (CAPTUREFAB_CAMERA). Without it: the session's only camera, else the only camera list finds (not sim: or screens)",
-            "routing": "--session NAME, else a session holding the camera, else the auto session, open 60s after last use (--keep DUR); --keep 0 or --no-session: a worker of the command",
-            "jobs": "capture/record block until done; --background prints a job instead (jobs wait ID). Ctrl-C: capture exits 130 with details.files; open-ended record ends normally",
-            "streams": "NDJSON: watch a line per measurement, shell per command; capture, record, jobs wait --progress: stderr lines {progress:{job,state,saved,planned?,elapsed_s,left_s?,…}}",
-            "results": "snake_case keys; units in names (exposure_us); times RFC 3339 UTC; lists bounded with truncated",
-            "credentials": "never printed; URLs are redacted",
-            "describe": "capturefab schema COMMAND: arguments, result fields and errors"
+            "json": "`--json` or `CAPTUREFAB_JSON=1` usually writes one result line to stdout. A failure returns `error` with `code`, `message` and optional `hint` and `details`",
+            "globals": "Put global options before or after the command",
+            "camera": "Use `-c CAM` or `CAPTUREFAB_CAMERA`. By default, use the session's only camera or the only camera discovered. Discovery for this default excludes simulators and screens",
+            "routing": "Use `--session NAME` to choose a session. Otherwise, commands reuse a matching session. Most camera commands keep the camera open in `auto` for 60s after use. `--keep 0` can reuse a session. Use `--no-session` to bypass sessions",
+            "jobs": "`capture` and `record` normally wait for the job. `--background` returns a job to follow with `jobs wait ID`",
+            "streams": "`watch --json` and `shell --json` emit NDJSON. With `capture --json -o -`, image bytes go to stdout and JSON goes to stderr. `--progress` sends JSON progress to stderr",
+            "results": "Keys use `snake_case`, with units in names such as `exposure_us`. Timestamps use RFC 3339 UTC. Missing fields are omitted",
+            "credentials": "Capturefab redacts credentials in camera URLs",
+            "describe": "Run `capturefab schema COMMAND` for arguments, result fields and errors"
         },
         "grammars": {
-            "selector": "list id (gige:…, u3v:…, avfoundation:…, v4l2:…, dshow:…), serial, IPv4, rtsp(s)://, srt://, http(s)://, onvif://host[/path], file, sim:N[?drop=0..0.5&line0=every:DUR], sim:replay:PATH",
-            "name": "Feature | Feature[Selector=Value,…] | Feature[Value] (when one selector addresses it) | control: exposure, gain, fps, roi, format, trigger, auto_exposure, auto_wb",
-            "duration": "number+unit, repeatable: 500us, 250ms, 2s, 5m, 1h30m; 0; none where a wait may be unlimited. A bare number is invalid_duration",
-            "template": "-o: {camera} {serial} {seq} {seq:N} {time} {date} {tag:KEY} {ext}; a folder holds {camera}-{time}-{seq}.{ext}; a taken name fails without {seq}, {time} or --on-exists number"
+            "selector": "Camera ID from `list`, serial, IPv4, stream URL such as `rtsp://HOST/PATH`, `onvif://HOST`, file path, `sim:N[?drop=0..0.5&line0=every:DUR]` or `sim:replay:PATH`",
+            "name": "Use `Feature`, `Feature[Selector=Value,…]` or `Feature[Value]` for one selector. Controls include `exposure`, `gain`, `fps`, `roi`, `format`, `trigger`, `auto_exposure` and `auto_wb`",
+            "duration": "Add a unit, as in `250ms`, `1.5s` or `1h30m`. Use `0` where allowed. Some waits accept `none` for an unlimited wait",
+            "template": "Capture names accept `{camera}`, `{serial}`, `{seq}`, `{seq:N}`, `{frame}`, `{time}`, `{date}`, `{datetime}`, `{tag:KEY}` and `{ext}`"
         },
         "exit_codes": exit_codes,
         "errors": errors,

@@ -1,10 +1,12 @@
 # Build and run Capturefab on embedded Linux
 
-Capturefab runs on Yocto-style and other immutable Linux images: a read-only root file system, a home that may be read-only or unset, no `XDG_*` variables, often root, with only `/tmp`, `/run`, `/var/volatile` (tmpfs) and explicit data mounts writable. It needs no writable folder to capture: `capture -o /data/shot.png` and `record -o /data/clip.mkv` work wherever `-o` points. Everything else degrades one feature at a time, and `capturefab doctor` says which.
+You can run Capturefab on a read-only Linux image. Put captures and recordings on a writable data
+mount, such as `/data`. Provide writable runtime, state and cache folders for features such as
+sessions, presets and bundled FFmpeg. Run `capturefab doctor` on the target to see which paths it uses.
 
 ## Build
 
-Build without the features that need C libraries or desktop services:
+To build a small binary with USB3 Vision support, use only the `usb` feature:
 
 ```sh
 cargo build --release --target aarch64-unknown-linux-gnu --no-default-features --features usb
@@ -12,12 +14,16 @@ cargo build --release --target aarch64-unknown-linux-gnu --no-default-features -
 
 | Feature | Default | On an embedded image |
 |---|---|---|
-| `usb` | on | Keep for USB3 Vision cameras. Pure Rust; the image needs read/write access to `/dev/bus/usb` (see the udev rule `capturefab doctor` prints). |
-| `jpeg` | on | libjpeg-turbo, built from source with CMake (and NASM on x86). Keep it when the cross toolchain has them; without it captures are PNG or raw and previews PNG. |
-| `nvjpeg`, `vaapi` | on | GPU JPEG encoders (NVIDIA's nvJPEG, including on Jetson, and VA-API), pure Rust: their libraries are loaded when the host has the device, in a helper process the camera worker starts. Their output is checked against libjpeg-turbo, so they need `jpeg` to be used. |
-| `keychain` | on | Saves camera passwords in the Secret Service over D-Bus, which images rarely run. Without it, `login add` is unsupported: put credentials in the camera address. |
+| `usb` | on | Keep for USB3 Vision cameras. Give the process read and write access to `/dev/bus/usb`. See the udev rule reported by `capturefab doctor`. |
+| `jpeg` | on | Builds libjpeg-turbo with CMake and, on x86, NASM. Without this feature, use PNG or raw for captures. Previews use PNG. |
+| `nvjpeg`, `vaapi` | on | Enable GPU JPEG encoders where the driver and runtime libraries are available. Also enable `jpeg` so Capturefab can verify the encoder output with libjpeg-turbo. |
+| `keychain` | on | Enables `login add` for saved camera passwords. On Linux it uses the Secret Service over D-Bus. |
 
-The same features build for 32-bit ARM (`armv7-unknown-linux-gnueabihf`) and musl (`aarch64-unknown-linux-musl`, `x86_64-unknown-linux-musl`), for a static executable with no glibc dependency. In a Yocto layer, build it with the `cargo` class and pass the features through `CARGO_BUILD_FLAGS`, or cross-compile it outside and install the executable with its license files.
+Choose a target that matches the operating system. For 32-bit ARM with glibc, use
+`armv7-unknown-linux-gnueabihf`. To build a static executable without glibc, use a musl target such
+as `aarch64-unknown-linux-musl` or `x86_64-unknown-linux-musl`. Supply the matching cross toolchain.
+In a Yocto layer, you can build with the `cargo` class and pass features through `CARGO_BUILD_FLAGS`.
+Install the executable and its license files.
 
 ## FFmpeg
 
@@ -28,13 +34,21 @@ Webcams, RTSP/SRT streams, video files and `record` use an FFmpeg executable. Ca
 3. an `ffmpeg` next to the `capturefab` executable;
 4. the first `ffmpeg` on `PATH`.
 
-On an image, ship FFmpeg as a package of the image and leave it out of Capturefab's build: a build without `CAPTUREFAB_FFMPEG_BINARY` embeds none, and finds `/usr/bin/ffmpeg` on `PATH`, or set `CAPTUREFAB_FFMPEG=/usr/bin/ffmpeg` in the service. Captures and inspection of GigE Vision, USB3 Vision and simulated cameras need no FFmpeg.
+To use the image's FFmpeg package, set `CAPTUREFAB_FFMPEG=/usr/bin/ffmpeg` in the service.
+To omit the embedded copy, leave `CAPTUREFAB_FFMPEG_BINARY` unset and build without an FFmpeg
+binary in `target/ffmpeg/<target>/bin/`. Cargo release builds otherwise pick up that binary.
+Captures and inspections of GigE Vision, USB3 Vision and pattern simulators work without FFmpeg.
 
-A build that embeds FFmpeg extracts it once, on the first command that needs it, to the cache folder below, else a `cache` folder in the runtime folder, else `/tmp/capturefab-<uid>/cache`, and every later command reuses that copy (a marker beside it records the copy that was checked, so it is not hashed again). A folder mounted `noexec` is skipped, and a copy the system will not start, as under an execution policy, is marked so later commands only try to start it. Where none is writable and allows running programs, an FFmpeg on `PATH` is used instead, or the command fails with `ffmpeg_missing` naming each folder and why; `CAPTUREFAB_CACHE_DIR` names a folder that works.
+Capturefab extracts the embedded copy to the cache, runtime cache or temporary cache directory.
+Each later command can reuse the extracted copy. Capturefab skips folders mounted `noexec`.
+If extraction fails, it looks next to the executable and on `PATH`. If those lookups also fail,
+it reports `ffmpeg_missing`. Set `CAPTUREFAB_CACHE_DIR` to a writable folder that permits execution.
 
 ## Writable folders
 
-Capturefab keeps three kinds of files, each in the first folder of its list that is, or can be made, private to the user (mode 0700, owned, not a symbolic link) and writable. A variable is used as given, with no fallback; a cache folder of the user's that others may enter is made private, while a runtime or state folder like that is refused with a `chmod 700` hint.
+Capturefab uses the first suitable folder for each role. Keep these folders private to the
+Capturefab user with mode 0700. Use real directories with the correct owner. If you set one of the
+`CAPTUREFAB_*_DIR` variables, Capturefab uses that path for its role.
 
 | Folder | Holds | Looked for in |
 |---|---|---|
@@ -42,13 +56,14 @@ Capturefab keeps three kinds of files, each in the first folder of its list that
 | State | presets, saved sign-ins, sessions' jobs and logs | `CAPTUREFAB_STATE_DIR`; else `CAPTUREFAB_SESSION_DIR`; else `$XDG_STATE_HOME/capturefab` or `~/.local/state/capturefab` |
 | Cache | the extracted FFmpeg, GenICam XML | `CAPTUREFAB_CACHE_DIR`; else `$XDG_CACHE_HOME/capturefab` or `~/.cache/capturefab`; else the runtime folder's `cache` |
 
-Folders are looked for only by the commands that need them, so a read-only system costs nothing to commands that never write. Without a folder:
+- Without a runtime folder, ordinary camera commands can open their own camera workers.
+  Sessions and camera locks are unavailable. Give `inspect` a writable `--preview FILE`, or use
+  `--preview none` to skip the image.
+- Without writable state, you can read presets stored in the image. Saving presets and sign-ins
+  fails with `permission_denied`. Sessions can keep job records in memory until they end.
+- Without a cache, Capturefab reads GenICam XML again when it opens a camera.
 
-- no runtime folder: no session starts, so each camera command opens its camera alone (no warm cameras, about as fast as `--keep 0`), camera locks are skipped and previews go to `$TMPDIR/capturefab-<uid>/inspect`, or need `--preview FILE` or `--preview none`;
-- no state folder, or a read-only one: saving presets and sign-ins fails with `permission_denied` and a hint naming `CAPTUREFAB_STATE_DIR`; a read-only one baked into the image can still be read. A session keeps its jobs in memory while it runs; once it ends they are gone, and `jobs wait ID` or `jobs list ID` for one of them gives `session_not_found` with the same hint;
-- no cache: GenICam XML is read from each camera every time.
-
-A systemd service on such an image gives each a folder of its own, kept by systemd with the right owner and mode:
+To let systemd create these folders with the correct owner and mode, add the following service settings.
 
 ```ini
 [Service]
@@ -65,11 +80,17 @@ Environment=CAPTUREFAB_CACHE_DIR=/var/cache/capturefab
 
 Point `CAPTUREFAB_STATE_DIR` at the data partition when `/var/lib` does not outlive a reboot on the image.
 
-A shell or script that uses such a service's sessions sets the same `CAPTUREFAB_SESSION_DIR` to find them, and the same `CAPTUREFAB_STATE_DIR` to share its presets, saved sign-ins and the jobs of sessions that ended: the camera worker reads sign-ins from the service's state folder. `preset apply` sends the preset it read to the session, so it applies what the shell saved either way.
+When a shell or script uses this service, set the same `CAPTUREFAB_SESSION_DIR` to find its sessions.
+Set the same `CAPTUREFAB_STATE_DIR` to share presets, saved sign-ins and finished jobs. Camera workers
+read sign-ins from the service's state folder.
 
 ## Memory and CPUs
 
-Capturefab sizes its work from what the host and its cgroups leave it: `doctor` shows the CPUs (the affinity mask and cgroup CPU quota) and the memory available under cgroup v2 `memory.max` or v1 `memory.limit_in_bytes`. Encoders and FFmpeg use one thread per available CPU, up to eight; `CAPTUREFAB_THREADS` caps them. A burst holds at most a quarter of the memory left, up to 1 GiB, and counts any frame it could not hold as dropped instead of exhausting memory. A camera's worker keeps at most two frames' buffers for the frames to come, holding no more than a twentieth of the memory left, and gives the rest back to the system once they are freed, so a warm camera does not keep a burst's peak for the commands after it.
+Capturefab sizes processing pools and queues from the CPU and memory available to the process.
+The default processing thread limit is the available CPU count, up to eight. Set
+`CAPTUREFAB_THREADS` to override it. The still capture queue uses at most a quarter of the
+available memory, up to 1 GiB. When the queue is full, the result counts dropped frames.
+Run `doctor --json` to read the CPU count, thread limit and memory budget under `host`.
 
 ## Check the image
 

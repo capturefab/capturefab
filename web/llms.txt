@@ -1,55 +1,52 @@
 # Capturefab
 
-> A camera capture command-line tool for people, scripts and AI agents: find, configure, capture from and record GigE Vision, USB3 Vision and GenICam cameras, webcams, RTSP/SRT/ONVIF streams and files, with one JSON document and a typed exit code per command.
+> Capturefab is a camera capture CLI for macOS, Windows and Linux. Use it to find cameras, read or change settings, save images and record video.
 
-Capturefab is one `capturefab` executable for macOS, Windows and Linux. GigE Vision, USB3 Vision and GenICam are implemented natively in Rust (no vendor SDK); webcams, streams, files and video encoding use an FFmpeg executable embedded in every download. The simulator camera `sim:0` lets every command run without hardware. Capturefab is MIT-licensed and has no telemetry.
+Capturefab supports GigE Vision and USB3 Vision cameras with GenICam controls. It also opens webcams, network streams and video files. Release binaries include FFmpeg for media input and recording. Use `sim:0` for capture and control examples without camera hardware.
 
 ## For agents
 
-- [Agent instructions](agents.md): rules, permissions, call patterns for common tasks and error recovery by `error.code`.
-- [Command reference](reference.html): every command, option, JSON result field, exit code and error code, generated from `capturefab schema`.
-- `capturefab schema` prints the same contract as JSON (about 8 KB, roughly 2,500 tokens); `capturefab schema COMMAND` describes one command.
+- [Agent instructions](agents.md) cover the JSON contract, command permissions, workflows and error recovery.
+- [Command reference](reference.html) lists commands, flags, JSON fields and errors.
+- Run `capturefab schema` for the installed version's command list. Run `capturefab schema COMMAND` for one command, including subcommands such as `jobs wait`.
 
 ## Contract in brief
 
-- `--json` (or `CAPTUREFAB_JSON=1`): exactly one single-line JSON document on stdout. Exit 0: the result. Non-zero: `{"error":{"code","message","hint"?,"details"?}}`. `watch` and `shell` stream one JSON line per measurement or command instead.
-- Exit codes: 0 ok, 1 failed, 2 usage, 3 unavailable, 4 timeout, 5 unsupported, 6 storage full, 130 interrupted.
-- Cameras: `-c` takes a `list` ID, serial, IP address, `rtsp://`, `srt://`, `http(s)://`, `onvif://host`, a file path, `sim:N` or `sim:replay:PATH`.
-- Names: GenICam features, banks such as `TriggerMode[FrameStart]` (quote them in the shell), and controls `exposure`, `gain`, `fps`, `roi`, `format`, `trigger`, `auto_exposure`, `auto_wb`.
-- Durations need a unit (`250ms`, `2s`, `1h30m`); files are never overwritten (`{seq}` in `-o`, or `--on-exists number`).
-- Cameras stay open for 60 s between calls in the `auto` session (`--keep 5m` for longer, `--keep 0` or `--no-session` to close at once); `--background` returns a job: pass its `job.id` to `jobs wait ID` or `jobs stop ID` (`jobs` lists them all).
-- Storage full (exit 6) means a write would take the disk below its free-space floor (`CAPTUREFAB_MIN_FREE`).
-- Every common PFNC pixel format converts; PNG keeps monochrome wider than 8 bits as 16-bit gray, results report `bit_depth` and `source_bits`, and `-f raw` keeps the exact bytes with a `NAME.json` sidecar. Webcams, streams and files arrive in the format FFmpeg decodes them to (gray, YUV such as `YCbCr709_420_8_Planar`, or RGB8).
-- `CAPTUREFAB_JPEG=auto|cpu|videotoolbox|nvjpeg|vaapi` chooses the JPEG encoder (nvJPEG and VA-API on Linux, in a helper process) and `CAPTUREFAB_HWDEC=auto|none|METHOD` hardware decoding (under `auto`, of streams and compressed webcams in a session; files and `--no-session` decode in software; Motion JPEG always decodes with libjpeg-turbo); `doctor --json` reports both (`jpeg`, `hwdec`). A session's cameras keep the values of these and `CAPTUREFAB_FFMPEG` the session started with: stop it, or use `--no-session`, to change them. A command's own `CAPTUREFAB_MIN_FREE` raises a session's free-space floor for its files but does not lower it.
+- Pass `--json` or set `CAPTUREFAB_JSON=1`. Most commands write one JSON line to stdout. Success gives a result and failure gives an `error` object with `code`, `message` and optional `hint` and `details`.
+- `watch` and `shell` write one JSON line per measurement or command. `capture -o -` writes the image to stdout and its JSON document to stderr. `--help` and `--version` print text.
+- Use exit codes for the category and `error.code` for the reason. Exit codes are 0 for success, 1 for failure, 2 for invalid input, 3 for unavailable resources, 4 for timeout, 5 for unsupported operations and 6 for full storage. Interruptions use 130 (SIGINT), 143 (SIGTERM) or 129 (SIGHUP).
+- Pass a camera ID from `list` with `-c`. The selector also accepts a serial, IP address, RTSP, SRT, HTTP(S) or ONVIF URL, file path or simulator. Quote selectors and feature names with shell characters.
+- Use duration units, such as `250ms`, `2s` or `1h30m`. Use `{seq}` in capture and recording filenames to keep existing outputs.
+- The automatic session keeps a camera open for 60 seconds by default. Use `--keep 5m` to extend that time or `--no-session` for one command.
+- With `--background`, read the returned `job.id`. Use `jobs wait --json ID` to follow it. Use `jobs stop --json ID` to stop it and keep files already saved.
 
 ## Common calls
 
-- Find cameras: `capturefab list --json`
-- What a camera can do: `capturefab info --json -c CAM`
-- Measure exposure and focus: `capturefab inspect --json -c CAM --preview none` (`verdict` is a list; `["ok"]` means well exposed)
-- Change settings and measure in one call: `capturefab inspect --json -c CAM --set exposure=5ms`
-- Capture: `capturefab capture --json -c CAM -o 'shots/{seq}.png'` (a `.jpg` of a Motion JPEG webcam, stream or file without `--quality` is the JPEG it sent, `"passthrough": true`)
-- Capture, measure and log in one call: `capturefab capture --json -c CAM -o shot.png --inspect --manifest shots.jsonl` (results give `time`, `device_ts_ns`, `frames`, `dropped`; the frame saved is exposed after the last settings change)
-- Time lapse: `capturefab capture --json -c CAM --every 10s --for 1h -o 'lapse/{seq}.jpg' --background`
-- Record: `capturefab record --json -c CAM -o clip.mp4 --for 30s` (an H.264 or HEVC source is copied without re-encoding, `"encoder":"copy"`, unless `--codec`, `--fps` or `--bitrate` asks otherwise)
-- Live measurements: `capturefab watch --json -c CAM --for 10s` (one JSON line per measurement)
-- Several commands in one start: `capturefab shell --json -c CAM -e 'inspect --preview none' -e 'capture -o shot.png'`
-- Check this computer: `capturefab doctor --json`
+- Find cameras: `capturefab list --json`. Add `--kind sim` to find the default simulator.
+- See supported controls: `capturefab info --json -c sim:0`.
+- Measure exposure and focus: `capturefab inspect --json -c sim:0 --preview none`.
+- Change exposure and measure again: `capturefab inspect --json -c sim:0 --set exposure=5ms --preview none`.
+- Save a PNG: `capturefab capture --json -c sim:0 -o 'shots/{seq}.png'`.
+- Measure the saved frame and log its provenance: `capturefab capture --json -c sim:0 -o shot.png --inspect --manifest shots.jsonl`.
+- Start a time lapse: `capturefab capture --json -c sim:0 --every 1s --for 5s -o 'lapse/{seq}.png' --background`.
+- Record video: `capturefab record --json -c sim:0 -o clip.mp4 --for 2s`.
+- Stream measurements to stdout: `capturefab watch --json -c sim:0 --for 2s`.
+- Diagnose setup: `capturefab doctor --json`.
 
 ## Guides
 
-- [Documentation](docs.html): installation, first capture and task guides.
-- [CLI workflows](guides/cli-workflows.md): end-to-end shell recipes.
-- [Simulated cameras](guides/simulation.md): `sim:N`, typed simulators and replaying files.
-- [Camera compatibility](guides/camera-compatibility.md): transport requirements, pixel formats and known limits.
-- [Embedded and read-only hosts](guides/embedded.md): folders, fallbacks and limits on small and immutable systems.
-- [Plant-floor capture](guides/plant-floor.md): naming, tags and folders for analysis.
-- [Line computers](guides/line-computer.md): sessions under systemd on Raspberry Pi, Jetson and industrial PCs.
-- [FFmpeg build and licensing](guides/ffmpeg-build.md): the embedded FFmpeg and its corresponding source.
+- [Documentation](docs.html) covers setup and first capture.
+- [CLI workflows](guides/cli-workflows.md) shows task examples for the shell.
+- [Simulated cameras](guides/simulation.md) covers camera simulation and replay.
+- [Camera requirements](guides/camera-compatibility.md) covers transport, pixel formats and camera limits.
+- [Embedded Linux](guides/embedded.md) covers writable folders, fallbacks and resource limits.
+- [Plant-floor capture](guides/plant-floor.md) covers naming, tags and folders for analysis.
+- [Line computers](guides/line-computer.md) covers sessions under systemd.
+- [FFmpeg build and licensing](guides/ffmpeg-build.md) covers the embedded executable and corresponding source.
 
 ## Downloads
 
-- [Downloads](downloads.html): archives for every system with SHA-256 checksums.
-- [install.sh](install.sh) and [install.ps1](install.ps1): one-line installers that check the checksum.
-- [Release manifest](releases.json): published files, architectures, checksums and signatures.
-- [Release feed](feed.xml): Atom release announcements.
+- [Downloads](downloads.html) lists supported systems, archives and SHA-256 checksums.
+- [macOS and Linux installer](install.sh) and [Windows installer](install.ps1) verify archive checksums.
+- [Release manifest](releases.json) lists published files, architectures, checksums and signatures.
+- [Release feed](feed.xml) provides Atom release announcements.

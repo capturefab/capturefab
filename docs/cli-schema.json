@@ -1,11 +1,11 @@
 {
- "about": "Camera capture for people and agents: list, configure, capture and record cameras.",
+ "about": "Find cameras, change their settings, and save images and video.",
  "commands": {
   "auto": {
    "args": [
     {
      "env": "CAPTUREFAB_CAMERA",
-     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "help": "Camera ID, serial, IP address, stream URL, file path or simulator (sim:0)",
      "long": "--camera",
      "name": "camera",
      "repeatable": false,
@@ -64,7 +64,7 @@
     },
     {
      "env": "CAPTUREFAB_KEEP",
-     "help": "Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)",
+     "help": "Keep the camera open in a session after use (default 60s). Use 0 to reuse an open session or run without one",
      "long": "--keep",
      "name": "keep",
      "repeatable": false,
@@ -113,7 +113,7 @@
    "args": [
     {
      "env": "CAPTUREFAB_CAMERA",
-     "help": "Camera, repeatable: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "help": "Camera ID, serial, IP address, stream URL, file path or simulator (sim:0). Repeat for more cameras",
      "long": "--camera",
      "name": "cameras",
      "repeatable": true,
@@ -123,7 +123,7 @@
      "value_name": "CAM"
     },
     {
-     "help": "File, folder (existing, or ending in /) or template with {camera} {serial} {seq} {seq:N} {time} {date} {tag:KEY} {ext}; - writes one image to stdout (default: this folder, as {camera}-{time}-{seq}.png)",
+     "help": "Save to a file, template or folder. Use - for one image on stdout. By default, save in the current folder as {camera}-{time}-{seq}.{ext}",
      "long": "--output",
      "name": "output",
      "repeatable": false,
@@ -161,7 +161,7 @@
      "value_name": "DUR"
     },
     {
-     "help": "Begin at a time: HH:MM[:SS] here, or RFC 3339",
+     "help": "Start at the next local HH:MM[:SS], or an RFC 3339 timestamp",
      "long": "--at",
      "name": "at",
      "repeatable": false,
@@ -170,7 +170,7 @@
      "value_name": "TIME"
     },
     {
-     "help": "Begin after a delay",
+     "help": "Start after a delay",
      "long": "--in",
      "name": "after",
      "repeatable": false,
@@ -328,7 +328,7 @@
     },
     {
      "env": "CAPTUREFAB_KEEP",
-     "help": "Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)",
+     "help": "Keep the camera open in a session after use (default 60s). Use 0 to reuse an open session or run without one",
      "long": "--keep",
      "name": "keep",
      "repeatable": false,
@@ -425,7 +425,7 @@
     "warnings": "[string]",
     "width": "int"
    },
-   "summary": "Save frames: one shot, a burst, a time lapse or a delayed capture; never overwrites"
+   "summary": "Save an image, burst, time lapse or scheduled capture without overwriting files"
   },
   "completions": {
    "args": [
@@ -477,7 +477,7 @@
    "args": [
     {
      "env": "CAPTUREFAB_CAMERA",
-     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "help": "Camera ID, serial, IP address, stream URL, file path or simulator (sim:0)",
      "long": "--camera",
      "name": "camera",
      "repeatable": false,
@@ -537,7 +537,7 @@
    "args": [
     {
      "env": "CAPTUREFAB_CAMERA",
-     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "help": "Camera ID, serial, IP address, stream URL, file path or simulator (sim:0)",
      "long": "--camera",
      "name": "camera",
      "repeatable": false,
@@ -576,7 +576,7 @@
    "args": [
     {
      "env": "CAPTUREFAB_CAMERA",
-     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "help": "Camera ID, serial, IP address, stream URL, file path or simulator (sim:0)",
      "long": "--camera",
      "name": "camera",
      "repeatable": false,
@@ -635,7 +635,7 @@
    "args": [
     {
      "env": "CAPTUREFAB_CAMERA",
-     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "help": "Camera ID, serial, IP address, stream URL, file path or simulator (sim:0)",
      "long": "--camera",
      "name": "camera",
      "repeatable": false,
@@ -727,7 +727,7 @@
    "args": [
     {
      "env": "CAPTUREFAB_CAMERA",
-     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "help": "Camera ID, serial, IP address, stream URL, file path or simulator (sim:0)",
      "long": "--camera",
      "name": "camera",
      "repeatable": false,
@@ -746,7 +746,7 @@
     },
     {
      "env": "CAPTUREFAB_KEEP",
-     "help": "Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)",
+     "help": "Keep the camera open in a session after use (default 60s). Use 0 to reuse an open session or run without one",
      "long": "--keep",
      "name": "keep",
      "repeatable": false,
@@ -784,7 +784,7 @@
    "args": [
     {
      "env": "CAPTUREFAB_CAMERA",
-     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "help": "Camera ID, serial, IP address, stream URL, file path or simulator (sim:0)",
      "long": "--camera",
      "name": "camera",
      "repeatable": false,
@@ -822,7 +822,7 @@
     },
     {
      "env": "CAPTUREFAB_KEEP",
-     "help": "Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)",
+     "help": "Keep the camera open in a session after use (default 60s). Use 0 to reuse an open session or run without one",
      "long": "--keep",
      "name": "keep",
      "repeatable": false,
@@ -866,7 +866,7 @@
    "args": [
     {
      "env": "CAPTUREFAB_CAMERA",
-     "help": "Camera, repeatable: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "help": "Camera ID, serial, IP address, stream URL, file path or simulator (sim:0). Repeat for more cameras",
      "long": "--camera",
      "name": "cameras",
      "repeatable": true,
@@ -885,7 +885,7 @@
     },
     {
      "env": "CAPTUREFAB_KEEP",
-     "help": "Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)",
+     "help": "Keep the camera open in a session after use (default 60s). Use 0 to reuse an open session or run without one",
      "long": "--keep",
      "name": "keep",
      "repeatable": false,
@@ -929,7 +929,7 @@
    "args": [
     {
      "env": "CAPTUREFAB_CAMERA",
-     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "help": "Camera ID, serial, IP address, stream URL, file path or simulator (sim:0)",
      "long": "--camera",
      "name": "camera",
      "repeatable": false,
@@ -940,7 +940,7 @@
     },
     {
      "env": "CAPTUREFAB_KEEP",
-     "help": "Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)",
+     "help": "Keep the camera open in a session after use (default 60s). Use 0 to reuse an open session or run without one",
      "long": "--keep",
      "name": "keep",
      "repeatable": false,
@@ -1001,7 +1001,7 @@
    "args": [
     {
      "env": "CAPTUREFAB_CAMERA",
-     "help": "Camera, repeatable: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "help": "Camera ID, serial, IP address, stream URL, file path or simulator (sim:0). Repeat for more cameras",
      "long": "--camera",
      "name": "cameras",
      "repeatable": true,
@@ -1115,7 +1115,7 @@
     },
     {
      "env": "CAPTUREFAB_KEEP",
-     "help": "Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)",
+     "help": "Keep the camera open in a session after use (default 60s). Use 0 to reuse an open session or run without one",
      "long": "--keep",
      "name": "keep",
      "repeatable": false,
@@ -1180,7 +1180,7 @@
     "warmup_ms": "int — how long a camera that sets its own exposure took to settle after it started",
     "warnings": "[string] — such as a camera still settling when --warmup ran out (verdict not_settled)"
    },
-   "summary": "Measure a fresh frame: exposure, clipping, focus, suggested exposure, a preview"
+   "summary": "Measure brightness, clipping and focus, with an exposure suggestion and a preview"
   },
   "jobs": {
    "args": [],
@@ -1478,7 +1478,7 @@
    ],
    "examples": [
     "printf '%s\\n' \"$PASS\" | capturefab login add rtsp://cam.local/stream --user admin --password-stdin",
-    "CAPTUREFAB_CAMERA_PASSWORD=secret capturefab login add onvif://cam.local --user admin"
+    "printf '%s\\n' \"$PASS\" | capturefab login add onvif://cam.local --user admin --password-stdin"
    ],
    "notes": [],
    "result": {
@@ -1520,6 +1520,9 @@
    "summary": "List saved camera sign-ins (never their passwords)"
   },
   "login rm": {
+   "aliases": [
+    "remove"
+   ],
    "args": [
     {
      "name": "address",
@@ -1682,7 +1685,7 @@
     },
     {
      "env": "CAPTUREFAB_CAMERA",
-     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "help": "Camera ID, serial, IP address, stream URL, file path or simulator (sim:0)",
      "long": "--camera",
      "name": "camera",
      "repeatable": false,
@@ -1741,7 +1744,7 @@
     },
     {
      "env": "CAPTUREFAB_KEEP",
-     "help": "Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)",
+     "help": "Keep the camera open in a session after use (default 60s). Use 0 to reuse an open session or run without one",
      "long": "--keep",
      "name": "keep",
      "repeatable": false,
@@ -1975,7 +1978,7 @@
     },
     {
      "env": "CAPTUREFAB_CAMERA",
-     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "help": "Camera ID, serial, IP address, stream URL, file path or simulator (sim:0)",
      "long": "--camera",
      "name": "camera",
      "repeatable": false,
@@ -2005,7 +2008,7 @@
     },
     {
      "env": "CAPTUREFAB_KEEP",
-     "help": "Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)",
+     "help": "Keep the camera open in a session after use (default 60s). Use 0 to reuse an open session or run without one",
      "long": "--keep",
      "name": "keep",
      "repeatable": false,
@@ -2085,7 +2088,7 @@
    "args": [
     {
      "env": "CAPTUREFAB_CAMERA",
-     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "help": "Camera ID, serial, IP address, stream URL, file path or simulator (sim:0)",
      "long": "--camera",
      "name": "camera",
      "repeatable": false,
@@ -2216,7 +2219,7 @@
     },
     {
      "env": "CAPTUREFAB_KEEP",
-     "help": "Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)",
+     "help": "Keep the camera open in a session after use (default 60s). Use 0 to reuse an open session or run without one",
      "long": "--keep",
      "name": "keep",
      "repeatable": false,
@@ -2341,7 +2344,7 @@
     },
     {
      "env": "CAPTUREFAB_CAMERA",
-     "help": "Camera, repeatable: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "help": "Camera ID, serial, IP address, stream URL, file path or simulator (sim:0). Repeat for more cameras",
      "long": "--camera",
      "name": "cameras",
      "repeatable": true,
@@ -2424,7 +2427,7 @@
     },
     {
      "env": "CAPTUREFAB_CAMERA",
-     "help": "Camera, repeatable: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "help": "Camera ID, serial, IP address, stream URL, file path or simulator (sim:0). Repeat for more cameras",
      "long": "--camera",
      "name": "cameras",
      "repeatable": true,
@@ -2556,7 +2559,7 @@
    "args": [
     {
      "env": "CAPTUREFAB_CAMERA",
-     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "help": "Camera ID, serial, IP address, stream URL, file path or simulator (sim:0)",
      "long": "--camera",
      "name": "camera",
      "repeatable": false,
@@ -2585,7 +2588,7 @@
     },
     {
      "env": "CAPTUREFAB_KEEP",
-     "help": "Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)",
+     "help": "Keep the camera open in a session after use (default 60s). Use 0 to reuse an open session or run without one",
      "long": "--keep",
      "name": "keep",
      "repeatable": false,
@@ -2727,7 +2730,7 @@
    "args": [
     {
      "env": "CAPTUREFAB_CAMERA",
-     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "help": "Camera ID, serial, IP address, stream URL, file path or simulator (sim:0)",
      "long": "--camera",
      "name": "camera",
      "repeatable": false,
@@ -2785,7 +2788,7 @@
     },
     {
      "env": "CAPTUREFAB_KEEP",
-     "help": "Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)",
+     "help": "Keep the camera open in a session after use (default 60s). Use 0 to reuse an open session or run without one",
      "long": "--keep",
      "name": "keep",
      "repeatable": false,
@@ -2817,7 +2820,7 @@
     "capturefab watch -c sim:0 --json --for 10s --every 1s"
    ],
    "notes": [
-    "Ctrl-C ends it (exit 0). Without a terminal, or with --json, each measurement is one JSON line."
+    "Use Ctrl-C to stop. The command exits with code 0. When you redirect stdout or use --json, watch writes one JSON line per measurement."
    ],
    "result": {
     "camera": "string — camera ID",
@@ -2833,21 +2836,21 @@
     "t": "float — seconds since watching began; one JSON line each --every (a terminal shows them redrawn instead)",
     "verdict": "[ok|dark|bright|clipped_high|clipped_low|…] — as inspect"
    },
-   "summary": "Live measurements while aiming, focusing or setting exposure: redrawn in a terminal, one JSON line each otherwise"
+   "summary": "Measure brightness and focus live while you adjust the camera"
   }
  },
  "generated_by": "scripts/site-reference.py --binary target/debug/capturefab",
  "global_options": [
   {
    "env": "CAPTUREFAB_JSON",
-   "help": "One JSON document on stdout: the result, or {\"error\":{...}} with a non-zero exit",
+   "help": "Print JSON results and errors",
    "long": "--json",
    "short": null,
    "value_name": null
   },
   {
    "env": null,
-   "help": "No progress or notes on stderr; errors still print",
+   "help": "Hide status and notes. Still report errors and explicit --progress output",
    "long": "--quiet",
    "short": "-q",
    "value_name": null
@@ -2868,7 +2871,7 @@
   },
   {
    "env": null,
-   "help": "Never use a running session: open the camera in a worker of this command",
+   "help": "Bypass sessions for camera commands",
    "long": "--no-session",
    "short": null,
    "value_name": null
@@ -2933,7 +2936,7 @@
     "capturefab session stop"
    ],
    "notes": [
-    "Camera commands keep their camera open in the auto session for 60s after their last use (--keep DUR to change it, --keep 0 or --no-session for none), and use a session that holds their camera on their own."
+    "Camera commands can reuse a session that already holds the camera. Most keep the camera open in the auto session for 60s after use. Use --keep DUR to change that time. Use --keep 0 to avoid starting a session for a foreground camera command. Use --no-session to bypass existing sessions."
    ],
    "summary": "Sessions keep cameras open between commands: start one in the background, stop it, see it"
   }
@@ -2946,7 +2949,7 @@
    ],
    "capture": [
     "file_write",
-    "Save frames: one shot, a burst, a time lapse or a delayed capture; never overwrites"
+    "Save an image, burst, time lapse or scheduled capture without overwriting files"
    ],
    "completions": [
     "read",
@@ -2990,7 +2993,7 @@
    ],
    "inspect": [
     "read",
-    "Measure a fresh frame: exposure, clipping, focus, suggested exposure, a preview"
+    "Measure brightness, clipping and focus, with an exposure suggestion and a preview"
    ],
    "jobs": [
     "read",
@@ -3102,20 +3105,20 @@
    ],
    "watch": [
     "read",
-    "Live measurements while aiming, focusing or setting exposure: redrawn in a terminal, one JSON line each otherwise"
+    "Measure brightness and focus live while you adjust the camera"
    ]
   },
   "contract_version": 1,
   "conventions": {
-   "camera": "-c/--camera CAM (CAPTUREFAB_CAMERA). Without it: the session's only camera, else the only camera list finds (not sim: or screens)",
-   "credentials": "never printed; URLs are redacted",
-   "describe": "capturefab schema COMMAND: arguments, result fields and errors",
-   "globals": "--json, -q/--quiet, -v/--verbose, --session NAME (CAPTUREFAB_SESSION), --no-session (overrides it); before or after the command",
-   "jobs": "capture/record block until done; --background prints a job instead (jobs wait ID). Ctrl-C: capture exits 130 with details.files; open-ended record ends normally",
-   "json": "--json (or CAPTUREFAB_JSON=1): one line on stdout, the result on exit 0, else {\"error\":{code,message,hint?,details?}}: code is the reason (see errors), the exit code its category. No nulls; warnings ≤10",
-   "results": "snake_case keys; units in names (exposure_us); times RFC 3339 UTC; lists bounded with truncated",
-   "routing": "--session NAME, else a session holding the camera, else the auto session, open 60s after last use (--keep DUR); --keep 0 or --no-session: a worker of the command",
-   "streams": "NDJSON: watch a line per measurement, shell per command; capture, record, jobs wait --progress: stderr lines {progress:{job,state,saved,planned?,elapsed_s,left_s?,…}}"
+   "camera": "Use `-c CAM` or `CAPTUREFAB_CAMERA`. By default, use the session's only camera or the only camera discovered. Discovery for this default excludes simulators and screens",
+   "credentials": "Capturefab redacts credentials in camera URLs",
+   "describe": "Run `capturefab schema COMMAND` for arguments, result fields and errors",
+   "globals": "Put global options before or after the command",
+   "jobs": "`capture` and `record` normally wait for the job. `--background` returns a job to follow with `jobs wait ID`",
+   "json": "`--json` or `CAPTUREFAB_JSON=1` usually writes one result line to stdout. A failure returns `error` with `code`, `message` and optional `hint` and `details`",
+   "results": "Keys use `snake_case`, with units in names such as `exposure_us`. Timestamps use RFC 3339 UTC. Missing fields are omitted",
+   "routing": "Use `--session NAME` to choose a session. Otherwise, commands reuse a matching session. Most camera commands keep the camera open in `auto` for 60s after use. `--keep 0` can reuse a session. Use `--no-session` to bypass sessions",
+   "streams": "`watch --json` and `shell --json` emit NDJSON. With `capture --json -o -`, image bytes go to stdout and JSON goes to stderr. `--progress` sends JSON progress to stderr"
   },
   "effect_with": {
    "capture": {
@@ -3258,10 +3261,10 @@
    "6": "storage full"
   },
   "grammars": {
-   "duration": "number+unit, repeatable: 500us, 250ms, 2s, 5m, 1h30m; 0; none where a wait may be unlimited. A bare number is invalid_duration",
-   "name": "Feature | Feature[Selector=Value,…] | Feature[Value] (when one selector addresses it) | control: exposure, gain, fps, roi, format, trigger, auto_exposure, auto_wb",
-   "selector": "list id (gige:…, u3v:…, avfoundation:…, v4l2:…, dshow:…), serial, IPv4, rtsp(s)://, srt://, http(s)://, onvif://host[/path], file, sim:N[?drop=0..0.5&line0=every:DUR], sim:replay:PATH",
-   "template": "-o: {camera} {serial} {seq} {seq:N} {time} {date} {tag:KEY} {ext}; a folder holds {camera}-{time}-{seq}.{ext}; a taken name fails without {seq}, {time} or --on-exists number"
+   "duration": "Add a unit, as in `250ms`, `1.5s` or `1h30m`. Use `0` where allowed. Some waits accept `none` for an unlimited wait",
+   "name": "Use `Feature`, `Feature[Selector=Value,…]` or `Feature[Value]` for one selector. Controls include `exposure`, `gain`, `fps`, `roi`, `format`, `trigger`, `auto_exposure` and `auto_wb`",
+   "selector": "Camera ID from `list`, serial, IPv4, stream URL such as `rtsp://HOST/PATH`, `onvif://HOST`, file path, `sim:N[?drop=0..0.5&line0=every:DUR]` or `sim:replay:PATH`",
+   "template": "Capture names accept `{camera}`, `{serial}`, `{seq}`, `{seq:N}`, `{frame}`, `{time}`, `{date}`, `{datetime}`, `{tag:KEY}` and `{ext}`"
   }
  }
 }

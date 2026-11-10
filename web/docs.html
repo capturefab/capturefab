@@ -53,9 +53,9 @@
         </details>
         <header class="docs-head">
           <p class="eyebrow">Documentation</p>
-          <h1>Find cameras. Capture images. Script it.</h1>
-          <p class="lead">One <code>capturefab</code> command for people, scripts and AI agents. Learn with the simulator camera, then connect your own.</p>
-          <p class="notice">These guides describe the current source. An installed release can differ: <code>capturefab --version</code> names it, and <code>capturefab COMMAND --help</code> and <code>capturefab schema COMMAND</code> list exactly what it accepts.</p>
+          <h1>Capturefab documentation</h1>
+          <p class="lead">Find cameras, save images and record video from the terminal. Start with the built-in simulator to learn the commands without a camera.</p>
+          <p class="notice">These guides describe the current source. Run <code>capturefab --version</code> to see your installed version. Use <code>capturefab COMMAND --help</code> or <code>capturefab schema COMMAND</code> for the options your version supports.</p>
           <div id="search" class="docs-search">
             <label for="docs-query">Search the documentation</label>
             <input id="docs-query" type="search" placeholder="Search cameras, capture, triggers, commands…" aria-controls="docs-results" autocomplete="off">
@@ -66,42 +66,41 @@
         </header>
         <div class="docs-start-grid" aria-label="Popular documentation">
           <a href="#getting-started"><strong>Try the simulator</strong><span>Capture, measure and record with <code>sim:0</code>, no hardware needed.</span></a>
-          <a href="#agent-setup"><strong>Use your coding agent</strong><span>Let Claude Code, Codex or another harness drive cameras through the CLI.</span></a>
+          <a href="#agent-setup"><strong>Use your coding agent</strong><span>Let a coding agent run camera commands and read the results.</span></a>
           <a href="reference.html"><strong>Command reference</strong><span>Every command, option, result field and error code.</span></a>
         </div>
 
         <article class="doc-section" id="getting-started" data-doc-section data-doc-title="Your first capture" data-doc-category="Start here" data-doc-tags="quickstart,getting started,simulator,first image,demo,sim:0">
           <p class="eyebrow">Start here</p><h2>Your first capture</h2>
-          <p class="doc-summary">The simulator camera <code>sim:0</code> lets you try every command without hardware.</p>
-          <ol><li><a href="#installation">Install Capturefab</a>.</li><li>Open a terminal and run the commands below one at a time.</li><li>Then replace <code>sim:0</code> with an ID from <code>capturefab list</code>.</li></ol>
+          <p class="doc-summary">Use <code>sim:0</code> to save your first image without connecting a camera.</p>
+          <ol><li><a href="#installation">Install Capturefab</a>.</li><li>Open a terminal in a folder where you can save files.</li><li>Run the commands below in order.</li></ol>
           <div class="code-wrap"><pre><code>capturefab list --kind sim
 capturefab info -c sim:0
 capturefab capture -c sim:0 -o 'first-{seq}.png'
-capturefab inspect -c sim:0
-capturefab set -c sim:0 exposure=5ms gain=3
-capturefab record -c sim:0 -o clip.mp4 --for 10s</code></pre><button class="copy-button" type="button" aria-label="Copy the first capture commands">Copy</button></div>
-          <p><code>info</code> shows the image size, pixel format, exposure, gain, trigger and the controls the camera has. <code>capture</code> saves <code>first-0001.png</code>; run it again for <code>first-0002.png</code>, because Capturefab never overwrites a file. <code>inspect</code> measures brightness, clipping and sharpness and writes a small preview image. <code>set</code> changes several values as one change. <code>record</code> saves ten seconds of H.264 video.</p>
-          <p>Add <code>--json</code> to any command for one JSON document on stdout. Each command lists its options and examples with <code>--help</code>.</p>
+capturefab inspect -c sim:0</code></pre><button class="copy-button" type="button" aria-label="Copy the first capture commands">Copy</button></div>
+          <p><code>info</code> shows the simulator's image size, pixel format and available controls. Open the file named in the capture result to see the test pattern. In an empty folder, this is <code>first-0001.png</code>. The <code>{seq}</code> template picks the next free number. <code>inspect</code> measures brightness and sharpness and prints the path to a JPEG preview.</p>
+          <p>To try a connected camera, run <code>capturefab list</code>. Replace <code>sim:0</code> with the ID of your camera. If it does not appear, see <a href="#discovery">Find cameras</a>.</p>
         </article>
 
         <article class="doc-section" id="agent-setup" data-doc-section data-doc-title="Use Capturefab from an AI agent" data-doc-category="Start here" data-doc-tags="agent,ai,claude code,codex,harness,llm,json,schema,permissions,allowlist,preview,tokens">
           <p class="eyebrow">Start here</p><h2>Use Capturefab from an AI agent</h2>
           <p class="doc-summary">Coding agents such as Claude Code or Codex drive cameras through the CLI and read its JSON results.</p>
-          <ol><li>Install Capturefab where the agent runs, so <code>capturefab</code> is on its <code>PATH</code>.</li><li>Give the agent <a href="agents.md">agents.md</a>, or tell it to run <code>capturefab schema</code> first.</li><li>Allow the commands it may run without asking, by prefix (see below).</li><li>Start with a bounded task on <code>sim:0</code>, then name the real camera.</li></ol>
+          <ol><li>Put <code>capturefab</code> on the agent's <code>PATH</code>.</li><li>Give the agent <a href="agents.md">agents.md</a> or ask it to run <code>capturefab schema</code>.</li><li>Ask it to capture one image from <code>sim:0</code> in the task folder.</li><li>For real hardware, give it a camera ID and specify which settings it can change.</li></ol>
           <div class="code-wrap"><pre><code>capturefab schema
 capturefab schema capture
 capturefab list --json
 capturefab inspect --json -c sim:0 --preview none
 capturefab capture --json -c sim:0 -o 'shots/{seq}.png'</code></pre><button class="copy-button" type="button" aria-label="Copy the agent commands">Copy</button></div>
-          <p>Every command takes <code>--json</code> and prints exactly one JSON document. The exit code gives the category and <code>error.code</code> the reason, so an agent knows what to do next without reading prose. <code>schema</code> describes every command in about 8 KB (roughly 2,500 tokens). Flags can follow the command, so a harness can allow commands by their first words.</p>
+          <p>Use <code>--json</code> for <a href="#cli-reference">structured results and errors</a>. Read the exit code and <code>error.code</code> before deciding what to do next. Use <code>schema COMMAND</code> to look up the options, result fields and errors for one command.</p>
           <div class="table-scroll"><table><caption>Command effects, from capturefab schema</caption><thead><tr><th scope="col">Effect</th><th scope="col">Examples</th><th scope="col">Suggested permission</th></tr></thead><tbody>
-            <tr><td><code>read</code></td><td><code>list</code>, <code>info</code>, <code>features</code>, <code>get</code>, <code>inspect</code>, <code>jobs</code>, <code>doctor</code>, <code>schema</code></td><td>Allow</td></tr>
+            <tr><td><code>read</code></td><td><code>list</code>, <code>info</code>, <code>features</code>, <code>get</code>, <code>inspect</code>, <code>jobs list</code>, <code>doctor</code>, <code>schema</code></td><td>Allow for the task</td></tr>
             <tr><td><code>file_write</code></td><td><code>capture</code>, <code>record</code>, <code>preset save</code></td><td>Allow in the task's folder</td></tr>
             <tr><td><code>camera_write</code></td><td><code>set</code>, <code>auto</code>, <code>preset apply</code>, <code>jobs stop</code></td><td>Allow for the task's cameras</td></tr>
             <tr><td><code>disruptive</code></td><td><code>exec</code>, <code>session start</code>, <code>session stop</code>, <code>serve</code>, <code>debug write</code></td><td>Ask first</td></tr>
           </tbody></table></div>
-          <p>The effect is for a command without these flags: <code>--set</code> on <code>inspect</code>, <code>capture</code> and <code>record</code>, and <code>--auto</code> on <code>capture</code> and <code>record</code>, change camera settings and leave them changed, and <code>network --tune</code> writes camera network settings; <code>inspect --preview PATH</code> and <code>debug xml -o FILE</code> write that file, as a <code>file_write</code> command does. A prefix also matches every subcommand: a rule for <code>capturefab jobs</code> allows <code>capturefab jobs stop all</code>. Allow exact prefixes such as <code>capturefab jobs list</code> and <code>capturefab jobs wait</code>, and have the agent ask before a call with <code>--set</code>, <code>--auto</code> or <code>--tune</code> on a camera the task does not own.</p>
-          <p><code>inspect</code> writes its preview into a private folder: <code>capturefab --json doctor</code> names it in <code>inspect_dir</code>. Let the agent read files there, or pass <code>--preview none</code> or <code>--preview PATH</code>. Your harness decides whether the model sees images. <code>--keep 5m</code> keeps a camera open between calls, which makes measuring loops fast.</p>
+          <p>Review flags as well as command names. <code>--set</code>, <code>--auto</code> and <code>network --tune</code> leave camera settings changed. <code>inspect --preview PATH</code> and <code>debug xml -o FILE</code> write to the specified paths.</p>
+          <p>If your agent tool uses prefix rules, allow specific subcommands such as <code>capturefab jobs list</code>. A rule for <code>capturefab jobs</code> also matches <code>capturefab jobs stop all</code>.</p>
+          <p>Use <code>inspect --preview none</code> for measurements alone. To give the agent a preview, use <code>--preview PATH</code> to save it in the task folder. Otherwise, <code>capturefab doctor --json</code> gives the default preview folder in <code>inspect_dir</code>.</p>
         </article>
 
         <article class="doc-section" id="installation" data-doc-section data-doc-title="Install and verify" data-doc-category="Start here" data-doc-tags="install,download,install script,curl,irm,linux,macos,windows,arm64,checksum,sha256,smartscreen,unsigned,firewall,winusb,zadig,local network,camera permission,permission,privacy,gatekeeper,path,terminal">
@@ -111,17 +110,17 @@ capturefab capture --json -c sim:0 -o 'shots/{seq}.png'</code></pre><button clas
 curl -fsSL https://capturefab.com/install.sh | sh
 # Windows PowerShell: %LOCALAPPDATA%\Programs\Capturefab, on your user PATH
 irm https://capturefab.com/install.ps1 | iex</code></pre><button class="copy-button" type="button" aria-label="Copy the install commands">Copy</button></div>
-          <p>The installers never use <code>sudo</code> or administrator rights. To read the script first: <code>curl -fsSLO https://capturefab.com/install.sh; less install.sh; sh install.sh</code>. <code>--dry-run</code> prints the file, URL and checksum it would use; <code>--prefix DIR</code> and <code>--bin-dir DIR</code> choose other folders.</p>
-          <p>To download by hand, open the <a href="downloads.html">download page</a>. Select the build for your installed operating system and processor: Apple silicon uses ARM64, Intel and AMD PCs usually use x64. Check the file in the download's folder:</p>
+          <p>The installers use your account's permissions. You can read the <a href="install.sh">macOS and Linux script</a> or the <a href="install.ps1">Windows script</a> before running it. To see which file the installer would use, run the saved script with <code>--dry-run</code> on macOS or Linux, or <code>-DryRun</code> on Windows.</p>
+          <p>To download by hand, select a build for your operating system and processor. Use ARM64 for Apple silicon and x64 for Intel Macs. In the commands below, replace <code>DOWNLOADED_FILE</code> with the filename and <code>EXPECTED_SHA256</code> with its checksum from the <a href="downloads.html">download page</a>.</p>
           <div class="code-wrap"><pre><code># Linux
 echo "EXPECTED_SHA256  DOWNLOADED_FILE" | sha256sum -c
 # macOS
 echo "EXPECTED_SHA256  DOWNLOADED_FILE" | shasum -a 256 -c
 # Windows PowerShell
 if ((Get-FileHash .\DOWNLOADED_FILE -Algorithm SHA256).Hash -eq 'EXPECTED_SHA256') { 'OK: checksum matches' } else { 'MISMATCH: do not open this file' }</code></pre><button class="copy-button" type="button" aria-label="Copy the checksum commands">Copy</button></div>
-          <p>Linux and macOS print <code>OK</code> for a match; anything else means do not use the file. Then extract the archive. It holds the <code>capturefab</code> executable (<code>capturefab.exe</code> on Windows), a README and the license files.</p>
+          <p>Run the command for your operating system from the folder with the download. If the checksum matches, extract the archive. It contains <code>capturefab</code> or <code>capturefab.exe</code>, a README and the license files.</p>
           <h3 id="cli-path">Put capturefab on your PATH</h3>
-          <p>The installers already do this. After a manual download, put the executable in a folder on your <code>PATH</code>:</p>
+          <p>The Windows installer updates your user <code>PATH</code>. The macOS and Linux installer prints instructions if its command folder is missing from <code>PATH</code>. If you downloaded and extracted the archive by hand, use the commands for your operating system below.</p>
           <div class="code-wrap"><pre><code># macOS and Linux, from the extracted folder
 install -Dm755 ./capturefab ~/.local/bin/capturefab   # Linux
 mkdir -p ~/.local/bin &amp;&amp; cp ./capturefab ~/.local/bin/  # macOS
@@ -165,13 +164,13 @@ gh attestation verify DOWNLOADED_FILE --repo capturefab/capturefab</code></pre><
 
         <article class="doc-section" id="discovery" data-doc-section data-doc-title="Find cameras" data-doc-category="Cameras" data-doc-tags="list,ls,discover,find,gige,usb,u3v,webcam,onvif,serial,ip address,candidates,camera_ambiguous,camera_not_found">
           <p class="eyebrow">Cameras</p><h2>Find cameras</h2>
-          <p class="doc-summary"><code>list</code> searches every transport at once and prints an ID for each camera.</p>
+          <p class="doc-summary"><code>list</code> searches for connected cameras and prints an ID you can pass to <code>-c</code>.</p>
           <div class="code-wrap"><pre><code>capturefab list
 capturefab list --kind gige,u3v --timeout 3s
 capturefab list --kind webcam
 capturefab --json list</code></pre><button class="copy-button" type="button" aria-label="Copy the camera listing commands">Copy</button></div>
-          <p>Kinds are <code>gige</code>, <code>u3v</code>, <code>webcam</code>, <code>onvif</code>, <code>screen</code> and <code>sim</code>. Screen captures and simulators appear only when <code>--kind</code> names them. <code>--timeout</code> sets how long GigE and ONVIF broadcasts collect answers (default <code>1s</code>). A transport that cannot be searched adds a line to <code>warnings</code> instead of failing the command.</p>
-          <p>Pass an ID to <code>-c</code>. A unique serial number or a GigE IPv4 address also works. Without <code>-c</code>, a command uses the only camera a session holds, or else the only camera <code>list</code> finds; with several it exits 2 with <code>camera_ambiguous</code> and lists the candidates, except at a terminal without <code>--json</code>, where it shows a numbered list and asks which (Enter takes the first). <code>CAPTUREFAB_CAMERA</code> sets a default.</p>
+          <p>Use <code>--kind</code> to filter the search. Screen sources and simulators appear only when you ask for <code>screen</code> or <code>sim</code>. Use <code>--timeout</code> to give GigE Vision and ONVIF cameras more time to reply. If a search fails for one connection type, read <code>warnings</code> in the JSON result.</p>
+          <p>In scripts, pass the camera ID with <code>-c</code>. A unique serial number or a GigE camera’s IPv4 address also works. If you omit <code>-c</code> and Capturefab finds several cameras, it can prompt you to choose in a terminal. An ambiguous selector returns <code>camera_ambiguous</code>.</p>
           <p>A GigE camera needs a reachable address on a wired adapter's subnet; <a href="#network"><code>capturefab network</code></a> checks the path. USB3 Vision needs operating system access: the udev rule on Linux, an available IOKit interface on macOS and <a href="#winusb">WinUSB</a> on Windows. Read the <a href="guides/camera-compatibility.md">camera requirements and limits</a>.</p>
         </article>
 
@@ -186,7 +185,7 @@ capturefab --json list</code></pre><button class="copy-button" type="button" ari
             <tr><td>Video or image file</td><td>a path, such as <code>clip.mkv</code></td></tr>
             <tr><td>Simulator</td><td><code>sim:0</code>, <code>sim:1</code>, <code>sim:line</code>, <code>sim:depth</code>, <code>sim:microscope</code>, <code>sim:thermal</code>, <code>sim:replay:PATH</code></td></tr>
           </tbody></table></div>
-          <p>Quote selectors with spaces, <code>?</code> or <code>&amp;</code> in a shell. Never put a password in a selector you save in a script; save it with <a href="#logins"><code>login add</code></a> instead. Credentials in URLs are always redacted in output.</p>
+          <p>Quote selectors that contain spaces, <code>?</code> or <code>&amp;</code>. For supported password-protected cameras, use <a href="#logins"><code>login add</code></a> to store credentials outside the script.</p>
           <div class="code-wrap"><pre><code>capturefab capture -c 'avfoundation:Camera Name?size=1280x720' -o webcam.png
 capturefab features -c v4l2:/dev/video0 VideoMode
 capturefab capture -c rtsp://cam.local/stream -n 5 -o snapshots/
@@ -196,16 +195,16 @@ capturefab capture -c clip.mkv -n 100 -o frames/</code></pre><button class="copy
         <article class="doc-section" id="simulation" data-doc-section data-doc-title="Simulated cameras" data-doc-category="Cameras" data-doc-tags="simulation,simulator,sim:0,sim:line,sim:depth,sim:microscope,sim:thermal,replay,sim:replay,test,no hardware">
           <p class="eyebrow">Cameras</p><h2>Simulated cameras</h2>
           <p class="doc-summary">Built-in cameras for learning, scripting and tests without hardware.</p>
-          <p><code>sim:0</code> (and <code>sim:1</code>, <code>sim:2</code>, …) is a moving pattern camera with exposure, gain, frame rate, region, pixel formats (Mono8, Mono12, Mono12p, Mono14p, Mono16, RGB8, RGB12, BayerRG8, BayerRG12, BayerRG12p), auto exposure and a trigger bank. <code>sim:line</code>, <code>sim:depth</code>, <code>sim:microscope</code> and <code>sim:thermal</code> act like those kinds of camera. <code>sim:replay:PATH</code> replays a video, an image or a folder of them.</p>
+          <p><code>sim:0</code> and other numbered simulators generate a moving pattern. They support exposure, gain, frame rate, region, several pixel formats and triggers. Use <code>sim:line</code>, <code>sim:depth</code>, <code>sim:microscope</code> or <code>sim:thermal</code> to try a different camera type. Use <code>sim:replay:PATH</code> to replay a video, an image or a folder of media files.</p>
           <div class="code-wrap"><pre><code>capturefab inspect -c sim:0 --set exposure=40ms
 capturefab capture -c sim:0 -c sim:1 -o 'multi/{camera}-{seq}.png'
 capturefab capture -c sim:replay:/data/clip.mp4 -n 100 -o replay-frames/</code></pre><button class="copy-button" type="button" aria-label="Copy the simulator examples">Copy</button></div>
-          <p>A simulator keeps the settings you give it until its runtime folder is cleared, as a real camera keeps its own until it powers off, and commands keep it open for 60 seconds between them. <code>capture --set</code> changes settings and captures in one call. Read the <a href="guides/simulation.md">simulated camera guide</a> for replay rules.</p>
+          <p>Simulator settings stay in the runtime folder between commands. Use <code>capture --set</code> to change settings before saving an image. See the <a href="guides/simulation.md">simulator guide</a> for replay and trigger options.</p>
         </article>
 
         <article class="doc-section" id="features" data-doc-section data-doc-title="Read and change settings" data-doc-category="Cameras" data-doc-tags="info,features,get,set,exec,genicam,exposure,gain,fps,roi,format,trigger,controls,bank,selector,dry run,rollback,out_of_range,feature_not_found,user set">
           <p class="eyebrow">Cameras</p><h2>Read and change settings</h2>
-          <p class="doc-summary"><code>info</code> summarizes a camera; <code>get</code> and <code>set</code> read and write features and controls in one call.</p>
+          <p class="doc-summary">Use <code>info</code> to see what a camera supports. Use <code>get</code> and <code>set</code> to read and change its settings.</p>
           <div class="code-wrap"><pre><code>capturefab info -c sim:0
 capturefab features -c sim:0 Trigger
 capturefab features -c sim:0 'Exposure*' --all
@@ -213,9 +212,11 @@ capturefab get -c sim:0 exposure gain ExposureTime 'TriggerMode[FrameStart]'
 capturefab set -c sim:0 exposure=5ms gain=3
 capturefab set -c sim:0 roi=0,0,320,240 fps=20 --dry-run
 capturefab exec -c sim:0 'TriggerSoftware[FrameStart]'</code></pre><button class="copy-button" type="button" aria-label="Copy the settings commands">Copy</button></div>
-          <p>Names are the camera's GenICam features (<code>ExposureTime</code>), a feature at a selector value (<code>TriggerMode[FrameStart]</code>, or <code>Feature[Selector=Value]</code>; quote these in the shell, because zsh expands brackets), or a portable control: <code>exposure</code>, <code>gain</code>, <code>fps</code>, <code>roi</code> (<code>x,y,w,h</code> or <code>full</code>), <code>format</code>, <code>trigger</code> (<code>off</code>, <code>software</code>, <code>line0:rising</code> …), <code>auto_exposure</code> and <code>auto_wb</code>. Time features take durations: <code>ExposureTime=10ms</code>.</p>
-          <p><code>set</code> writes every value as one change, in an order that keeps the camera valid: a size before its offset (the offset first when it gets smaller), an auto mode off before its value, a lower frame rate before a longer exposure. If a write fails, every value written is put back, and so is the rest of the image geometry a write moved (a binning rescales the size and offsets); the error's <code>details.rollback</code> lists what was restored. <code>--dry-run</code> checks the values against the camera and shows the writes in order. The result lists each <code>changed</code> value as read back, which can be rounded to the camera's increment.</p>
-          <p>A wrong name exits 2 with <code>feature_not_found</code> and close names in <code>details.did_you_mean</code>; a value outside the range exits 2 with <code>out_of_range</code> and <code>details.nearest</code>. <code>features</code> shows the common features by default; a pattern, <code>--category</code> or <code>--all</code> searches every level. <code>exec</code> runs a command feature, such as <code>UserSetSave[UserSet1]</code> to keep settings in the camera.</p>
+          <p>Use portable controls such as <code>exposure</code>, <code>gain</code>, <code>fps</code> and <code>roi</code> when the camera supports them. For a GenICam feature, use the name from <code>features</code>, such as <code>ExposureTime</code>. A selector in brackets, such as <code>TriggerMode[FrameStart]</code>, chooses which value to read or change. Quote names with brackets so the shell passes them as written.</p>
+          <p>Use <code>set --dry-run</code> to see the planned writes in order. After a write, the result shows the value read back from the camera. A camera can round a value to its supported increment.</p>
+          <p>If a write fails, Capturefab tries to restore the earlier values. Read <code>error.details.rollback</code> to see which values it restored and which it could not restore.</p>
+          <p>For an unknown feature, look for <code>details.did_you_mean</code>. For an out-of-range value, look for <code>details.nearest</code>.</p>
+          <p><code>features</code> shows common features by default. Use a name pattern, <code>--category</code> or <code>--all</code> to see more. <code>exec</code> runs a command feature such as <code>UserSetSave[UserSet1]</code>.</p>
         </article>
 
         <article class="doc-section" id="inspect" data-doc-section data-doc-title="Measure exposure and focus" data-doc-category="Cameras" data-doc-tags="inspect,watch,live,show,exposure,brightness,clipping,histogram,focus,sharpness,laplacian,tenengrad,brenner,variance,verdict,suggest,preview,region">
@@ -225,9 +226,15 @@ capturefab exec -c sim:0 'TriggerSoftware[FrameStart]'</code></pre><button class
 capturefab inspect -c sim:0 --set exposure=20ms --region 0.25,0.25,0.5,0.5
 capturefab inspect -c sim:0 --keep 5m --preview none
 capturefab --json inspect -c sim:0 -v --preview none
-capturefab watch -c sim:0 --show</code></pre><button class="copy-button" type="button" aria-label="Copy the inspect commands">Copy</button></div>
-          <p>The result gives brightness as fractions of full scale (<code>mean</code>, <code>p1</code>, <code>p50</code>, <code>p99</code>), the shares and counts of pixels at black and full scale (<code>clipped_low</code>, <code>clipped_high</code>, <code>clipped_low_px</code>, <code>clipped_high_px</code>), counted over every pixel at the frame's own bit depth, a <code>verdict</code> list of one or more of <code>ok</code>, <code>dark</code>, <code>bright</code>, <code>clipped_high</code>, <code>clipped_low</code>, <code>not_settled</code> and <code>not_measured</code> (such as <code>["ok"]</code> or <code>["clipped_high","bright"]</code>; the frame is fine when it is exactly <code>["ok"]</code>) and, when exposure is off, <code>suggest</code>: how many stops to move and the exposure to try. <code>focus.sharpness</code> is the variance of the Laplacian; compare it between frames of one camera and scene. <code>-v</code> adds a 16-bin histogram, color channels and the Tenengrad, Brenner and variance focus measures.</p>
-          <p><code>--set</code> changes settings first, as <code>set</code> does, then measures a frame taken after the change. <code>--region X,Y,W,H</code> measures part of the frame, in fractions 0 to 1. The preview is a JPEG (longest edge <code>--size</code>, default 768) in a private folder that <code>doctor</code> names; <code>--preview PATH</code> writes it elsewhere and <code>--preview none</code> skips it. For a focus or aiming loop, the camera stays open between calls (60 seconds, or <code>--keep 5m</code>), and <code>--for 10s --every 200ms</code> measures a series and returns the sharpest frame's measurements and preview. The measured frame is always one exposed after the camera's last settings change; <code>--fresh N</code> lets N more pass. A camera that sets its own exposure (a webcam, a stream, <code>ExposureAuto=Continuous</code>) gets up to <code>--warmup</code> (default <code>2s</code>) to settle after it starts; <code>not_settled</code> in the verdict says it had not. <code>--clip-threshold</code> sets the share of pixels at full scale that makes the verdict <code>clipped_high</code>. <code>watch</code> measures continuously instead: in a terminal it redraws the measurements in place, and with <code>--show</code> the frame under them; otherwise, as with <code>--json</code>, it prints one JSON line per measurement (<code>--every</code>, <code>--for</code>).</p>
+capturefab watch -c sim:0 --show --for 5s</code></pre><button class="copy-button" type="button" aria-label="Copy the inspect commands">Copy</button></div>
+          <ul>
+            <li>Read <code>verdict</code> for conditions such as <code>dark</code> or <code>clipped_high</code>. One frame can have more than one condition.</li>
+            <li>Read <code>exposure</code> for brightness and counts of pixels at black or full scale. When present, <code>suggest</code> gives an exposure to try.</li>
+            <li>Compare <code>focus.sharpness</code> across frames from the same camera and scene. Higher values indicate sharper edges. Use <code>-v</code> for a histogram and more focus measures.</li>
+          </ul>
+          <p>Use <code>--set</code> to change settings before measuring. Use <code>--region X,Y,W,H</code> to measure part of the frame. Each number is a fraction of the full width or height. The JPEG preview’s longest edge is 768 pixels by default. Use <code>--size</code> to change it, or <code>--preview none</code> to skip the preview.</p>
+          <p>Use <code>--for 10s --every 200ms</code> to measure a series and get the sharpest frame’s results. For live measurements, use <code>watch</code>. Add <code>--show</code> to see frames in a compatible terminal, or <code>--json</code> for one JSON line per measurement.</p>
+          <p>Use <code>--fresh N</code> to skip extra frames before measuring. If <code>verdict</code> contains <code>not_settled</code>, the camera’s automatic exposure was still changing when <code>--warmup</code> ended.</p>
         </article>
 
         <article class="doc-section" id="auto-exposure" data-doc-section data-doc-title="Auto exposure" data-doc-category="Cameras" data-doc-tags="auto,auto exposure,gain,settle,hold,continuous,off,ExposureAuto,GainAuto,BalanceWhiteAuto">
@@ -237,19 +244,19 @@ capturefab watch -c sim:0 --show</code></pre><button class="copy-button" type="b
 capturefab auto -c sim:0 --timeout 10s
 capturefab auto -c sim:0 --off
 capturefab capture -c sim:0 --auto -o settled.png</code></pre><button class="copy-button" type="button" aria-label="Copy the auto exposure commands">Copy</button></div>
-          <p><code>auto</code> uses the camera's own auto exposure once when it has one, and otherwise adjusts exposure and gain itself until the brightness settles or <code>--timeout</code> ends. The result reports <code>settled</code>, the exposure and gain it holds, and <code>limited_by</code> when a limit stopped it; <code>settled: false</code> still exits 0. <code>--off</code> turns the camera's auto exposure, gain and white balance off and keeps their values. <code>--continuous</code> leaves the camera's continuous auto exposure on; for cameras without one, Capturefab's own loop runs only in a session. Cameras without exposure control, such as thermal and line scan sources, exit 5 <code>unsupported</code>, as does a camera that sends frames only when triggered; a trigger whose source is the camera's own timing (<code>Freerun</code> or <code>FixedRate</code>) holds no frames back.</p>
+          <p><code>auto</code> uses the camera’s auto exposure when available. Capturefab adjusts exposure and gain itself if the camera has no auto mode or if you set <code>--region</code> or <code>--max-exposure</code>. Read <code>settled</code> even when the command exits 0. If present, <code>limited_by</code> names the limit that affected the result.</p>
+          <p>Use <code>--off</code> to turn off automatic exposure, gain and white balance while keeping their current values. Use <code>--continuous</code> to keep adjusting exposure. Capturefab’s own continuous loop runs only in a session. A camera without exposure control or one that waits for external triggers can return <code>unsupported</code>.</p>
         </article>
 
         <article class="doc-section" id="triggers" data-doc-section data-doc-title="Triggered capture" data-doc-category="Cameras" data-doc-tags="trigger,hardware trigger,software trigger,line0,TriggerMode,TriggerSoftware,trigger_timeout,timeout,none">
           <p class="eyebrow">Cameras</p><h2>Triggered capture</h2>
           <p class="doc-summary">With a software trigger, <code>capture</code> fires it; with a hardware trigger, it waits for the line.</p>
-          <div class="code-wrap"><pre><code>capturefab capture -c 'sim:0?line0=every:500ms' --set trigger=software -o part.png
+          <div class="code-wrap"><pre><code>capturefab capture -c 'sim:0?line0=every:500ms' --set trigger=software -o 'software-{seq}.png'
 capturefab set -c 'sim:0?line0=every:500ms' trigger=line0:rising --keep 5m
 capturefab capture -c 'sim:0?line0=every:500ms' -o 'part-{seq}.png' --timeout 30s
-capturefab capture -c 'sim:0?line0=every:500ms' -n 1000 -o 'station/{time}.png' --timeout none --background
-capturefab jobs stop all
 capturefab set -c 'sim:0?line0=every:500ms' trigger=off</code></pre><button class="copy-button" type="button" aria-label="Copy the trigger commands">Copy</button></div>
-          <p><code>sim:0?line0=every:500ms</code> is a simulator whose Line0 input fires every 500 ms; on plain <code>sim:0</code> the line never fires (see <a href="guides/simulation.md#frame-loss-and-hardware-triggers">simulated cameras</a>). The <code>trigger</code> control sets <code>TriggerMode</code>, <code>TriggerSource</code> and <code>TriggerActivation</code> of the frame-start trigger together. A hardware-triggered capture waits up to <code>--timeout</code> for each frame (default <code>5s</code>); expiry exits 4 with <code>trigger_timeout</code> and the trigger configuration in <code>error.details.trigger</code>. <code>--timeout none</code> waits until the capture is stopped, and <code>inspect --timeout none</code> waits for its triggered frame the same way. Run a long triggered capture with <code>--background</code> and watch it with <code>jobs</code>. The trigger setting stays for the captures that follow: a camera keeps its settings, and a simulator or webcam keeps the ones Capturefab emulates for it until its runtime folder is cleared.</p>
+          <p><code>sim:0?line0=every:500ms</code> supplies a Line0 trigger every 500 ms. Plain <code>sim:0</code> does not supply those signals. The trigger setting stays in effect for later commands. Set <code>trigger=off</code> to return to free-running capture.</p>
+          <p>For a hardware trigger, <code>capture</code> waits up to <code>--timeout</code> per frame. The default wait is at least <code>5s</code>. If no trigger arrives in time, it exits 4 with <code>trigger_timeout</code>. For a long wait, use <code>--timeout none --background</code> and follow the job ID with <a href="#sessions"><code>jobs</code></a>.</p>
         </article>
 
         <article class="doc-section" id="capture" data-doc-section data-doc-title="Capture images" data-doc-category="Capture and record" data-doc-tags="capture,save,png,jpeg,jpg,raw,burst,frames,stdout,timeout,quality,never overwrite,exists,multiple cameras">
@@ -260,16 +267,23 @@ capturefab capture -c sim:0 -n 10 -o frames/
 capturefab capture -c sim:0 -o shot.jpg --quality 85
 capturefab capture -c sim:0 -o frames/ -f raw
 capturefab capture -c sim:0 --set exposure=20ms --set gain=6 -o bright.png
-capturefab capture -c sim:0 -o - > frame.png
 capturefab capture -c sim:0 -o shot2.png --dry-run</code></pre><button class="copy-button" type="button" aria-label="Copy the capture commands">Copy</button></div>
-          <div class="table-scroll"><table><caption>Image formats</caption><thead><tr><th scope="col">Format</th><th scope="col">Use</th></tr></thead><tbody><tr><td><code>png</code></td><td>The default: lossless; 16-bit gray for monochrome frames wider than 8 bits (Mono10 to Mono16, packed or not), 8-bit gray for other monochrome, 8-bit RGB for color and Bayer. Carries tags and camera settings in its metadata.</td></tr><tr><td><code>jpg</code></td><td>Smaller files; <code>--quality</code> 1–100, default 90. Carries tags and camera settings. A Motion JPEG webcam, stream or file gives the JPEG it sent, as it was, at its own quality, and the result says <code>"passthrough": true</code>; <code>--quality</code> encodes the frame again.</td></tr><tr><td><code>raw</code></td><td>The frame's bytes exactly as the camera sent them, at full bit depth: Bayer data, depth and thermal samples, and for webcams, streams and files the format FFmpeg decodes them to (gray, YUV or RGB). A <code>NAME.json</code> sidecar names the pixel format, its PFNC code, the size and the row length, or each plane's offset and rows for planar layouts.</td></tr></tbody></table></div>
-          <p>Every common PFNC pixel format converts (see the <a href="guides/camera-compatibility.md#pixel-formats">pixel format table</a>). The result reports <code>bit_depth</code>, and <code>source_bits</code> when the file keeps fewer bits than the frame, such as a 12-bit Bayer frame saved as 8-bit PNG or JPEG.</p>
-          <p>The format comes from the <code>-o</code> extension; <code>-f</code> chooses it when the name has none. A folder (existing, or ending in <code>/</code>) gets names like <code>{camera}-{time}-{seq}.png</code>. Without <code>-o</code>, files go to the current folder. <code>-o -</code> writes one image to stdout; with <code>--json</code> the result then goes to stderr.</p>
-          <p><code>--timeout</code> is how long to wait for each frame (default <code>5s</code>). <code>--set</code> and <code>--auto</code> change the camera first. A file name that exists exits 1 with <code>exists</code>; add <code>{seq}</code> or pass <code>--on-exists number</code>. Repeat <code>-c</code> to capture from several cameras at once: each is armed first, then all are asked for a frame at the same moment; the JSON result holds <code>cameras</code>, one entry each, and <code>skew_ms</code>, how far apart their first frames arrived. GigE cameras that share a network adapter are paced to a share of it (<code>bandwidth_mbps</code>). Ctrl-C stops a capture with exit 130, and <code>error.details.files</code> lists what was saved.</p>
+          <div class="table-scroll"><table><caption>Image formats</caption><thead><tr><th scope="col">Format</th><th scope="col">Use</th></tr></thead><tbody>
+            <tr><td><code>png</code></td><td>The default. Saves high-bit-depth monochrome frames as 16-bit grayscale. Saves color and Bayer frames as 8-bit RGB.</td></tr>
+            <tr><td><code>jpg</code></td><td>Use <code>--quality</code> from 1 to 100. The default is 90 for encoded JPEGs. For Motion JPEG input, Capturefab can save the source JPEG directly. Look for <code>"passthrough": true</code>. To encode it again, set <code>--quality</code>.</td></tr>
+            <tr><td><code>raw</code></td><td>Saves the frame buffer at its original bit depth. For FFmpeg sources, this is the decoded frame. A file such as <code>shot.raw.json</code> describes the pixel format, dimensions and layout of <code>shot.raw</code>.</td></tr>
+          </tbody></table></div>
+          <p>See the <a href="guides/camera-compatibility.md#pixel-formats">pixel format table</a> for supported conversions. The result gives the output <code>bit_depth</code>. If the file uses fewer bits than the input, it also gives <code>source_bits</code>.</p>
+          <p>The output extension sets the format. Use <code>-f</code> to choose a format when there is no extension. End a new folder path with <code>/</code> to save numbered files there. If you omit <code>-o</code>, Capturefab saves to the current folder.</p>
+          <p>Use <code>-o -</code> to write one image to stdout. With <code>--json</code>, the result or error goes to stderr in this mode.</p>
+          <p>Use <code>--timeout</code> to set the wait per frame. The default is at least <code>5s</code> and can be longer for slow cameras. Use <code>--set</code> or <code>--auto</code> to adjust the camera before capture.</p>
+          <p>A fixed filename that already exists returns <code>exists</code> unless you pass <code>--on-exists number</code>. Use <code>{seq}</code> to choose the next free number automatically.</p>
+          <p>Repeat <code>-c</code> to request frames from several cameras together. A foreground result has one entry per camera in <code>cameras</code>. <code>skew_ms</code> measures how far apart the first frames arrived. For synchronized exposures, use a shared hardware trigger. With <code>--background</code>, the result has a <code>jobs</code> list instead.</p>
           <div class="code-wrap"><pre><code>capturefab capture -c sim:0 -o measured.png --inspect --manifest shots.jsonl
 capturefab capture -c sim:0 --set exposure=20ms --fresh 2 -o after.png
 capturefab capture -c sim:0 -n 100 -o 'scratch/{seq}.raw' --sync none</code></pre><button class="copy-button" type="button" aria-label="Copy the capture detail commands">Copy</button></div>
-          <p>The result says which frame each capture is: <code>time</code> (RFC 3339) and <code>device_ts_ns</code>, the camera's own clock where it has one. <code>frames</code> counts the frames the camera delivered while the capture ran, <code>dropped</code> those lost, and <code>incomplete</code> and <code>resent</code> what the transport received incomplete or asked for again, where it counts them; a burst adds <code>fps</code>, <code>first_id</code>, <code>last_id</code>, <code>gaps</code> and <code>consecutive</code>. The first frame saved is always one exposed after the camera's last settings change (<code>after_change</code> when frames were let pass for it), and <code>--fresh N</code> lets N more pass. A camera that sets its own exposure gets up to <code>--warmup</code> (default <code>2s</code>) to settle after it starts: <code>warmup_ms</code> says how long it took, and <code>settled: false</code> with a warning that it had not. <code>--inspect</code> measures the last frame as <code>inspect</code> does, in the result's <code>inspect</code> block. <code>--manifest FILE</code> appends one JSON line per saved file with its path, time, size, SHA-256, settings and tags. Each file reaches the disk before it is reported; <code>--sync none</code> skips that for scratch captures a power cut may lose.</p>
+          <p>Use <code>time</code> for the frame’s host timestamp and <code>device_ts_ns</code> for the camera’s own clock when available. For a burst, read <code>fps</code>, <code>gaps</code> and <code>consecutive</code> to see how the capture ran.</p>
+          <p>Use <code>--fresh N</code> to skip extra frames after a change. Use <code>--inspect</code> to measure the last frame. Use <code>--manifest FILE</code> to append a JSON line for each saved file with its path, SHA-256, settings and tags. The default sync writes each capture to disk before reporting it. Use <code>--sync none</code> for temporary images you can afford to lose after a power failure.</p>
         </article>
 
         <article class="doc-section" id="naming" data-doc-section data-doc-title="Name files and tag captures" data-doc-category="Capture and record" data-doc-tags="template,placeholder,file name,seq,camera,serial,date,time,tag,on exists,number,overwrite,label,part,metadata">
@@ -282,38 +296,40 @@ capturefab capture -c sim:0 -o shot.png --on-exists number</code></pre><button c
             <tr><td><code>{camera}</code></td><td>The camera's model and serial, safe for file names</td></tr>
             <tr><td><code>{serial}</code></td><td>The serial number</td></tr>
             <tr><td><code>{seq}</code>, <code>{seq:N}</code></td><td>1, 2, 3 …, padded to N digits (4 by default)</td></tr>
+            <tr><td><code>{frame}</code></td><td>Frame number within this capture, starting at <code>000001</code></td></tr>
             <tr><td><code>{time}</code></td><td>The time, such as <code>20261031-142233.123</code></td></tr>
             <tr><td><code>{date}</code></td><td>The date, such as <code>2026-10-31</code></td></tr>
+            <tr><td><code>{datetime}</code></td><td>Date and time to the second, such as <code>20261031-142233</code></td></tr>
             <tr><td><code>{tag:KEY}</code></td><td>The value of <code>--tag KEY=VALUE</code></td></tr>
             <tr><td><code>{ext}</code></td><td><code>png</code>, <code>jpg</code> or <code>raw</code></td></tr>
           </tbody></table></div>
-          <p>Tags also go into each PNG and JPEG with the camera's settings. Paths are resolved against the folder you run the command in, also when a session does the work. Capturefab never overwrites a file: with <code>{seq}</code> it takes the next free number, and <code>--on-exists number</code> adds <code>-0001</code>, <code>-0002</code> … to a fixed name. Read the <a href="guides/plant-floor.md">plant-floor guide</a> for naming that analysis tools can read.</p>
+          <p>Capturefab saves tags and camera settings in PNG and JPEG metadata. Relative paths start in the folder where you run the command, even when a session writes the files. Use <code>--on-exists number</code> to add <code>-0001</code>, <code>-0002</code> and so on when a fixed name is already in use. See the <a href="guides/plant-floor.md">plant-floor guide</a> for naming and tagging examples.</p>
         </article>
 
         <article class="doc-section" id="scheduling" data-doc-section data-doc-title="Time lapses and delayed captures" data-doc-category="Capture and record" data-doc-tags="time lapse,timelapse,interval,every,for,at,in,delay,schedule,background,jobs,wait,stop">
           <p class="eyebrow">Capture &amp; record</p><h2>Time lapses and delayed captures</h2>
           <p class="doc-summary"><code>--every</code> spaces frames, <code>--for</code> or <code>-n</code> bounds them, and <code>--at</code> or <code>--in</code> delays the start.</p>
-          <div class="code-wrap"><pre><code>capturefab capture -c sim:0 --every 10s --for 1h -o 'lapse/{seq}.jpg' --background
-capturefab capture -c sim:0 -n 100 --every 2s -o 'lapse/{seq:5}.png'
-capturefab capture -c sim:0 --at 06:00 -o morning.png
-capturefab capture -c sim:0 --in 5m -o later.png
-capturefab jobs
-capturefab jobs wait ID --timeout 10m
-capturefab jobs stop ID</code></pre><button class="copy-button" type="button" aria-label="Copy the time lapse commands">Copy</button></div>
-          <p>Durations need a unit: <code>250ms</code>, <code>2s</code>, <code>5m</code>, <code>1h30m</code>. <code>--at</code> takes <code>HH:MM[:SS]</code> in local time or an RFC 3339 time. Without <code>--background</code> the command runs until the series ends; with it, a session runs the job and the command returns it once it is armed or has saved its first frame (on a triggered camera, add <code>--timeout none</code> so it does not wait for a trigger). Pass the ID it prints (<code>job.id</code> with <code>--json</code>) to <code>jobs wait ID</code> and <code>jobs stop ID</code>: IDs count on across a session's jobs and its runs, so another ID may name an earlier, finished job. See <a href="#sessions">sessions and jobs</a>.</p>
+          <div class="code-wrap"><pre><code>capturefab capture -c sim:0 -n 3 --every 2s -o 'lapse/{seq:5}.png'
+capturefab capture -c sim:0 --in 5s -o 'later-{seq}.png'
+# Schedule a capture for 06:00 local time
+capturefab capture -c sim:0 --at 06:00 -o 'morning-{seq}.png' --background</code></pre><button class="copy-button" type="button" aria-label="Copy the time lapse commands">Copy</button></div>
+          <p>Give durations a unit, such as <code>250ms</code>, <code>2s</code> or <code>1h30m</code>. Use <code>--at HH:MM</code> for a time on the local clock, or pass an RFC 3339 timestamp with its time zone.</p>
+          <p>Use <code>--background</code> to return a job ID while a session runs the capture. In JSON, read <code>job.id</code>. Pass that ID to <code>jobs wait</code> or <code>jobs stop</code>. See <a href="#sessions">sessions and jobs</a>.</p>
         </article>
 
         <article class="doc-section" id="recording" data-doc-section data-doc-title="Record and stream video" data-doc-category="Capture and record" data-doc-tags="record,recording,video,mkv,mp4,mov,ts,webm,h264,hevc,av1,ffv1,lossless,codec,encoder,bitrate,max size,rtsp,srt,rtmp,udp,mediamtx,stream">
           <p class="eyebrow">Capture &amp; record</p><h2>Record and stream video</h2>
           <p class="doc-summary"><code>record</code> writes video to a file or streams it to a server through the bundled FFmpeg.</p>
-          <div class="code-wrap"><pre><code>capturefab record -c sim:0 -o clip.mp4 --for 30s
-capturefab record -c sim:0 -o clip.mkv --codec ffv1 --for 5m
-capturefab record -c sim:0 -o clip.mp4 --bitrate 4M --max-size 2G
-capturefab record -c sim:0 -o rtsp://localhost:8554/cam --background
-capturefab record -c sim:0 -o 'srt://localhost:8890?streamid=publish:cam' --for 10m</code></pre><button class="copy-button" type="button" aria-label="Copy the recording commands">Copy</button></div>
-          <p>Files can be <code>.mkv</code>, <code>.mp4</code>, <code>.mov</code>, <code>.ts</code> or <code>.webm</code>, and must not exist. Streams go to <code>rtsp://</code>, <code>srt://</code>, <code>rtmp://</code> or <code>udp://</code> receivers such as MediaMTX. <code>--codec h264</code> (the default) uses a hardware encoder where one works and libx264 otherwise; <code>hevc</code> and <code>av1</code> need a hardware encoder, unless the source is copied (below), and exit 5 before recording without one; <code>ffv1</code> is lossless, in <code>.mkv</code>, and stores a Bayer camera's mosaic itself as gray samples.</p>
-          <p>An H.264 or HEVC stream, video file or webcam mode is recorded as it arrives, without decoding or re-encoding its video: the result says <code>"encoder":"copy"</code> and the source's <code>codec</code>. The file starts at the source's last key frame, so it can begin up to one key-frame interval before the command. <code>--codec</code> naming another codec, <code>--fps</code> or <code>--bitrate</code> encodes instead. Windows always encodes. The source is still decoded while it is copied, for captures and inspection.</p>
-          <p>Recording runs until <code>--for</code> ends, <code>--max-size</code> is reached or you press Ctrl-C, which is a normal end. The result reports <code>frames</code>, <code>dropped</code>, <code>fps_actual</code>, the <code>codec</code> and <code>encoder</code> used, why it <code>ended</code> and whether the file was <code>finalized</code>. <code>--fps</code> sets the frame rate written (default: the camera's).</p>
+          <div class="code-wrap"><pre><code>capturefab record -c sim:0 -o 'clip-{seq}.mp4' --for 5s
+capturefab record -c sim:0 -o 'lossless-{seq}.mkv' --codec ffv1 --for 5s
+capturefab record -c sim:0 -o 'limited-{seq}.mp4' --bitrate 4M --max-size 2G --for 5s</code></pre><button class="copy-button" type="button" aria-label="Copy the local recording commands">Copy</button></div>
+          <p>To stream video, start a receiver such as MediaMTX first. Use the URL for the protocol your receiver accepts.</p>
+          <div class="code-wrap"><pre><code>capturefab record -c sim:0 -o rtsp://localhost:8554/cam --for 10s
+capturefab record -c sim:0 -o 'srt://localhost:8890?streamid=publish:cam' --for 10s</code></pre><button class="copy-button" type="button" aria-label="Copy the streaming commands">Copy</button></div>
+          <p>For a local file, use <code>.mkv</code>, <code>.mp4</code>, <code>.mov</code>, <code>.ts</code> or <code>.webm</code>. Choose a container that supports the codec.</p>
+          <p>Use <code>--codec ffv1</code> in an MKV file for lossless video. For Bayer input, it saves the mosaic as gray samples. When Capturefab encodes H.264, it tries hardware first and can use libx264 from the bundled FFmpeg. HEVC and AV1 encoding need a supported hardware encoder.</p>
+          <p>On supported systems, Capturefab can copy H.264 or HEVC video directly into the output. Look for <code>"encoder":"copy"</code>. A recording can start at the previous key frame. To encode instead, set <code>--fps</code>, <code>--bitrate</code> or a different codec. Windows always encodes.</p>
+          <p>Use <code>--for</code> or <code>--max-size</code> to limit a recording. To stop a foreground recording, push Ctrl-C. Read <code>ended</code> and <code>finalized</code> in the JSON result to see how it ended and whether Capturefab finished writing the file.</p>
         </article>
 
         <article class="doc-section" id="presets" data-doc-section data-doc-title="Save and restore settings" data-doc-category="Capture and record" data-doc-tags="preset,save,apply,restore,export,import,dry run,strict,persist,user set,other model">
@@ -325,7 +341,8 @@ capturefab preset apply bench -c sim:0 --dry-run
 capturefab preset apply bench -c sim:0
 capturefab preset export bench -o bench.json
 capturefab preset import bench.json --name bench2</code></pre><button class="copy-button" type="button" aria-label="Copy the preset commands">Copy</button></div>
-          <p><code>apply</code> writes every saved value as one change and puts every value back if one fails. <code>--dry-run</code> shows what would change, with disruptive changes (triggering, I/O lines, acquisition rate) marked. <code>--strict</code> changes nothing when a saved value does not fit the camera. <code>--allow-other-model</code> applies the settings two models share. <code>--persist</code> then saves the result in the camera's user set and makes it the power-on default. A preset lives on this computer; a user set lives in the camera.</p>
+          <p>Use <code>apply --dry-run</code> to review changes before applying them. The plan marks disruptive changes such as triggering or I/O settings. Use <code>--strict</code> to stop if a saved value does not fit the camera. Use <code>--allow-other-model</code> to apply compatible settings to another model.</p>
+          <p>If a write fails, Capturefab tries to restore the earlier settings. To save the applied settings as the camera’s power-on defaults, use <code>--persist</code> on cameras that support user sets.</p>
         </article>
 
         <article class="doc-section" id="logins" data-doc-section data-doc-title="Password-protected cameras" data-doc-category="Capture and record" data-doc-tags="login,sign in,password,credentials,keychain,credential store,rtsp,onvif,auth_required,auth_rejected">
@@ -335,34 +352,38 @@ capturefab preset import bench.json --name bench2</code></pre><button class="cop
 capturefab login list
 capturefab onvif resolve cam.local
 capturefab login rm rtsp://cam.local/stream</code></pre><button class="copy-button" type="button" aria-label="Copy the sign-in commands">Copy</button></div>
-          <p><code>login add</code> connects once and saves the sign-in only if the camera accepts it (<code>--no-check</code> skips that). The password comes from <code>--password-stdin</code> or <code>CAPTUREFAB_CAMERA_PASSWORD</code>, never the command line. Every later command for that address uses it. A camera that asks for a sign-in exits 3 with <code>auth_required</code>, and one that refuses it with <code>auth_rejected</code>.</p>
-          <p>FFmpeg takes RTSP credentials only in its input URL, so other local users can read them in its command line. Plain RTSP Basic authentication and ONVIF over <code>http://</code> send the password readably over the network; prefer <code>rtsps://</code>, Digest authentication and fixed addresses on trusted networks. <code>onvif resolve</code> lists an ONVIF camera's profiles and RTSP streams.</p>
+          <p>Use a camera address without credentials. Supply the password on stdin with <code>--password-stdin</code>, or set <code>CAPTUREFAB_CAMERA_PASSWORD</code>. In this example, <code>PASSWORD</code> is a shell variable you set before running the command.</p>
+          <p>By default, <code>login add</code> verifies the sign-in before saving it. Use <code>--no-check</code> to skip the connection. Later commands for that address use the saved credentials. If credentials are missing or the camera rejects them, look for <code>auth_required</code> or <code>auth_rejected</code>.</p>
+          <p>Capturefab passes RTSP credentials to FFmpeg in its input URL. On systems where other users can read process arguments, they can see those credentials. RTSP Basic authentication also exposes credentials on an unencrypted connection. Use <code>rtsps://</code> if the camera supports it.</p>
         </article>
 
         <article class="doc-section" id="sessions" data-doc-section data-doc-title="Sessions, --keep and jobs" data-doc-category="Automate" data-doc-tags="session,serve,keep,background,jobs,wait,stop,live,idle,systemd,headless,camera_busy,no-session">
           <p class="eyebrow">Automate</p><h2>Sessions, --keep and jobs</h2>
           <p class="doc-summary">A session keeps cameras open between commands and runs background jobs.</p>
-          <div class="code-wrap"><pre><code>capturefab inspect -c sim:0 --keep 5m
-capturefab session start --name bench -c sim:0 --live
-capturefab session status bench
-capturefab capture -c sim:0 --every 10s --for 1h -o 'lapse/{seq}.jpg' --background
-capturefab jobs
-capturefab session stop bench
-capturefab serve --name line1 -c sim:0 --live</code></pre><button class="copy-button" type="button" aria-label="Copy the session commands">Copy</button></div>
-          <p>Each camera runs in a worker process of its own. Every camera command keeps its camera warm: it starts or reuses a session named <code>auto</code> that holds the camera until it has been unused for 60 seconds, so the next commands skip connecting. <code>--keep DUR</code> holds it longer; <code>--keep 0</code>, <code>CAPTUREFAB_KEEP=0</code> or <code>--no-session</code> open and close the camera in the command alone, as on a computer without a writable runtime folder. Results are the same either way. <code>session start</code> starts a named session in the background that ends after <code>--idle</code> unused (default <code>30m</code>); <code>serve</code> runs one in the foreground with no idle limit, for systemd. <code>--live</code> keeps the cameras streaming, so captures take the newest frame at once.</p>
-          <p>A command uses a session that holds its camera on its own. <code>--session NAME</code> picks one (also <code>CAPTUREFAB_SESSION</code>), and <code>--no-session</code> never uses one. A camera another process holds exits 3 with <code>camera_busy</code>, naming the holder. <code>capturefab shell -c CAM</code> runs many commands with the cameras kept connected: a prompt with history and Tab completion in a terminal, or one command per line of stdin (or <code>-e</code>) with one result per line. <code>--background</code> on <code>capture</code> or <code>record</code> returns a job: <code>jobs</code> lists every session's jobs (<code>jobs list ID...</code> only those, <code>--running</code> only those not ended), <code>jobs wait ID...</code> exits 0 when the jobs are done (4 while one still runs) and <code>jobs stop ID</code> ends one, keeping the files. <code>session stop</code> does not wait for jobs: those still running end as <code>interrupted</code>, keeping their files. A job is <code>armed</code>, <code>running</code> or <code>stopping</code>, then <code>done</code>, <code>failed</code>, <code>cancelled</code> or <code>interrupted</code>; the jobs of a session that died are listed as <code>lost</code>. <code>session status</code> lists each camera's state, frame counts and jobs, and for a camera whose worker exited, an <code>error</code> (<code>worker_crashed</code> with its exit status and the last lines it wrote); the next command on that camera starts another worker. <code>debug rpc</code> sends one session command, a JSON object on stdin such as <code>{"op":"status"}</code>, <code>{"op":"jobs"}</code>, <code>{"op":"wait","job":"auto-1","timeout_ms":5000}</code> or <code>{"op":"stop_job","job":"auto-1"}</code>, and prints its reply; it is for debugging, and its commands can change between releases. The <a href="guides/line-computer.md">line computer guide</a> runs a session at boot.</p>
+          <h3>Run a capture in a named session</h3>
+          <div class="code-wrap"><pre><code>capturefab session start --name bench -c sim:1 --live
+capturefab capture --session bench -c sim:1 -n 3 --every 2s -o 'bench/{seq}.png' --background
+capturefab session status bench</code></pre><button class="copy-button" type="button" aria-label="Copy the session commands">Copy</button></div>
+          <p>Replace <code>JOB_ID</code> below with the ID from the capture result.</p>
+          <div class="code-wrap"><pre><code>capturefab jobs wait JOB_ID --timeout 10s
+capturefab session stop bench</code></pre><button class="copy-button" type="button" aria-label="Copy the job wait and session stop commands">Copy</button></div>
+          <p>Capturefab normally holds a camera in the <code>auto</code> session for 60 seconds after a command. Use <code>--keep DUR</code> to change that time. Use <code>--keep 0</code> to avoid starting a warm session. Use <code>--no-session</code> to bypass existing sessions as well.</p>
+          <p><code>session start</code> runs a named session in the background with a default idle limit of 30 minutes. Use <code>--session NAME</code> to select it. <code>--live</code> keeps frames flowing between commands. For a service manager, use <code>serve --name NAME</code> to run the session in the foreground. See the <a href="guides/line-computer.md">line computer guide</a>.</p>
+          <p>Use <code>jobs list --running</code> to see active jobs. <code>jobs wait</code> exits 0 when all requested jobs succeed. It returns a failed job’s exit code, or exits 4 if the wait times out. Use <code>jobs stop JOB_ID</code> to stop a specific job and keep the files it saved. Stopping a session interrupts its active jobs.</p>
+          <p>See <a href="guides/cli-workflows.md">CLI workflows</a> for examples of how to combine these commands in scripts.</p>
         </article>
 
         <article class="doc-section" id="cli-reference" data-doc-section data-doc-title="JSON results and exit codes" data-doc-category="Automate" data-doc-tags="json,exit code,error code,schema,stdout,stderr,scripts,contract,completions,help">
           <p class="eyebrow">Automate</p><h2>JSON results and exit codes</h2>
-          <p class="doc-summary">With <code>--json</code>, every command prints one JSON document and exits with a typed code.</p>
+          <p class="doc-summary">Use <code>--json</code> to read command results and errors from a script.</p>
           <div class="code-wrap"><pre><code>capturefab --json get -c sim:0 ExposureTime 'TriggerMode[FrameStart]'
 capturefab schema
 capturefab schema set
 capturefab completions zsh &gt; ~/.zfunc/_capturefab</code></pre><button class="copy-button" type="button" aria-label="Copy the JSON contract commands">Copy</button></div>
-          <p>Exit 0 means stdout holds the result. Any other exit means it holds <code>{"error":{"code","message","hint"?,"details"?}}</code>, also for a mistyped option. Logs and progress go to stderr. Keys use snake_case with units in their names (<code>exposure_us</code>), times are RFC 3339 UTC, and lists are bounded with a <code>truncated</code> count. <code>CAPTUREFAB_JSON=1</code> turns JSON on for every command.</p>
+          <p>Most commands write one JSON result to stdout on exit 0. A failure returns a nonzero exit code and a JSON <code>error</code> with <code>code</code>, <code>message</code> and optional <code>hint</code> and <code>details</code>. Logs and progress go to stderr. Set <code>CAPTUREFAB_JSON=1</code> to make JSON the default.</p>
+          <p>Some commands use different output. <code>watch --json</code> emits one JSON line per measurement. Batch <code>shell --json</code> emits one line per command. <code>capture -o -</code> reserves stdout for the image and sends the JSON to stderr. Top-level help and version output remain text.</p>
           <div class="table-scroll"><table><caption>Process exit codes</caption><thead><tr><th scope="col">Code</th><th scope="col">Category</th><th scope="col">Examples of <code>error.code</code></th></tr></thead><tbody><tr><td>0</td><td>ok</td><td>—</td></tr><tr><td>1</td><td>failed</td><td><code>failed</code>, <code>exists</code>, <code>feature_locked</code>, <code>incomplete</code></td></tr><tr><td>2</td><td>usage or input</td><td><code>usage</code>, <code>invalid_duration</code>, <code>feature_not_found</code>, <code>out_of_range</code>, <code>invalid_choice</code>, <code>camera_ambiguous</code></td></tr><tr><td>3</td><td>unavailable</td><td><code>camera_not_found</code>, <code>camera_busy</code>, <code>permission_denied</code>, <code>disconnected</code>, <code>ffmpeg_missing</code>, <code>auth_required</code></td></tr><tr><td>4</td><td>timeout</td><td><code>frame_timeout</code>, <code>trigger_timeout</code>, <code>timeout</code></td></tr><tr><td>5</td><td>unsupported</td><td><code>unsupported</code></td></tr><tr><td>6</td><td>storage full</td><td><code>storage_full</code></td></tr><tr><td>130</td><td>interrupted (143 SIGTERM, 129 SIGHUP)</td><td><code>interrupted</code>, with partial results in <code>details</code></td></tr></tbody></table></div>
-          <p>The <a href="reference.html">command reference</a> lists every command's options, result fields and error codes. It is generated from <code>capturefab schema</code>, which the installed binary prints itself.</p>
+          <p>The <a href="reference.html">command reference</a> lists options, result fields and error codes. The site generates it from <code>capturefab schema</code> and command help.</p>
         </article>
 
         <article class="doc-section" id="network" data-doc-section data-doc-title="GigE network checks" data-doc-category="Automate" data-doc-tags="network,gige,mtu,jumbo frames,link speed,subnet,bandwidth,packet delay,tune,rmem_max,firewall">
@@ -370,15 +391,16 @@ capturefab completions zsh &gt; ~/.zfunc/_capturefab</code></pre><button class="
           <p class="doc-summary"><code>network</code> checks how each GigE camera is reached; <code>--tune</code> shares bandwidth between cameras.</p>
           <div class="code-wrap"><pre><code>capturefab network
 capturefab network --tune -c gige:00c0df123456 -c gige:00c0df654321</code></pre><button class="copy-button" type="button" aria-label="Copy the network commands">Copy</button></div>
-          <p><code>network</code> lists the IPv4 adapters with their MTU and link speed, and each GigE camera found with the adapter that reaches it and a health summary. It changes nothing. <code>--tune</code> sets packet delay or throughput limits on the named cameras so they share a link without losing packets; they keep the setting until they power off. Host addresses, routes and MTUs are never changed. Give camera networks their own wired adapter where you can, and on Linux raise <code>net.core.rmem_max</code> as <code>doctor</code> suggests.</p>
+          <p>Run <code>network</code> to see which adapter reaches each GigE camera. It reports the adapter’s IPv4 address, MTU and link speed when available. Use <code>--tune</code> to set camera packet delays or throughput limits when cameras share a link. Tuning changes camera settings only.</p>
         </article>
 
         <article class="doc-section" id="doctor" data-doc-section data-doc-title="Check this computer" data-doc-category="Reference" data-doc-tags="doctor,checks,ffmpeg,usb access,udev,rmem_max,runtime dir,linger,folders,dirs,features,fix">
           <p class="eyebrow">Reference</p><h2>Check this computer</h2>
-          <p class="doc-summary"><code>doctor</code> prints one line per check, with a copyable fix under each warning.</p>
+          <p class="doc-summary"><code>doctor</code> reports problems with camera access, FFmpeg and local folders. It gives a fix when one is available.</p>
           <div class="code-wrap"><pre><code>capturefab doctor
 capturefab --json doctor</code></pre><button class="copy-button" type="button" aria-label="Copy the doctor commands">Copy</button></div>
-          <p>The checks cover the bundled FFmpeg (webcams, streams, files and recording need it), the folders Capturefab uses, wired adapters for GigE Vision and, on Linux, the GigE receive buffer, USB3 Vision device access and where a service keeps its sessions. <code>--json</code> adds the build's <code>features</code>, the FFmpeg in use and <code>dirs</code>: <code>runtime</code> (sessions), <code>state</code> (presets, sign-in records), <code>cache</code> (FFmpeg) and <code>inspect</code> (previews); <code>jpeg</code>, the JPEG encoders and whether each hardware engine (Apple's, nvJPEG, VA-API) is on this computer and passed its accuracy check here, or why not; and <code>hwdec</code>, each hardware decoding method and whether it decodes here.</p>
+          <p>Use <code>capturefab doctor --json</code> to see the build’s <code>features</code> and the FFmpeg it uses in <code>ffmpeg</code>. Look in <code>folders</code> for the runtime, state and cache paths. Look in <code>inspect_dir</code> for the preview path.</p>
+          <p>Use <code>jpeg</code> and <code>hwdec</code> to see whether JPEG encoders and hardware video decoders passed local tests.</p>
         </article>
 
         <article class="doc-section" id="troubleshooting" data-doc-section data-doc-title="Troubleshooting" data-doc-category="Reference" data-doc-tags="troubleshooting,error,timeout,unavailable,unsupported,usb,permissions,gige,packets,ffmpeg,disk full,doctor,raspberry pi,jetson,systemd,ssh,session not found,camera_busy">
@@ -410,7 +432,7 @@ capturefab -v info -c sim:0</code></pre><button class="copy-button" type="button
             <tr><td><code>CAPTUREFAB_CAMERA_PASSWORD</code></td><td>The password for <code>login add</code> without <code>--password-stdin</code></td></tr>
             <tr><td><code>CAPTUREFAB_FFMPEG</code></td><td>An absolute path to an FFmpeg executable to use instead of the bundled one</td></tr>
             <tr><td><code>CAPTUREFAB_SESSION_DIR</code></td><td>One folder for sessions, presets and the sign-in index; for isolated runs and tests use a private (mode 0700) folder, such as one from <code>mktemp -d</code>, or a path that does not exist yet</td></tr>
-            <tr><td><code>CAPTUREFAB_STATE_DIR</code></td><td>The folder for presets, the sign-in index and the jobs of ended sessions alone, such as a data partition on a read-only system</td></tr>
+            <tr><td><code>CAPTUREFAB_STATE_DIR</code></td><td>The folder for presets, the sign-in index, job records and session logs</td></tr>
             <tr><td><code>CAPTUREFAB_CACHE_DIR</code></td><td>The folder for the extracted FFmpeg, encoder probes and GenICam XML</td></tr>
             <tr><td><code>CAPTUREFAB_MIN_FREE</code></td><td>The free space a write leaves on its disk, in bytes or a size such as <code>2G</code>; <code>0</code> turns the floor off</td></tr>
             <tr><td><code>CAPTUREFAB_THREADS</code></td><td>At most this many image processing threads</td></tr>
@@ -423,19 +445,20 @@ capturefab -v info -c sim:0</code></pre><button class="copy-button" type="button
             <tr><td><code>CAPTUREFAB_HWDEC</code></td><td>Hardware decoding of H.264, HEVC and other compressed video: <code>auto</code> (the default: compressed streams and webcams in a session, the warm one included, whose decoder runs on between commands; files and <code>--no-session</code> commands get their one frame sooner in software), <code>none</code>, or a method such as <code>videotoolbox</code>, <code>cuda</code>, <code>vulkan</code> or <code>d3d11va</code>, used for files and <code>--no-session</code> too; one this FFmpeg lacks or that fails its probe is exit 3. Motion JPEG is decoded with libjpeg-turbo whatever it says.</td></tr>
           </tbody></table></div>
           <p>A session's cameras keep the <code>CAPTUREFAB_JPEG</code>, <code>CAPTUREFAB_HWDEC</code> and <code>CAPTUREFAB_FFMPEG</code> the session started with, the warm <code>auto</code> session included: stop it with <code>capturefab session stop auto</code>, or use <code>--no-session</code>, for a command to use other values. A command's own <code>CAPTUREFAB_MIN_FREE</code> raises the free-space floor for the files a session writes for it, but does not lower the floor the session started with.</p>
-          <p>Sessions live in the runtime folder (<code>$XDG_RUNTIME_DIR/capturefab</code> on Linux), presets and the sign-in index in the state folder (<code>~/.local/state/capturefab</code> on Linux; the same folder as sessions elsewhere), and the extracted FFmpeg in the cache folder. <code>capturefab --json doctor</code> prints all of them in <code>dirs</code>, and under <code>folders</code> the fallbacks it passed over. Where a default folder cannot be written, as on a read-only root file system, Capturefab falls back to a private folder in a tmpfs and turns off only what needs the missing folder; the <a href="guides/embedded.md">embedded and read-only hosts guide</a> lists each case.</p>
+          <p>The runtime folder holds active sessions. The state folder holds presets, sign-in records and job history. The cache folder holds extracted FFmpeg and cached probes. Run <code>capturefab doctor --json</code> and read <code>folders</code> for the paths and fallbacks. See the <a href="guides/embedded.md">embedded and read-only hosts guide</a> for defaults and permission rules.</p>
         </article>
 
         <article class="doc-section" id="architecture" data-doc-section data-doc-title="Build, architecture and licensing" data-doc-category="Reference" data-doc-tags="architecture,source,rust,build,cargo,ffmpeg,license,mit,gpl,process,worker,features">
           <p class="eyebrow">Reference</p><h2>Build, architecture and licensing</h2>
-          <p class="doc-summary">One Rust executable; each camera runs in a worker process of its own, and FFmpeg runs as a separate executable.</p>
-          <p>Capturefab implements GigE Vision, USB3 Vision and GenICam in Rust. Every camera command reaches its camera through a worker process, started by the command itself or held by a session, so a camera driver that hangs or crashes cannot take other cameras down. Webcams, streams, files and video encoding use the embedded FFmpeg, run as a separate process. This is an early implementation: it does not provide every feature of Aravis or vendor SDKs, and behavior can change between releases.</p>
+          <p class="doc-summary">Capturefab runs each camera in its own worker process. It runs FFmpeg as a separate executable.</p>
+          <p>Capturefab implements GigE Vision, USB3 Vision and GenICam in Rust. The camera worker belongs to the command or to a session. This separation helps other camera workers continue when one fails. Capturefab uses FFmpeg for webcams, streams, media files and video encoding.</p>
           <h3>Build from source</h3>
-          <p>Install a stable Rust toolchain, a C compiler and CMake, and on x86 NASM for libjpeg-turbo. Webcams, streams, files and recording need FFmpeg. A build embeds the FFmpeg named by <code>CAPTUREFAB_FFMPEG_BINARY</code>, or in release builds <code>target/ffmpeg/&lt;target&gt;/bin/ffmpeg</code> when it exists, which <code>scripts/build-ffmpeg.sh</code> builds from the pinned sources (this takes a while); <code>cargo build</code> never builds FFmpeg itself. At run time Capturefab uses <code>CAPTUREFAB_FFMPEG</code>, else the embedded copy, else an <code>ffmpeg</code> next to the executable or on <code>PATH</code>.</p>
+          <p>Install a stable Rust toolchain, a C compiler and CMake. On x86, also install NASM for libjpeg-turbo. Download the <a href="downloads.html#source">release source archive</a>. Replace <code>VERSION</code> below with the version you downloaded.</p>
           <div class="code-wrap"><pre><code>tar -xzf capturefab-VERSION-source.tar.gz
 cd capturefab-VERSION
 cargo --config .cargo/vendor-config.toml build --release --offline --locked
 target/release/capturefab capture -c sim:0 -o first.png</code></pre><button class="copy-button" type="button" aria-label="Copy source build commands">Copy</button></div>
+          <p>To bundle FFmpeg, build it separately and set <code>CAPTUREFAB_FFMPEG_BINARY</code> when building Capturefab. At run time Capturefab looks for <code>CAPTUREFAB_FFMPEG</code>, the bundled copy, a copy next to <code>capturefab</code>, then a copy on <code>PATH</code>. See the <a href="guides/ffmpeg-build.md">FFmpeg build guide</a>.</p>
           <p>The default features are <code>usb</code> (USB3 Vision), <code>jpeg</code> (libjpeg-turbo), <code>videotoolbox</code> (Apple's JPEG engine on macOS), <code>nvjpeg</code> and <code>vaapi</code> (the GPU JPEG encoders on Linux, whose libraries are loaded at run time in a helper process, so a build needs no SDK), <code>keychain</code> (the OS credential store for <code>login</code>) and <code>shell</code> (line editing in <code>capturefab shell</code>); <code>--no-default-features</code> builds without them, and <code>doctor --json</code> lists what a build has.</p>
           <h3>Licensing and release provenance</h3>
           <p>Capturefab uses the MIT license. The embedded FFmpeg is GPLv3 with x264, SRT, OpenSSL and zlib; <code>capturefab licenses</code> prints both notices. See the <a href="guides/ffmpeg-build.md">FFmpeg build and compliance guide</a>. The <a href="downloads.html">downloads page</a> shows how to verify each file, and the <a href="releases.json">release manifest</a> lists files, checksums and build metadata.</p>

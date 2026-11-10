@@ -26,15 +26,15 @@ SITE = 'https://capturefab.com/'
 GROUPS = [
     ('cli-cameras', 'Cameras and settings', 'Find a camera, read what it can do and change its settings.',
      ['list', 'info', 'features', 'get', 'set', 'exec']),
-    ('cli-capture', 'Capture, record and measure', 'Save images and video, measure exposure and focus once or live, settle auto exposure.',
+    ('cli-capture', 'Capture, record and measure', 'Save images and video. Measure brightness and focus or set auto exposure.',
      ['capture', 'record', 'inspect', 'watch', 'auto']),
     ('cli-presets', 'Presets', 'Save a camera\'s settings on this computer and restore them as one change.',
      ['preset']),
     ('cli-sessions', 'Sessions and jobs', 'Keep cameras open between commands and run captures and recordings in the background.',
      ['session', 'serve', 'jobs']),
-    ('cli-network', 'Sign-ins and networks', 'Save camera passwords, resolve ONVIF streams and check GigE paths.',
+    ('cli-network', 'Sign-ins and networks', 'Save camera passwords, find ONVIF stream URLs and diagnose GigE connections.',
      ['login', 'onvif', 'network']),
-    ('cli-tools', 'Diagnostics and tools', 'Check this computer, describe the CLI, run commands one after another in a shell, complete them and talk to camera registers.',
+    ('cli-tools', 'Diagnostics and tools', 'Diagnose this computer, see the CLI contract, use the Capturefab shell or access camera registers.',
      ['doctor', 'schema', 'shell', 'completions', 'debug', 'licenses']),
 ]
 OTHER = ('cli-more', 'More commands', 'Commands without a section of their own yet.')
@@ -104,18 +104,22 @@ def collect(binary):
         env.update(CAPTUREFAB_SESSION_DIR=str(Path(temp) / 'sessions'), CAPTUREFAB_CACHE_DIR=str(Path(temp) / 'cache'))
         bare = json.loads(run(binary, 'schema', env=env))
         top = parse_help(run(binary, '-h', env=env))
+        group_names = {name.rpartition(' ')[0] for name in bare['commands'] if ' ' in name}
+        help_by_name = {'': top}
+        for name in sorted(set(bare['commands']) | group_names):
+            help_by_name[name] = parse_help(run(binary, *name.split(), '-h', env=env))
         commands = {}
         for name in bare['commands']:
-            words = name.split()
-            detail = json.loads(run(binary, 'schema', *words, env=env))
-            help_ = parse_help(run(binary, *words, '-h', env=env))
+            detail = json.loads(run(binary, 'schema', *name.split(), env=env))
+            help_ = help_by_name[name]
             detail.update(examples=help_['examples'], notes=help_['notes'])
-            if top['aliases'].get(name):
-                detail['aliases'] = top['aliases'][name]
+            parent, _, child = name.rpartition(' ')
+            if aliases := help_by_name[parent]['aliases'].get(child):
+                detail['aliases'] = aliases
             commands[name] = detail
         groups = {}
-        for name in sorted({name.split()[0] for name in bare['commands'] if ' ' in name} - set(commands)):
-            help_ = parse_help(run(binary, name, '-h', env=env))
+        for name in sorted(group_names - set(commands)):
+            help_ = help_by_name[name]
             groups[name] = dict(summary=help_['about'], notes=help_['notes'], examples=help_['examples'])
     return dict(generated_by='scripts/site-reference.py --binary target/debug/capturefab', about=top['about'],
                 global_options=top['options'], schema=bare, commands=commands, groups=groups)
@@ -138,7 +142,7 @@ def code(text):
 
 
 def prose(text):
-    """Help text with `quoted` spans, flags and commands set as code."""
+    """Help text with `quoted` spans set as code."""
     parts = re.split(r'(`[^`]+`)', str(text))
     out = []
     for part in parts:
@@ -160,7 +164,7 @@ def spelling(arg):
     return code(label if arg.get('required') else f'[{label}]')
 
 
-def facts(arg):
+def facts(arg, effect):
     items = []
     if arg.get('choices'):
         items.append('one of ' + ', '.join(code(choice) for choice in arg['choices']))
@@ -172,6 +176,8 @@ def facts(arg):
         items.append('repeatable')
     if arg.get('required') and (arg.get('long') or arg.get('short')):
         items.append('required')
+    if effect:
+        items.append('effect ' + code(effect))
     return '; '.join(items) or '—'
 
 
@@ -200,14 +206,16 @@ def examples(lines, label):
 
 def command_block(name, detail):
     out = [f'<h3 id="{slug(name)}"><code>capturefab {esc(name)}</code></h3>']
-    aliases = detail.get('aliases') or []
+    parent = name.rpartition(' ')[0]
+    aliases = [' '.join(part for part in (parent, alias) if part) for alias in detail.get('aliases', [])]
     alias = f' Alias: {", ".join(code(a) for a in aliases)}.' if aliases else ''
     out.append(f'<p>{prose(detail["summary"])}. Effect: {code(detail["effect"])}.{alias}</p>')
     out += [f'<p>{prose(note)}</p>' for note in detail.get('notes', [])]
     args = detail.get('args') or []
     if args:
-        out.append(table(f'capturefab {esc(name)} arguments', ['Argument or option', 'Meaning', 'Values'],
-                         [(spelling(arg), prose(arg.get('help', '')), facts(arg)) for arg in args]))
+        effects = detail.get('effect_with', {})
+        out.append(table(f'capturefab {esc(name)} arguments', ['Argument or option', 'Meaning', 'Details'],
+                         [(spelling(arg), prose(arg.get('help', '')), facts(arg, effects.get(arg.get('long')))) for arg in args]))
     out.append(examples(detail.get('examples'), f'capturefab {name}'))
     result = detail.get('result')
     if result:
@@ -240,23 +248,40 @@ def render(snapshot):
     exit_rows = [(code(key), esc(value)) for key, value in sorted(schema['exit_codes'].items(), key=lambda item: int(item[0]))]
     errors = sorted(schema['errors'].items(), key=lambda item: (item[1][0], item[0]))
     error_rows = [(f'<code id="error-{esc(name)}">{esc(name)}</code>', code(exit_), prose(meaning)) for name, (exit_, meaning) in errors]
-    basics = [f'<p>{prose(conventions["json"])}.</p>', f'<p>{prose(conventions["results"])}. Credentials: {prose(conventions["credentials"])}.</p>',
-              f'<p>{prose(conventions["describe"])}. This page is generated from that output (contract version {code(schema["contract_version"])}), so it lists exactly what the CLI accepts.</p>',
+    basics = [f'<p>{prose(conventions["json"])}. Use the exit code for the category and <code>error.code</code> for the specific reason.</p>',
+              f'<p>{prose(conventions["streams"])}. NDJSON means one JSON object per line. <code>--help</code> and <code>--version</code> print text.</p>',
+              '<p>Use <code>--progress</code> with <code>capture</code>, <code>record</code> or <code>jobs wait</code> to follow job progress. Each line has a <code>progress</code> object.</p>',
+              f'<p>{prose(conventions["results"])}. A result can include up to 10 distinct warnings. {prose(conventions["credentials"])}.</p>',
+              f'<p>{prose(conventions["describe"])}. This reference uses that output and the CLI help. The contract version is {code(schema["contract_version"])}.</p>',
               table('Exit codes', ['Exit code', 'Category'], exit_rows),
               table('Error codes in <code>error.code</code>', ['Code', 'Exit', 'Meaning'], error_rows)]
-    sections.append(article('cli-basics', 'JSON results, exit codes and errors', 'Run any command with --json for one JSON document and a typed exit code.',
-                            ['json', 'exit code', 'error code', 'schema', 'stdout', 'stderr'], '\n'.join(basics)))
+    sections.append(article('cli-basics', 'JSON results, exit codes and errors', 'Read JSON results and progress lines. Use exit codes to handle errors.',
+                            ['json', 'ndjson', 'exit code', 'error code', 'schema', 'stdout', 'stderr', '--progress'], '\n'.join(basics)))
 
     option_rows = [(', '.join(code(x) for x in (o.get('short'), o.get('long')) if x) + (f' {esc(o["value_name"])}' if o.get('value_name') else ''),
                     prose(o['help']), code(o['env']) if o.get('env') else '—') for o in snapshot['global_options']]
     globals_body = [f'<p>{prose(conventions["globals"])}.</p>', table('Global options', ['Option', 'Meaning', 'Environment'], option_rows),
-                    f'<p>{prose(conventions["camera"])}.</p>', f'<p>{prose(conventions["routing"])}.</p>', f'<p>{prose(conventions["jobs"])}.</p>']
-    sections.append(article('cli-global-options', 'Global options, cameras and sessions', 'Options every command takes, how a camera is chosen and when a session is used.',
+                    f'<p>{prose(conventions["camera"])}.</p>', f'<p>{prose(conventions["routing"])}.</p>',
+                    '<p><code>--no-session</code> overrides <code>CAPTUREFAB_SESSION</code> and <code>CAPTUREFAB_KEEP</code>. '
+                    'It conflicts with an explicit <code>--session</code>, <code>--background</code> or positive <code>--keep</code>.</p>',
+                    f'<p>{prose(conventions["jobs"])}.</p>',
+                    '<p>Each command lists its default effect. Look for options that add a file or camera write in the argument table.</p>',
+                    '<dl><dt><code>read</code></dt><dd>Reads data. It can write a temporary preview.</dd>'
+                    '<dt><code>file_write</code></dt><dd>Can write files or update saved data on this computer.</dd>'
+                    '<dt><code>camera_write</code></dt><dd>Can change camera settings or jobs.</dd>'
+                    '<dt><code>disruptive</code></dt><dd>Can hold cameras, stop streams or run camera commands.</dd></dl>']
+    sections.append(article('cli-global-options', 'Global options, cameras and sessions', 'Choose a camera, control session use and see what commands can change.',
                             ['global options', 'environment', 'session', 'camera', '--keep', '--background'], '\n'.join(globals_body)))
 
     grammar_rows = [(esc(key), prose(value)) for key, value in sorted(schema['grammars'].items())]
-    sections.append(article('cli-grammars', 'Selectors, names, durations and templates', 'The forms camera selectors, feature names, durations and output names take.',
-                            ['selector', 'feature name', 'bank', 'duration', 'template', 'controls'], table('Value grammars', ['Value', 'Form'], grammar_rows)))
+    grammars = table('Accepted forms', ['Value', 'Form'], grammar_rows)
+    grammars += ('\n<p>In a shell, put quotes around names, selectors and templates with special characters. '
+                 'For example, use <code>\'TriggerMode[FrameStart]\'</code> or <code>\'frames/{seq}.png\'</code>.</p>'
+                 '\n<p>Use an existing folder or end the path with a separator to save numbered files. '
+                 'Use <code>{seq:N}</code> to pad the number to N digits, from 1 to 9. '
+                 'Use <code>--on-exists number</code> to add a number when a fixed capture filename already exists.</p>')
+    sections.append(article('cli-grammars', 'Selectors, names, durations and templates', 'See what to type for camera selectors, feature names, durations and output templates.',
+                            ['selector', 'feature name', 'bank', 'duration', 'template', 'controls'], grammars))
 
     placed = set()
     for identity, title, summary, roots in GROUPS + [(OTHER[0], OTHER[1], OTHER[2], None)]:
@@ -317,7 +342,7 @@ TEMPLATE = '''<!doctype html>
     </header>
     <main id="main" class="docs-layout"><aside class="docs-sidebar" aria-label="Command reference navigation"><div class="sidebar-group"><p>Command reference</p>{links}</div><a class="sidebar-source" href="docs.html">Back to the guides</a></aside><div class="docs-content">
 <details class="docs-mobile-nav"><summary>Browse the command reference</summary><nav aria-label="Command reference topics">{links}</nav></details>
-<header class="docs-head"><p class="eyebrow">Reference</p><h1>Commands, options and results</h1><p class="lead">{about} For tasks step by step, read the <a href="docs.html">guides</a>; agents can read <a href="agents.md">agents.md</a>.</p></header>
+<header class="docs-head"><p class="eyebrow">Reference</p><h1>Commands, options and results</h1><p class="lead">{about} Follow a task in the <a href="docs.html">guides</a> or use the <a href="agents.md">agent instructions</a> for automation.</p></header>
 {sections}
 </div></main>
     <footer class="site-footer">

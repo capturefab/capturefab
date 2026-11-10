@@ -36,7 +36,7 @@
         <section class="hero-copy" aria-labelledby="hero-title">
           <p class="eyebrow"><span class="brand-dot" aria-hidden="true"></span> Free, open-source (MIT) camera capture CLI</p>
           <h1 id="hero-title">Camera capture for people, scripts and AI agents.</h1>
-          <p class="lead">One <code>capturefab</code> command finds, configures, captures from and records GigE Vision and USB3 Vision cameras, webcams, RTSP/ONVIF streams and files. Every command can print one JSON document with a typed exit code, so an agent drives a camera in a few calls.</p>
+          <p class="lead">Find cameras, adjust settings, save images and record video with <code>capturefab</code>. Use GigE Vision and USB3 Vision cameras, webcams, network streams or local files. Scripts and agents can read JSON results and error codes.</p>
           <div class="actions"><a class="button primary" href="#download" data-oneclick>Download Capturefab <span aria-hidden="true">↓</span></a></div>
           <p class="oneclick-alt" data-oneclick-alt hidden></p>
           <div class="code-wrap"><pre><code>curl -fsSL https://capturefab.com/install.sh | sh</code></pre><button class="copy-button" type="button" aria-label="Copy the install command">Copy</button></div>
@@ -50,7 +50,7 @@
         <p class="compatibility-note">Camera support depends on the device, connection and operating system. <a href="guides/camera-compatibility.md">Read the camera requirements →</a></p>
       </section>
       <section id="agents" class="section" aria-labelledby="agents-title">
-        <div class="section-heading"><p class="eyebrow">Built for agents</p><h2 id="agents-title">Few calls, small results, clear errors.</h2><p>Claude Code, Codex and other agents that run shell commands use Capturefab as it is. <code>schema</code> describes every command; each result is one JSON document; the exit code and <code>error.code</code> say what to do next.</p></div>
+        <div class="section-heading"><p class="eyebrow">Built for agents</p><h2 id="agents-title">Few calls, small results, clear errors.</h2><p>Give your coding agent <code>capturefab schema</code> to look up commands and options. Use <code>--json</code> to read results and errors. The exit code identifies the failure category, and <code>error.code</code> gives the reason.</p></div>
         <div class="automation-grid"><div><div class="code-wrap"><pre><code><span data-run-hint># Not installed? Use the one-line installer above, or ./capturefab (.\capturefab.exe on Windows) from the extracted folder.</span>
 
 capturefab schema
@@ -86,9 +86,9 @@ capturefab capture --json -c sim:0 -o 'shots/{seq}.png'</code></pre><button clas
         <div class="section-heading"><p class="eyebrow">What it does</p><h2 id="features-title">Measure, change, capture, record.</h2><p>Each command does one job well and reports exactly what happened.</p></div>
         <div class="start-routes capability-routes">
           <article><h3>Measure before you capture</h3><p><code>inspect</code> measures exposure, clipping and focus on a fresh frame, suggests an exposure and writes a small preview.</p><a href="docs.html#inspect">Exposure and focus</a></article>
-          <article><h3>Change settings safely</h3><p><code>set</code> writes several values as one change, in a valid order, and puts every value back if one fails. Portable controls work across vendors.</p><a href="docs.html#features">Read and change settings</a></article>
-          <article><h3>Capture and record</h3><p>Single frames, bursts, time lapses and triggered captures; H.264, HEVC, AV1 or lossless FFV1 video to files or streams. Files are never overwritten.</p><a href="docs.html#capture">Capture images</a><a href="docs.html#recording">Record video</a></article>
-          <article><h3>Keep cameras open</h3><p><code>--keep 5m</code> keeps a camera open between calls; <code>--background</code> runs long captures and recordings as jobs; <code>serve</code> runs a session under systemd.</p><a href="docs.html#sessions">Sessions and jobs</a></article>
+          <article><h3>Change settings safely</h3><p><code>set</code> writes several values in order. Use <code>--dry-run</code> to see the planned writes. If a write fails, Capturefab tries to restore the earlier values.</p><a href="docs.html#features">Read and change settings</a></article>
+          <article><h3>Capture and record</h3><p>Save single frames, bursts, time lapses and triggered captures. Record video to a file or stream to a receiver. Capture and recording preserve existing output files.</p><a href="docs.html#capture">Capture images</a><a href="docs.html#recording">Record video</a></article>
+          <article><h3>Keep cameras open</h3><p><code>--keep 5m</code> keeps a camera open between commands. Use <code>--background</code> for long captures or recordings. Use <code>serve</code> to run a session under a service manager.</p><a href="docs.html#sessions">Sessions and jobs</a></article>
         </div>
       </section>
       <section id="quickstart" class="section" aria-labelledby="quickstart-title">
@@ -101,7 +101,7 @@ capturefab list --kind sim
 # What it is and what it can do
 capturefab info -c sim:0
 
-# Save an image; run it again for first-0002.png
+# Save an image with the next available number
 capturefab capture -c sim:0 -o 'first-{seq}.png'
 
 # Measure exposure and focus
@@ -135,15 +135,15 @@ capturefab inspect -c sim:0</code></pre><button class="copy-button" type="button
             <noscript><p class="notice">Open <a href="downloads.html">all downloads</a> to select a file. JavaScript is not necessary.</p></noscript>
           </div>
       </section>
-      <section id="how" class="section" aria-labelledby="how-title"><div class="reliability"><div><p class="eyebrow">Capture with clear limits</p><h2 id="how-title">Predictable by design.</h2><p>Each camera runs in a separate worker process, so one camera's driver cannot take the others down. Every command reports what it did, or exactly why it could not.</p><a href="docs.html#architecture">Read about the architecture →</a></div><dl><div><dt>Never overwrites</dt><dd>An existing file is never replaced. Templates such as <code>{seq}</code> name new files.</dd></div><div><dt>No half-made changes</dt><dd><code>set</code> and preset changes apply as one change and put every value back on failure.</dd></div><div><dt>Runs locally</dt><dd>No account, no cloud and no telemetry. Capturefab connects only to the cameras and stream receivers you name.</dd></div></dl></div></section>
+      <section id="how" class="section" aria-labelledby="how-title"><div class="reliability"><div><p class="eyebrow">Capture with clear limits</p><h2 id="how-title">Predictable by design.</h2><p>Each camera runs in a separate worker process. If one worker crashes, the others can continue.</p><a href="docs.html#architecture">Read about the architecture →</a></div><dl><div><dt>Numbered output</dt><dd>Use <code>{seq}</code> to give each capture or recording a new filename.</dd></div><div><dt>Settings recovery</dt><dd>When a settings write fails, Capturefab tries to restore the earlier values and reports the result.</dd></div><div><dt>Runs locally</dt><dd>Capturefab runs on your computer without an account. It uses the network to discover cameras and connect to network sources and receivers.</dd></div></dl></div></section>
       <section id="faq" class="section" aria-labelledby="faq-title">
         <div class="section-heading"><h2 id="faq-title">Before you download</h2></div>
         <div class="faq">
           <details><summary>Which cameras can I connect?</summary><p>GigE Vision and USB3 Vision (GenICam) cameras, webcams and capture cards, RTSP, SRT and ONVIF streams, and video files. Support depends on the device and operating system; this is an early implementation with less coverage than some vendor SDKs. Read the <a href="guides/camera-compatibility.md">camera requirements and limits</a>.</p></details>
           <details><summary>Do I need a vendor SDK or FFmpeg?</summary><p>No. Downloads include FFmpeg for webcams, streams and video. You need the operating system's camera and USB drivers. USB3 Vision cameras on Windows must use WinUSB; the <a href="docs.html#first-launch">first-use steps</a> say how. Read the <a href="docs.html#installation">installation instructions</a>.</p></details>
-          <details><summary>How does an AI agent use it?</summary><p>Through the shell, like any command-line tool. Give your agent <a href="agents.md">agents.md</a> or let it run <code>capturefab schema</code>. Results are JSON, exit codes are typed, and each error has a code and a hint. Your agent decides what its model sees.</p></details>
+          <details><summary>How does an AI agent use it?</summary><p>Give your agent <a href="agents.md">agents.md</a> or ask it to run <code>capturefab schema</code>. With <code>--json</code>, errors include a code and a message. An error may also include a hint.</p></details>
           <details><summary>Windows says the program is unrecognized. Is that expected?</summary><p>If a Windows download is listed as Unsigned, Microsoft Defender SmartScreen may warn the first time you run <code>capturefab.exe</code>. Check the SHA-256 checksum first, then choose <strong>More info</strong> → <strong>Run anyway</strong>, or use the PowerShell installer. The <a href="downloads.html">download list</a> shows each file's signature.</p></details>
-          <details><summary>How do I check that my computer is ready?</summary><p>Run <code>capturefab doctor</code>. It checks FFmpeg, folders, GigE adapters and, on Linux, USB and network limits, and prints a fix for each warning. Read the <a href="docs.html#doctor">checks</a> and the <a href="docs.html#troubleshooting">troubleshooting guide</a>.</p></details>
+          <details><summary>How do I check that my computer is ready?</summary><p>Run <code>capturefab doctor</code>. It examines FFmpeg, folders and GigE adapters. On Linux it also examines USB access and network limits. It shows a fix when one is available. Read the <a href="docs.html#doctor">checks</a> and the <a href="docs.html#troubleshooting">troubleshooting guide</a>.</p></details>
           <details><summary>Can I use Capturefab for commercial work?</summary><p>Yes. Capturefab uses the MIT license. The separate FFmpeg executable uses GPLv3. Each release includes the corresponding source and license notices. Read the <a href="guides/ffmpeg-build.md">licensing details</a> before redistribution.</p></details>
           <details><summary>Where is the desktop app?</summary><p>Capturefab is now a command-line tool. Version 0.5.0 and earlier included a desktop app; keep 0.5.0 to go on using it. Read <a href="docs.html#upgrade-desktop">upgrading from the desktop app</a>.</p></details>
           <details><summary>How do I verify a download?</summary><p>The download selector shows a command with the file name and its SHA-256 filled in. Run it in your Downloads folder: it prints OK when the file matches. The install script checks the checksum before it installs anything. You can verify GitHub build provenance with <code>gh attestation verify FILE --repo capturefab/capturefab</code>.</p></details>

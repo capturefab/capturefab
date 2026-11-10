@@ -2,29 +2,36 @@
 
 # CLI workflows
 
-Shell recipes for whole tasks. Each one runs on the simulator (`sim:0`); replace `-c sim:0` with
-your camera's `list` ID. Add `--json` when a script or an agent reads the output: stdout then
-holds exactly one JSON document, and the exit code says what kind of outcome it was (0 ok,
-1 failed, 2 usage, 3 unavailable, 4 timeout, 5 unsupported, 6 storage full, 130 interrupted).
-`capturefab schema COMMAND` describes any command's arguments and results.
+Try the capture examples with the built-in simulator, `sim:0`. For a real camera, run
+`capturefab list` and use the camera ID with `-c`. Each example starts in its own working
+directory unless it uses files from an earlier step.
+
+For scripts, add `--json` to get one JSON document on stdout. When `capture -o -` writes an
+image to stdout, the JSON goes to stderr. The exit code gives the result category. On
+failure, `error.code` gives the specific reason. Run `capturefab schema COMMAND` for the
+options and result fields.
 
 ## Set up a bench camera
 
+Use `info` to read the current settings. Use `inspect` to measure exposure and focus and get
+the path to a JPEG preview. Adjust the exposure and measure again in one command.
+
 ```sh
-capturefab list                                  # find the camera's ID
-capturefab info -c sim:0                         # size, format, exposure, gain, trigger
-capturefab inspect -c sim:0 --keep 15m           # exposure verdict, focus and a preview path
-capturefab inspect -c sim:0 --set exposure=6ms   # change and measure in one call
+capturefab info -c sim:0
+capturefab inspect -c sim:0 --keep 15m
+capturefab inspect -c sim:0 --set exposure=6ms
 capturefab set -c sim:0 roi=0,0,640,480 fps=30 --dry-run
 capturefab set -c sim:0 roi=0,0,640,480 fps=30
 capturefab preset save bench -c sim:0 --note 'ring light 60%'
 ```
 
-`--keep 15m` keeps the camera open in a session, so the commands after it start at once. `set`
-writes every value as one change, ordered so that geometry and frame rate stay valid, and puts
-every value back if one write fails. `--dry-run` shows the writes in order without changing
-anything. A preset restores the setup later, also on another camera of the same model:
-`capturefab preset apply bench -c CAMERA`.
+`--keep 15m` keeps the camera open for at least 15 idle minutes. Use `--dry-run` to see the
+planned writes before you change the settings. If a write fails, Capturefab tries to restore
+the previous values. With `--json`, read `error.details.rollback` for the result of that
+attempt.
+
+To restore the preset on the same camera or another of the same model, run
+`capturefab preset apply bench -c sim:0` with the target camera ID.
 
 ## Capture a sequence with names and tags
 
@@ -32,107 +39,135 @@ anything. A preset restores the setup later, also on another camera of the same 
 capturefab capture -c sim:0 -n 10 -o 'parts/{date}/{tag:part}-{seq:4}.png' --tag part=A-100 --tag station=3 --manifest parts.jsonl
 ```
 
-Templates: `{camera}`, `{serial}`, `{seq}` (`{seq:4}` pads to four digits), `{time}`, `{date}`,
-`{tag:KEY}` and `{ext}`. A folder (an existing one, or a name ending in `/`) gets
-`{camera}-{time}-{seq}.{ext}`. Tags also go into each image's metadata. Existing files are never
-overwritten; a name without `{seq}` that exists fails with `exists`, or is numbered with
-`--on-exists number`. `--manifest` appends one JSON line per saved file (path, time, size,
-SHA-256, settings and tags) for whatever reads the files later.
+This saves ten PNGs with names such as `A-100-0001.png` in a dated folder. The images carry
+both tags. The manifest appends one JSON line per image with its path, time, size, SHA-256,
+settings and tags.
 
-## A time lapse that outlives the terminal
+Use an existing folder or end the output path with `/` to get the default name
+`{camera}-{time}-{seq}.{ext}`. Capturefab picks a free name for templates that use `{seq}`
+or `{time}`. For a fixed name such as `part.png`, use `--on-exists number` to add a suffix
+if the file exists. See the [file naming guide](plant-floor.md#name-files-for-analysis)
+for the placeholders.
+
+## Run a time lapse in the background
+
+Run these commands in a POSIX shell with Python 3 available.
 
 ```sh
-job=$(capturefab capture --json -c sim:0 --every 30s --for 8h -o 'lapse/{seq:5}.jpg' --background |
-  python3 -c 'import json,sys; print(json.load(sys.stdin)["job"]["id"])')
-capturefab jobs                         # progress: saved, planned, next_at
+result=$(capturefab capture --json -c sim:0 --every 30s --for 8h -o 'lapse/{seq:5}.jpg' --background) &&
+  job=$(printf '%s\n' "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["job"]["id"])')
+```
+
+`--background` submits the job to a session and returns `job.id`, for example `auto-3`.
+If Capturefab starts the session for this job, the session ends after a minute without
+requests or running jobs. The capture can continue after you close the terminal.
+
+Use the returned ID to see the job's progress or wait up to one minute for it to finish.
+The wait can time out while the job continues.
+
+```sh
+capturefab jobs list "$job"
 capturefab jobs wait "$job" --timeout 1m
-capturefab jobs stop "$job"             # end early; files saved so far stay
 ```
 
-`--background` starts a session if none holds the camera, submits the job and returns its ID
-(`job.id`, such as `auto-3`). Use the ID it returns: IDs count on across a session's jobs and
-its runs, so another ID may name an earlier, finished job. A session started this way ends once
-it has had no jobs and no requests for a minute. `--at 06:00` or `--in 10m` delays the first
-frame; `-n 100 --every 2s` bounds the series by count instead of time.
+To end the time lapse early, run `capturefab jobs stop "$job"`. The saved images stay on disk.
+Use `--at 06:00` or `--in 10m` to delay the first frame. Use `-n 100 --every 2s` to set
+a frame count instead of a duration.
 
-## A triggered inspection station
+## Set up a triggered inspection station
+
+This simulator sends a rising edge to `Line0` every 500 ms, like a sensor wired to a camera.
+Use the same selector in each command.
 
 ```sh
-capturefab session start --name station -c 'sim:0?line0=every:500ms' --live --idle 8h
-capturefab set -c 'sim:0?line0=every:500ms' trigger=line0:rising exposure=2ms
-capturefab capture -c 'sim:0?line0=every:500ms' -n 1000 -o 'station/{time}.png' --timeout none --background
+cam='sim:0?line0=every:500ms'
+capturefab session start --name station -c "$cam" --idle 8h
+capturefab set --session station -c "$cam" trigger=line0:rising exposure=2ms
+capturefab capture --session station -c "$cam" -n 1000 -o 'station/{seq:4}.png' --timeout none --background
 capturefab session status station
-capturefab jobs stop all                # at the end of the shift; files saved so far stay
-capturefab session stop station
-capturefab set -c 'sim:0?line0=every:500ms' trigger=off     # back to free running
 ```
 
-`sim:0?line0=every:500ms` is a simulator whose Line0 input fires every 500 ms, standing in for a
-camera wired to a sensor; on plain `sim:0` the line never fires
-([simulated cameras](simulation.md#frame-loss-and-hardware-triggers)).
+The capture waits for a trigger for each frame. With `--timeout none`, it keeps waiting until
+a trigger arrives or you stop it. If the wait reaches a finite timeout, the job fails with
+`trigger_timeout`. A foreground capture returns exit code `4` and gives the trigger settings
+in `error.details.trigger` with `--json`.
 
-With a hardware trigger, `capture` saves one frame per trigger and waits for the next;
-`--timeout none` waits without limit, and a bounded `--timeout` ends with exit 4
-`trigger_timeout` and the trigger configuration in `error.details.trigger`. With
-`trigger=software`, `capture` fires the software trigger itself, and `exec -c CAM
-TriggerSoftware` fires one by hand. `--live` keeps the camera streaming between commands.
+To stop the station, run `capturefab session stop station`. Capturefab keeps the images it
+already saved. Run `capturefab set -c "$cam" trigger=off` to return the camera to free-running
+mode. With `trigger=software`, `capture` sends the trigger itself.
 
-## Several cameras at once
+## Capture from several cameras
 
 ```sh
-capturefab capture -c sim:0 -c sim:1 -o 'multi/{camera}-{seq}.png'
+capturefab capture --json -c sim:0 -c sim:1 -o 'multi/{camera}-{seq}.png'
 capturefab get -c sim:0 -c sim:1 ExposureTime Width
 capturefab inspect -c sim:0 -c sim:1 --preview none
 ```
 
-With `-c` repeated, the JSON result holds `cameras`, one entry per camera. A capture arms every
-camera first, then asks all of them for a frame at once; `skew_ms` says how far apart their first
-frames arrived, and each entry's `time` and `device_ts_ns` say when its own frame was taken.
+Capturefab arms the cameras before it requests their frames in parallel. For a successful
+foreground capture, the JSON result has one entry per camera in `cameras`. The host clock
+gives each entry's `time` and the difference between the earliest and latest first-frame
+times in `skew_ms`. When available, `device_ts_ns` gives that camera's timestamp in
+nanoseconds. For synchronized exposures, use cameras with a shared hardware trigger.
 
 ## Record and stream video
 
 ```sh
 capturefab record -c sim:0 -o clip.mp4 --for 30s
-capturefab record -c sim:0 -o clip.mkv --codec ffv1 --for 2m          # lossless
-capturefab record -c sim:0 -o 'srt://localhost:8890?streamid=publish:cam' --background
-capturefab jobs stop all
+capturefab record -c sim:0 -o clip.mkv --codec ffv1 --for 2m
 ```
 
-Recordings go to `.mkv`, `.mp4`, `.mov`, `.ts` or `.webm` files, or to an `rtsp://`, `srt://`,
-`rtmp://` or `udp://` receiver such as MediaMTX. `--codec h264` (the default) uses a hardware
-encoder where one works (VideoToolbox, NVENC, Jetson's GStreamer encoder, AMF, Quick Sync,
-Vulkan, Media Foundation or V4L2) and libx264 otherwise; `hevc` and `av1` need a hardware
-encoder. An H.264 or HEVC stream, file or webcam mode is copied as it arrives, without
-re-encoding or an encoder (`"encoder":"copy"`), unless `--codec` names another codec or `--fps`
-or `--bitrate` is given; Windows encodes. `--max-size 2G` ends a file before that size, leaving
-FFmpeg room to finish it; Ctrl-C ends an open-ended recording normally. `.mkv` files get their
-length and seek index once the recording ends.
+Use `.mkv`, `.mp4`, `.mov`, `.ts` or `.webm` for a file. Use FFV1 with `.mkv` for
+lossless video. For H.264, Capturefab uses a hardware encoder when available and libx264
+otherwise. HEVC and AV1 use hardware encoders. Run `capturefab doctor` to see the FFmpeg in
+use.
 
-## Password-protected cameras
+On macOS and Linux, Capturefab can copy H.264 and HEVC video from supported streams, files and
+webcam modes. An output that accepts the source codec can use this path when `--fps` and
+`--bitrate` are absent. The JSON result shows `"encoder":"copy"` when it does. To choose a
+different codec, use `--codec`.
+
+Use `--max-size 2G` to set a file size limit. Without `--for`, push Ctrl+C to finish a
+foreground recording. For background recordings, use `capturefab jobs stop JOB_ID`. The
+Matroska duration and seek index are available after the file closes.
+
+For a stream, start a compatible receiver first. The next example sends video to a local
+receiver listening on UDP port 8890.
+
+```sh
+capturefab record -c sim:0 -o udp://127.0.0.1:8890 --background
+```
+
+Capturefab also accepts `rtsp://`, `srt://` and `rtmp://` output URLs. Use the URL and
+stream parameters for your receiver. The FFmpeg in use must support that protocol.
+
+## Connect to a camera with a password
+
+Replace the example RTSP URL and user name with your camera's details. Supply the password
+in the shell variable `PASSWORD`.
 
 ```sh
 printf '%s\n' "$PASSWORD" | capturefab login add rtsp://192.168.1.20/stream --user admin --password-stdin
-capturefab onvif resolve 192.168.1.10                     # an ONVIF camera's RTSP streams
 capturefab capture -c rtsp://192.168.1.20/stream -o door.png
 capturefab login list
-capturefab login rm rtsp://192.168.1.20/stream
 ```
 
-`login add` connects once and saves the sign-in only if the camera accepts it (`--no-check` saves
-without connecting). The password comes from `--password-stdin` or `CAPTUREFAB_CAMERA_PASSWORD`,
-never the command line, and goes to the OS credential store; addresses and user names are listed
-in the state folder without secrets. Every later command for that address, `onvif://` included,
-uses the saved sign-in. Know the trade-offs before saving one:
+`login add` verifies the sign-in before it saves it. Use `--no-check` to save it without
+connecting. Supply the password through stdin or `CAPTUREFAB_CAMERA_PASSWORD`. Capturefab
+stores it in the OS credential store. The local sign-in index holds the address and user name.
 
-- FFmpeg's RTSP reader takes credentials only in its input URL. Capturefab hands FFmpeg that
-  URL on its standard input, and a session the cameras it holds the same way, so neither process's
-  command line shows them; a command you type with `-c rtsp://USER:PASS@...` still shows the
-  password in that command's own command line while it runs.
-- A saved password is sent to whatever answers at that host, port and path. Plain RTSP Basic
-  authentication and ONVIF over `http://` expose it on the network; prefer `rtsps://`, Digest
-  authentication and fixed addresses on trusted networks.
+For ONVIF, save the sign-in under the ONVIF address, such as `onvif://192.168.1.20`. Then use
+`capturefab onvif resolve 192.168.1.20` to see the camera's profiles and stream URLs.
+To remove a sign-in, use `capturefab login rm ADDRESS` with the address you used to save it.
 
-## A script that checks every result
+Keep passwords out of camera URLs on the command line. A URL you type with a password can
+appear in the process list and shell history. Use encrypted connections when the camera
+supports them. RTSP Basic authentication on an unencrypted link exposes the password.
+
+## Use the result in a script
+
+This POSIX shell script prints the path to the saved image. On failure it writes the JSON
+error to stderr and returns Capturefab's exit code. It uses Python 3 to read the path.
 
 ```sh
 #!/bin/sh
@@ -141,19 +176,21 @@ out=$(capturefab capture --json -c sim:0 -o 'shots/{seq}.png')
 status=$?
 case $status in
   0) printf '%s\n' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["files"][0])' ;;
-  3|4) echo "camera unavailable or slow; retry later: $out" >&2; exit "$status" ;;
-  *) echo "capture failed: $out" >&2; exit "$status" ;;
+  *) printf '%s\n' "$out" >&2; exit "$status" ;;
 esac
 ```
 
-## GigE network checks
+Use exit code `3` for an unavailable camera and `4` for a timeout. Use `error.code` if the
+script must tell a trigger timeout from another timeout.
+
+## Diagnose a GigE Vision connection
 
 ```sh
 capturefab network
 capturefab network --tune -c gige:00c0df123456 -c gige:00c0df654321
 ```
 
-`network` lists the computer's IPv4 adapters and each GigE camera found, with how it is reached
-(link speed, MTU, subnet) and a summary of anything that limits it. `--tune` shares the link's
-bandwidth between the named cameras with packet delay or throughput limits; cameras keep it until
-they power off. Host addresses, routes and MTUs are never changed.
+`network` shows the host's IPv4 interfaces and the route to each GigE Vision camera, with
+link speed, MTU and subnet details. To share bandwidth, replace the example IDs with the
+cameras on your link. `--tune` writes packet delay or throughput limits to those cameras.
+The command changes camera settings only.

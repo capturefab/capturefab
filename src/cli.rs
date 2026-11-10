@@ -54,7 +54,7 @@ Usage: capturefab [--json] COMMAND [-c CAMERA] ...
   capturefab set -c sim:0 exposure=5ms  change settings as one atomic change
   capturefab capture -c sim:0 -o shot.png
 
-Agents: use --json (one document on stdout, typed exit codes); `capturefab schema` describes every command.
+Use --json for structured results. Run `capturefab schema` for the command contract.
 More: capturefab --help, capturefab COMMAND --help";
 
 #[derive(Debug, Parser)]
@@ -62,8 +62,8 @@ More: capturefab --help, capturefab COMMAND --help";
     name = "capturefab",
     bin_name = "capturefab",
     version,
-    about = "Camera capture for people and agents: list, configure, capture and record cameras.",
-    long_about = "Camera capture for people and agents: list, configure, capture and record cameras.\n\nWith --json every command prints exactly one JSON document on stdout: the result when it exits 0, {\"error\":{code,message,hint?,details?}} otherwise. Exit codes: 0 ok, 1 failed, 2 usage, 3 unavailable, 4 timeout, 5 unsupported, 6 storage full, 130 interrupted. `capturefab schema` describes every command, its arguments, results and errors.",
+    about = "Find cameras, change their settings, and save images and video.",
+    long_about = "Find cameras, change their settings, and save images and video.\n\nUse --json for structured output. Most commands print one result or error as a JSON line on stdout. Watch and shell can print multiple lines. When capture -o - writes the image to stdout, it sends JSON to stderr. Help and version flags print text.\n\nRun capturefab schema for commands and exit codes. Run capturefab schema COMMAND for options, results and errors.",
     after_help = "Examples:\n  capturefab list --kind sim\n  capturefab info -c sim:0\n  capturefab set -c sim:0 exposure=5ms gain=3\n  capturefab --json get -c sim:0 ExposureTime 'TriggerMode[FrameStart]'",
     disable_help_subcommand = true
 )]
@@ -77,7 +77,7 @@ pub(crate) struct Cli {
 /// Flags every command takes, before or after its name.
 #[derive(Debug, Clone, Default, Args)]
 pub(crate) struct Global {
-    /// One JSON document on stdout: the result, or {"error":{...}} with a non-zero exit
+    /// Print JSON results and errors
     #[arg(
         long,
         global = true,
@@ -86,7 +86,7 @@ pub(crate) struct Global {
         value_parser = clap::builder::FalseyValueParser::new()
     )]
     pub json: bool,
-    /// No progress or notes on stderr; errors still print
+    /// Hide status and notes. Still report errors and explicit --progress output
     #[arg(short = 'q', long, global = true)]
     pub quiet: bool,
     /// More detail on stderr, including camera worker logs
@@ -95,7 +95,7 @@ pub(crate) struct Global {
     /// Use this running session (session start or serve --name NAME)
     #[arg(long, global = true, value_name = "NAME", env = "CAPTUREFAB_SESSION")]
     pub session: Option<String>,
-    /// Never use a running session: open the camera in a worker of this command
+    /// Bypass sessions for camera commands
     #[arg(long, global = true)]
     pub no_session: bool,
     /// The session came from `CAPTUREFAB_SESSION`, not --session: a default
@@ -167,7 +167,7 @@ pub(crate) enum Command {
         after_help = "Examples:\n  capturefab exec -c sim:0 'TriggerSoftware[FrameStart]'\n  capturefab exec -c gige:00c0df123456 'UserSetSave[UserSet1]'"
     )]
     Exec(camera::ExecArgs),
-    /// Save frames: one shot, a burst, a time lapse or a delayed capture; never overwrites
+    /// Save an image, burst, time lapse or scheduled capture without overwriting files
     #[command(
         after_help = "Examples:\n  capturefab capture -c sim:0 -o shot.png\n  capturefab capture -c sim:0 -n 10 -o frames/\n  capturefab capture -c sim:0 --every 10s --for 1h -o 'lapse/{seq}.jpg' --background\n  capturefab capture -c sim:0 -o - > frame.png"
     )]
@@ -177,14 +177,14 @@ pub(crate) enum Command {
         after_help = "Examples:\n  capturefab record -c sim:0 -o clip.mp4 --for 30s\n  capturefab record -c sim:0 -o clip.mkv --codec ffv1 --for 5m\n  capturefab record -c sim:0 -o rtsp://localhost:8554/cam --background"
     )]
     Record(record::RecordArgs),
-    /// Measure a fresh frame: exposure, clipping, focus, suggested exposure, a preview
+    /// Measure brightness, clipping and focus, with an exposure suggestion and a preview
     #[command(
         after_help = "Examples:\n  capturefab inspect -c sim:0\n  capturefab inspect -c sim:0 --set exposure=20ms --region 0.25,0.25,0.5,0.5\n  capturefab inspect -c sim:0 --keep 5m --preview none\n  capturefab inspect -c sim:0 --show"
     )]
     Inspect(inspect::InspectArgs),
-    /// Live measurements while aiming, focusing or setting exposure: redrawn in a terminal, one JSON line each otherwise
+    /// Measure brightness and focus live while you adjust the camera
     #[command(
-        after_help = "Ctrl-C ends it (exit 0). Without a terminal, or with --json, each measurement is one JSON line.\n\nExamples:\n  capturefab watch -c sim:0\n  capturefab watch -c sim:0 --show --region 0.4,0.4,0.2,0.2\n  capturefab watch -c sim:0 --json --for 10s --every 1s"
+        after_help = "Use Ctrl-C to stop. The command exits with code 0. When you redirect stdout or use --json, watch writes one JSON line per measurement.\n\nExamples:\n  capturefab watch -c sim:0\n  capturefab watch -c sim:0 --show --region 0.4,0.4,0.2,0.2\n  capturefab watch -c sim:0 --json --for 10s --every 1s"
     )]
     Watch(watch::WatchArgs),
     /// Settle exposure and gain, then hold them; or turn auto exposure off or on
@@ -208,7 +208,7 @@ pub(crate) enum Command {
     /// Sessions keep cameras open between commands: start one in the background, stop it, see it
     #[command(
         subcommand,
-        after_help = "Camera commands keep their camera open in the auto session for 60s after their last use (--keep DUR to change it, --keep 0 or --no-session for none), and use a session that holds their camera on their own.\n\nExamples:\n  capturefab session start -c sim:0 --live\n  capturefab session status\n  capturefab session stop"
+        after_help = "Camera commands can reuse a session that already holds the camera. Most keep the camera open in the auto session for 60s after use. Use --keep DUR to change that time. Use --keep 0 to avoid starting a session for a foreground camera command. Use --no-session to bypass existing sessions.\n\nExamples:\n  capturefab session start -c sim:0 --live\n  capturefab session status\n  capturefab session stop"
     )]
     Session(session::SessionAction),
     /// Run a session in the foreground (systemd, a terminal); Ctrl-C stops it

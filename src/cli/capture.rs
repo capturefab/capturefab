@@ -47,7 +47,7 @@ impl Format {
 pub(crate) struct CaptureArgs {
     #[command(flatten)]
     pub cameras: CamerasArg,
-    /// File, folder (existing, or ending in /) or template with {camera} {serial} {seq} {seq:N} {time} {date} {tag:KEY} {ext}; - writes one image to stdout (default: this folder, as {camera}-{time}-{seq}.png)
+    /// Save to a file, template or folder. Use - for one image on stdout. By default, save in the current folder as {camera}-{time}-{seq}.{ext}
     #[arg(short = 'o', long, value_name = "PATH")]
     pub output: Option<String>,
     /// Frames to save, 1..100000
@@ -60,9 +60,9 @@ pub(crate) struct CaptureArgs {
     #[arg(long = "for", value_name = "DUR", value_parser = super::args::duration)]
     pub duration: Option<Duration>,
     /// Absolute start time in local or RFC 3339 notation.
-    #[arg(long, value_name = "TIME", conflicts_with = "after", value_parser = super::args::time, help = "Begin at a time: HH:MM[:SS] here, or RFC 3339")]
+    #[arg(long, value_name = "TIME", conflicts_with = "after", value_parser = super::args::time, help = "Start at the next local HH:MM[:SS], or an RFC 3339 timestamp")]
     pub at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Begin after a delay
+    /// Start after a delay
     #[arg(long = "in", value_name = "DUR", value_parser = super::args::duration)]
     pub after: Option<Duration>,
     /// Image format when -o has no extension: png (default; 16-bit for Mono10..Mono16), jpg or raw (the exact bytes, with NAME.json beside)

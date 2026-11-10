@@ -2,129 +2,131 @@
 
 # Run Capturefab on a line computer
 
-A line computer is a small Linux machine beside the cameras, such as a Raspberry Pi 4 or 5, a
-Jetson board or a fanless industrial PC, that runs Capturefab without a screen. This guide
-installs the release, gives it access to the cameras, runs a `capturefab serve` session as a
-service that starts at boot and keeps the cameras open, and controls it over SSH.
+Use a small Linux computer beside the cameras to run Capturefab without a screen. This
+guide starts a camera session at boot with systemd. You can control the session over SSH.
 
-The examples use the account you log in with over SSH, here `pi` with UID 1000 (`id -u` prints
-yours), and the session name `line1`. Replace them with your own.
+The examples use the account `pi`, its home folder `/home/pi`, UID `1000` and the session
+name `line1`. Run `id -u` to find your account's UID. Replace these example values with yours.
 
 ## 1. Install
 
-The archive you need matches the installed operating system, not the processor:
+On Debian, Ubuntu or Raspberry Pi OS, use `dpkg --print-architecture` to find the installed
+system's architecture.
+
+| Output | Archive |
+| --- | --- |
+| `arm64` | `linux-aarch64` |
+| `amd64` | `linux-x86_64` |
+| `armhf` | Install a 64-bit operating system that your board supports. Capturefab releases use 64-bit Linux. |
+
+The Linux release also uses glibc 2.28 or newer. Download the install script as the
+account that will run Capturefab.
 
 ```sh
-dpkg --print-architecture
+curl -fsSLo install-capturefab.sh https://capturefab.com/install.sh
+sh install-capturefab.sh --dry-run
+sh install-capturefab.sh
+"$HOME/.local/bin/capturefab" doctor
 ```
 
-`arm64` takes the `linux-aarch64` archive and `amd64` the `linux-x86_64` one. `armhf` is a 32-bit
-system, for which there is no build: Raspberry Pi 3 and later run the 64-bit Raspberry Pi OS, so
-reinstall with that. Do not go by `uname -m`, which prints `aarch64` on 32-bit Raspberry Pi OS
-too. Releases need glibc 2.28 or newer: Debian 10, Ubuntu 18.10, Jetson Linux R34 and later.
+The dry run prints the selected archive, URL and SHA-256 checksum. The install verifies
+that checksum before it extracts the release. The script installs into
+`${XDG_DATA_HOME:-$HOME/.local/share}/capturefab/VERSION` and links the command in
+`~/.local/bin`. Follow the script's PATH instructions if your shell cannot find
+`capturefab`.
 
-The install script does the choosing and checking. It reads `dpkg --print-architecture`, refuses
-`armhf`, downloads the matching archive from capturefab.com, checks its SHA-256 before extracting,
-installs it in `~/.local/share/capturefab/VERSION` and links `~/.local/bin/capturefab`. It does
-not use `sudo`:
+For a manual install, download the matching archive and `SHA256SUMS` into the same
+directory. [Capturefab downloads](https://capturefab.com/downloads.html)
+
+Replace `VERSION` with the release version. Use `linux-x86_64` in the archive and
+folder names if you have an x86-64 system.
 
 ```sh
-curl -fsSL https://capturefab.com/install.sh | sh -s -- --dry-run   # the file and checksum it would use
-curl -fsSL https://capturefab.com/install.sh | sh
-capturefab doctor
+package=capturefab-VERSION-linux-aarch64
+awk -v archive="$package.tar.gz" '$2 == archive' SHA256SUMS | sha256sum --check --strict - &&
+  tar -xzf "$package.tar.gz" &&
+  install -Dm755 "$package/capturefab" "$HOME/.local/bin/capturefab"
 ```
 
-To install by hand, download the archive and `SHA256SUMS` from the
-[downloads page](https://capturefab.com/downloads.html), then (replace `VERSION`):
+Run `"$HOME/.local/bin/capturefab" doctor` after the install. For each reported problem,
+use the applicable instructions below and run `doctor` again.
+
+## 2. Give the account camera access
+
+### USB3 Vision
+
+The service account must have read and write access to the camera's USB device. The
+Linux archive contains the udev rule at `share/udev/rules.d/70-capturefab-usb3vision.rules`.
+For a script install, set `package` to the installed release folder. For a manual install,
+set it to the extracted archive folder.
 
 ```sh
-sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf capturefab-VERSION-linux-aarch64.tar.gz
-install -Dm755 capturefab-VERSION-linux-aarch64/capturefab ~/.local/bin/capturefab
-capturefab doctor
-```
-
-The service below runs `/usr/local/bin/capturefab`; give it a system path with
-`sudo ln -sf ~/.local/bin/capturefab /usr/local/bin/capturefab`. The link follows the script's
-link, so rerunning the script upgrades the service after `sudo systemctl restart capturefab-line1`.
-`capturefab doctor` prints a copyable fix under each warning; the next sections explain the ones a
-line computer usually needs. Run it again after each step.
-
-## 2. Give the account the cameras
-
-**USB3 Vision.** A camera's `/dev/bus/usb` node must be readable and writable by the account that
-runs Capturefab. One udev rule covers every USB3 Vision camera by matching the USB3 Vision
-interface class. The Linux archive ships it as `share/udev/rules.d/70-capturefab-usb3vision.rules`;
-install it and add the service account to `plugdev`:
-
-```sh
-sudo install -m 644 ~/.local/share/capturefab/VERSION/share/udev/rules.d/70-capturefab-usb3vision.rules /etc/udev/rules.d/
-sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb --action=add
+package="${XDG_DATA_HOME:-$HOME/.local/share}/capturefab/VERSION"
+sudo install -m 644 "$package/share/udev/rules.d/70-capturefab-usb3vision.rules" /etc/udev/rules.d/
+sudo udevadm control --reload
+sudo udevadm trigger --subsystem-match=usb --action=add
 sudo usermod -aG plugdev pi
 ```
 
-With a camera plugged in that it cannot open, `capturefab doctor` names it and prints the same
-rule as a one-line fix. On a distribution without a `plugdev` group, create one
-(`sudo groupadd plugdev`) or put a group of your own in the rule. `TAG+="uaccess"` covers someone
-logged in at the computer; a service has no seat, so it relies on the group, which applies to new
-logins and to the service once it restarts.
+If the distribution has no `plugdev` group, create it with `sudo groupadd plugdev`
+before you add the service account. The group takes effect on a new login or when the
+service restarts. Run `capturefab doctor` with the camera connected to find access problems.
 
-Linux charges every USB transfer against the kernel's usbfs memory, 16 MB by default and shared
-by all USB cameras. If other USB software uses it up, frames stop and the log says
-`usbfs memory is exhausted`. To give several cameras room, raise it now and at every boot, for
-example to 256 MB:
+Linux limits the memory available to USB transfers. If the log reports
+`usbfs memory is exhausted`, increase the limit. For example, set it to 256 MiB on the
+running system.
 
 ```sh
 echo 256 | sudo tee /sys/module/usbcore/parameters/usbfs_memory_mb
-echo 'options usbcore usbfs_memory_mb=256' | sudo tee /etc/modprobe.d/60-capturefab.conf
 ```
 
-Where usbcore is built into the kernel, as on Raspberry Pi OS and Jetson Linux, add
-`usbcore.usbfs_memory_mb=256` to the kernel command line instead: `/boot/firmware/cmdline.txt` on
-Raspberry Pi OS, the `APPEND` line of `/boot/extlinux/extlinux.conf` on Jetson.
+To keep the setting across reboots, add `usbcore.usbfs_memory_mb=256` to the kernel
+command line when the kernel has built-in usbcore. Follow your distribution's boot
+configuration instructions. If your distribution loads usbcore as a module, put
+`options usbcore usbfs_memory_mb=256` in `/etc/modprobe.d/60-capturefab.conf`.
 
-**GigE Vision.** Linux caps every socket's receive buffer at `net.core.rmem_max`, usually
-208 KiB, which loses packets from larger frames. A process allowed to administer the network
-(root, or `CAP_NET_ADMIN`, as a systemd service can grant with `AmbientCapabilities`) gets the
-buffer it asks for regardless; for any other, raise the limit now and at every boot:
+### GigE Vision
+
+Run `capturefab network` to see link speed, MTU and subnet details for each camera.
+To share bandwidth between cameras on a link, use `capturefab network --tune` with
+`-c` for each camera.
+
+A small UDP receive buffer can cause packet loss. If `capturefab doctor` reports a low
+`net.core.rmem_max`, use its suggested setting. These commands set the limit to
+32 MiB now and at each boot.
 
 ```sh
 sudo sysctl -w net.core.rmem_max=33554432
 echo net.core.rmem_max=33554432 | sudo tee /etc/sysctl.d/60-capturefab.conf
 ```
 
-Give the camera network its own interface where you can. `capturefab network` checks how each
-GigE camera is reached (link speed, MTU, subnet), and `capturefab network --tune -c CAM -c CAM`
-shares the link's bandwidth between cameras.
+## 3. Use the same runtime folder over SSH
 
-## 3. Know where Capturefab keeps things
-
-| What | Where on Linux | Notes |
-| --- | --- | --- |
-| Runtime: running sessions and their descriptors | `$XDG_RUNTIME_DIR/capturefab`; without `XDG_RUNTIME_DIR`, `/run/user/<uid>/capturefab` for an account that lingers, otherwise `~/.cache/capturefab/sessions` | Under `/run/user` it is memory, so nothing here wears the SD card; gone at reboot |
-| State: presets, the list of saved sign-ins and the logs of background sessions | `$XDG_STATE_HOME/capturefab`, normally `~/.local/state/capturefab` | On disk; survives reboots |
-| Cache: the extracted FFmpeg and encoder probe results | `$XDG_CACHE_HOME/capturefab`, normally `~/.cache/capturefab` | Safe to delete |
-| Captures | Where `-o` says, relative to the directory the command ran in | Never overwritten |
-
-`capturefab --json doctor` prints these folders in `folders`. `CAPTUREFAB_SESSION_DIR=/some/folder`
-puts runtime and state together in one folder; every process that should see the same sessions
-must then set the same value, including your SSH shell. `CAPTUREFAB_CACHE_DIR` moves the cache.
-
-A session is found by name in the runtime folder, so the service and your SSH login must agree on
-it. An SSH login sets `XDG_RUNTIME_DIR=/run/user/1000`, but a system service does not, and logind
-keeps `/run/user/1000` only while the user is logged in unless the account lingers. Let it
-linger, so the folder exists from boot and survives logout:
+The service and SSH commands must run as the same user and use the same runtime
+folder to find each other. Enable lingering so logind keeps `/run/user/1000` available
+from boot and after logout.
 
 ```sh
 sudo loginctl enable-linger pi
 ```
 
-`capturefab doctor` in your SSH login says where a service without `XDG_RUNTIME_DIR` would keep
-its sessions, and warns when that is somewhere your login does not look.
+| Data | Usual location on Linux |
+| --- | --- |
+| Running sessions and their descriptors | `$XDG_RUNTIME_DIR/capturefab`, usually `/run/user/1000/capturefab` for this example |
+| Presets, job history, sign-in index and background session logs | `$XDG_STATE_HOME/capturefab` or `~/.local/state/capturefab` |
+| Extracted FFmpeg, encoder probes and cached GenICam XML | `$XDG_CACHE_HOME/capturefab` or `~/.cache/capturefab` |
+| Images and recordings | The output path from `-o`, relative to the client command's working directory |
+
+Run `capturefab --json doctor` and read `folders` for the actual paths. If you set
+`CAPTUREFAB_SESSION_DIR`, use the same private directory in the service and in your SSH
+shell. It also holds state unless you set `CAPTUREFAB_STATE_DIR`. Set
+`CAPTUREFAB_CACHE_DIR` to move the cache.
 
 ## 4. Run a session as a service
 
-Save this as `/etc/systemd/system/capturefab-line1.service`, with your account, UID and camera:
+Save this unit as `/etc/systemd/system/capturefab-line1.service`. Use the path to your
+installed executable in `ExecStart`. Start with `sim:0` to test the service without
+hardware. For a real camera, run `capturefab list` and use its ID in place of `sim:0`.
 
 ```ini
 [Unit]
@@ -134,13 +136,9 @@ After=network-online.target user@1000.service
 
 [Service]
 User=pi
-# The folder an SSH login uses, so commands over SSH find the session.
 Environment=XDG_RUNTIME_DIR=/run/user/1000
-# Relative capture paths land in the account's home folder.
-WorkingDirectory=~
-ExecStart=/usr/local/bin/capturefab serve --name line1 -c gige:00c0df123456 --live
-# systemctl stop sends SIGTERM to serve alone; serve then finishes its
-# recordings and captures and stops its camera workers itself.
+WorkingDirectory=/home/pi
+ExecStart=/home/pi/.local/bin/capturefab serve --name line1 -c sim:0 --live
 KillMode=mixed
 TimeoutStopSec=45
 Restart=on-failure
@@ -154,48 +152,53 @@ WantedBy=multi-user.target
 sudo systemctl daemon-reload
 sudo systemctl enable --now capturefab-line1
 systemctl status capturefab-line1
-journalctl -u capturefab-line1 -f
 ```
 
-`serve` runs the session in the foreground with no idle limit and logs to stderr, which the
-journal keeps. `-c` (repeatable) opens cameras when it starts, and `--live` keeps them streaming,
-so a capture takes the newest frame at once. `Wants=` and `After=user@1000.service` start the
-service once logind has made `/run/user/1000`.
+Use `sudo journalctl -u capturefab-line1 -f` to see the service log. `serve` opens
+the cameras named with `-c` and runs in the foreground. `--live` keeps acquisition
+active between commands. Use a separate `-c` for each camera.
 
-`serve` stops on SIGTERM, SIGHUP and Ctrl-C alike, and finishes its recordings first. Keep
-`KillMode=mixed`: by default systemd signals every process of the service at once, so a camera
-worker would end before `serve` could finish a recording. Jobs belong to the running process and
-do not survive a restart; start them again after one.
+Keep `KillMode=mixed` so systemd first signals only `serve`. This gives Capturefab time
+to finish recordings and shut down its camera workers. After a restart, submit the
+jobs again. If you upgrade the installed binary, use
+`sudo systemctl restart capturefab-line1` to start the new version.
 
-Over SSH, as the same account, every command for a camera the session holds goes through it:
+In your SSH shell, run these commands as `pi`. Use the camera ID from the unit with `-c`.
 
 ```sh
 capturefab session status line1
-capturefab inspect -c gige:00c0df123456
-capturefab capture -c gige:00c0df123456 -o 'checks/{time}.png'
-capturefab capture -c gige:00c0df123456 --every 1m --for 8h -o 'shift/{seq:4}.jpg' --background
+capturefab inspect --session line1 -c sim:0
+capturefab capture --session line1 -c sim:0 -o 'checks/{time}.png'
+capturefab capture --session line1 -c sim:0 --every 1m --for 8h -o 'shift/{seq:4}.jpg' --background
 capturefab jobs
 ```
 
-`--session line1` names the session explicitly, and `CAPTUREFAB_SESSION=line1` makes it the
-default. For an occasional session without systemd, `capturefab session start --name line1 -c CAM
---live --idle 8h` starts one in the background that ends after eight unused hours.
+The files go under the directory from which you ran `capturefab capture` over SSH.
+Use an absolute path with `-o` to use the same destination from each login. Set
+`CAPTUREFAB_SESSION=line1` to select the session by default in your shell.
+
+For a session that starts on demand without systemd, use
+`capturefab session start --name line1 -c sim:0 --live --idle 8h`. The session
+ends after eight hours without requests or running jobs.
 
 ## 5. Plan for storage
 
-Captures go where `-o` says, and Capturefab never overwrites a file. When the disk fills, a
-capture or recording stops with exit 6 `storage_full` rather than deleting anything. Check the
-free space on an SD card before a long time lapse (`df -h ~`), and save to a removable drive by
-pointing `-o` at a folder on it once it is mounted.
+Before a long capture, use `df -h` with the destination folder to see its available
+space. For a removable drive, mount it before you start the capture.
 
-Capturefab stops a write before it would take a disk below its free-space floor, so the system
-and other services keep room to work: 1% of the disk, at least 512 MiB and at most 20 GiB.
-`error.details` gives the `path` and its `free_bytes`. Set `CAPTUREFAB_MIN_FREE` (bytes or a
-size such as `2G`; `0` turns the floor off) in the service's environment to change it, and
-`capturefab doctor` warns when the disk of the folder it runs in is below it.
+Capturefab stops writes that would take the disk below its free-space floor. The
+default is 1% of the disk, with a minimum of 512 MiB and a maximum of 20 GiB. The
+command reports exit code `6` and error code `storage_full`. The JSON error details
+include the path and may include `free_bytes`.
 
-## 6. Small boards
+To set the floor for a service, add `Environment=CAPTUREFAB_MIN_FREE=2G` under
+`[Service]`. Use bytes or a size such as `2G`. A value of `0` disables that floor.
+Reload systemd and restart the service after the change. A client can raise the
+service's floor by setting a larger value for its own command.
 
-`CAPTUREFAB_THREADS=2` limits image processing to two threads when the board also runs other
-work, such as inference. `capturefab record` uses the Jetson hardware encoder through GStreamer
-where one works, and libx264 otherwise; the result's `encoder` field says which.
+## 6. Limit CPU use on a small computer
+
+Set `CAPTUREFAB_THREADS=2` in the service environment to limit the image processing
+thread count Capturefab uses. On Jetson, H.264 recording can use the board's encoder
+through GStreamer when available. Read `encoder` in the JSON result to see which
+encoder it used.

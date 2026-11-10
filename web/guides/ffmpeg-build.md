@@ -2,15 +2,44 @@
 
 # Building the bundled FFmpeg payload
 
-Capturefab's camera control, GenICam interpreter, GigE transport, and USB3 Vision transport are Rust. Webcams, network streams, video files and video recording use an FFmpeg executable embedded into the release executable at build time. The end user installs one `capturefab` executable; the embedded payload is extracted to the user's cache when needed. There is no runtime dependency on a separately installed FFmpeg or camera SDK.
+Capturefab uses FFmpeg for webcams, network streams, video files and recording. Release binaries
+include a separate FFmpeg executable inside `capturefab`. Capturefab extracts it when a command
+uses it. GigE Vision, USB3 Vision and GenICam use Capturefab's native Rust code.
 
-The executable stores the complete FFmpeg payload with lossless zlib compression. `build.rs` records its uncompressed length and SHA-256 in a versioned envelope. Release packaging decompresses that envelope and compares every byte with the original FFmpeg executable before accepting the binary. No codec, format or platform support is changed by this storage format.
+The embedded copy uses lossless zlib compression. `build.rs` records the original length and
+SHA-256. Release packaging decompresses the copy and compares it with the original executable.
 
-Extraction happens once per build. The first extraction streams through a fixed 64 KiB buffer, verifies the length and SHA-256, and writes the original bytes directly to disk without retaining a decompressed copy in application memory. The first process to need FFmpeg writes it to `ffmpeg-<digest prefix>/ffmpeg` in the user cache (`~/Library/Caches/capturefab` on macOS, `$XDG_CACHE_HOME/capturefab` or `~/.cache/capturefab` on Linux, `%LOCALAPPDATA%\capturefab\cache` on Windows, or `CAPTUREFAB_CACHE_DIR`): under a lock, into a new temporary file that is renamed into place, without an fsync. Directories are mode 0700. Every later process and camera worker runs that file, so its pages are shared. A copy is checked against the SHA-256 once, when it is written or first found, and must start before a `verified` marker beside it records the file it checked (device, inode, size and times); later processes check the file's owner, mode and length and compare it with the marker instead of hashing it again, and a copy that fails is written again. A copy the system will not start, as under an execution policy, gets a `refused` marker instead, so later processes only try to start it. Copies of other builds that no process is using are removed. When the cache directory is unusable, for example read-only or mounted noexec, the copy goes to a `cache` folder in the runtime directory, else in `$TMPDIR/capturefab-<uid>` (`%TEMP%\capturefab` on Windows), skipping folders mounted noexec, and is shared and reused there the same way. Where none works, an `ffmpeg` next to the executable or on `PATH` is used instead and `doctor --json` reports why in `ffmpeg.bundled_error`; without one, commands fail with `ffmpeg_missing`, naming each folder tried and why. On Linux and macOS, encoder and hardware-decoding probe results are kept beside the copy (`probes.json`) for the rest of the boot, failures for five minutes, and probes that time out or are killed from outside (as by an out-of-memory killer) not at all; elsewhere each process probes once. A process given `CAPTUREFAB_FFMPEG`, or using an installed FFmpeg, runs that file in place and extracts nothing; its probe results are kept the same way in `probes/` in the cache, under the file's path, size and modification time, so an upgraded FFmpeg is probed again.
+## Where Capturefab runs FFmpeg
 
-`scripts/build-ffmpeg.sh` builds FFmpeg 9.0.2, x264 commit `b35605ace3ddf7c1a5d67a2eb553f034aef41d55` (r3222), SRT 1.5.7, OpenSSL 3.6.4, and zlib 1.3.1 from pinned upstream source archives (x264 through its GitHub mirror). Every archive has a pinned SHA-256 in the script. This is a repeatable source recipe with fixed inputs, not a promise of identical binary bytes across different compilers, SDKs, build paths, or operating systems. [FFmpeg releases](https://ffmpeg.org/releases/), [x264](https://www.videolan.org/developers/x264.html), [SRT release](https://github.com/Haivision/srt/releases/tag/v1.5.7), [OpenSSL source](https://openssl-library.org/source/), [zlib release](https://github.com/madler/zlib/releases/tag/v1.3.1).
+Capturefab verifies the extracted copy by length and SHA-256. Later processes reuse that copy and
+compare its file metadata with a verification marker. Capturefab can extract it again if the
+copy changes.
 
-The build enables GPLv3, H.264 encoding with libx264, SRT with OpenSSL encryption, HTTPS, RTSP, UDP/RTP, FFmpeg's native decoders, and its native format support. It enables AVFoundation and VideoToolbox on macOS, V4L2 and V4L2 mem2mem on Linux, and DirectShow/Media Foundation on Windows. External library autodetection is disabled and pkg-config is isolated to the freshly built static libraries, preventing an installed package from silently becoming a runtime dependency. macOS retains its operating system libraries/frameworks; Linux normally retains libc and its related operating system libraries; Windows retains operating system DLLs. SRT, x264, OpenSSL, and zlib are linked statically.
+Set `CAPTUREFAB_CACHE_DIR` to select the cache folder. The defaults are:
+
+| System | Default cache |
+| --- | --- |
+| macOS | `~/Library/Caches/capturefab` |
+| Linux | `$XDG_CACHE_HOME/capturefab` or `~/.cache/capturefab` |
+| Windows | `%LOCALAPPDATA%\capturefab\cache` |
+
+If that folder is unusable, Capturefab tries the runtime cache and then a temporary cache.
+It skips directories on mounts that disallow execution. If the embedded copy cannot run,
+Capturefab tries an `ffmpeg` beside its executable, then on `PATH`.
+Run `capturefab doctor --json` to see `ffmpeg.source` and any `ffmpeg.bundled_error`.
+If no FFmpeg can run, media commands return `ffmpeg_missing`.
+
+To select a specific FFmpeg executable, set `CAPTUREFAB_FFMPEG` to its absolute path.
+Capturefab uses that executable directly. On Linux and macOS, it caches successful encoder and
+hardware decoder probes for the rest of the boot. A changed FFmpeg binary gets new probes.
+
+`scripts/build-ffmpeg.sh` builds FFmpeg 9.0.2, x264 r3222, SRT 1.5.7, OpenSSL 3.6.4 and zlib
+1.3.1. The script pins the source archives by SHA-256. Build output can vary with the compiler,
+SDK, build path and operating system.
+
+The script links SRT, x264, OpenSSL and zlib statically. It disables FFmpeg's automatic detection
+of system libraries and limits pkg-config to the build's dependencies. The build can still use
+system libraries, such as libc on Linux, system frameworks on macOS and system DLLs on Windows.
 
 ## Camera-focused component policy
 
@@ -20,41 +49,35 @@ unusual webcam formats, older IP cameras, image sequences and existing media
 files rather than limiting inputs to H.264/H.265/MJPEG. Native camera inputs
 remain AVFoundation, V4L2 and DirectShow, plus the synthetic lavfi input.
 
-Only output-side encoders and processing are narrowed: raw video, PPM preview
-frames, lossless FFV1, the null-test frame wrapper, software H.264 (libx264),
-and the platform's H.264/HEVC/AV1 hardware
-encoders remain. Audio/subtitle encoders, legacy video and non-preview still-image
-encoders, audio capture, screen capture and device playback are omitted. Capturefab's
-stills use its own JPEG/PNG paths. All container muxers remain available.
-Filters are limited to scaling, padding, frame rate and pixel format conversion,
-microsecond recording clocks,
-hardware frame transfers, pass-through and synthetic test/probe sources.
-Unavailable platform encoders remain governed by their existing hardware switches
-and FFmpeg's dependency checks. No new software HEVC/AV1 encoder is introduced, so HEVC and AV1 recordings need a working hardware encoder; Capturefab refuses them before recording, naming the codecs that work, when none does.
+The bundled build enables lossless FFV1, software H.264 (libx264) and platform-specific video
+encoders. It also retains raw video, PPM and the test frame wrapper. Capturefab uses its own
+JPEG and PNG encoders for stills. The bundled FFmpeg uses the filters necessary for capture,
+recording and validation.
 
-Native builds check essential decoder, format, filter and camera-device listings,
-verify that the recording clock preserves adjacent frames,
-then encode H.264 into MP4, Matroska, MPEG-TS and FLV and decode each back through
-the scaling/padding/FPS pipeline to raw RGB and the PPM preview pipe. These checks
-complement the existing SRT and encoder checks; physical cameras and GPU drivers still need
-validation on their target systems. Cross builds must run these checks natively.
+HEVC and AV1 encoding use hardware. If no encoder works, Capturefab reports the codecs it can
+use. The bundled build omits audio and subtitle encoders, audio and screen capture, and device
+playback.
 
-On 2026-10-16, a macOS ARM64 comparison using the same pinned sources, static
-libraries and Apple compiler measured 29,917,032 → 24,455,464 bytes for the
-stripped executable (18.3% smaller). Gzip-compressing each executable measured
-14,172,812 → 11,672,268 bytes (17.6% smaller); these are payload measurements,
-not complete Capturefab download sizes. Decoder, demuxer, muxer, protocol and
-hardware-acceleration listings matched the previous configuration. The reduced
-payload passed the eight existing ignored FFmpeg integration tests, including
-raw sensor conversion, file recording/replay, ONVIF fallback and simulated RTSP
-TCP/UDP decoding, plus Capturefab → MediaMTX → Capturefab RTSP and SRT round trips.
-Other targets still require their native release builds and device validation.
+By default, native builds verify the available components and the recording clock. They encode
+H.264 to MP4, Matroska, MPEG-TS and FLV. They decode each container to raw RGB and PPM.
+Run the validation on the target after a cross build.
 
-`ENABLE_NVENC=1` enables NVIDIA NVENC/NVDEC/CUVID using pinned FFmpeg `nv-codec-headers` 12.0.16.2. It defaults to 1 on Linux/Windows x86_64 and ARM64, and 0 elsewhere. These are build-only MIT-licensed headers; FFmpeg loads the installed GPU driver's libraries when that backend is used. The 12.0 API adds AV1 NVENC (`av1_nvenc`, Ada and newer GPUs) and requires NVIDIA driver 520 or newer; older drivers fall back to the next encoder candidate. A build that lists an encoder still needs matching hardware and a working driver. Jetson Orin's video encoder is not reachable through NVENC (its `libnvidia-encode` needs `libnvcuvid`, shipped only for OpenRM GPUs such as Jetson Thor); Capturefab drives it through NVIDIA's GStreamer elements instead. [Header release requirements](https://github.com/FFmpeg/nv-codec-headers/blob/n12.0.16.2/README).
+### Hardware encoder switches
 
-`ENABLE_VULKAN=1` (default on Linux and Windows) enables Vulkan Video encoders (`h264_vulkan`, `hevc_vulkan`, `av1_vulkan`) using pinned Khronos Vulkan-Headers 1.4.363.0. Only headers are used at build time; FFmpeg loads the system Vulkan loader at run time, so no Vulkan library is linked. NVIDIA, AMD (RADV) and Intel (ANV) drivers implement Vulkan Video encode on supporting GPUs, which covers Linux AMD/Intel hardware without linking libva. `ENABLE_QSV=1` (default on Windows x86_64) builds Intel's MIT-licensed libvpl 2.17.0 dispatcher statically (the build script narrows one MSVC-only preprocessor check so it compiles against mingw-w64 14 headers, and adds the C++ runtime its `vpl.pc` omits so static linking works) and enables D3D11VA/DXVA2 for Intel Quick Sync (`*_qsv`); the dispatcher loads the GPU driver's runtime. Linux QSV and VAAPI would require linking system libva/libdrm, so they are not built. JPEG stills do not depend on FFmpeg: libjpeg-turbo encodes them in process, or on Linux Capturefab's own nvJPEG or VA-API helper process, which loads those libraries at run time (no libva is linked) and is checked against libjpeg-turbo.
+| Switch | Enabled by default on | FFmpeg support |
+| --- | --- | --- |
+| `ENABLE_NVENC` | Linux and Windows x86_64 and ARM64 | NVIDIA NVENC, NVDEC and CUVID with `nv-codec-headers` 12.0.16.2. |
+| `ENABLE_VULKAN` | Linux and Windows | Vulkan Video with Khronos Vulkan-Headers 1.4.363.0. |
+| `ENABLE_QSV` | Windows x86_64 | Intel Quick Sync with libvpl 2.17.0 and D3D11VA/DXVA2. |
+| `ENABLE_AMF` | Linux and Windows x86_64 | AMD AMF with AMF 1.5.3 headers. |
+| `ENABLE_MF` | Windows | Media Foundation and D3D11VA. |
 
-`ENABLE_AMF=1` enables AMD AMF using pinned upstream AMF 1.5.3 headers and defaults to 1 on Linux and Windows x86_64. Only the unmodified upstream headers and license are used, from a checksummed headers-only archive shipped with the build script; SDK sample executables are never installed or bundled. This enables an optional driver API and adds no linked AMD runtime library. `ENABLE_MF=1` defaults to 1 on Windows and enables system Media Foundation encoders such as `h264_mf`, including where a Windows ARM64/Qualcomm device exposes an appropriate system encoder. Set any of these switches to 0 to omit it. Their actual GPU/device behavior must be tested on the deployment hardware. [AMF release](https://github.com/GPUOpen-LibrariesAndSDKs/AMF/releases/tag/v1.5.3), [FFmpeg platform features](https://ffmpeg.org/ffmpeg-codecs.html).
+Set a switch to `0` to omit that backend. An enabled encoder still depends on the target's GPU
+and driver. Verify it with a recording on the target. See the [NVENC header requirements](https://github.com/FFmpeg/nv-codec-headers/blob/n12.0.16.2/README)
+and [FFmpeg codec documentation](https://ffmpeg.org/ffmpeg-codecs.html).
+
+Capturefab can use NVIDIA's GStreamer elements for encoding on Jetson. Linux nvJPEG and VA-API
+support for stills comes from Capturefab's own JPEG helper process.
 
 ## Native build
 
@@ -67,11 +90,25 @@ CAPTUREFAB_FFMPEG_LICENSE="$PWD/target/ffmpeg-bundle/licenses/NOTICE.txt" \
     cargo build --release
 ```
 
-Without `CAPTUREFAB_FFMPEG_BINARY`, a release build embeds `target/ffmpeg/<target>/bin/ffmpeg[.exe]` when that file exists, and debug and test builds embed nothing; `build.rs` never builds FFmpeg itself. At run time Capturefab uses `CAPTUREFAB_FFMPEG`, else the embedded copy, else an `ffmpeg` next to the executable, else one on `PATH`; `capturefab doctor` reports which as `ffmpeg.source`, and without any a command that needs FFmpeg fails with `ffmpeg_missing`. `scripts/release.py` refuses to build a release without the bundle's FFmpeg.
+`CAPTUREFAB_FFMPEG_BINARY` selects the binary to embed in a Cargo build. If this variable is unset,
+a release build embeds `target/ffmpeg/<target>/bin/ffmpeg[.exe]` when that file exists.
+`build.rs` can embed a prebuilt executable. Run the build script first to produce one.
 
-On Windows, run from an MSYS2 MinGW/UCRT shell with the matching target compiler and CMake available, using `CC=gcc CXX=g++`. The output is `bin/ffmpeg.exe`; use that filename for `CAPTUREFAB_FFMPEG_BINARY`. Do not use the MSYS compiler, which adds a dependency on `msys-2.0.dll`. Native Windows ARM64 needs an ARM64 MinGW toolchain: MSYS2 has no ARM64 GCC, so use its CLANGARM64 environment with `TARGET_ARCH=aarch64 CC=clang CXX=clang++ AR=llvm-ar RANLIB=llvm-ranlib STRIP=llvm-strip OBJDUMP=llvm-objdump`. Pass `TARGET_ARCH` explicitly there, because the MSYS2 shell itself runs as x86_64 under emulation and `uname -m` reports x86_64; the script also passes the host triple to x264's configure for the same reason, and uses OpenSSL's `mingwarm64` target. It adds winpthreads to SRT's static link flags, which LLVM's libc++ does not pull in itself; as on every target, screen capture is omitted under the camera-focused component policy. Media Foundation builds also enable D3D11VA, which FFmpeg's `mfenc` needs. The recipe does not use MSVC.
+For Windows x86_64, run the script from an MSYS2 MinGW or UCRT shell with the target compiler and
+CMake available. Set `CC=gcc CXX=g++`. For Windows ARM64, use the MSYS2 CLANGARM64 environment:
 
-The script recognizes macOS Intel/ARM64, Linux x86_64/ARM64/ARMv7 (including Raspberry Pi and Jetson), and MinGW x86_64/ARM64. A native build on the oldest supported deployment system gives the clearest libc/SDK compatibility baseline. macOS defaults to deployment target 11.0 on ARM64 and 10.15 on Intel. Raspberry Pi 32-bit builds use ARMv7; 64-bit Raspberry Pi and Jetson builds use ARM64. Hardware encoder availability still depends on the operating system and device driver. Jetson-specific NVIDIA encoder support is not asserted by this portable recipe.
+```sh
+TARGET_ARCH=aarch64 CC=clang CXX=clang++ AR=llvm-ar RANLIB=llvm-ranlib \
+    STRIP=llvm-strip OBJDUMP=llvm-objdump \
+    scripts/build-ffmpeg.sh "$PWD/target/ffmpeg-bundle"
+```
+
+Set `TARGET_ARCH` explicitly because `uname -m` in the emulated shell can report x86_64.
+On Windows, set `CAPTUREFAB_FFMPEG_BINARY` to the resulting `bin/ffmpeg.exe`.
+
+The script accepts macOS Intel and ARM64, Linux x86_64, ARM64 and ARMv7, and MinGW x86_64 and ARM64.
+The default macOS deployment targets are 11.0 on ARM64 and 10.15 on Intel. Choose ARMv7 for a
+32-bit Raspberry Pi system. Choose ARM64 for a 64-bit Raspberry Pi or Jetson system.
 
 The output includes:
 
@@ -121,10 +158,16 @@ Cross builds default to `RUN_CHECKS=0` because a host cannot execute a different
     -i testsrc2=size=64x64:rate=2 -frames:v 2 -c:v libx264 -f null -
 ```
 
-Confirm `srt` appears under both input and output, and `libx264` appears in the encoders. Inspect linked libraries with `otool -L` on macOS, `readelf -d` on Linux, or the target's `objdump -p` on Windows. Native builds perform these checks automatically. Protocol enumeration and an encoder smoke test do not substitute for an actual RTSP/SRT network roundtrip on the deployment target.
+Make sure `srt` appears under input and output protocols. Make sure `libx264` appears in the
+encoders. Examine linked libraries with `otool -L` on macOS, `readelf -d` on Linux or `objdump -p`
+on Windows. Test RTSP or SRT on the target if you use it for streaming.
 
 ## Distribution and validation
 
-The combined FFmpeg payload is GPLv3 or later; Capturefab itself is MIT-licensed and runs FFmpeg as a separate executable rather than linking it. Keep the exact source archives, build script, configuration, and upstream notices with each published release's corresponding-source materials. FFmpeg is built with `--enable-gpl --enable-version3`; SRT is MPLv2, OpenSSL is Apache 2.0, zlib uses the zlib License, and x264 is GPLv2 or later. [FFmpeg licensing](https://ffmpeg.org/legal.html), [SRT license](https://github.com/Haivision/srt/blob/v1.5.7/LICENSE), [OpenSSL license](https://github.com/openssl/openssl/blob/openssl-3.6.4/LICENSE.txt).
+The combined FFmpeg payload is GPLv3 or later. Capturefab uses the MIT license and runs FFmpeg
+as a separate executable. Keep the exact source archives, build script, configuration and
+upstream notices in each release's corresponding-source materials.
 
-As of 2026-10-04, a macOS ARM64 FFmpeg 9.0.2 build has been verified to provide both SRT directions, encode with libx264, and link only macOS operating system libraries/frameworks. Other target recipes need target-specific build and runtime validation before release; they are not claimed as tested binaries.
+The build uses `--enable-gpl --enable-version3`. SRT uses MPLv2. OpenSSL uses Apache 2.0.
+zlib uses the zlib License. x264 uses GPLv2 or later.
+[FFmpeg licensing](https://ffmpeg.org/legal.html), [SRT license](https://github.com/Haivision/srt/blob/v1.5.7/LICENSE), [OpenSSL license](https://github.com/openssl/openssl/blob/openssl-3.6.4/LICENSE.txt).

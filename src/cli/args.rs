@@ -7,7 +7,7 @@ use std::time::Duration;
 /// One camera.
 #[derive(Debug, Clone, Default, Args)]
 pub(crate) struct CameraArg {
-    /// Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)
+    /// Camera ID, serial, IP address, stream URL, file path or simulator (sim:0)
     #[arg(
         short = 'c',
         long = "camera",
@@ -21,7 +21,7 @@ pub(crate) struct CameraArg {
 /// One or more cameras, `-c` repeated.
 #[derive(Debug, Clone, Default, Args)]
 pub(crate) struct CamerasArg {
-    /// Camera, repeatable: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)
+    /// Camera ID, serial, IP address, stream URL, file path or simulator (sim:0). Repeat for more cameras
     #[arg(
         short = 'c',
         long = "camera",
@@ -35,10 +35,10 @@ pub(crate) struct CamerasArg {
 
 /// `--keep DUR`: run through a session that stays this long after its
 /// last use, started if none holds the camera. Without it a command keeps
-/// its camera warm for `WARM`; `--keep 0` runs it alone.
+/// its camera warm for `WARM`; `--keep 0` can still reuse a session.
 #[derive(Debug, Clone, Default, Args)]
 pub(crate) struct KeepArg {
-    /// Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)
+    /// Keep the camera open in a session after use (default 60s). Use 0 to reuse an open session or run without one
     #[arg(
         long,
         value_name = "DUR",
