@@ -10,7 +10,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use support::cli::Home;
+use support::{cli::Home, time};
 
 const UNIT_TYPE: u64 = 0xFFFF_F030_0020;
 const PUC: u64 = 0xFFFF_F030_0004;
@@ -20,18 +20,14 @@ const PUBLISHED: u32 = 0x4178_0000;
 
 fn accept(listener: &TcpListener) -> TcpStream {
     listener.set_nonblocking(true).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + time::secs(5);
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
                 // Darwin accepted sockets inherit the listener's nonblocking mode.
                 stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
+                stream.set_read_timeout(Some(time::secs(3))).unwrap();
+                stream.set_write_timeout(Some(time::secs(3))).unwrap();
                 stream.set_nodelay(true).unwrap();
                 return stream;
             }
@@ -103,7 +99,7 @@ fn serve(
         assert_eq!(rest, Vec::<u8>::new(), "no request after a failed exchange");
         // No reconnect: a second connection never arrives.
         listener.set_nonblocking(true).unwrap();
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(time::millis(50));
         assert!(
             matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
             "unexpected reconnect"
@@ -140,7 +136,7 @@ fn configure(home: &Home, address: &str, model: &str, channels: &Value) {
         serde_json::to_vec(&json!({
             "version":1,"sources":[{"id":"edge","protocol":"optommp",
                 "profile":"groov_expanded_inputs","model":model,"address":address,
-                "every_ms":100,"timeout_ms":1000,"channels":channels}]
+                "every_ms":time::ms(100),"timeout_ms":time::ms(1000),"channels":channels}]
         }))
         .unwrap(),
     )
@@ -157,13 +153,14 @@ fn samples(rows: &[Value]) -> Vec<&Value> {
     rows.iter().filter(|row| row["kind"] == "sample").collect()
 }
 fn args() -> [&'static str; 8] {
+    static WINDOW: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| time::arg(450));
     [
         "data",
         "record",
         "--config",
         "sources.json",
         "--for",
-        "450ms",
+        WINDOW.as_str(),
         "-o",
         "run.jsonl",
     ]

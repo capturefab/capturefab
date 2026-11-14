@@ -9,7 +9,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use support::cli::Home;
+use support::{cli::Home, time};
 
 /// The manufacturer's documented request and reply (`GoPxL` 1.3 polling commands).
 const REQUEST: &[u8] = b"measurement,0,1\r\n";
@@ -17,18 +17,14 @@ const REPLY: &[u8] = b"OK,M0,V-5000,D0,M1,V5000,D1\r\n";
 
 fn accept(listener: &TcpListener) -> TcpStream {
     listener.set_nonblocking(true).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + time::secs(5);
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
                 // Darwin accepted sockets inherit the listener's nonblocking mode.
                 stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
+                stream.set_read_timeout(Some(time::secs(3))).unwrap();
+                stream.set_write_timeout(Some(time::secs(3))).unwrap();
                 return stream;
             }
             Err(error)
@@ -66,7 +62,7 @@ fn serve(
             stream.write_all(reply).unwrap();
         }
         listener.set_nonblocking(true).unwrap();
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(time::millis(50));
         assert!(
             matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
             "unexpected reconnect"
@@ -81,7 +77,7 @@ fn configure(home: &Home, address: &str, trailing: &str) {
             "version":1,"sources":[{"id":"gauge","protocol":"gopxl_ascii",
                 "profile":"gopxl_1_3_measurement","address":address,
                 "delimiter":",","terminator":"crlf","invalid_token":"INVALID",
-                "trailing_delimiter":trailing,"every_ms":100,"timeout_ms":1000,
+                "trailing_delimiter":trailing,"every_ms":time::ms(100),"timeout_ms":time::ms(1000),
                 "measurements":[{"name":"gap","id":0},{"name":"flush","id":1}]}]
         }))
         .unwrap(),
@@ -99,13 +95,14 @@ fn samples(rows: &[Value]) -> Vec<&Value> {
     rows.iter().filter(|row| row["kind"] == "sample").collect()
 }
 fn args() -> [&'static str; 8] {
+    static WINDOW: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| time::arg(450));
     [
         "data",
         "record",
         "--config",
         "sources.json",
         "--for",
-        "450ms",
+        WINDOW.as_str(),
         "-o",
         "run.jsonl",
     ]

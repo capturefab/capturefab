@@ -25,7 +25,9 @@ const MAX_PRODUCERS: usize = 64;
 const MAX_DEVICES: usize = 256;
 const MAX_NAME: usize = 4096;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
-const CLEANUP_TIMEOUT: Duration = Duration::from_millis(250);
+/// A helper's orderly close (SDK unlock and process exit) gets this long
+/// before it is killed; a loaded host can need more than a few hundred ms.
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 const NATIVE_EVENT_WAIT: Duration = Duration::from_millis(10);
 const EVENT_REPLY_HEADROOM: Duration = Duration::from_millis(20);
 /// How long after a frame slice's deadline the reply to its short native

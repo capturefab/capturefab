@@ -690,8 +690,12 @@ impl Control {
                             first_send: first_send.unwrap_or(sent),
                         });
                     }
-                    Err(error) if is_receive_timeout(&error) => break,
-                    Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                    // Windows can end a socket wait a little before the timeout
+                    // it was given; only the attempt deadline itself ends it, or
+                    // an early wakeup would resend just before the cutoff.
+                    Err(error)
+                        if is_receive_timeout(&error) || error.kind() == ErrorKind::Interrupted => {
+                    }
                     Err(error) => {
                         let context = crate::network::with_local_network_hint(
                             "receiving GVCP acknowledgement",

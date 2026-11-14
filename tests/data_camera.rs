@@ -476,7 +476,7 @@ fn a_camera_timeout_after_a_successful_frame_cannot_be_reported_complete() {
     let started = Instant::now();
     let error = Run::of_output(command.args(args).output().unwrap(), &args).failure(4);
     assert!(
-        started.elapsed() < Duration::from_secs(9),
+        started.elapsed() < support::time::secs(9),
         "delivery timeout remains bounded"
     );
     assert_eq!(error["code"], "timeout");

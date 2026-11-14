@@ -621,8 +621,10 @@ fn correlated_malformed_and_remote_status_errors_retain_only_the_prior_poll() {
         });
         let home = Home::new("yaskawa-hses-prefix");
         let mut source = peer.source(reads(std::slice::from_ref(&spec)));
-        source["every_ms"] = json!(200);
-        let error = record(&home, &json!([source]), "1s").failure(1);
+        source["every_ms"] = json!(time::ms(200));
+        source["timeout_ms"] = json!(time::ms(500));
+        source["reply_horizon_ms"] = json!(time::ms(2000));
+        let error = record(&home, &json!([source]), &time::arg(1000)).failure(1);
         let seen = peer.finish();
         match mode {
             5 => check_error(&error, 0x1f, 1, 0xa002),
