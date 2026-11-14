@@ -13,9 +13,10 @@ use std::{
     io::{Read as _, Write as _},
     os::fd::{AsRawFd as _, FromRawFd as _},
     thread,
-    time::{Duration, Instant},
+    time::Instant,
 };
 use support::cli::{Home, Run};
+use support::time;
 
 const RD_REQUEST: &[u8] = b"@12RD0100000450*\r";
 const RD_REPLY: &[u8] = b"@12RD0032107654BA98FEDC53*\r";
@@ -74,7 +75,7 @@ impl Terminal {
     }
 
     fn expect(&self, expected: &[u8]) {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + time::secs(3);
         let mut request = vec![0; expected.len()];
         let mut consumed = 0;
         while consumed < request.len() {
@@ -105,7 +106,7 @@ impl Terminal {
     fn reply(&self, response: &[u8]) {
         for chunk in response.chunks(11) {
             (&self.master).write_all(chunk).unwrap();
-            thread::sleep(Duration::from_millis(2));
+            thread::sleep(time::millis(2));
         }
     }
 }
@@ -114,7 +115,7 @@ fn config(terminal: &Terminal, mode: &str, signals: &Value) -> Value {
     json!({"version":1,"sources":[{
         "id":"plc","protocol":"omron_host_link","device":terminal.device,
         "mode":mode,"unit":12,"data_bits":8,"stop_bits":1,"parity":"none",
-        "every_ms":3_600_000,"timeout_ms":350,"signals":signals
+        "every_ms":3_600_000,"timeout_ms":time::ms(350),"signals":signals
     }]})
 }
 
@@ -140,7 +141,7 @@ fn record(home: &Home, config: &Value) -> Run {
         "--config",
         "sources.json",
         "--for",
-        "600ms",
+        &time::arg(600),
         "-o",
         "run.jsonl",
     ])
@@ -264,10 +265,10 @@ fn both_fa_signals_share_one_deadline() {
     thread::scope(|scope| {
         scope.spawn(|| {
             terminal.expect(FA_DM_REQUEST);
-            thread::sleep(Duration::from_millis(210));
+            thread::sleep(time::millis(210));
             terminal.reply(FA_DM_REPLY);
             terminal.expect(FA_BITS_REQUEST);
-            thread::sleep(Duration::from_millis(210));
+            thread::sleep(time::millis(210));
             terminal.reply(FA_BITS_REPLY);
         });
         let error = record(&home, &config).failure(4);

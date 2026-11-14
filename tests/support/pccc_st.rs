@@ -1,7 +1,7 @@
 //! Independent complete84-byte ST literals, over direct and routed CLI reads.
 use super::{
     accept, cleanup, config, listener, read_request, readings, record, register, response, send,
-    support::cli::Home,
+    support::{cli::Home, time},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
@@ -10,7 +10,6 @@ use std::{
     io::{Read as _, Write as _},
     net::TcpStream,
     thread,
-    time::Duration,
 };
 
 fn cases() -> Vec<Value> {
@@ -301,16 +300,20 @@ fn string_siblings_share_request_and_acquisition_deadlines_without_tail_query() 
                 {"name":"never","address":"ST9:0"}
             ]),
         );
-        cfg["sources"][0]["timeout_ms"] = if acquisition { 1000.into() } else { 250.into() };
+        cfg["sources"][0]["timeout_ms"] = if acquisition {
+            time::ms(1000).into()
+        } else {
+            time::ms(250).into()
+        };
         let worker = thread::spawn(move || {
             let mut stream = accept(&server);
             register(&mut stream);
             let c = cases();
             let packet = read_request(&mut stream, None, (3, 0x8d, 0, 84));
-            thread::sleep(Duration::from_millis(160));
+            thread::sleep(time::millis(160));
             send(&mut stream, &response(&packet, None, &raw(&c[0])));
             let packet = read_request(&mut stream, None, (8, 0x8d, 0, 84));
-            thread::sleep(Duration::from_millis(160));
+            thread::sleep(time::millis(160));
             match stream.write_all(&response(&packet, None, &raw(&c[1]))) {
                 Ok(()) => {}
                 Err(error)
@@ -325,7 +328,7 @@ fn string_siblings_share_request_and_acquisition_deadlines_without_tail_query() 
             retired(&mut stream);
         });
         assert_eq!(
-            record(&home, &cfg, if acquisition { "250ms" } else { "700ms" }).failure(4)["code"],
+            record(&home, &cfg, &time::arg(if acquisition { 250 } else { 700 })).failure(4)["code"],
             "timeout"
         );
         worker.join().unwrap();

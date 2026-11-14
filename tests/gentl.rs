@@ -14,7 +14,10 @@ use std::{
     process::Command,
     time::{Duration, Instant},
 };
-use support::cli::{Home, Run};
+use support::{
+    cli::{Home, Run},
+    time,
+};
 
 fn producer(directory: &Path, mode: u8) -> PathBuf {
     let path = directory.join(format!("mock-{mode}.cti"));
@@ -619,7 +622,7 @@ fn ordinary_trigger_waits_preserve_the_helper_until_a_frame_arrives() {
             "--fresh",
             "0",
             "--timeout",
-            "3s",
+            &time::arg(3000),
         ],
     )
     .success();
@@ -627,7 +630,7 @@ fn ordinary_trigger_waits_preserve_the_helper_until_a_frame_arrives() {
         began.elapsed() >= Duration::from_millis(350),
         "fixture must span several caller deadlines"
     );
-    assert!(began.elapsed() < Duration::from_secs(5));
+    assert!(began.elapsed() < time::secs(5));
     assert_eq!(
         fs::read(home.work.join("triggered.raw")).unwrap(),
         [1, 2, 3, 4, 5, 6]
@@ -915,7 +918,14 @@ fn enumeration_waits_share_the_deadline_across_empty_interfaces_and_open() {
         let output = run(
             &home,
             std::slice::from_ref(&producer),
-            &["--json", "list", "--kind", "gentl", "--timeout", "2s"],
+            &[
+                "--json",
+                "list",
+                "--kind",
+                "gentl",
+                "--timeout",
+                &time::arg(2000),
+            ],
         )
         .success();
         assert_eq!(output["cameras"].as_array().unwrap().len(), 1, "{output}");
@@ -923,7 +933,7 @@ fn enumeration_waits_share_the_deadline_across_empty_interfaces_and_open() {
             output.get("warnings").is_none(),
             "healthy enumeration must finish before its outer deadline: {output}"
         );
-        assert!(began.elapsed() < Duration::from_secs(3));
+        assert!(began.elapsed() < time::secs(3));
         let log = fs::read_to_string(home.root.join("sdk.log")).unwrap();
         let waits = log
             .lines()
@@ -934,7 +944,7 @@ fn enumeration_waits_share_the_deadline_across_empty_interfaces_and_open() {
             .collect::<Vec<_>>();
         assert_eq!(waits.len(), if mode == 28 { 4 } else { 17 }, "{log}");
         assert!(
-            waits.iter().all(|wait| *wait < 1000),
+            waits.iter().all(|wait| *wait < time::ms(1000)),
             "native SDK waits must share the operation budget: {log}"
         );
         if mode == 28 {
@@ -951,7 +961,7 @@ fn enumeration_waits_share_the_deadline_across_empty_interfaces_and_open() {
                     "--fresh",
                     "0",
                     "--timeout",
-                    "2s",
+                    &time::arg(2000),
                 ],
             )
             .success();
@@ -970,7 +980,14 @@ fn a_failed_interface_keeps_the_same_producers_healthy_camera() {
     let output = run(
         &home,
         std::slice::from_ref(&producer),
-        &["--json", "list", "--kind", "gentl", "--timeout", "2s"],
+        &[
+            "--json",
+            "list",
+            "--kind",
+            "gentl",
+            "--timeout",
+            &time::arg(2000),
+        ],
     )
     .success();
     assert_eq!(output["cameras"].as_array().unwrap().len(), 1, "{output}");
@@ -2431,7 +2448,7 @@ fn multipart_malformed_ranges_and_unsupported_layouts_never_publish_a_partial_im
                 "--fresh",
                 "0",
                 "--timeout",
-                "2s",
+                &time::arg(2000),
             ],
         )
         .failure(exit);
@@ -5124,7 +5141,7 @@ fn selected_auto_meters_the_exact_part_and_resets_a_warm_controller_before_captu
     assert_eq!(entered["auto"]["metering_part"]["index"], 0);
     assert!(entered["auto"]["brightness"].is_null());
     warm(&rpc, Some(&json!({"op":"start"}))).success();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + time::secs(5);
     loop {
         let status = warm(&rpc, Some(&request)).success();
         if let Some(mean) = status["auto"]["brightness"].as_f64() {
@@ -5139,7 +5156,7 @@ fn selected_auto_meters_the_exact_part_and_resets_a_warm_controller_before_captu
     let reset = warm(&rpc, Some(&combined)).success();
     assert_eq!(reset["auto"]["metering_part"]["index"], 1);
     assert!(reset["auto"]["brightness"].is_null());
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + time::secs(5);
     loop {
         let status = warm(&rpc, Some(&combined)).success();
         if let Some(mean) = status["auto"]["brightness"].as_f64() {
@@ -5172,7 +5189,7 @@ fn selected_auto_meters_the_exact_part_and_resets_a_warm_controller_before_captu
             "--fresh",
             "0",
             "--timeout",
-            "3s",
+            &time::arg(3000),
         ],
         None,
     )

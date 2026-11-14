@@ -294,7 +294,7 @@ fn configuration_literals_are_accepted_or_rejected() {
         // The protocol key selects the adapter; it is checked by the outer dispatch.
         if case["field"] == "protocol" {
             let config = json!({"version":1,"sources":[{"id":"s"}]});
-            let mut source = value.clone();
+            let mut source = value;
             source["id"] = json!("s");
             let mut whole = config;
             whole["sources"] = json!([source]);

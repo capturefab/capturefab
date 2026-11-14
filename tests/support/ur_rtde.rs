@@ -1,5 +1,6 @@
 //! Manual-layout RTDE peers over private loopback; no real robot or `URSim` claim.
 use super::{Device, Home, accept, listener, receive, support::cli::Run};
+use crate::support::time;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use std::{
@@ -62,13 +63,13 @@ fn types(fields: &[Value], recipe: u8) -> Vec<u8> {
     );
     packet(b'O', &payload)
 }
-fn query(stream: &mut impl Read, stop: &AtomicBool, expected: &[u8]) {
+fn query(stream: &mut (impl Read + std::os::fd::AsRawFd), stop: &AtomicBool, expected: &[u8]) {
     let mut bytes = vec![0; expected.len()];
     assert!(receive(stream, &mut bytes, stop));
     assert_eq!(bytes, expected);
 }
-fn no_more(stream: &mut impl Read, stop: &AtomicBool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+fn no_more(stream: &mut (impl Read + std::os::fd::AsRawFd), stop: &AtomicBool) {
+    let deadline = Instant::now() + time::secs(10);
     loop {
         match stream.read(&mut [0]) {
             Ok(0) => return,
@@ -119,8 +120,8 @@ fn hello(stream: &mut impl ReadWrite, stop: &AtomicBool, fields: &[Value], pre_t
     );
     query(stream, stop, &packet(b'O', &payload));
 }
-trait ReadWrite: Read + io::Write {}
-impl<T: Read + io::Write> ReadWrite for T {}
+trait ReadWrite: Read + io::Write + std::os::fd::AsRawFd {}
+impl<T: Read + io::Write + std::os::fd::AsRawFd> ReadWrite for T {}
 fn start(stream: &mut impl ReadWrite, stop: &AtomicBool, fields: &[Value]) {
     hello(stream, stop, fields, false);
     stream.write_all(&types(fields, 7)).unwrap();
@@ -143,7 +144,7 @@ fn run(home: &Home, sources: &[Value], duration: &str) -> Run {
         "--config",
         "sources.json",
         "--for",
-        duration,
+        &super::window(duration),
         "-o",
         "run.jsonl",
     ])
@@ -451,15 +452,15 @@ fn ur_rtde_setup_original_budget_and_partial_cutoffs_are_strict() {
             return 0;
         };
         query(&mut stream, &stop, b"\x00\x05V\x00\x02");
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(time::millis(50));
         stream.write_all(b"\x00\x04V\x01").unwrap();
         query(&mut stream, &stop, b"\x00\x03v");
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(time::millis(50));
         stream.write_all(VERSION).unwrap();
         let mut payload = hex("405F400000000000");
         payload.extend(b"timestamp");
         query(&mut stream, &stop, &packet(b'O', &payload));
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(time::millis(200));
         match stream.write_all(&packet(b'O', b"\x07DOUBLE")) {
             Ok(()) => {}
             Err(error)
@@ -474,7 +475,7 @@ fn ur_rtde_setup_original_budget_and_partial_cutoffs_are_strict() {
     });
     let fields = scalar();
     let mut config = source(&address.to_string(), &fields);
-    config["timeout_ms"] = json!(250);
+    config["timeout_ms"] = json!(time::ms(250));
     assert_eq!(run(&home, &[config], "1s").failure(4)["code"], "timeout");
     assert_eq!(device.finish(), 3);
     check(&home, &[], false, 0);
@@ -495,7 +496,7 @@ fn ur_rtde_setup_original_budget_and_partial_cutoffs_are_strict() {
             4_u64
         });
         let mut config = source(&address.to_string(), &fields);
-        config["timeout_ms"] = json!(if acquisition { 1000 } else { 250 });
+        config["timeout_ms"] = json!(time::ms(if acquisition { 1000 } else { 250 }));
         assert_eq!(
             run(&home, &[config], if acquisition { "450ms" } else { "1s" }).failure(4)["code"],
             "timeout"

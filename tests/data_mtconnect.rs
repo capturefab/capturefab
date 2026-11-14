@@ -14,7 +14,10 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use support::cli::{Home, Run};
+use support::{
+    cli::{Home, Run},
+    time,
+};
 
 const LITERALS_SHA: &str = "e61d0c603203de9330614877df105f6f8db1bc01238c5062849c0c4ba2fd70fe";
 const USER_ENV: &str = "CAPTUREFAB_MTCONNECT_FIXTURE_USER";
@@ -131,10 +134,10 @@ fn reply(stream: &mut dyn Duplex, response: &Reply) -> io::Result<()> {
     stream.write_all(header.as_bytes())?;
     if response.slow {
         let middle = response.body.len() / 2;
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(time::millis(100));
         stream.write_all(&response.body.as_bytes()[..middle])?;
         stream.flush()?;
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(time::millis(100));
         stream.write_all(&response.body.as_bytes()[middle..])?;
     } else {
         stream.write_all(response.body.as_bytes())?;
@@ -148,7 +151,7 @@ struct Server {
 }
 fn accept(listener: &TcpListener, stop: &AtomicBool) -> Option<TcpStream> {
     listener.set_nonblocking(true).unwrap();
-    let end = Instant::now() + Duration::from_secs(5);
+    let end = Instant::now() + time::secs(5);
     loop {
         if stop.load(Ordering::SeqCst) {
             return None;
@@ -157,12 +160,8 @@ fn accept(listener: &TcpListener, stop: &AtomicBool) -> Option<TcpStream> {
             Ok((stream, _)) => {
                 stream.set_nonblocking(false).unwrap();
                 stream.set_nodelay(true).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
+                stream.set_read_timeout(Some(time::secs(3))).unwrap();
+                stream.set_write_timeout(Some(time::secs(3))).unwrap();
                 return Some(stream);
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -212,7 +211,7 @@ impl Server {
         }
     }
     fn source(&self) -> Value {
-        json!({"id":"mill","protocol":"mtconnect","address":self.listener.local_addr().unwrap().to_string(),"base_path":"/UMC","signal":"observations","count":5,"every_ms":3_600_000,"timeout_ms":2000})
+        json!({"id":"mill","protocol":"mtconnect","address":self.listener.local_addr().unwrap().to_string(),"base_path":"/UMC","signal":"observations","count":5,"every_ms":3_600_000,"timeout_ms":time::ms(2000)})
     }
     fn finish(mut self) {
         self.stop.store(true, Ordering::SeqCst);
@@ -648,9 +647,9 @@ fn grouped_conditions_dataset_deltas_empty_pages_and_idle_heads_preserve_cursor(
         });
         let home = Home::new("mtconnect-cursor");
         let mut source = server.source();
-        source["every_ms"] = json!(300);
+        source["every_ms"] = json!(time::ms(300));
         assert_eq!(
-            record(&home, &json!([source]), "1050ms").success()["samples"],
+            record(&home, &json!([source]), &time::arg(1050)).success()["samples"],
             4
         );
         server.finish();
@@ -770,7 +769,7 @@ fn namespace_admission_and_haas_style_identity_keep_explicit_effective_count() {
         source["mode"] = json!("current");
         source["count"] = json!(1024);
         assert_eq!(
-            record(&home, &json!([source]), "150ms").success()["samples"],
+            record(&home, &json!([source]), &time::arg(150)).success()["samples"],
             1
         );
         server.finish();
@@ -812,7 +811,7 @@ fn lost_buffer_reset_and_changed_models_retire_without_rebase_or_partial_rows() 
             _ => first_probe.clone(),
         };
         let mut script = vec![
-            ("/UMC/probe", first_probe.clone()),
+            ("/UMC/probe", first_probe),
             ("/UMC/current", first_current.clone()),
             ("/UMC/probe", changed),
         ];
@@ -826,8 +825,8 @@ fn lost_buffer_reset_and_changed_models_retire_without_rebase_or_partial_rows() 
         });
         let home = Home::new("mtconnect-failed-prefix");
         let mut source = server.source();
-        source["every_ms"] = json!(250);
-        let error = record(&home, &json!([source]), "1s").failure(1);
+        source["every_ms"] = json!(time::ms(250));
+        let error = record(&home, &json!([source]), &time::arg(1000)).failure(1);
         server.finish();
         assert_eq!(error["code"], "incomplete");
         if mode == 0 {
@@ -884,7 +883,11 @@ fn mismatched_references_duplicate_sequences_unknown_versions_and_error_xml_are_
         });
         let home = Home::new("mtconnect-atomic-error");
         let source = server.source();
-        let error = record(&home, &json!([source]), "1s").failure(if mode == 4 { 5 } else { 1 });
+        let error = record(&home, &json!([source]), &time::arg(1000)).failure(if mode == 4 {
+            5
+        } else {
+            1
+        });
         server.finish();
         assert_eq!(
             error["code"],
@@ -953,7 +956,7 @@ fn digest_auth_and_all_endpoint_progress_share_one_original_deadline() {
         if index == 0 {
             assert!(!request.fields.contains_key("authorization"));
             let mut reply = Reply::challenge();
-            reply.delay = Duration::from_millis(100);
+            reply.delay = time::millis(100);
             reply
         } else {
             digest(&request, u32::try_from(index).unwrap());
@@ -977,8 +980,8 @@ fn digest_auth_and_all_endpoint_progress_share_one_original_deadline() {
     source["username_env"] = json!(USER_ENV);
     source["password_env"] = json!(PASS_ENV);
     source["start"] = json!("buffer_begin");
-    source["timeout_ms"] = json!(250);
-    let error = record(&home, &json!([source]), "1s").failure(4);
+    source["timeout_ms"] = json!(time::ms(250));
+    let error = record(&home, &json!([source]), &time::arg(1000)).failure(4);
     server.finish();
     assert_eq!(error["code"], "timeout");
     assert_eq!(samples(&home, "failed").len(), 0);
@@ -1012,7 +1015,7 @@ fn invalid_static_paths_modes_counts_and_auth_fail_before_output() {
             source[key].clone_from(value);
         }
         assert_eq!(
-            record(&home, &json!([source]), "1s").failure(2)["code"],
+            record(&home, &json!([source]), &time::arg(1000)).failure(2)["code"],
             "usage"
         );
         assert!(!home.path("run.jsonl").exists());
@@ -1049,12 +1052,12 @@ fn digest_nonce_reuse_rechallenge_and_auth_refusals_do_not_fallback() {
     let home = Home::new("mtconnect-digest");
     let mut source = server.source();
     source["mode"] = json!("current");
-    source["every_ms"] = json!(300);
+    source["every_ms"] = json!(time::ms(300));
     source["auth"] = json!("digest");
     source["username_env"] = json!(USER_ENV);
     source["password_env"] = json!(PASS_ENV);
     assert_eq!(
-        record(&home, &json!([source]), "500ms").success()["samples"],
+        record(&home, &json!([source]), &time::arg(500)).success()["samples"],
         2
     );
     server.finish();
@@ -1086,7 +1089,7 @@ fn digest_nonce_reuse_rechallenge_and_auth_refusals_do_not_fallback() {
         source["auth"] = json!("digest");
         source["username_env"] = json!(USER_ENV);
         source["password_env"] = json!(PASS_ENV);
-        let error = record(&home, &json!([source]), "1s").failure(3);
+        let error = record(&home, &json!([source]), &time::arg(1000)).failure(3);
         server.finish();
         assert_eq!(
             error["code"],
@@ -1138,7 +1141,7 @@ fn resumed_u64_cursor_is_exact_and_filtered_empty_page_can_advance() {
     let mut source = server.source();
     source["start"] = json!({"instance_id":CURSOR,"sequence":CURSOR});
     assert_eq!(
-        record(&home, &json!([source]), "150ms").success()["samples"],
+        record(&home, &json!([source]), &time::arg(150)).success()["samples"],
         1
     );
     server.finish();
@@ -1237,7 +1240,7 @@ mod tls {
                 source["password_env"] = json!(PASS_ENV);
             }
             assert_eq!(
-                record(&home, &json!([source]), "300ms").success()["samples"],
+                record(&home, &json!([source]), &time::arg(300)).success()["samples"],
                 1
             );
             server.finish();
@@ -1273,8 +1276,8 @@ mod tls {
             }
             panic!("untrusted name completed TLS handshake");
         });
-        let source = json!({"id":"mill","protocol":"mtconnect","address":address,"tls":tls,"auth":"basic","username_env":USER_ENV,"password_env":PASS_ENV,"timeout_ms":1000});
-        let error = record(&home, &json!([source]), "1500ms").failure(3);
+        let source = json!({"id":"mill","protocol":"mtconnect","address":address,"tls":tls,"auth":"basic","username_env":USER_ENV,"password_env":PASS_ENV,"timeout_ms":time::ms(1000)});
+        let error = record(&home, &json!([source]), &time::arg(1500)).failure(3);
         thread.join().unwrap();
         assert_eq!(error["code"], "auth_rejected");
         assert_eq!(samples(&home, "failed").len(), 0);
@@ -1291,7 +1294,7 @@ fn tls_requires_the_build_feature_before_output_or_connection() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let source = json!({"id":"mill","protocol":"mtconnect","address":listener.local_addr().unwrap().to_string(),"tls":{"server_name":"mt.test"}});
     assert_eq!(
-        record(&home, &json!([source]), "1s").failure(5)["code"],
+        record(&home, &json!([source]), &time::arg(1000)).failure(5)["code"],
         "unsupported"
     );
     assert!(!home.path("run.jsonl").exists());

@@ -2,6 +2,7 @@
 //! protocol framing with 8N1, independently of the configured hardware UART.
 
 use super::{Device, Home, assert_unpublished, receive, record_modbus, serial_pair};
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{fs, io::Write as _, sync::atomic::AtomicBool, thread, time::Duration};
 
@@ -12,7 +13,7 @@ const WIDE_INPUT: &[u8; 17] = b":F70410000008ED\r\n";
 
 fn source(device: &str, signals: &Value) -> Value {
     json!({"id":"bus","protocol":"modbus_ascii","device":device,
-        "data_bits":8,"parity":"none","every_ms":3_600_000,"timeout_ms":1000,"signals":signals})
+        "data_bits":8,"parity":"none","every_ms":3_600_000,"timeout_ms":time::ms(1000),"signals":signals})
 }
 
 fn expect(master: &mut fs::File, stop: &AtomicBool, expected: &[u8; 17]) {
@@ -165,11 +166,11 @@ fn modbus_ascii_later_fragments_share_the_first_requests_deadline() {
     let server = Device::start(move |stop| {
         let _slave = slave;
         expect(&mut master, &stop, D100);
-        thread::sleep(Duration::from_millis(300));
+        thread::sleep(time::millis(300));
         master.write_all(D100_REPLY).unwrap();
         expect(&mut master, &stop, b":F7030000000105\r\n");
         master.write_all(b":F70302").unwrap();
-        thread::sleep(Duration::from_millis(300));
+        thread::sleep(time::millis(300));
         master.write_all(b"0007FD\r\n").unwrap();
         2
     });
@@ -178,7 +179,7 @@ fn modbus_ascii_later_fragments_share_the_first_requests_deadline() {
         &json!([{"name":"first","address":0x1064,"data_type":"u32"},
             {"name":"second","unit":247,"address":0}]),
     );
-    cfg["timeout_ms"] = json!(450);
+    cfg["timeout_ms"] = json!(time::ms(450));
     let error = record_modbus(&home, &cfg).failure(4);
     assert_eq!(server.finish(), 2);
     assert_eq!(error["code"], "timeout");

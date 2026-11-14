@@ -965,7 +965,7 @@ mod tests {
         let mut metadata = image();
         metadata.multipart = Some(frame.multipart.as_ref().unwrap().layout.clone());
         let mut binding = Selector {
-            producer: "/mock.cti".into(),
+            producer: std::env::temp_dir().join("mock.cti"),
             interface: "if0".into(),
             device: "dev0".into(),
             stream: None,

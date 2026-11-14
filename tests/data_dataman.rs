@@ -12,7 +12,10 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use support::cli::{Home, Run};
+use support::{
+    cli::{Home, Run},
+    time,
+};
 
 const REGISTER: [u8; 28] = [
     0x65, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
@@ -35,7 +38,7 @@ enum Answer {
 
 fn accept(listener: &TcpListener, stop: &AtomicBool) -> Option<TcpStream> {
     listener.set_nonblocking(true).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + time::secs(5);
     loop {
         if stop.load(Ordering::SeqCst) {
             return None;
@@ -44,12 +47,8 @@ fn accept(listener: &TcpListener, stop: &AtomicBool) -> Option<TcpStream> {
             Ok((stream, _)) => {
                 stream.set_nonblocking(false).unwrap();
                 stream.set_nodelay(true).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
+                stream.set_read_timeout(Some(time::secs(3))).unwrap();
+                stream.set_write_timeout(Some(time::secs(3))).unwrap();
                 return Some(stream);
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -99,7 +98,14 @@ fn finish_wire(stream: &mut TcpStream) {
                 bytes.extend_from_slice(&block[..count]);
                 assert!(bytes.len() <= 24, "unexpected retry, write or extra poll");
             }
-            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => break,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                break;
+            }
             Err(error) => panic!("DataMan connection did not retire: {error}"),
         }
     }
@@ -144,7 +150,7 @@ impl Peer {
                         let bytes = packet(header, &cip);
                         let groups = bytes.len().div_ceil(4);
                         for part in bytes.chunks(groups) {
-                            thread::sleep(Duration::from_millis(100));
+                            thread::sleep(time::millis(100));
                             if stream.write_all(part).is_err() {
                                 break;
                             }
@@ -328,10 +334,10 @@ fn complete_binary_results_keep_tail_repeat_wrap_and_typed_exports() {
         Answer::Complete(wrapped),
     ]);
     let mut source = peer.source();
-    source["every_ms"] = json!(300);
+    source["every_ms"] = json!(time::ms(300));
     let sources =
         json!([source,{"id":"sim","protocol":"simulator","signal":"cycle","every_ms":3_600_000}]);
-    let result = record(&home, &sources, "1050ms").success();
+    let result = record(&home, &sources, &time::arg(1050)).success();
     peer.finish();
     assert_eq!(result["samples"], 5);
     let samples = check_rows(
@@ -377,14 +383,14 @@ fn late_malformed_partial_status_and_strict_text_failures_retain_only_prior_poll
         let home = Home::new("dataman-prefix");
         let peer = Peer::new(vec![Answer::Complete(good.clone()), Answer::Complete(bad)]);
         let mut source = peer.source();
-        source["every_ms"] = json!(200);
+        source["every_ms"] = json!(time::ms(200));
         if index == 3 {
             source["max_result_bytes"] = json!(1);
         }
         if index == 4 {
             source["encoding"] = json!("utf8");
         }
-        let error = record(&home, &json!([source]), "1s").failure(1);
+        let error = record(&home, &json!([source]), &time::arg(1000)).failure(1);
         peer.finish();
         assert_eq!(error["code"], code);
         if let Some((field, value)) = detail {
@@ -428,11 +434,11 @@ fn progressing_valid_reply_cannot_renew_request_or_acquisition_deadline() {
         let (cip, _) = vector("empty");
         let peer = Peer::new(vec![Answer::Slow(cip)]);
         let mut source = peer.source();
-        source["timeout_ms"] = json!(if acquisition { 2000 } else { 250 });
+        source["timeout_ms"] = json!(time::ms(if acquisition { 2000 } else { 250 }));
         let error = record(
             &home,
             &json!([source]),
-            if acquisition { "250ms" } else { "1s" },
+            &time::arg(if acquisition { 250 } else { 1000 }),
         )
         .failure(4);
         peer.finish();

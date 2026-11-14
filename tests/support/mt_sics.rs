@@ -1,6 +1,7 @@
 //! The independent literal weight replies are from the IND360 User's Guide
 //! §C.2.3 and the `NewClassic` MT-SICS Reference Manual p. 103.
 use super::{Device, Home, accept, assert_unpublished, listener, receive, serial_pair};
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -10,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-fn expect_query(port: &mut impl Read, stop: &AtomicBool) {
+fn expect_query(port: &mut (impl Read + std::os::fd::AsRawFd), stop: &AtomicBool) {
     let mut request = [0; 4];
     assert!(receive(port, &mut request, stop));
     assert_eq!(&request, b"SI\r\n");
@@ -32,7 +33,7 @@ fn record(home: &Home, mut source: Value) -> super::support::cli::Run {
         "--config",
         "sources.json",
         "--for",
-        "650ms",
+        &time::arg(650),
         "-o",
         "run.jsonl",
     ])
@@ -130,14 +131,14 @@ fn mt_sics_split_crlf_cannot_renew_the_poll_deadline() {
     let scale = Device::start(move |stop| {
         let mut socket = accept(&listener, &stop).unwrap();
         expect_query(&mut socket, &stop);
-        thread::sleep(Duration::from_millis(160));
+        thread::sleep(time::millis(160));
         let _ = socket.write_all(b"S I\r");
-        thread::sleep(Duration::from_millis(160));
+        thread::sleep(time::millis(160));
         let _ = socket.write_all(b"\n");
         assert!(!receive(&mut socket, &mut [0], &stop));
         1
     });
-    let run = record(&home, json!({"address":address,"timeout_ms":250}));
+    let run = record(&home, json!({"address":address,"timeout_ms":time::ms(250)}));
     assert_eq!(run.failure(4)["code"], "timeout");
     assert_eq!(scale.finish(), 1);
     assert_unpublished(&home);

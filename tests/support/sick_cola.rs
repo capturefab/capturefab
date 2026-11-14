@@ -1,5 +1,6 @@
 //! Independent `CoLa A` wire fixture from `TiM4xx` 8026151/1ONO Table 78.
 use super::{Device, Home, accept, assert_unpublished, listener, receive, support::cli::Run};
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{fs, io::Write as _, thread, time::Duration};
 
@@ -21,7 +22,7 @@ fn record(home: &Home, sources: &Value) -> Run {
         "--config",
         "sources.json",
         "--for",
-        "650ms",
+        &time::arg(650),
         "-o",
         "run.jsonl",
     ])
@@ -54,7 +55,7 @@ fn sick_cola_replays_vendor_single_scan_and_preserves_raw_exports_with_simulator
         1
     });
     let sources = json!([
-        {"id":"lidar","protocol":"sick_cola","address":address,"signal":"front_scan","every_ms":3_600_000,"timeout_ms":600},
+        {"id":"lidar","protocol":"sick_cola","address":address,"signal":"front_scan","every_ms":3_600_000,"timeout_ms":time::ms(600)},
         {"id":"counter","protocol":"simulator","signal":"count","every_ms":3_600_000}
     ]);
     assert_eq!(record(&home, &sources).success()["samples"], 2);
@@ -140,7 +141,7 @@ fn sick_cola_rejects_unsolicited_mismatched_and_partial_scans_atomically() {
             1
         });
         let sources = json!([{"id":"lidar","protocol":"sick_cola","address":address,
-            "every_ms":3_600_000,"timeout_ms":250}]);
+            "every_ms":3_600_000,"timeout_ms":time::ms(250)}]);
         let result = record(&home, &sources).failure(if mode == "partial" { 4 } else { 1 });
         assert_eq!(
             result["code"],

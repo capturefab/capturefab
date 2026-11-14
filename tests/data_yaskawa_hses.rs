@@ -15,6 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 use support::cli::{Home, Run};
+use support::time;
 
 const PROFILE: &str = "yrc1000_hw1483358_rev12";
 const PACKET_PINS: &str = "d2e1bcd2dfa6864958bf9fbcdbc911ad67338cc927e44a281e75899fdf8f2c32";
@@ -277,7 +278,7 @@ impl Peer {
         let stopped = stop.clone();
         let wrong = UdpSocket::bind("127.0.0.1:0").unwrap();
         let handle = thread::spawn(move || {
-            let until = Instant::now() + Duration::from_secs(8);
+            let until = Instant::now() + time::secs(8);
             let mut buffer = vec![0; 65_535];
             let mut seen = Vec::new();
             while !stopped.load(Ordering::SeqCst) {
@@ -316,6 +317,7 @@ impl Peer {
                             io::ErrorKind::WouldBlock
                                 | io::ErrorKind::TimedOut
                                 | io::ErrorKind::ConnectionRefused
+                                | io::ErrorKind::ConnectionReset
                         ) => {}
                     Err(error) => panic!("{error}"),
                 }
@@ -339,11 +341,16 @@ impl Peer {
         let seen = self.handle.take().unwrap().join().unwrap();
         self.socket.set_nonblocking(true).unwrap();
         let mut extra = [0; 33];
-        // A delayed send to a retired client may leave asynchronous ICMP.
-        // Consume only those errors; every actual datagram is still forbidden.
+        // A delayed send to a retired client may leave asynchronous ICMP
+        // (ConnectionReset on Windows). Consume only those errors; every
+        // actual datagram is still forbidden.
         for _ in 0..32 {
             match self.socket.recv_from(&mut extra) {
-                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset
+                    ) => {}
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return seen,
                 Err(error) => panic!("unexpected final UDP error: {error}"),
                 Ok(_) => panic!("queued unexpected HSES request"),
@@ -663,23 +670,24 @@ fn late_sibling_has_no_partial_poll_and_shared_deadline_cannot_be_renewed() {
                     Emission {
                         bytes: stale,
                         wrong_peer: false,
-                        delay: Duration::from_millis(50),
+                        delay: time::millis(50),
                     },
                     Emission {
                         bytes: response,
                         wrong_peer: false,
-                        delay: Duration::from_millis(100),
+                        delay: time::millis(100),
                     },
                 ]
             }
         });
         let home = Home::new("yaskawa-hses-atomic-deadline");
         let mut source = peer.source(reads(&pair));
-        source["timeout_ms"] = json!(if mode == 2 { 2000 } else { 250 });
+        source["reply_horizon_ms"] = json!(time::ms(2000));
+        source["timeout_ms"] = json!(time::ms(if mode == 2 { 2000 } else { 250 }));
         let error = record(
             &home,
             &json!([source]),
-            if mode == 2 { "250ms" } else { "1s" },
+            &time::arg(if mode == 2 { 250 } else { 1000 }),
         )
         .failure(if mode == 0 { 1 } else { 4 });
         peer.finish();

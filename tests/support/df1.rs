@@ -2,6 +2,7 @@
 //! chapters 4–7 and `SCADAmetrics EtherMeter` 2.06 printed pages 58–59.
 
 use super::{Device, Home, assert_unpublished, receive, serial_pair};
+use crate::support::time;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use std::{
@@ -112,10 +113,10 @@ fn response(checksum: Checksum, tns: [u8; 2], data: &[u8]) -> Vec<u8> {
 }
 fn source(device: &str, signals: &Value) -> Value {
     let baud: Value = serde_json::from_str("1.92e4").unwrap();
-    let ack: Value = serde_json::from_str("9e1").unwrap();
+    let ack: Value = serde_json::from_str(&format!("{}e1", time::ms(9))).unwrap();
     json!({"id":"plc","protocol":"df1","device":device,"destination_node":4,
         "baud":baud,"ack_timeout_ms":ack,"max_read_bytes":16,"every_ms":3_600_000,
-        "timeout_ms":800,"signals":signals})
+        "timeout_ms":time::ms(800),"signals":signals})
 }
 fn record(home: &Home, source: &Value) -> super::support::cli::Run {
     fs::write(
@@ -130,7 +131,7 @@ fn record(home: &Home, source: &Value) -> super::support::cli::Run {
         "--config",
         "sources.json",
         "--for",
-        "1s",
+        &time::arg(1000),
         "-o",
         "run.jsonl",
     ])
@@ -383,7 +384,7 @@ fn df1_rejects_corrupt_or_mismatched_replies_without_publishing_a_sibling() {
             &device,
             &json!([{"name":"first","address":"N7:0"},{"name":"second","address":"N7:1"}]),
         );
-        config["timeout_ms"] = json!(400);
+        config["timeout_ms"] = json!(time::ms(400));
         let run = record(&home, &config);
         let error = run.failure(exit);
         assert_eq!(server.finish(), 2);
@@ -409,7 +410,7 @@ fn df1_ack_recovery_and_all_signal_reads_share_one_poll_deadline() {
         let checksum = Checksum::Crc;
         let (first, _) = command(&mut master, &stop, checksum, &[2, 7, 0x89, 0, 0]);
         send(&mut master, &ACK);
-        thread::sleep(Duration::from_millis(350));
+        thread::sleep(time::millis(350));
         send(&mut master, &response(checksum, first, &[11, 0]));
         expect(&mut master, &stop, &ACK);
         let _ = command(&mut master, &stop, checksum, &[2, 7, 0x89, 1, 0]);
@@ -422,8 +423,8 @@ fn df1_ack_recovery_and_all_signal_reads_share_one_poll_deadline() {
         &device,
         &json!([{"name":"first","address":"N7:0"},{"name":"second","address":"N7:1"}]),
     );
-    config["timeout_ms"] = json!(650);
-    config["ack_timeout_ms"] = json!(200);
+    config["timeout_ms"] = json!(time::ms(650));
+    config["ack_timeout_ms"] = json!(time::ms(200));
     let run = record(&home, &config);
     assert_eq!(server.finish(), 2);
     assert_eq!(run.failure(4)["code"], "timeout");
@@ -819,7 +820,7 @@ fn df1_late_string_width_or_text_failure_retains_only_the_prior_complete_poll() 
             ]),
         );
         cfg["max_read_bytes"] = 168.into();
-        cfg["every_ms"] = 200.into();
+        cfg["every_ms"] = time::ms(200).into();
         if mode != "short" {
             cfg["signals"][1]["encoding"] = mode.into();
         }
@@ -846,7 +847,7 @@ fn df1_string_chunks_keep_one_deadline_and_small_caps_fail_before_serial_open() 
         let checksum = Checksum::Crc;
         let (tns, _) = command(&mut master, &stop, checksum, &[84, 9, 0x8d, 0, 0]);
         send(&mut master, &ACK);
-        thread::sleep(Duration::from_millis(350));
+        thread::sleep(time::millis(350));
         send(&mut master, &response(checksum, tns, &raw));
         let required = AtomicBool::new(false);
         expect(&mut master, &required, &ACK);
@@ -860,8 +861,8 @@ fn df1_string_chunks_keep_one_deadline_and_small_caps_fail_before_serial_open() 
         &json!([{"name":"array","address":"ST9:0","elements":3}]),
     );
     cfg["max_read_bytes"] = 84.into();
-    cfg["timeout_ms"] = 650.into();
-    cfg["ack_timeout_ms"] = 200.into();
+    cfg["timeout_ms"] = time::ms(650).into();
+    cfg["ack_timeout_ms"] = time::ms(200).into();
     assert_eq!(record(&home, &cfg).failure(4)["code"], "timeout");
     assert_eq!(server.finish(), 2);
     assert_eq!(samples(&home).collect::<Vec<_>>(), [] as [Value; 0]);

@@ -44,7 +44,7 @@ fn assert_values_and_exports(home: &Home, cases: &[Value]) {
         assert!(sample.get("source_time").is_none());
         let elapsed = sample["elapsed_ns"].as_u64().unwrap();
         assert!(elapsed >= previous);
-        assert!(elapsed <= 500_000_000);
+        assert!(elapsed <= time::ms(500) * 1_000_000);
         assert!(sample["read_duration_ns"].as_u64().unwrap() <= elapsed);
         assert_eq!(sample["elapsed_ns"], samples[0]["elapsed_ns"]);
         assert!(sample["delivery_latency_ns"].is_u64());
@@ -289,15 +289,15 @@ fn late_timer_errors_are_atomic_and_previous_polls_still_export() {
                 {"name":"done","area":"counter","address":4095,"data_type":"bool"}
             ]),
         ));
-        config["sources"][0]["every_ms"] = json!(1);
-        config["sources"][0]["timeout_ms"] = json!(250);
+        config["sources"][0]["every_ms"] = json!(time::ms(1));
+        config["sources"][0]["timeout_ms"] = json!(time::ms(250));
         let server = thread::spawn(move || {
             let mut stream = accept(&listener);
             handshake(&mut stream, 0, CLIENT);
             for sid in [1, 3] {
                 let first = read_request(&mut stream, LOCAL, sid, 0x89, 0x0fff, 0, 1);
                 if sid == 3 && mode == "deadline" {
-                    thread::sleep(Duration::from_millis(150));
+                    thread::sleep(time::millis(150));
                 }
                 reply(&mut stream, &first, &[0x80, 1]);
                 let second = read_request(&mut stream, LOCAL, sid + 1, 0x09, 0x8fff, 0, 1);
@@ -314,7 +314,7 @@ fn late_timer_errors_are_atomic_and_previous_polls_still_export() {
                         bytes
                     }
                     "deadline" => {
-                        thread::sleep(Duration::from_millis(150));
+                        thread::sleep(time::millis(150));
                         response(&second, &[0])
                     }
                     _ => unreachable!(),

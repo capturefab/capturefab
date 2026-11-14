@@ -1,9 +1,9 @@
 //! W353-E1-06 complete C-mode frames. All reply bytes are spec-derived,
 //! not a stock decoder/device trace; the immutable JSON predates this decoder.
 
-use super::{Home, Terminal, config, record, rows};
+use super::{Home, Terminal, config, record, rows, time};
 use serde_json::{Value, json};
-use std::{fs, io::Write as _, os::fd::AsRawFd as _, thread, time::Duration};
+use std::{fs, io::Write as _, os::fd::AsRawFd as _, thread};
 
 fn vectors() -> Value {
     serde_json::from_str(include_str!("../fixtures/omron/cpm-literals.json")).unwrap()
@@ -12,7 +12,7 @@ fn cpm_config(terminal: &Terminal, signals: &Value) -> Value {
     let mut config = config(terminal, "c_mode_cpm", signals);
     config["sources"][0]["model"] = json!("cpm2a");
     config["sources"][0]["unit"] = json!(0);
-    config["sources"][0]["timeout_ms"] = json!(550);
+    config["sources"][0]["timeout_ms"] = json!(time::ms(550));
     config
 }
 fn exchange(terminal: &Terminal, case: &Value) {
@@ -234,7 +234,7 @@ fn malformed_late_sibling_and_remote_status_keep_only_earlier_complete_poll() {
                 {"name":"flags","area":"tc_status","address":0,"elements":5,"data_type":"bool"}
             ]),
         );
-        config["sources"][0]["every_ms"] = json!(200);
+        config["sources"][0]["every_ms"] = json!(time::ms(200));
         let error = thread::scope(|scope| {
             scope.spawn(|| {
                 exchange(&terminal, first);
@@ -310,7 +310,7 @@ fn original_request_and_acquisition_cutoffs_do_not_admit_a_third_read() {
                 {"name":"never","area":"hr","address":0}
             ]),
         );
-        config["sources"][0]["timeout_ms"] = json!(if acquisition { 5000 } else { 1000 });
+        config["sources"][0]["timeout_ms"] = json!(time::ms(if acquisition { 3000 } else { 1000 }));
         thread::scope(|scope| {
             scope.spawn(|| {
                 terminal.expect(
@@ -319,7 +319,7 @@ fn original_request_and_acquisition_cutoffs_do_not_admit_a_third_read() {
                         .unwrap()
                         .as_bytes(),
                 );
-                thread::sleep(Duration::from_millis(600));
+                thread::sleep(time::millis(600));
                 terminal.reply(
                     input["cases"][0]["response_ascii"]
                         .as_str()
@@ -338,14 +338,14 @@ fn original_request_and_acquisition_cutoffs_do_not_admit_a_third_read() {
                     .as_bytes()
                     .chunks(6)
                 {
-                    thread::sleep(Duration::from_millis(200));
+                    thread::sleep(time::millis(200));
                     (&terminal.master).write_all(chunk).unwrap();
                 }
             });
             let run = if acquisition {
-                run_for(&home, &config, "1s")
+                run_for(&home, &config, &time::arg(1000))
             } else {
-                run_for(&home, &config, "2s")
+                run_for(&home, &config, &time::arg(2000))
             };
             assert_eq!(run.failure(4)["code"], "timeout");
         });

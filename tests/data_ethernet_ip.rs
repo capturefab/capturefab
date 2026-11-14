@@ -18,7 +18,10 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use support::cli::{Home, Run};
+use support::{
+    cli::{Home, Run},
+    time,
+};
 
 const SESSION: u32 = 0x4433_2211;
 fn listener() -> TcpListener {
@@ -26,18 +29,14 @@ fn listener() -> TcpListener {
 }
 fn accept(listener: &TcpListener) -> TcpStream {
     listener.set_nonblocking(true).unwrap();
-    let until = Instant::now() + Duration::from_secs(5);
+    let until = Instant::now() + time::secs(5);
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
                 stream.set_nonblocking(false).unwrap();
                 stream.set_nodelay(true).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
+                stream.set_read_timeout(Some(time::secs(3))).unwrap();
+                stream.set_write_timeout(Some(time::secs(3))).unwrap();
                 return stream;
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -158,7 +157,7 @@ fn reply(service: u8, status: u8, kind: u16, payload: &[u8]) -> Vec<u8> {
 
 fn config(listener: &TcpListener, signals: Value, slot: Option<u8>) -> Value {
     let mut config = json!({"version":1,"sources":[{"id":"plc","protocol":"ethernet_ip",
-        "address":listener.local_addr().unwrap().to_string(),"every_ms":3_600_000,"timeout_ms":2000}]});
+        "address":listener.local_addr().unwrap().to_string(),"every_ms":3_600_000,"timeout_ms":time::ms(2000)}]});
     config["sources"][0]["signals"] = signals;
     if let Some(slot) = slot {
         config["sources"][0]["slot"] = json!(slot);
@@ -174,7 +173,7 @@ fn record(home: &Home, config: &Value) -> Run {
         "--config",
         "sources.json",
         "--for",
-        "1s",
+        &time::arg(1000),
         "-o",
         "run.jsonl",
     ])
@@ -564,7 +563,7 @@ fn later_read_fragments_cannot_extend_the_total_poll_deadline() {
         ]),
         None,
     );
-    config["sources"][0]["timeout_ms"] = json!(250);
+    config["sources"][0]["timeout_ms"] = json!(time::ms(250));
     let server = thread::spawn(move || {
         let mut stream = accept(&listener);
         register(&mut stream);
@@ -579,19 +578,19 @@ fn later_read_fragments_cannot_extend_the_total_poll_deadline() {
             None,
             &read_request(&path(b"Counts", Some(3)), 64, None),
         );
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(time::millis(100));
         send(&mut stream, &request, &reply(0xcc, 6, 0xc9, &[0; 8])).unwrap();
         let request = query(
             &mut stream,
             None,
             &read_request(&path(b"Counts", Some(3)), 64, Some(8)),
         );
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(time::millis(200));
         let _ = send(&mut stream, &request, &reply(0xd2, 0, 0xc9, &[0; 504]));
     });
     let began = Instant::now();
     assert_eq!(record(&home, &config).failure(4)["code"], "timeout");
-    assert!(began.elapsed() < Duration::from_secs(2));
+    assert!(began.elapsed() < time::secs(2));
     server.join().unwrap();
     assert!(!rows(&home).iter().any(|row| row["kind"] == "sample"));
 }

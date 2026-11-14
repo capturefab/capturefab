@@ -2,6 +2,7 @@
 use super::{
     Device, Home, accept, assert_unpublished, listener, receive, serial_pair, support::cli::Run,
 };
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{
     fs::{self, File},
@@ -33,7 +34,7 @@ fn record(home: &Home, sources: &Value) -> Run {
         "--config",
         "sources.json",
         "--for",
-        "650ms",
+        &time::arg(650),
         "-o",
         "run.jsonl",
     ])
@@ -43,7 +44,7 @@ fn source(endpoint: &Value) -> Value {
     let mut config = endpoint.clone();
     config["id"] = json!("position");
     config["protocol"] = json!("nmea_gnss");
-    config["timeout_ms"] = json!(35);
+    config["timeout_ms"] = json!(time::ms(35));
     config["signals"] = json!([{"name":"fix","sentence":"GGA"},{"name":"motion","sentence":"RMC"}]);
     config
 }
@@ -58,7 +59,7 @@ fn values(home: &Home, filename: &str) -> Vec<Value> {
 }
 
 fn await_terminal(terminal: &File, stop: &AtomicBool) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + time::secs(3);
     while !stop.load(Ordering::Acquire) {
         let mut mode = std::mem::MaybeUninit::<libc::termios>::uninit();
         // SAFETY: live PTY descriptor and writable termios allocation.
@@ -94,7 +95,7 @@ fn nmea_serial_retains_manufacturer_precision_across_idle_reads_and_exports() {
             .write_all(b"tail of a sentence before attachment\r\n")
             .unwrap();
         master.write_all(&LONG[..23]).unwrap();
-        thread::sleep(Duration::from_millis(95));
+        thread::sleep(time::millis(95));
         master.write_all(&LONG[23..]).unwrap();
         master.write_all(MODERN).unwrap();
         master.write_all(&LONG[..10]).unwrap();

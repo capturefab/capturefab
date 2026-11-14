@@ -4,9 +4,10 @@ use super::{
     Home, accept, config, listener, path, query, read_request, record, register, reply, rows, send,
     unregister,
 };
+use crate::support::time;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
-use std::{fs, io::Read as _, net::TcpStream, thread, time::Duration};
+use std::{fs, io::Read as _, net::TcpStream, thread};
 
 const TWO_WORDS: [u8; 8] = [0x81, 0, 0, 0x80, 3, 0, 0, 1];
 
@@ -275,7 +276,7 @@ fn explicit_dword_continuations_share_one_original_deadline() {
         json!([{"name":"bits","tag":"Flags[3]","data_type":"logix_bool_array","elements":2}]),
         None,
     );
-    cfg["sources"][0]["timeout_ms"] = json!(250);
+    cfg["sources"][0]["timeout_ms"] = json!(time::ms(250));
     let server = thread::spawn(move || {
         let mut stream = accept(&listener);
         register(&mut stream);
@@ -284,7 +285,7 @@ fn explicit_dword_continuations_share_one_original_deadline() {
             None,
             &read_request(&path(b"Flags", Some(3)), 2, None),
         );
-        thread::sleep(Duration::from_millis(150));
+        thread::sleep(time::millis(150));
         send(&mut stream, &packet, &reply(0xcc, 6, 0xd3, &TWO_WORDS[..3])).unwrap();
         let _packet = query(
             &mut stream,
@@ -293,9 +294,7 @@ fn explicit_dword_continuations_share_one_original_deadline() {
         );
         // The original 250ms cutoff has about100ms left; restarting it for
         // this fragment would keep the connection open beyond this150ms wait.
-        stream
-            .set_read_timeout(Some(Duration::from_millis(150)))
-            .unwrap();
+        stream.set_read_timeout(Some(time::millis(150))).unwrap();
         no_more(&mut stream);
     });
     assert_eq!(record(&home, &cfg).failure(4)["code"], "timeout");

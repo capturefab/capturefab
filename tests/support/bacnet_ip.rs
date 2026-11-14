@@ -1,12 +1,12 @@
 //! Direct BACnet/IP through the CLI, using Annex J and literal `ReadProperty` APDUs.
 
 use super::{Home, assert_unpublished, support::cli::Run};
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{
     fs,
     net::{SocketAddr, UdpSocket},
     thread,
-    time::Duration,
 };
 
 const ANALOG: [u8; 17] = [
@@ -44,9 +44,7 @@ const STATE_ACK: [u8; 21] = [
 
 fn udp_socket() -> UdpSocket {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    socket
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
+    socket.set_read_timeout(Some(time::secs(3))).unwrap();
     socket
 }
 
@@ -64,7 +62,7 @@ fn reply(socket: &UdpSocket, client: SocketAddr, bytes: &[u8]) {
 fn source(socket: &UdpSocket, signals: &Value) -> Value {
     json!({
         "id":"meter","protocol":"bacnet_ip","address":socket.local_addr().unwrap().to_string(),
-        "every_ms":3_600_000,"timeout_ms":1000,"signals":signals
+        "every_ms":3_600_000,"timeout_ms":time::ms(1000),"signals":signals
     })
 }
 
@@ -81,7 +79,7 @@ fn record(home: &Home, source: &Value) -> Run {
         "--config",
         "sources.json",
         "--for",
-        "1400ms",
+        &time::arg(1400),
         "-o",
         "run.jsonl",
     ])
@@ -229,15 +227,15 @@ fn status_and_value_share_a_poll_deadline_even_with_stale_responses() {
     let mut signal = analog();
     signal["units"] = json!(true);
     let mut config = source(&socket, &json!([signal]));
-    config["timeout_ms"] = json!(320);
+    config["timeout_ms"] = json!(time::ms(320));
     let server = thread::spawn(move || {
         let client = request(&socket, &ANALOG);
-        thread::sleep(Duration::from_millis(160));
+        thread::sleep(time::millis(160));
         reply(&socket, client, &ANALOG_ACK);
         assert_eq!(request(&socket, &UNITS), client);
-        thread::sleep(Duration::from_millis(80));
+        thread::sleep(time::millis(80));
         reply(&socket, client, &ANALOG_ACK);
-        thread::sleep(Duration::from_millis(120));
+        thread::sleep(time::millis(120));
         let _ = socket.send_to(&UNITS_ACK, client);
     });
     assert_eq!(record(&home, &config).failure(4)["code"], "timeout");
@@ -257,8 +255,10 @@ fn invoke_wrap_rotates_ephemeral_ports_or_guards_a_fixed_port() {
                 .map(|invoke| json!({"name":format!("power_{invoke}"),"object_type":"analog_value","instance":17}))
                 .collect::<Vec<_>>()),
         );
-        config["every_ms"] = json!(200);
-        config["reply_horizon_ms"] = json!(5000);
+        config["every_ms"] = json!(time::ms(200));
+        // Longer than the `--for` window; capped at the product's 30 s maximum.
+        let horizon = time::ms(5000).min(30_000);
+        config["reply_horizon_ms"] = json!(horizon);
         let binding = fixed.then(|| {
             let address = udp_socket().local_addr().unwrap();
             config["bind"] = json!(address.to_string());
@@ -280,9 +280,7 @@ fn invoke_wrap_rotates_ephemeral_ports_or_guards_a_fixed_port() {
             }
             reply(&socket, first, &unknown_object);
             if fixed {
-                socket
-                    .set_read_timeout(Some(Duration::from_millis(450)))
-                    .unwrap();
+                socket.set_read_timeout(Some(time::millis(450))).unwrap();
                 let error = socket.recv_from(&mut [0; 32]).unwrap_err();
                 assert!(matches!(
                     error.kind(),
@@ -297,7 +295,7 @@ fn invoke_wrap_rotates_ephemeral_ports_or_guards_a_fixed_port() {
         let error = record(&home, &config).failure(if fixed { 4 } else { 1 });
         if fixed {
             assert_eq!(error["details"]["invoke_id"], 0);
-            assert_eq!(error["details"]["reply_horizon_ms"], 5000);
+            assert_eq!(error["details"]["reply_horizon_ms"], horizon);
         } else {
             assert_eq!(error["details"]["bacnet_error_code"], 31);
         }

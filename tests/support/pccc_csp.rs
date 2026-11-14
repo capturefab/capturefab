@@ -1,7 +1,10 @@
 //! Legacy `CSPv4` direct SLC reads through the CLI, with Redpoint's registration
 //! and a bounded pseudo-peer based on `PCCCComm` commit 223cfa29.
 
-use super::{accept, listener, readings, record, send, support::cli::Home};
+use super::{
+    accept, listener, readings, record, send,
+    support::{cli::Home, time},
+};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use std::{
@@ -9,7 +12,6 @@ use std::{
     io::{self, Read as _, Write as _},
     net::{TcpListener, TcpStream},
     thread,
-    time::Duration,
 };
 
 const REGISTER: [u8; 28] = [
@@ -309,16 +311,16 @@ fn csp_uses_one_deadline_across_segments_and_closes_on_timeout() {
         &json!([{"name":"array","address":"N7:0","elements":3}]),
     );
     config["sources"][0]["max_read_bytes"] = json!(4);
-    config["sources"][0]["timeout_ms"] = json!(700);
+    config["sources"][0]["timeout_ms"] = json!(time::ms(700));
     let worker = thread::spawn(move || {
         let mut stream = accept(&listener);
         let register = registration(&mut stream);
         send(&mut stream, &register);
         command(&mut stream, 1, 0, &[4, 7, 0x89, 0, 0]);
-        thread::sleep(Duration::from_millis(420));
+        thread::sleep(time::millis(420));
         send(&mut stream, &response(1, 0, &[1, 0, 2, 0]));
         command(&mut stream, 2, 0, &[2, 7, 0x89, 2, 0]);
-        thread::sleep(Duration::from_millis(420));
+        thread::sleep(time::millis(420));
         let _ = stream.write_all(&response(2, 0, &[3, 0]));
         let closed = stream.read(&mut [0]);
         assert!(
@@ -326,7 +328,7 @@ fn csp_uses_one_deadline_across_segments_and_closes_on_timeout() {
                 || closed.is_err_and(|error| error.kind() == io::ErrorKind::ConnectionReset)
         );
     });
-    let run = record(&home, &config, "2s");
+    let run = record(&home, &config, &time::arg(2000));
     let error = run.failure(4);
     worker.join().unwrap();
     assert_eq!(error["code"], "timeout");
@@ -709,17 +711,17 @@ fn csp_strings_keep_the_original_chunk_deadline_and_reject_small_caps_before_con
         &json!([{"name":"array","address":"ST9:0","elements":3}]),
     );
     cfg["sources"][0]["max_read_bytes"] = 84.into();
-    cfg["sources"][0]["timeout_ms"] = 250.into();
+    cfg["sources"][0]["timeout_ms"] = time::ms(250).into();
     let (raw, _) = st_literal("odd_abc", None);
     let worker = thread::spawn(move || {
         let mut stream = accept(&listener);
         let register = registration(&mut stream);
         send(&mut stream, &register);
         command(&mut stream, 1, 0, &[84, 9, 0x8d, 0, 0]);
-        thread::sleep(Duration::from_millis(160));
+        thread::sleep(time::millis(160));
         send(&mut stream, &response(1, 0, &raw));
         command(&mut stream, 2, 0, &[84, 9, 0x8d, 1, 0]);
-        thread::sleep(Duration::from_millis(160));
+        thread::sleep(time::millis(160));
         let _ = stream.write_all(&response(2, 0, &raw));
         let seen = stream.read(&mut [0]);
         assert!(
@@ -727,7 +729,10 @@ fn csp_strings_keep_the_original_chunk_deadline_and_reject_small_caps_before_con
                 || seen.is_err_and(|error| error.kind() == io::ErrorKind::ConnectionReset)
         );
     });
-    assert_eq!(record(&home, &cfg, "700ms").failure(4)["code"], "timeout");
+    assert_eq!(
+        record(&home, &cfg, &time::arg(700)).failure(4)["code"],
+        "timeout"
+    );
     worker.join().unwrap();
     assert_eq!(readings(&home), Vec::<Value>::new());
 

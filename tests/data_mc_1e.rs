@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 use support::cli::Home;
+use support::time;
 
 fn listener() -> TcpListener {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -18,18 +19,14 @@ fn listener() -> TcpListener {
 }
 
 fn accept(listener: &TcpListener) -> TcpStream {
-    let deadline = Instant::now() + Duration::from_secs(4);
+    let deadline = Instant::now() + time::secs(4);
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
                 stream.set_nonblocking(false).unwrap();
                 stream.set_nodelay(true).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
+                stream.set_read_timeout(Some(time::secs(2))).unwrap();
+                stream.set_write_timeout(Some(time::secs(2))).unwrap();
                 return stream;
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -59,7 +56,7 @@ fn reply(stream: &mut TcpStream, bytes: &[u8]) {
 fn config(listener: &TcpListener, ascii: bool, signals: &Value) -> Value {
     json!({"version":1,"sources":[{"id":"fx","protocol":"mc_1e",
         "address":listener.local_addr().unwrap().to_string(), "encoding":if ascii {"ascii"} else {"binary"},
-        "monitoring_timer":1e1, "every_ms":3_600_000, "timeout_ms":1000, "signals":signals}]})
+        "monitoring_timer":1e1, "every_ms":3_600_000, "timeout_ms":time::ms(1000), "signals":signals}]})
 }
 
 fn record(home: &Home, config: &Value) -> support::cli::Run {
@@ -71,7 +68,7 @@ fn record(home: &Home, config: &Value) -> support::cli::Run {
         "--config",
         "sources.json",
         "--for",
-        "500ms",
+        &time::arg(500),
         "-o",
         "run.jsonl",
     ])
@@ -336,16 +333,16 @@ fn split_ascii_replies_and_later_reads_share_one_poll_deadline() {
             {"name":"first","device":"D","address":0}, {"name":"second","device":"D","address":1}
         ]),
     );
-    config["sources"][0]["timeout_ms"] = json!(240);
+    config["sources"][0]["timeout_ms"] = json!(time::ms(240));
     let server = thread::spawn(move || {
         let mut stream = accept(&listener);
         request(&mut stream, b"01FF000A4420000000000100");
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(time::millis(100));
         reply(&mut stream, b"81000001");
         request(&mut stream, b"01FF000A4420000000010100");
-        thread::sleep(Duration::from_millis(60));
+        thread::sleep(time::millis(60));
         reply(&mut stream, b"8100");
-        thread::sleep(Duration::from_millis(130));
+        thread::sleep(time::millis(130));
         let _ = stream.write_all(b"0002");
     });
     assert_eq!(record(&home, &config).failure(4)["code"], "timeout");

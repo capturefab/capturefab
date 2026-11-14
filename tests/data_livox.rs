@@ -7,21 +7,28 @@ use std::{
     fs,
     net::{SocketAddr, UdpSocket},
     process::{Child, Stdio},
+    sync::LazyLock,
     thread,
     time::{Duration, Instant},
 };
-use support::cli::{Home, Run};
-const ARGS: [&str; 9] = [
-    "--json",
-    "data",
-    "record",
-    "--config",
-    "sources.json",
-    "--for",
-    "1s",
-    "-o",
-    "run.jsonl",
-];
+use support::{
+    cli::{Home, Run},
+    time,
+};
+fn args() -> [&'static str; 9] {
+    static WINDOW: LazyLock<String> = LazyLock::new(|| time::arg(1000));
+    [
+        "--json",
+        "data",
+        "record",
+        "--config",
+        "sources.json",
+        "--for",
+        WINDOW.as_str(),
+        "-o",
+        "run.jsonl",
+    ]
+}
 const PROFILES: [&str; 7] = [
     "sdk2_mid360_v0",
     "sdk2_mid360s_v0",
@@ -102,8 +109,13 @@ fn no_control(socket: &UdpSocket) {
         match socket.recv_from(&mut [0; 1]) {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
             // A deliberately late fixture send can generate an asynchronous
-            // loopback ICMP error; this is not an incoming control datagram.
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
+            // loopback ICMP error (Windows reports it as a reset); this is not an
+            // incoming control datagram.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+                ) => {}
             other => panic!("passive source emitted data or unexpected receive state: {other:?}"),
         }
     }
@@ -129,7 +141,7 @@ fn groups(home: &Home) -> Vec<Value> {
         .collect()
 }
 fn wait(mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(4);
+    let deadline = Instant::now() + time::secs(4);
     while !ready() {
         assert!(Instant::now() < deadline, "Livox fixture state not reached");
         thread::sleep(Duration::from_millis(2));
@@ -150,7 +162,7 @@ impl Capture {
         if let Some(context) = context {
             fs::write(home.path("configured-context"), context).unwrap();
         }
-        let mut config = json!({"id":"lidar","protocol":"livox_udp","listen":target,"source_ip":"127.0.0.1","source_port":source.port(),"profile":profile,"stream":stream,"output":"raw.livox","max_bytes":100_000_000,"packets_per_group":32,"timeout_ms":120,"every_ms":3_600_000});
+        let mut config = json!({"id":"lidar","protocol":"livox_udp","listen":target,"source_ip":"127.0.0.1","source_port":source.port(),"profile":profile,"stream":stream,"output":"raw.livox","max_bytes":100_000_000,"packets_per_group":32,"timeout_ms":time::ms(120),"every_ms":3_600_000});
         if context.is_some() {
             config["context"] = json!("configured-context");
         }
@@ -168,7 +180,7 @@ impl Capture {
         drop(reservation);
         let child = home
             .command()
-            .args(ARGS)
+            .args(args())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -182,12 +194,12 @@ impl Capture {
         (capture, target)
     }
     fn finish(mut self) -> Run {
-        let deadline = Instant::now() + Duration::from_secs(6);
+        let deadline = Instant::now() + time::secs(6);
         while self.0.as_mut().unwrap().try_wait().unwrap().is_none() {
             assert!(Instant::now() < deadline, "bounded Livox CLI completion");
             thread::sleep(Duration::from_millis(2));
         }
-        Run::of_output(self.0.take().unwrap().wait_with_output().unwrap(), &ARGS)
+        Run::of_output(self.0.take().unwrap().wait_with_output().unwrap(), &args())
     }
 }
 impl Drop for Capture {
@@ -948,7 +960,7 @@ fn foreign_work_and_late_selected_malformed_data_keep_only_committed_groups() {
             }
         } else {
             source.send_to(&raw, target).unwrap();
-            let mut bad = raw.clone();
+            let mut bad = raw;
             bad[36] ^= 1;
             source.send_to(&bad, target).unwrap();
         }
@@ -1034,7 +1046,7 @@ fn count_boundaries_and_original_cutoff_drain_each_accepted_packet_once() {
             "points",
             None,
             if cutoff {
-                json!({"packets_per_group":32,"timeout_ms":1500})
+                json!({"packets_per_group":32,"timeout_ms":time::ms(1500)})
             } else {
                 json!({"packets_per_group":2})
             },
@@ -1049,7 +1061,7 @@ fn count_boundaries_and_original_cutoff_drain_each_accepted_packet_once() {
             thread::sleep(Duration::from_millis(3));
         }
         if cutoff {
-            thread::sleep(Duration::from_millis(1100));
+            thread::sleep(time::millis(1100));
             source.send_to(&packet("legacy_type_7"), target).unwrap();
         }
         assert_eq!(capture.finish().success()["status"], "complete");

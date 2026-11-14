@@ -3474,7 +3474,7 @@ mod tests {
             assert_eq!(rgb(&frame).unwrap(), expected, "{name}");
             assert_eq!(unpacked(&frame).unwrap().pixel_format, RGB8);
             assert!(exposure(&frame).unwrap().channels.is_some());
-            let mut rows = frame.clone();
+            let mut rows = frame;
             (rows.width, rows.height) = (2, 2);
             rows.data.make_mut().truncate(8);
             assert_eq!(rgb(&rows).unwrap(), expected[..12], "{name}");

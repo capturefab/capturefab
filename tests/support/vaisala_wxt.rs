@@ -1,5 +1,6 @@
 //! PTY verification for the Vaisala WXT530 guide's ASCII composite query.
 use super::{Device, Home, assert_unpublished, receive, serial_pair, support::cli::Run};
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{
     fs::{self, File},
@@ -24,7 +25,7 @@ fn expect_query(port: &mut File, stop: &AtomicBool, crc: bool) {
 
 fn source(device: &str, crc: bool, signals: &Value) -> Value {
     json!({"id":"weather","protocol":"vaisala_wxt","device":device,"baud":1.92e4,
-        "crc":crc,"every_ms":3_600_000,"timeout_ms":900,"signals":signals})
+        "crc":crc,"every_ms":3_600_000,"timeout_ms":time::ms(900),"signals":signals})
 }
 
 fn record(home: &Home, config: &Value) -> Run {
@@ -40,7 +41,7 @@ fn record(home: &Home, config: &Value) -> Run {
         "--config",
         "sources.json",
         "--for",
-        "650ms",
+        &time::arg(650),
         "-o",
         "run.jsonl",
     ])
@@ -203,15 +204,15 @@ fn wxt_late_terminator_expires_the_whole_poll() {
     let weather = Device::start(move |stop| {
         let _slave = slave;
         expect_query(&mut master, &stop, false);
-        thread::sleep(Duration::from_millis(125));
+        thread::sleep(time::millis(125));
         master.write_all(b"0R0,Dx=005D\r").unwrap();
-        thread::sleep(Duration::from_millis(125));
+        thread::sleep(time::millis(125));
         master.write_all(b"\n").unwrap();
         assert!(!receive(&mut master, &mut [0], &stop));
         1
     });
     let mut config = source(&device, false, &json!([{"name":"direction","field":"Dx"}]));
-    config["timeout_ms"] = json!(200);
+    config["timeout_ms"] = json!(time::ms(200));
     assert_eq!(record(&home, &config).failure(4)["code"], "timeout");
     assert_eq!(weather.finish(), 1);
     assert_unpublished(&home);

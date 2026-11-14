@@ -2,6 +2,7 @@
 //! command1 transaction is Fisher-Rosemount Technical Overview2nded Fig3-6.
 //! PTYs validate host UART bytes, not physical FSK/modem arbitration.
 use super::{Device, Home, assert_unpublished, receive, serial_pair, support::cli::Run};
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{
     fs::{self, File},
@@ -18,7 +19,7 @@ const PUBLISHED_REPLY: [u8; 21] = [
     255, 255, 255, 255, 255, 0x86, 0xa6, 6, 0xbc, 0x61, 0x4e, 1, 7, 0, 0, 6, 0x40, 0xb0, 0, 0, 0x45,
 ];
 fn config(device: &str, signals: &Value) -> Value {
-    json!({"id":"process","protocol":"hart_serial","device":device,"modem":"microlink_hm_101_0035","master":"primary","every_ms":3_600_000,"timeout_ms":1000,"signals":signals})
+    json!({"id":"process","protocol":"hart_serial","device":device,"modem":"microlink_hm_101_0035","master":"primary","every_ms":3_600_000,"timeout_ms":time::ms(1000),"signals":signals})
 }
 fn record(home: &Home, config: &Value) -> Run {
     fs::write(
@@ -33,7 +34,7 @@ fn record(home: &Home, config: &Value) -> Run {
         "--config",
         "sources.json",
         "--for",
-        "1s",
+        &time::arg(1000),
         "-o",
         "run.jsonl",
     ])
@@ -129,7 +130,7 @@ fn identify(
     );
 }
 fn send(port: &mut File, mut bytes: &[u8]) {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + time::secs(3);
     while !bytes.is_empty() {
         match port.write(bytes) {
             Ok(0) => panic!("PTY write made no progress"),
@@ -148,7 +149,7 @@ fn send(port: &mut File, mut bytes: &[u8]) {
     }
 }
 fn no_more(port: &mut File) {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + time::secs(2);
     loop {
         match port.read(&mut [0]) {
             Ok(0) => return,
@@ -351,7 +352,7 @@ fn hart_malformed_siblings_and_command_rejections_are_atomic_and_terminal() {
                 {"name":"bad","polling_address":0,"read":"primary_variable"}
             ]),
         );
-        cfg["timeout_ms"] = json!(300);
+        cfg["timeout_ms"] = json!(time::ms(300));
         let worker = Device::start(move |stop| {
             identify(&mut port, slave, &stop, 0, true, UID, 5);
             expect(&mut port, &stop, &command(&UID, true, 1, 5));
@@ -453,11 +454,11 @@ fn hart_foreign_frames_keep_the_original_deadline_and_later_siblings_are_not_pub
             {"name":"late","polling_address":0,"read":"primary_variable"}
         ]),
     );
-    cfg["timeout_ms"] = json!(300);
+    cfg["timeout_ms"] = json!(time::ms(300));
     let worker = Device::start(move |stop| {
         identify(&mut port, slave, &stop, 0, true, UID, 5);
         expect(&mut port, &stop, &command(&UID, true, 1, 5));
-        thread::sleep(Duration::from_millis(150));
+        thread::sleep(time::millis(150));
         send(&mut port, &PUBLISHED_REPLY);
         expect(&mut port, &stop, &command(&UID, true, 1, 5));
         for _ in 0..2 {
@@ -465,7 +466,7 @@ fn hart_foreign_frames_keep_the_original_deadline_and_later_siblings_are_not_pub
                 &mut port,
                 &reply(&UID, true, 1, [0, 0], &[6, 0x40, 0xb0, 0, 0], true),
             );
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(time::millis(100));
         }
         no_more(&mut port);
         3
@@ -511,7 +512,7 @@ fn hart_cutoff_preserves_a_completed_poll_and_fails_a_later_partial_reply() {
         &device,
         &json!([{"name":"pressure","polling_address":0,"read":"primary_variable"}]),
     );
-    cfg["every_ms"] = json!(200);
+    cfg["every_ms"] = json!(time::ms(200));
     let worker = Device::start(move |stop| {
         identify(&mut port, slave, &stop, 0, true, UID, 5);
         expect(&mut port, &stop, &PUBLISHED_REQUEST);

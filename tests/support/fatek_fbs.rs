@@ -1,6 +1,7 @@
 //! Published and spec-derived FATEK frames over an owned transparent TCP peer.
 //! These fixtures do not qualify a physical PLC, RS232 cable or USB driver.
 use super::{Device, Home, accept, assert_unpublished, listener, receive, support::cli::Run};
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -25,13 +26,13 @@ fn request(unit: u8, command: &str, address: &str, count: u16) -> Vec<u8> {
 fn reply(unit: u8, command: &str, data: &str) -> Vec<u8> {
     frame(format!("\x02{unit:02X}{command}0{data}").as_bytes())
 }
-fn query(input: &mut impl Read, stop: &AtomicBool, expected: &[u8]) {
+fn query(input: &mut (impl Read + std::os::fd::AsRawFd), stop: &AtomicBool, expected: &[u8]) {
     let mut bytes = vec![0; expected.len()];
     assert!(receive(input, &mut bytes, stop));
     assert_eq!(bytes, expected);
 }
-fn no_more(input: &mut impl Read, stop: &AtomicBool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+fn no_more(input: &mut (impl Read + std::os::fd::AsRawFd), stop: &AtomicBool) {
+    let deadline = Instant::now() + time::secs(10);
     loop {
         match input.read(&mut [0]) {
             Ok(0) => return,
@@ -81,7 +82,7 @@ fn run(home: &Home, sources: &[Value], duration: &str) -> Run {
         "--config",
         "sources.json",
         "--for",
-        duration,
+        &super::window(duration),
         "-o",
         "run.jsonl",
     ])
@@ -385,7 +386,7 @@ fn fatek_repeat_polls_keep_one_owner_without_hidden_commands() {
             {"name":"bits","address":"X0050","data_type":"bool","elements":6}
         ]),
     );
-    config["every_ms"] = json!(200);
+    config["every_ms"] = json!(time::ms(200));
     assert_eq!(run(&home, &[config], "550ms").success()["samples"], 6);
     assert_eq!(device.finish(), 6);
     let mut expected = Vec::new();
@@ -465,7 +466,7 @@ fn fatek_damaged_late_reply_rolls_back_current_poll_and_keeps_prior_prefix() {
                 ]),
             );
             if prior {
-                config["every_ms"] = json!(200);
+                config["every_ms"] = json!(time::ms(200));
             }
             assert_eq!(run(&home, &[config], "1s").failure(1)["code"], "failed");
             assert_eq!(device.finish(), if prior { 4 } else { 2 });
@@ -508,7 +509,7 @@ fn fatek_request_and_acquisition_deadlines_are_shared_and_terminal() {
                 stream.write_all(b"\x0201460").unwrap();
             } else {
                 for part in reply(1, "46", "0007").chunks(5) {
-                    thread::sleep(Duration::from_millis(100));
+                    thread::sleep(time::millis(100));
                     match stream.write_all(part) {
                         Ok(()) => {}
                         Err(error)
@@ -532,9 +533,9 @@ fn fatek_request_and_acquisition_deadlines_are_shared_and_terminal() {
             json!([{"name":"first","address":"R00000"},{"name":"second","address":"R00001"}])
         };
         let mut config = source(&address.to_string(), signals);
-        config["timeout_ms"] = json!(if acquisition { 1000 } else { 250 });
+        config["timeout_ms"] = json!(time::ms(if acquisition { 1000 } else { 250 }));
         if acquisition {
-            config["every_ms"] = json!(200);
+            config["every_ms"] = json!(time::ms(200));
         }
         assert_eq!(
             run(&home, &[config], if acquisition { "450ms" } else { "1s" }).failure(4)["code"],
@@ -568,7 +569,7 @@ fn fatek_eof_after_completed_poll_is_disconnected_without_partial_republication(
         &address.to_string(),
         json!([{"name":"word","address":"R00000"}]),
     );
-    config["every_ms"] = json!(200);
+    config["every_ms"] = json!(time::ms(200));
     assert_eq!(
         run(&home, &[config], "1s").failure(3)["code"],
         "disconnected"

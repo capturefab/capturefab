@@ -2,6 +2,7 @@
 //! The PTY tests bytes and deadlines using portable 8N1 settings.
 
 use super::{Device, Home, assert_unpublished, receive, serial_pair};
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{
     fs::{self, File},
@@ -33,7 +34,7 @@ const I32_REPLY: &[u8] =
 fn source(device: &str, signals: &Value) -> Value {
     json!({"id":"power","protocol":"omron_compoway_f","device":device,
         "data_bits":8,"parity":"none","stop_bits":1,
-        "every_ms":3_600_000,"timeout_ms":800,"signals":signals})
+        "every_ms":3_600_000,"timeout_ms":time::ms(800),"signals":signals})
 }
 
 fn record(home: &Home, source: &Value) -> super::support::cli::Run {
@@ -49,7 +50,7 @@ fn record(home: &Home, source: &Value) -> super::support::cli::Run {
         "--config",
         "sources.json",
         "--for",
-        "1s",
+        &time::arg(1000),
         "-o",
         "run.jsonl",
     ])
@@ -224,17 +225,17 @@ fn compoway_f_uses_one_deadline_for_both_stations_and_the_final_bcc() {
     let server = Device::start(move |stop| {
         let _slave = slave;
         expect(&mut master, &stop, G3ZA_DWORD);
-        thread::sleep(Duration::from_millis(400));
+        thread::sleep(time::millis(400));
         master.write_all(DWORD_REPLY).unwrap();
         expect(&mut master, &stop, I16_ARRAY);
         let (bcc, body) = I16_REPLY.split_last().unwrap();
         master.write_all(body).unwrap();
-        thread::sleep(Duration::from_millis(400));
+        thread::sleep(time::millis(400));
         let _ = master.write_all(&[*bcc]);
         2
     });
     let mut config = source(&device, &two_signals());
-    config["timeout_ms"] = json!(700);
+    config["timeout_ms"] = json!(time::ms(700));
     let run = record(&home, &config);
     assert_eq!(server.finish(), 2);
     assert_eq!(run.failure(4)["code"], "timeout");

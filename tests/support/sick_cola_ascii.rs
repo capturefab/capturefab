@@ -1,6 +1,7 @@
 //! Explicit LMS `CoLa A` profiles: published reply replay and specification-derived
 //! multi-channel/optional-field cases. No physical-scanner qualification.
 use super::{Device, Home, accept, listener, receive, support::cli::Run};
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{
     fmt::Write as _,
@@ -9,7 +10,6 @@ use std::{
     net::{SocketAddr, TcpStream},
     sync::atomic::AtomicBool,
     thread,
-    time::Duration,
 };
 
 const REQUEST: &[u8] = b"\x02sRN LMDscandata\x03";
@@ -38,7 +38,7 @@ fn rows(home: &Home, name: &str) -> Vec<Value> {
 }
 fn record(home: &Home, address: SocketAddr, profile: &str, options: Value) -> Run {
     let mut source = json!({"id":"lidar","protocol":"sick_cola","address":address,
-        "profile":profile,"every_ms":3_600_000,"timeout_ms":1000});
+        "profile":profile,"every_ms":3_600_000,"timeout_ms":time::ms(1000)});
     let Value::Object(options) = options else {
         panic!("fixture options")
     };
@@ -59,7 +59,7 @@ fn record(home: &Home, address: SocketAddr, profile: &str, options: Value) -> Ru
         "--config",
         "sources.json",
         "--for",
-        "650ms",
+        &time::arg(650),
         "-o",
         "run.jsonl",
     ])
@@ -315,9 +315,7 @@ fn ascii_lms_high_resolution_scan_exceeds_legacy_limit_with_exact_native_arrays(
             }
             // Cap rejection can close with unread inbound bytes, producing RST.
             // Success must retire cleanly; neither path may send another query.
-            socket
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
+            socket.set_read_timeout(Some(time::secs(2))).unwrap();
             match socket.read(&mut [0]) {
                 Ok(0) => {}
                 Err(error)
@@ -368,12 +366,18 @@ fn ascii_lms_original_poll_deadline_includes_late_final_tail_and_retires_socket(
         let mut socket = accept(&listen, &stop).unwrap();
         request(&mut socket, &stop);
         socket.write_all(&PUBLISHED[..PUBLISHED.len() - 1]).unwrap();
-        thread::sleep(Duration::from_millis(180));
+        thread::sleep(time::millis(180));
         let _ = socket.write_all(&[3]);
         assert!(!receive(&mut socket, &mut [0], &stop));
         1_u64
     });
-    let error = record(&home, address, "cola_a_lms1xx", json!({"timeout_ms":80})).failure(4);
+    let error = record(
+        &home,
+        address,
+        "cola_a_lms1xx",
+        json!({"timeout_ms":time::ms(80)}),
+    )
+    .failure(4);
     assert_eq!(error["code"], "timeout");
     assert_eq!(scanner.finish(), 1);
     assert_eq!(rows(&home, "run.jsonl"), [] as [Value; 0]);

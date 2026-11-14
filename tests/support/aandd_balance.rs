@@ -3,6 +3,7 @@
 use super::{
     Device, Home, accept, assert_unpublished, listener, receive, serial_pair, support::cli::Run,
 };
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -19,7 +20,7 @@ fn cases() -> Vec<Value> {
         .unwrap()
         .clone()
 }
-fn query(port: &mut impl Read, stop: &AtomicBool, cr: bool) {
+fn query(port: &mut (impl Read + std::os::fd::AsRawFd), stop: &AtomicBool, cr: bool) {
     if cr {
         let mut bytes = [0; 2];
         assert!(receive(port, &mut bytes, stop));
@@ -30,8 +31,8 @@ fn query(port: &mut impl Read, stop: &AtomicBool, cr: bool) {
         assert_eq!(&bytes, b"Q\r\n");
     }
 }
-fn no_more(port: &mut impl Read, stop: &AtomicBool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+fn no_more(port: &mut (impl Read + std::os::fd::AsRawFd), stop: &AtomicBool) {
+    let deadline = Instant::now() + time::secs(10);
     loop {
         match port.read(&mut [0; 1]) {
             Ok(0) => return,
@@ -85,7 +86,7 @@ fn record_sources(home: &Home, sources: &[Value], duration: &str) -> Run {
         "--config",
         "sources.json",
         "--for",
-        duration,
+        &super::window(duration),
         "-o",
         "run.jsonl",
     ])
@@ -238,7 +239,9 @@ fn aandd_mixed_source_and_multiple_records_keep_same_owner_and_custom_signal() {
         no_more(&mut port, &stop);
         3_u64
     });
-    let source = configured(json!({"address":address,"every_ms":200,"signal":"gross_observation"}));
+    let source = configured(
+        json!({"address":address,"every_ms":time::ms(200),"signal":"gross_observation"}),
+    );
     let sources = [
         source,
         json!({"id":"counter","protocol":"simulator","signal":"cycle","every_ms":3_600_000}),
@@ -310,7 +313,12 @@ fn aandd_invalid_reply_never_publishes_partial_value_or_retries_and_keeps_prior_
                 1 + u64::from(prefix)
             });
             assert_eq!(
-                record(&home, json!({"address":address,"every_ms":100}), "1s").failure(exit)["code"],
+                record(
+                    &home,
+                    json!({"address":address,"every_ms":time::ms(100)}),
+                    "1s"
+                )
+                .failure(exit)["code"],
                 code
             );
             assert_eq!(device.finish(), 1 + u64::from(prefix));
@@ -327,15 +335,19 @@ fn aandd_invalid_reply_never_publishes_partial_value_or_retries_and_keeps_prior_
     }
 }
 
-fn delayed_reply(port: &mut (impl Read + io::Write), stop: &AtomicBool, prefix: bool) {
+fn delayed_reply(
+    port: &mut (impl Read + io::Write + std::os::fd::AsRawFd),
+    stop: &AtomicBool,
+    prefix: bool,
+) {
     if prefix {
         query(port, stop, false);
         port.write_all(b"ST,+03142.06  g\r\n").unwrap();
     }
     query(port, stop, false);
-    thread::sleep(Duration::from_millis(140));
+    thread::sleep(time::millis(140));
     let _ = port.write_all(b"ST,+03142.06  g\r");
-    thread::sleep(Duration::from_millis(140));
+    thread::sleep(time::millis(140));
     let _ = port.write_all(b"\n");
     no_more(port, stop);
 }
@@ -366,8 +378,8 @@ fn aandd_split_reply_shares_original_deadline_over_tcp_and_actual_pty() {
                     });
                     (device, json!({"address":address}))
                 };
-                source["every_ms"] = json!(100);
-                source["timeout_ms"] = json!(if cutoff { 2000 } else { 250 });
+                source["every_ms"] = json!(time::ms(100));
+                source["timeout_ms"] = json!(time::ms(if cutoff { 2000 } else { 250 }));
                 let duration = if cutoff {
                     if prefix { "320ms" } else { "220ms" }
                 } else {

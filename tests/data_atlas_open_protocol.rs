@@ -5,10 +5,11 @@ use std::{
     fs,
     io::{Read as _, Write as _},
     net::{TcpListener, TcpStream},
+    sync::LazyLock,
     thread,
     time::{Duration, Instant},
 };
-use support::cli::Home;
+use support::{cli::Home, time};
 
 fn corpus() -> Value {
     serde_json::from_str(include_str!("fixtures/atlas_open_protocol/pf6000.json")).unwrap()
@@ -32,17 +33,13 @@ fn frame(group: &str, name: &str) -> Vec<u8> {
 }
 fn accept(listener: &TcpListener) -> TcpStream {
     listener.set_nonblocking(true).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + time::secs(5);
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
                 stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
+                stream.set_read_timeout(Some(time::secs(3))).unwrap();
+                stream.set_write_timeout(Some(time::secs(3))).unwrap();
                 stream.set_nodelay(true).unwrap();
                 return stream;
             }
@@ -81,7 +78,7 @@ fn configure(home: &Home, address: &str) {
         home.path("sources.json"),
         serde_json::to_vec(&json!({
             "version":1,"sources":[{"id":"tightener","protocol":"atlas_open_protocol",
-                "profile":"pf6000_v2_8","address":address,"timeout_ms":1000}]
+                "profile":"pf6000_v2_8","address":address,"timeout_ms":time::ms(1000)}]
         }))
         .unwrap(),
     )
@@ -95,13 +92,14 @@ fn rows(home: &Home) -> Vec<Value> {
         .collect()
 }
 fn args() -> [&'static str; 8] {
+    static WINDOW: LazyLock<String> = LazyLock::new(|| time::arg(500));
     [
         "data",
         "record",
         "--config",
         "sources.json",
         "--for",
-        "500ms",
+        WINDOW.as_str(),
         "-o",
         "run.jsonl",
     ]

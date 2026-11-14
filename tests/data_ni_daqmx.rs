@@ -866,7 +866,7 @@ fn five_analog_profiles_reject_missing_null_or_unqualified_science_before_any_so
         let mut c = source.clone();
         c["channels"][1]["physical"] = json!("dev1/ai00");
         invalid.push(c);
-        let mut c = source.clone();
+        let mut c = source;
         c["channels"][0][if family < 3 {
             "excitation"
         } else {

@@ -6,23 +6,30 @@ use std::{
     fs,
     net::{SocketAddr, UdpSocket},
     process::{Child, Stdio},
+    sync::LazyLock,
     thread,
     time::{Duration, Instant},
 };
-use support::cli::{Home, Run};
+use support::{
+    cli::{Home, Run},
+    time,
+};
 const SERIAL: u64 = 123_456_789_012;
 const INIT: u32 = 0x12_3456;
-const ARGS: [&str; 9] = [
-    "--json",
-    "data",
-    "record",
-    "--config",
-    "sources.json",
-    "--for",
-    "500ms",
-    "-o",
-    "run.jsonl",
-];
+fn args() -> [&'static str; 9] {
+    static WINDOW: LazyLock<String> = LazyLock::new(|| time::arg(500));
+    [
+        "--json",
+        "data",
+        "record",
+        "--config",
+        "sources.json",
+        "--for",
+        WINDOW.as_str(),
+        "-o",
+        "run.jsonl",
+    ]
+}
 fn crc(raw: &[u8]) -> u64 {
     let mut crc = u64::MAX;
     for byte in raw {
@@ -160,7 +167,7 @@ fn groups(home: &Home) -> Vec<Value> {
         .collect()
 }
 fn wait(mut ready: impl FnMut() -> bool) {
-    let end = Instant::now() + Duration::from_secs(4);
+    let end = Instant::now() + time::secs(4);
     while !ready() {
         assert!(Instant::now() < end, "fixture did not reach state");
         thread::sleep(Duration::from_millis(2));
@@ -179,7 +186,7 @@ impl Capture {
         let target = reservation.local_addr().unwrap();
         let original = serde_json::to_vec_pretty(meta).unwrap();
         fs::write(home.path("sensor.json"), &original).unwrap();
-        let mut selected = json!({"id":"lidar","protocol":"ouster_udp","listen":target,"source_ip":"127.0.0.1","source_port":source.port(),"stream":stream,"metadata":"sensor.json","output":"raw.ouster","max_bytes":100_000_000,"packets_per_group":2,"timeout_ms":120,"every_ms":3_600_000});
+        let mut selected = json!({"id":"lidar","protocol":"ouster_udp","listen":target,"source_ip":"127.0.0.1","source_port":source.port(),"stream":stream,"metadata":"sensor.json","output":"raw.ouster","max_bytes":100_000_000,"packets_per_group":2,"timeout_ms":time::ms(120),"every_ms":3_600_000});
         let Value::Object(patch) = patch else {
             panic!("fixture patch must be an object")
         };
@@ -194,7 +201,7 @@ impl Capture {
         drop(reservation);
         let child = home
             .command()
-            .args(ARGS)
+            .args(args())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -207,7 +214,7 @@ impl Capture {
         (Self(Some(child)), target, original)
     }
     fn finish(mut self) -> Run {
-        Run::of_output(self.0.take().unwrap().wait_with_output().unwrap(), &ARGS)
+        Run::of_output(self.0.take().unwrap().wait_with_output().unwrap(), &args())
     }
 }
 impl Drop for Capture {
@@ -556,7 +563,7 @@ fn groups_bound_native_json_and_preserve_accepted_boundary_packets() {
         .collect::<Vec<_>>();
     for packet in &packets {
         source.send_to(packet, target).unwrap();
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(time::millis(20));
     }
     assert_eq!(capture.finish().success()["status"], "complete");
     archive(&home, &original, &packets);
@@ -681,7 +688,7 @@ fn configuration_and_metadata_bounds_fail_before_listening_or_artifacts() {
             json!({"version":1,"sources":[source]}).to_string(),
         )
         .unwrap();
-        assert_eq!(home.run(&ARGS).failure(2)["code"], "usage");
+        assert_eq!(home.run(&args()).failure(2)["code"], "usage");
         assert!(!home.path("run.jsonl").exists());
         assert!(!home.path("raw.ouster").exists());
     }

@@ -650,7 +650,8 @@ mod tests {
             let url = url.replace("127.0.0.1", "localhost");
             let (name, bytes) = get(
                 &format!("{url}/{name}?SchemaVersion=1.1.0"),
-                Duration::from_secs(2),
+                // Resolving and connecting to `localhost` is slow on some runners.
+                crate::test_time::millis(2000),
             )
             .unwrap();
             assert_eq!(

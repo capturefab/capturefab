@@ -66,7 +66,7 @@ use std::{
     fs::{self, File},
     io::{Read, Write as _},
     net::{SocketAddr, TcpListener, TcpStream},
-    os::fd::{AsRawFd as _, FromRawFd as _},
+    os::fd::{AsRawFd, FromRawFd as _},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -74,7 +74,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use support::cli::Home;
+use support::{cli::Home, time};
 
 const WIDE_COUNTS: [u64; 3] = [u64::MAX, 0x0123_4567_89ab_cdef, (1 << 53) + 1];
 const WIDE_SIGNED: [i64; 2] = [i64::MIN, -0x0123_4567_89ab_cdef];
@@ -109,6 +109,15 @@ impl Drop for Device {
     }
 }
 
+/// A `--for` window written as `"1s"` or `"600ms"`, stretched by the test time scale.
+fn window(duration: &str) -> String {
+    let millis = duration.strip_suffix("ms").map_or_else(
+        || duration.strip_suffix('s').unwrap().parse::<u64>().unwrap() * 1000,
+        |millis| millis.parse::<u64>().unwrap(),
+    );
+    time::arg(millis)
+}
+
 fn listener() -> (TcpListener, SocketAddr) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -116,7 +125,7 @@ fn listener() -> (TcpListener, SocketAddr) {
     (listener, address)
 }
 fn accept(listener: &TcpListener, stop: &AtomicBool) -> Option<TcpStream> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + time::secs(10);
     loop {
         if stop.load(Ordering::Acquire) {
             return None;
@@ -129,9 +138,7 @@ fn accept(listener: &TcpListener, stop: &AtomicBool) -> Option<TcpStream> {
                 stream
                     .set_read_timeout(Some(Duration::from_millis(50)))
                     .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(1)))
-                    .unwrap();
+                stream.set_write_timeout(Some(time::secs(1))).unwrap();
                 return Some(stream);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -145,10 +152,26 @@ fn accept(listener: &TcpListener, stop: &AtomicBool) -> Option<TcpStream> {
         }
     }
 }
+/// Wait up to 10 ms for `events` on a fixture descriptor. Unlike a short
+/// sleep, a readiness wakeup is not delayed by timer coalescing on a loaded host.
+fn wait_ready(file: &impl AsRawFd, events: libc::c_short) {
+    let mut descriptor = libc::pollfd {
+        fd: file.as_raw_fd(),
+        events,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd for a descriptor the caller keeps open.
+    let status = unsafe { libc::poll(&raw mut descriptor, 1, 10) };
+    assert!(
+        status >= 0 || std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted,
+        "fixture poll: {}",
+        std::io::Error::last_os_error()
+    );
+}
 /// Keep partial requests over short readiness timeouts, and bound every fixture
 /// even when a product failure prevents its normal EOF/stop handshake.
-fn receive(input: &mut impl Read, mut bytes: &mut [u8], stop: &AtomicBool) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(10);
+fn receive(input: &mut (impl Read + AsRawFd), mut bytes: &mut [u8], stop: &AtomicBool) -> bool {
+    let deadline = Instant::now() + time::secs(10);
     while !bytes.is_empty() {
         if stop.load(Ordering::Acquire) {
             return false;
@@ -165,7 +188,7 @@ fn receive(input: &mut impl Read, mut bytes: &mut [u8], stop: &AtomicBool) -> bo
                 ) =>
             {
                 assert!(Instant::now() < deadline, "device request did not finish");
-                thread::sleep(Duration::from_millis(1));
+                wait_ready(input, libc::POLLIN);
             }
             Err(error) => panic!("device receive: {error}"),
         }
@@ -429,18 +452,18 @@ fn native_modbus_tcp_rtu_and_ethernet_ip_share_a_recording_and_exports() {
     let cip = Device::start(move |stop| ethernet_ip(&cip_listener, &stop));
     let rtu = Device::start(move |stop| modbus_rtu(master, slave, &stop));
     fs::write(home.path("sources.json"),json!({"version":1,"sources":[
-        {"id":"modbus_tcp","protocol":"modbus_tcp","address":tcp_address.to_string(),"unit":17,"every_ms":100,"timeout_ms":1000,
+        {"id":"modbus_tcp","protocol":"modbus_tcp","address":tcp_address.to_string(),"unit":17,"every_ms":time::ms(100),"timeout_ms":time::ms(1000),
          "signals":[{"name":"count","address":0,"data_type":"u32"},{"name":"temperature","table":"input","address":9,"data_type":"f32","scale":0.1},{"name":"running","table":"coil","address":7,"data_type":"bool","elements":1.0},
                     {"name":"wide_count","address":20,"data_type":"u64"},{"name":"energy","table":"input","address":24,"data_type":"f64","word_order":"little","byte_order":"little","scale":0.1},
                     {"name":"wide_counts","address":100,"data_type":"u64","word_order":"little","byte_order":"little","elements":serde_json::from_str::<Value>("3e0").unwrap()},
                     {"name":"flags","table":"coil","address":70,"data_type":"bool","elements":13},
                     {"name":"register_window","table":"input","address":65_411,"elements":125,"scale":0.5,"offset":2}]},
-        {"id":"modbus_rtu","protocol":"modbus_rtu","device":device,"unit":3,"parity":"none","stop_bits":2,"every_ms":100,"timeout_ms":1000,
+        {"id":"modbus_rtu","protocol":"modbus_rtu","device":device,"unit":3,"parity":"none","stop_bits":2,"every_ms":time::ms(100),"timeout_ms":time::ms(1000),
          "signals":[{"name":"signed","address":3,"data_type":"i16"},{"name":"present","unit":247,"table":"discrete","address":9,"data_type":"bool"},
                     {"name":"wide_signed","address":19,"data_type":"i64","byte_order":"little"},
                     {"name":"wide_signed_array","unit":19,"address":100,"data_type":"i64","byte_order":"little","elements":2},
                     {"name":"inputs","unit":247,"table":"discrete","address":63_536,"data_type":"bool","elements":serde_json::from_str::<Value>("2e3").unwrap()}]},
-        {"id":"ethernet_ip","protocol":"ethernet_ip","address":cip_address.to_string(),"every_ms":100,"timeout_ms":1000,
+        {"id":"ethernet_ip","protocol":"ethernet_ip","address":cip_address.to_string(),"every_ms":time::ms(100),"timeout_ms":time::ms(1000),
          "signals":[{"name":"cycles","tag":"TotalCycles"},{"name":"ready","tag":"Ready"}]}
     ]}).to_string()).unwrap();
     let result = home.ok(&[
@@ -449,7 +472,7 @@ fn native_modbus_tcp_rtu_and_ethernet_ip_share_a_recording_and_exports() {
         "--config",
         "sources.json",
         "--for",
-        "500ms",
+        &time::arg(500),
         "-o",
         "run.jsonl",
     ]);
@@ -563,7 +586,7 @@ fn record_modbus(home: &Home, source: &Value) -> support::cli::Run {
         "--config",
         "sources.json",
         "--for",
-        "2s",
+        &time::arg(2000),
         "-o",
         "run.jsonl",
     ])
@@ -623,7 +646,7 @@ fn malformed_tcp_arrays_discard_successful_siblings() {
         let run = record_modbus(
             &home,
             &json!({"id":"modbus","protocol":"modbus_tcp","address":address.to_string(),"unit":17,
-            "every_ms":3_600_000,"timeout_ms":1000,"signals":[{"name":"sibling","address":0},signal]}),
+            "every_ms":3_600_000,"timeout_ms":time::ms(1000),"signals":[{"name":"sibling","address":0},signal]}),
         );
         assert_eq!(server.finish(), 2);
         let error = run.failure(1);
@@ -669,7 +692,7 @@ fn invalid_rtu_reply_discards_successful_siblings_from_another_unit() {
         let run = record_modbus(
             &home,
             &json!({"id":"modbus","protocol":"modbus_rtu","device":device,"unit":3,
-            "parity":"none","stop_bits":2,"every_ms":3_600_000,"timeout_ms":1000,
+            "parity":"none","stop_bits":2,"every_ms":time::ms(100),"timeout_ms":time::ms(1000),
             "signals":[{"name":"sibling","address":0},{"name":"array","unit":17,"address":16,"data_type":"i64","elements":2}]}),
         );
         assert_eq!(server.finish(), 2);
@@ -727,7 +750,7 @@ fn independent_serial_sources_cannot_reopen_the_same_terminal() {
             "--config",
             "sources.json",
             "--for",
-            "2s",
+            &time::arg(2000),
             "-o",
             "run.jsonl",
         ],
@@ -766,9 +789,7 @@ fn modbus_poll_budget_rejects_before_querying_another_array() {
             let request = expect_modbus_request(&mut stream, &stop, [1, 0, 0, 0x07, 0xd0]);
             modbus_tcp_reply(&mut stream, request, &response);
         }
-        stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
+        stream.set_read_timeout(Some(time::secs(3))).unwrap();
         let mut byte = [0];
         match stream.read(&mut byte) {
             Ok(0) => {}
@@ -780,7 +801,7 @@ fn modbus_poll_budget_rejects_before_querying_another_array() {
     let run = record_modbus(
         &home,
         &json!({"id":"modbus","protocol":"modbus_tcp","address":address.to_string(),"unit":17,
-        "every_ms":3_600_000,"timeout_ms":1800,"signals":signals}),
+        "every_ms":3_600_000,"timeout_ms":time::ms(1800),"signals":signals}),
     );
     assert_eq!(server.finish(), 88);
     let error = run.failure(1);
@@ -831,7 +852,7 @@ fn modbus_tcp_gateway_reads_multiple_units_and_local_cache_on_one_stream() {
     let run = record_modbus(
         &home,
         &json!({"id":"gateway","protocol":"modbus_tcp","address":address.to_string(),
-        "every_ms":3_600_000,"timeout_ms":1000,"signals":[
+        "every_ms":3_600_000,"timeout_ms":time::ms(1000),"signals":[
             {"name":"station_one","address":0},
             {"name":"station_five","unit":5.0,"address":10},
             {"name":"gateway_cache","unit":255,"address":0,"elements":2}
@@ -876,7 +897,7 @@ fn modbus_tcp_gateway_rejects_source_unit_echo_for_an_override_atomically() {
     let run = record_modbus(
         &home,
         &json!({"id":"gateway","protocol":"modbus_tcp","address":address.to_string(),
-        "unit":1,"every_ms":3_600_000,"timeout_ms":1000,"signals":[
+        "unit":1,"every_ms":3_600_000,"timeout_ms":time::ms(1000),"signals":[
             {"name":"station_one","address":0},
             {"name":"station_five","unit":5,"address":10}
         ]}),

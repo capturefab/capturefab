@@ -12,25 +12,31 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Stdio},
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use support::cli::{Home, Run};
+use support::{
+    cli::{Home, Run},
+    time,
+};
 
-const ARGS: [&str; 9] = [
-    "--json",
-    "data",
-    "record",
-    "--config",
-    "sources.json",
-    "--for",
-    "1200ms",
-    "-o",
-    "run.jsonl",
-];
+fn args() -> [&'static str; 9] {
+    static WINDOW: LazyLock<String> = LazyLock::new(|| time::arg(1200));
+    [
+        "--json",
+        "data",
+        "record",
+        "--config",
+        "sources.json",
+        "--for",
+        WINDOW.as_str(),
+        "-o",
+        "run.jsonl",
+    ]
+}
 const CORPUS: &str = include_str!("fixtures/sick_compact_tcp/literals.json");
 const CORPUS_SHA: &str = "c1bb32d0cbde59f0ccd7432dfe9dbcdef88da80f23f3a46f817015fc0e476af2";
 const RESERVE: usize = 4 * 1024 * 1024 + 16 * 1024;
@@ -148,7 +154,7 @@ fn parts(home: &Home) -> Vec<Value> {
         .collect()
 }
 fn wait(mut ready: impl FnMut() -> bool) {
-    let end = Instant::now() + Duration::from_secs(8);
+    let end = Instant::now() + time::secs(8);
     while !ready() {
         assert!(Instant::now() < end, "bounded Compact TCP fixture state");
         thread::sleep(Duration::from_millis(2));
@@ -174,7 +180,7 @@ impl Peer {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&stop);
         let owner = thread::spawn(move || {
-            let end = Instant::now() + Duration::from_secs(10);
+            let end = Instant::now() + time::secs(10);
             let mut stream = loop {
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
@@ -189,9 +195,7 @@ impl Peer {
                 }
             };
             stream.set_nonblocking(false).unwrap();
-            stream
-                .set_write_timeout(Some(Duration::from_secs(3)))
-                .unwrap();
+            stream.set_write_timeout(Some(time::secs(3))).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_millis(100)))
                 .unwrap();
@@ -214,7 +218,7 @@ impl Peer {
                     },
                     Action::Pause(delay) => thread::sleep(delay),
                     Action::Prefix(path, count) => {
-                        let end = Instant::now() + Duration::from_secs(6);
+                        let end = Instant::now() + time::secs(6);
                         loop {
                             if flag.load(Ordering::Acquire) {
                                 break 'actions;
@@ -294,7 +298,7 @@ impl Drop for Peer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(owner) = self.owner.take() {
-            let end = Instant::now() + Duration::from_secs(4);
+            let end = Instant::now() + time::secs(4);
             while !owner.is_finished() && Instant::now() < end {
                 thread::sleep(Duration::from_millis(2));
             }
@@ -309,7 +313,7 @@ impl Capture {
     fn start(home: &Home) -> Self {
         Self(Some(
             home.command()
-                .args(ARGS)
+                .args(args())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -318,7 +322,7 @@ impl Capture {
     }
     fn finish(mut self) -> Run {
         wait(|| self.0.as_mut().unwrap().try_wait().unwrap().is_some());
-        Run::of_output(self.0.take().unwrap().wait_with_output().unwrap(), &ARGS)
+        Run::of_output(self.0.take().unwrap().wait_with_output().unwrap(), &args())
     }
 }
 impl Drop for Capture {
@@ -337,7 +341,7 @@ fn config(
     context: Option<&[u8]>,
     patch: Value,
 ) {
-    let mut source = json!({"id":"lidar","protocol":"sick_compact_tcp","address":address,"profile":profile,"stream":stream,"output_directory":"capture","max_bytes":100_000_000,"timeout_ms":1000});
+    let mut source = json!({"id":"lidar","protocol":"sick_compact_tcp","address":address,"profile":profile,"stream":stream,"output_directory":"capture","max_bytes":100_000_000,"timeout_ms":time::ms(1000)});
     if let Some(context) = context {
         fs::write(home.path("configured-context"), context).unwrap();
         source["context"] = json!("configured-context");
@@ -1325,7 +1329,7 @@ fn fragmented_and_coalesced_full_native_geometries_archive_before_all_parts_and_
             profile,
             stream,
             Some(context),
-            json!({"timeout_ms":1000}),
+            json!({"timeout_ms":time::ms(1000)}),
         );
         let capture = Capture::start(&home);
         capture.finish().success();
@@ -1408,7 +1412,7 @@ fn complete_crc_version_encoding_and_module_link_failures_keep_exact_valid_prefi
                 profile,
                 stream,
                 Some(context),
-                json!({"timeout_ms":250}),
+                json!({"timeout_ms":time::ms(250)}),
             );
             let error = Capture::start(&home).finish().failure(
                 if matches!(fault, "type3_encoding" | "type3_version" | "type7_version") {
@@ -1462,7 +1466,7 @@ fn eof_at_each_structural_stage_is_terminal_without_resync_or_second_accept() {
             "lrs4000",
             "points",
             None,
-            json!({"timeout_ms":250}),
+            json!({"timeout_ms":time::ms(250)}),
         );
         let error = Capture::start(&home)
             .finish()
@@ -1490,13 +1494,13 @@ fn progressing_partial_frame_uses_original_deadline_and_finish_never_reads_fresh
         Action::Send(good.clone()),
         Action::Prefix(home.path("run.jsonl"), 1),
         Action::Send(good[..36].to_vec()),
-        Action::Pause(Duration::from_millis(80)),
+        Action::Pause(time::millis(80)),
         Action::Send(good[36..44].to_vec()),
-        Action::Pause(Duration::from_millis(80)),
+        Action::Pause(time::millis(80)),
         Action::Send(good[44..48].to_vec()),
         // At ~310ms this suffix is past the original 250ms cutoff, but
         // before a wrongly renewed 250ms budget after the ~160ms progress.
-        Action::Pause(Duration::from_millis(150)),
+        Action::Pause(time::millis(150)),
         Action::LateSend(good[48..].to_vec()),
     ];
     let peer = Peer::new(actions);
@@ -1506,7 +1510,7 @@ fn progressing_partial_frame_uses_original_deadline_and_finish_never_reads_fresh
         "multiscan200",
         "imu",
         None,
-        json!({"timeout_ms":250}),
+        json!({"timeout_ms":time::ms(250)}),
     );
     let error = Capture::start(&home).finish().failure(4);
     assert_eq!(error["code"], "timeout");

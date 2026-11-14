@@ -16,7 +16,7 @@ use std::{
     fs,
     time::{Duration, Instant},
 };
-use support::cli::Home;
+use support::{cli::Home, time};
 
 const LITERALS: &str = include_str!("fixtures/opcua/subscription-literals.json");
 const LITERAL_SHA: &str = "91e7cd69323f907ed8500018b37af241e002f58a0194e993f13915e3362e6411";
@@ -513,7 +513,7 @@ mod gap;
 struct RecordingChild(Option<std::process::Child>);
 impl RecordingChild {
     fn finish(mut self) -> support::cli::Run {
-        let end = Instant::now() + Duration::from_secs(12);
+        let end = Instant::now() + time::secs(12);
         let mut child = self.0.take().unwrap();
         while child.try_wait().unwrap().is_none() {
             if Instant::now() >= end {
@@ -579,6 +579,10 @@ fn real_republish_gap_releases_original_publish_at_actual_recovery_frontier_and_
     let mut config = source(&server, &["unused"]);
     config["endpoint"] = json!(proxy.endpoint);
     config["nodes"] = json!([{"name":"namespace","node_id":"i=2255"}]);
+    config["timeout_ms"] = json!(time::ms(3000));
+    config["request_timeout_ms"] = json!(time::ms(3000));
+    config["sampling_ms"] = json!(time::ms(20));
+    config["subscription"]["publishing_ms"] = json!(time::ms(100));
     configure(&home, &config);
     let child = home
         .command()
@@ -589,7 +593,7 @@ fn real_republish_gap_releases_original_publish_at_actual_recovery_frontier_and_
             "--config",
             "sources.json",
             "--for",
-            "3s",
+            time::arg(3000).as_str(),
             "-o",
             "run.jsonl",
         ])
@@ -599,12 +603,12 @@ fn real_republish_gap_releases_original_publish_at_actual_recovery_frontier_and_
         .unwrap();
     let child = RecordingChild(Some(child));
     assert!(matches!(
-        proxy.events.recv_timeout(Duration::from_secs(5)).unwrap(),
+        proxy.events.recv_timeout(time::secs(5)).unwrap(),
         gap::Event::Suppressed
     ));
     server.set_namespace_reply(namespace_value("urn:middle"));
     assert!(matches!(
-        proxy.events.recv_timeout(Duration::from_secs(5)).unwrap(),
+        proxy.events.recv_timeout(time::secs(5)).unwrap(),
         gap::Event::Repaired
     ));
     server.set_namespace_reply(namespace_value("urn:after"));

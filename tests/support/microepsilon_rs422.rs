@@ -1,5 +1,6 @@
 //! Manual-derived ILD2300 words over an actual PTY; no physical sensor claim.
 use super::{Device, Home, assert_unpublished, receive, serial_pair, support::cli::Run};
+use crate::support::time;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use std::{
@@ -53,7 +54,7 @@ fn configured(mut source: Value) -> Value {
     source["protocol"] = json!("microepsilon_rs422");
     source["every_ms"] = json!(3_600_000);
     if source.get("timeout_ms").is_none() {
-        source["timeout_ms"] = json!(500);
+        source["timeout_ms"] = json!(time::ms(500));
     }
     source
 }
@@ -76,7 +77,7 @@ fn record(home: &Home, source: Value, duration: &str, mixed: bool) -> Run {
         "--config",
         "sources.json",
         "--for",
-        duration,
+        &super::window(duration),
         "-o",
         "run.jsonl",
     ])
@@ -161,7 +162,7 @@ fn assert_recording(home: &Home, expected: &[Value], complete: bool, total: usiz
 }
 
 fn await_port(slave: &File, stop: &AtomicBool, baud: u32) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + time::secs(10);
     while !stop.load(Ordering::Acquire) {
         let mut settings = std::mem::MaybeUninit::<libc::termios>::uninit();
         // SAFETY: slave is live and settings is valid writable storage.
@@ -338,15 +339,15 @@ fn ild2300_split_words_share_one_deadline_and_partial_cutoffs_remain_strict_afte
                     master.write_all(&[0x38, 0x7f, 0x87]).unwrap();
                 }
                 master.write_all(&[0]).unwrap();
-                thread::sleep(Duration::from_millis(140));
+                thread::sleep(time::millis(140));
                 let _ = master.write_all(&[0x40]);
-                thread::sleep(Duration::from_millis(140));
+                thread::sleep(time::millis(140));
                 let _ = master.write_all(&[0x80]);
                 assert!(!receive(&mut master, &mut [0], &stop));
                 1 + u64::from(prefix)
             });
             let duration = if cutoff { "220ms" } else { "1s" };
-            let timeout = if cutoff { 2000 } else { 250 };
+            let timeout = time::ms(if cutoff { 2000 } else { 250 });
             assert_eq!(record(&home, json!({"device":path,"profile":"ild2300_dist1","baud":9600,"timeout_ms":timeout}), duration, false).failure(4)["code"], "timeout");
             assert_eq!(device.finish(), 1 + u64::from(prefix));
             let expected = if prefix {
@@ -370,7 +371,7 @@ fn ild2300_split_words_share_one_deadline_and_partial_cutoffs_remain_strict_afte
         assert_eq!(
             record(
                 &home,
-                json!({"device":path,"profile":"ild2300_dist1","baud":9600,"timeout_ms":80}),
+                json!({"device":path,"profile":"ild2300_dist1","baud":9600,"timeout_ms":time::ms(80)}),
                 "1s",
                 false
             )
@@ -390,7 +391,7 @@ fn ild2300_eof_and_invalid_config_do_not_restart_or_create_measurements() {
     let device = Device::start(move |stop| {
         assert!(await_port(&slave, &stop, 9600));
         master.write_all(&[0]).unwrap();
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(time::millis(20));
         drop(master);
         drop(slave);
         1_u64

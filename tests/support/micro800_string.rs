@@ -4,6 +4,7 @@ use super::{
     Home, Packet, SESSION, accept, close, connected_reply, listener, open, open_reply,
     open_request, path, read_tag, record, register, rows, rr, send, source, unit_body, unregister,
 };
+use crate::support::time;
 use base64::Engine as _;
 use serde_json::{Value, json};
 use std::{
@@ -11,7 +12,7 @@ use std::{
     io::{Read as _, Write as _},
     net::TcpStream,
     thread,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 fn expected(data: &[u8], capacity: u16, encoding: Option<&str>) -> Value {
@@ -274,19 +275,19 @@ fn malformed_short_strings_never_publish_prior_values_or_query_later_signals() {
 
 #[test]
 fn short_string_partial_read_cannot_refresh_the_handshake_or_acquisition_deadline() {
-    for (name, timeout, duration) in [("request", 250, "1s"), ("acquisition", 3000, "250ms")] {
+    for (name, timeout, duration) in [("request", 250, 1000), ("acquisition", 3000, 250)] {
         let home = Home::new(name);
         let listener = listener();
         let mut cfg = source(
             &listener,
             json!([{"name":"text","tag":"Text","data_type":"micro800_string","capacity":252}]),
         );
-        cfg["sources"][0]["timeout_ms"] = json!(timeout);
+        cfg["sources"][0]["timeout_ms"] = json!(time::ms(timeout));
         let server = thread::spawn(move || {
             let mut stream = accept(&listener);
             register(&mut stream);
             let (r, identity, originator) = open_request(&mut stream);
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(time::millis(100));
             send(
                 &mut stream,
                 &r,
@@ -294,7 +295,7 @@ fn short_string_partial_read_cannot_refresh_the_handshake_or_acquisition_deadlin
             )
             .unwrap();
             let r = read_tag(&mut stream, 1, &path(b"Text", None), 1, 0);
-            thread::sleep(Duration::from_millis(80));
+            thread::sleep(time::millis(80));
             send(
                 &mut stream,
                 &r,
@@ -302,7 +303,7 @@ fn short_string_partial_read_cannot_refresh_the_handshake_or_acquisition_deadlin
             )
             .unwrap();
             read_tag(&mut stream, 2, &path(b"Text", None), 1, 1);
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(time::millis(100));
             no_more(&mut stream);
         });
         fs::write(home.path("sources.json"), cfg.to_string()).unwrap();
@@ -315,14 +316,14 @@ fn short_string_partial_read_cannot_refresh_the_handshake_or_acquisition_deadlin
                 "--config",
                 "sources.json",
                 "--for",
-                duration,
+                &time::arg(duration),
                 "-o",
                 "run.jsonl"
             ])
             .failure(4)["code"],
             "timeout"
         );
-        assert!(began.elapsed() < Duration::from_secs(2));
+        assert!(began.elapsed() < time::secs(2));
         server.join().unwrap();
         failed(&home);
     }

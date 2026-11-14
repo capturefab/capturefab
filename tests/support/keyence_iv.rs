@@ -1,6 +1,7 @@
 //! Keyence IV2/IV3 field network and IV4 user manual replies through the CLI.
 
 use super::{Device, Home, accept, assert_unpublished, listener, receive};
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -8,7 +9,6 @@ use std::{
     net::{SocketAddr, TcpStream},
     sync::atomic::AtomicBool,
     thread,
-    time::Duration,
 };
 
 const IV2: &[u8] = b"VI,IV2-G500CA,R1.10.00\r";
@@ -32,7 +32,7 @@ fn respond(stream: &mut TcpStream, bytes: &[u8]) {
 
 fn source(address: SocketAddr) -> Value {
     json!({"id":"sensor", "protocol":"keyence_iv", "address":address.to_string(),
-        "timeout_ms":1000, "every_ms":3_600_000})
+        "timeout_ms":time::ms(1000), "every_ms":3_600_000})
 }
 
 fn record(home: &Home, source: &Value, duration: &str) -> super::support::cli::Run {
@@ -48,7 +48,7 @@ fn record(home: &Home, source: &Value, duration: &str) -> super::support::cli::R
         "--config",
         "sources.json",
         "--for",
-        duration,
+        &super::window(duration),
         "-o",
         "run.jsonl",
     ])
@@ -140,7 +140,7 @@ fn keyence_iv_detailed_master_readout_preserves_ocr_delimiters_padding_and_wrap(
     let mut cfg = source(address);
     cfg["format"] = json!("detailed_master");
     cfg["signal"] = json!("station_a");
-    cfg["every_ms"] = json!(350);
+    cfg["every_ms"] = json!(time::ms(350));
     let result = record(&home, &cfg, "650ms").success();
     assert_eq!(fixture.finish(), 2);
     assert_eq!(result["samples"], 2);
@@ -186,7 +186,7 @@ fn keyence_iv_no_current_result_is_explicit_and_can_recover_next_poll() {
         2
     });
     let mut cfg = source(address);
-    cfg["every_ms"] = json!(350);
+    cfg["every_ms"] = json!(time::ms(350));
     let result = record(&home, &cfg, "650ms").success();
     assert_eq!(fixture.finish(), 2);
     assert_eq!(result["samples"], 2);
@@ -371,16 +371,16 @@ fn keyence_iv_version_and_fragmented_result_share_one_deadline() {
     let fixture = Device::start(move |stop| {
         let mut stream = accept(&listener, &stop).unwrap();
         request(&mut stream, &stop, *b"VI\r");
-        thread::sleep(Duration::from_millis(240));
+        thread::sleep(time::millis(240));
         respond(&mut stream, IV3);
         request(&mut stream, &stop, *b"RT\r");
         stream.write_all(b"RT,01234,NG,").unwrap();
-        thread::sleep(Duration::from_millis(240));
+        thread::sleep(time::millis(240));
         let _ = stream.write_all(b"01,OK,0000080\r");
         1
     });
     let mut cfg = source(address);
-    cfg["timeout_ms"] = json!(400);
+    cfg["timeout_ms"] = json!(time::ms(400));
     let error = record(&home, &cfg, "1s").failure(4);
     assert_eq!(error["code"], "timeout");
     assert_eq!(fixture.finish(), 1);

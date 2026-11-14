@@ -1,6 +1,7 @@
 //! Native LS ELECTRIC `FEnet` CLI fixtures; the first exchange is the literal
 //! XBL-EMTA v2.1 manual's tables 5-6/5-7 (printed p. 5-7).
 use super::{Device, Home, accept, assert_unpublished, listener, receive};
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -8,7 +9,7 @@ use std::{
     net::TcpStream,
     sync::atomic::AtomicBool,
     thread,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 const VENDOR_REQUEST: &[u8] =
@@ -18,7 +19,7 @@ const VENDOR_RESPONSE: &[u8] =
 
 fn config(address: std::net::SocketAddr, signals: &Value) -> Value {
     json!({"id":"ls","protocol":"ls_xgt","address":address.to_string(),
-        "every_ms":3_600_000,"timeout_ms":1000,"signals":signals})
+        "every_ms":3_600_000,"timeout_ms":time::ms(1000),"signals":signals})
 }
 fn record(home: &Home, config: &Value) -> super::support::cli::Run {
     record_for(home, config, "1s")
@@ -36,7 +37,7 @@ fn record_for(home: &Home, config: &Value, duration: &str) -> super::support::cl
         "--config",
         "sources.json",
         "--for",
-        duration,
+        &super::window(duration),
         "-o",
         "run.jsonl",
     ])
@@ -106,7 +107,7 @@ fn send(stream: &mut TcpStream, bytes: &[u8]) {
 fn no_more_requests(stream: &mut TcpStream) {
     // accept() already sets a short read timeout. Do not change socket options
     // after the recorder has closed: macOS may reject that with EINVAL.
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + time::secs(1);
     let mut byte = [0];
     loop {
         assert!(
@@ -398,14 +399,14 @@ fn ls_xgt_continuations_share_the_original_poll_deadline() {
         &json!([{"name":"wide","variable":"%DB0","data_type":"u64","elements":3}]),
     );
     config["max_read_bytes"] = json!(8);
-    config["timeout_ms"] = json!(350);
+    config["timeout_ms"] = json!(time::ms(350));
     let server = Device::start(move |stop| {
         let mut stream = accept(&listener, &stop).unwrap();
         expect(&mut stream, &stop, 0, 0xa0, 0x14, "%DB0", Some(8));
-        thread::sleep(Duration::from_millis(220));
+        thread::sleep(time::millis(220));
         send(&mut stream, &reply(0, 0xa0, 0x14, &1_u64.to_le_bytes()));
         expect(&mut stream, &stop, 1, 0xa0, 0x14, "%DB8", Some(8));
-        thread::sleep(Duration::from_millis(220));
+        thread::sleep(time::millis(220));
         let _ = stream.write_all(&reply(1, 0xa0, 0x14, &2_u64.to_le_bytes()));
         no_more_requests(&mut stream);
         2

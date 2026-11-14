@@ -1,14 +1,13 @@
 //! Independent literal `HiSLIP` headers from IVI-6.1 Tables2/4/12/17/18/28/32.
 //! scpi-sim 0.7.4 covers synchronous basic exchange; overlap/SRQ/error fixtures
 //! here are specification fixtures, not claims about that stock server.
-use super::{Home, accept, config, decoded, hash, listener, record, samples};
+use super::{Home, accept, config, decoded, hash, listener, record, samples, time};
 use serde_json::{Value, json};
 use std::{
     fs,
     io::{self, Read as _, Write as _},
     net::{TcpListener, TcpStream},
     thread,
-    time::Duration,
 };
 
 struct Message {
@@ -142,7 +141,7 @@ fn hislip_synchronized_ids_rmt_srq_end_and_exact_artifacts_survive_exports() {
         send(&mut sync, 7, id, b"DMM,123,1.0");
         let id = query(&mut sync, b"FETC?", &mut next, true, 3);
         send(&mut sync, 6, id, b"18446744073709551615\n");
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(time::millis(10));
         send(&mut sync, 7, id, &[]);
         let id = query(&mut sync, b"CURVE?", &mut next, true, 3);
         send(&mut sync, 7, id, b"#13abc");
@@ -307,7 +306,7 @@ fn hislip_timeout_closes_both_channels_even_with_an_incomplete_async_header() {
     let home = Home::new("scpi-hislip-deadline");
     let listener = listener();
     let mut config = hislip_config(&listener, json!([{"name":"value","query":"FETC?"}]));
-    config["sources"][0]["timeout_ms"] = json!(250);
+    config["sources"][0]["timeout_ms"] = json!(time::ms(250));
     let server = thread::spawn(move || {
         let (mut sync, mut asynchronous) = initialize(&listener, false, 65_552);
         let mut next = 0xffff_ff00;

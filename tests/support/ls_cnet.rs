@@ -1,5 +1,6 @@
 //! Spec-derived XGB Cnet peers over owned PTYs; no physical PLC claim.
 use super::{Device, Home, assert_unpublished, receive, serial_pair, support::cli::Run};
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{
     fmt::Write as _,
@@ -19,7 +20,7 @@ fn frame(body: &[u8], tail: u8) -> Vec<u8> {
     result.extend(format!("{sum:02X}").bytes());
     result
 }
-fn query(port: &mut impl Read, stop: &AtomicBool, expected: &[u8]) {
+fn query(port: &mut (impl Read + std::os::fd::AsRawFd), stop: &AtomicBool, expected: &[u8]) {
     let mut bytes = vec![0; expected.len()];
     assert!(receive(port, &mut bytes, stop));
     assert_eq!(bytes, expected);
@@ -38,8 +39,8 @@ fn reply(unit: u8, blocks: &[&str]) -> Vec<u8> {
     }
     frame(body.as_bytes(), 3)
 }
-fn no_more(port: &mut impl Read, stop: &AtomicBool) {
-    let end = Instant::now() + Duration::from_secs(10);
+fn no_more(port: &mut (impl Read + std::os::fd::AsRawFd), stop: &AtomicBool) {
+    let end = Instant::now() + time::secs(10);
     while !stop.load(Ordering::Acquire) {
         match port.read(&mut [0]) {
             Ok(0) => return,
@@ -86,7 +87,7 @@ fn run(home: &Home, sources: &[Value], duration: &str) -> Run {
         "--config",
         "sources.json",
         "--for",
-        duration,
+        &super::window(duration),
         "-o",
         "run.jsonl",
     ])
@@ -331,7 +332,7 @@ fn ls_cnet_vendor_request_and_reconstructed_multi_reply_reuse_one_owner() {
             {"name":"words","variables":["%MW020","%PW001"]}
         ]),
     );
-    config["every_ms"] = json!(200);
+    config["every_ms"] = json!(time::ms(200));
     assert_eq!(run(&home, &[config], "550ms").success()["samples"], 6);
     assert_eq!(device.finish(), 6);
     let mut expected = Vec::new();
@@ -420,7 +421,7 @@ fn ls_cnet_malformed_late_block_never_publishes_a_partial_poll() {
             let mut config = source(&path, json!([{"name":"first","variable":"%MW000"},second]));
             config["unit"] = json!(10);
             if prior {
-                config["every_ms"] = json!(200);
+                config["every_ms"] = json!(time::ms(200));
             }
             assert_eq!(run(&home, &[config], "1s").failure(1)["code"], "failed");
             assert_eq!(device.finish(), if prior { 4 } else { 2 });
@@ -467,7 +468,7 @@ fn ls_cnet_request_and_acquisition_cutoffs_keep_original_budget_and_prefix() {
                 master.write_all(b"\x0601rSS").unwrap();
             } else {
                 for part in reply(1, &["0007"]).chunks(5) {
-                    thread::sleep(Duration::from_millis(100));
+                    thread::sleep(time::millis(100));
                     master.write_all(part).unwrap();
                 }
             }
@@ -481,9 +482,9 @@ fn ls_cnet_request_and_acquisition_cutoffs_keep_original_budget_and_prefix() {
         };
         let mut config = source(&path, signals);
         if acquisition {
-            config["every_ms"] = json!(200);
+            config["every_ms"] = json!(time::ms(200));
         } else {
-            config["timeout_ms"] = json!(250);
+            config["timeout_ms"] = json!(time::ms(250));
         }
         assert_eq!(
             run(&home, &[config], if acquisition { "350ms" } else { "1s" }).failure(4)["code"],

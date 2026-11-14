@@ -2,12 +2,12 @@
 //! Known-answer RCS request: Panasonic ACG-M0024-2-1 p. 61.
 
 use super::{Device, Home, accept, assert_unpublished, listener, receive, serial_pair};
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{
     fs,
     io::{Read, Write},
     thread,
-    time::Duration,
 };
 
 const X0: &[u8] = b"%01#RCSX00001D\r";
@@ -18,7 +18,7 @@ const DT1: &[u8] = b"%01#RDD000010000155\r";
 
 fn source(signals: &Value) -> Value {
     json!({"id":"fp","protocol":"mewtocol","every_ms":3_600_000,
-        "timeout_ms":800,"signals":signals})
+        "timeout_ms":time::ms(800),"signals":signals})
 }
 
 fn record(home: &Home, source: &Value) -> super::support::cli::Run {
@@ -34,7 +34,7 @@ fn record(home: &Home, source: &Value) -> super::support::cli::Run {
         "--config",
         "sources.json",
         "--for",
-        "1s",
+        &time::arg(1000),
         "-o",
         "run.jsonl",
     ])
@@ -227,15 +227,15 @@ fn mewtocol_partial_poll_uses_original_deadline() {
         {"name":"second","area":"DT","address":1}
     ]));
     cfg["address"] = json!(address.to_string());
-    cfg["timeout_ms"] = json!(350);
+    cfg["timeout_ms"] = json!(time::ms(350));
     let server = Device::start(move |stop| {
         let mut stream = accept(&listener, &stop).unwrap();
         expect(&mut stream, DT0);
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(time::millis(200));
         send(&mut stream, DT0_REPLY);
         expect(&mut stream, DT1);
         stream.write_all(b"%01$RD02").unwrap();
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(time::millis(200));
         drop(stream.write_all(b"0014\r"));
         2
     });

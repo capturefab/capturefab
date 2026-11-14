@@ -13,6 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 use support::cli::Home;
+use support::time;
 
 const CLIENT: u8 = 239;
 const SERVER: u8 = 42;
@@ -34,18 +35,14 @@ fn listener() -> TcpListener {
 }
 fn accept(listener: &TcpListener) -> TcpStream {
     listener.set_nonblocking(true).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + time::secs(5);
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
                 stream.set_nonblocking(false).unwrap();
                 stream.set_nodelay(true).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
+                stream.set_read_timeout(Some(time::secs(3))).unwrap();
+                stream.set_write_timeout(Some(time::secs(3))).unwrap();
                 return stream;
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -143,12 +140,12 @@ fn reply(stream: &mut TcpStream, request: &[u8], bytes: &[u8]) {
 fn config(listener: &TcpListener, signals: &Value) -> Value {
     json!({"version":1,"sources":[
         {"id":"plc","protocol":"fins_tcp","address":listener.local_addr().unwrap().to_string(),
-         "every_ms":3_600_000,"timeout_ms":1000,"signals":signals},
+         "every_ms":3_600_000,"timeout_ms":time::ms(1000),"signals":signals},
         {"id":"sensor","protocol":"simulator","signal":"tick","every_ms":10}
     ]})
 }
 fn record(home: &Home, config: &Value) -> support::cli::Run {
-    record_for(home, config, "500ms")
+    record_for(home, config, &time::arg(500))
 }
 fn record_for(home: &Home, config: &Value, duration: &str) -> support::cli::Run {
     fs::write(home.path("sources.json"), config.to_string()).unwrap();
@@ -835,7 +832,7 @@ fn trickling_handshake_and_multiple_reads_share_one_total_poll_deadline() {
             &listener,
             &json!([{"name":"first","address":0},{"name":"second","address":1}]),
         );
-        config["sources"][0]["timeout_ms"] = json!(160);
+        config["sources"][0]["timeout_ms"] = json!(time::ms(160));
         let server = thread::spawn(move || {
             let mut stream = accept(&listener);
             assert_eq!(receive(&mut stream).len(), 12);
@@ -845,26 +842,26 @@ fn trickling_handshake_and_multiple_reads_share_one_total_poll_deadline() {
                     if stream.write_all(&[byte]).is_err() {
                         return;
                     }
-                    thread::sleep(Duration::from_millis(8));
+                    thread::sleep(time::millis(8));
                 }
             } else {
-                thread::sleep(Duration::from_millis(60));
+                thread::sleep(time::millis(60));
                 send(&mut stream, &negotiated).unwrap();
             }
             let first = read_request(&mut stream, LOCAL, 1, 0x82, 0, 0, 1);
             if !trickle {
-                thread::sleep(Duration::from_millis(60));
+                thread::sleep(time::millis(60));
             }
             reply(&mut stream, &first, &[0, 1]);
             let second = read_request(&mut stream, LOCAL, 2, 0x82, 1, 0, 1);
             if !trickle {
-                thread::sleep(Duration::from_millis(80));
+                thread::sleep(time::millis(80));
             }
             let _ = send(&mut stream, &response(&second, &[0, 2]));
         });
         let start = Instant::now();
         assert_eq!(record(&home, &config).failure(4)["code"], "timeout");
-        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(start.elapsed() < time::secs(2));
         server.join().unwrap();
         assert!(!rows(&home).iter().any(|row| row["source"] == "plc"));
     }
@@ -934,9 +931,7 @@ fn invalid_configuration_is_rejected_before_output_or_network_access() {
 
 fn udp_socket() -> UdpSocket {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-    socket
-        .set_read_timeout(Some(Duration::from_secs(3)))
-        .unwrap();
+    socket.set_read_timeout(Some(time::secs(3))).unwrap();
     socket
 }
 
@@ -1108,17 +1103,17 @@ fn udp_reads_and_late_service_ids_share_one_total_deadline() {
             {"name":"first","address":0}, {"name":"last","address":1}
         ]),
     );
-    config["sources"][0]["timeout_ms"] = json!(240);
+    config["sources"][0]["timeout_ms"] = json!(time::ms(240));
     let server = thread::spawn(move || {
         let first = request_frame(LOCAL, 0, 0x82, 0, 0, 1);
         let client = udp_request(&socket, &first);
-        thread::sleep(Duration::from_millis(80));
+        thread::sleep(time::millis(80));
         udp_reply(&socket, client, &first, &[0, 7]);
         let last = request_frame(LOCAL, 1, 0x82, 1, 0, 1);
         assert_eq!(udp_request(&socket, &last), client);
-        thread::sleep(Duration::from_millis(70));
+        thread::sleep(time::millis(70));
         udp_reply(&socket, client, &first, &[0, 7]);
-        thread::sleep(Duration::from_millis(130));
+        thread::sleep(time::millis(130));
         let _ = socket.send_to(&response_frame(&last, &[0, 9]), client);
     });
     assert_eq!(record(&home, &config).failure(4)["code"], "timeout");

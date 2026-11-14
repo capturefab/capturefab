@@ -3910,9 +3910,9 @@ impl WriterQueue {
 /// Hands a frame's own bytes to the encoder's pipe without copying them.
 #[cfg(target_os = "linux")]
 use pipes::Splicer;
-/// Elsewhere every frame is written into the pipe.
+/// Elsewhere every frame is written into the pipe: there is never a splicer.
 #[cfg(not(target_os = "linux"))]
-enum Splicer {}
+type Splicer = std::convert::Infallible;
 /// When a writer sends the last frame again on a slot without a new one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Repeat {
@@ -10086,7 +10086,7 @@ esac"#
                     .spawn()
                     .unwrap();
                 let mut stdin = child.stdin.take().unwrap();
-                let input = bytes.clone();
+                let input = bytes;
                 let feeder = thread::spawn(move || stdin.write_all(&input));
                 let output = child.wait_with_output().unwrap();
                 let _ = feeder.join().unwrap();

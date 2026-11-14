@@ -2,6 +2,7 @@
 //! The production unit fixtures retain the unchanged official sSN and bad manual
 //! sRA bytes separately; neither is relabeled as a valid captured poll reply.
 use super::{Device, Home, accept, listener, receive, support::cli::Run};
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{fs, io::Write as _, thread, time::Duration};
 
@@ -21,7 +22,7 @@ fn record(home: &Home, address: std::net::SocketAddr, profile: &str, every_ms: u
         home.path("sources.json"),
         json!({"version":1,"sources":[
             {"id":"lidar","protocol":"sick_cola","address":address,"profile":profile,
-             "signal":"scan","every_ms":every_ms,"timeout_ms":1000},
+             "signal":"scan","every_ms":every_ms,"timeout_ms":time::ms(1000)},
             {"id":"counter","protocol":"simulator","signal":"count","every_ms":3_600_000}
         ]})
         .to_string(),
@@ -34,7 +35,7 @@ fn record(home: &Home, address: std::net::SocketAddr, profile: &str, every_ms: u
         "--config",
         "sources.json",
         "--for",
-        "650ms",
+        &time::arg(650),
         "-o",
         "run.jsonl",
     ])
@@ -208,7 +209,7 @@ fn binary_in_flight_cutoff_after_success_retains_only_complete_scan() {
         assert!(!receive(&mut socket, &mut [0], &stop));
         2_u64
     });
-    let error = record(&home, address, "cola_b_lms1xx", 100).failure(4);
+    let error = record(&home, address, "cola_b_lms1xx", time::ms(100)).failure(4);
     assert_eq!(error["code"], "timeout");
     assert_eq!(scanner.finish(), 2);
     let saved = rows(&home, "run.jsonl");

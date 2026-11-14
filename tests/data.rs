@@ -4,15 +4,15 @@ use serde_json::{Value, json};
 #[cfg(unix)]
 use std::time::Instant;
 use std::{fs, time::Duration};
-use support::cli::Home;
+use support::{cli::Home, time};
 
 fn config(home: &Home) {
     fs::write(
         home.path("sources.json"),
         serde_json::to_vec(&json!({
             "version": 1, "sources": [
-                {"id":"press", "protocol":"simulator", "signal":"cycle", "every_ms":5},
-                {"id":"oven", "protocol":"simulator", "signal":"temperature", "every_ms":7}
+                {"id":"press", "protocol":"simulator", "signal":"cycle", "every_ms":time::ms(5)},
+                {"id":"oven", "protocol":"simulator", "signal":"temperature", "every_ms":time::ms(7)}
             ]
         }))
         .unwrap(),
@@ -34,7 +34,7 @@ fn record(home: &Home) -> Value {
         "--config",
         "sources.json",
         "--for",
-        "80ms",
+        &time::arg(80),
         "-o",
         "run.jsonl",
     ])
@@ -422,7 +422,7 @@ fn interrupt_finishes_recording_and_reports_saved_samples() {
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let ready_by = Instant::now() + Duration::from_secs(5);
+    let ready_by = Instant::now() + time::secs(5);
     loop {
         assert!(child.try_wait().unwrap().is_none());
         if fs::metadata(home.path("run.jsonl")).is_ok_and(|meta| meta.len() > 1000) {
@@ -584,9 +584,9 @@ fn camera_files_and_sensor_values_share_the_frame_receive_timeline() {
     fs::write(
         home.path("sources.json"),
         json!({"version":1,"sources":[
-            {"id":"press","protocol":"simulator","signal":"cycle","every_ms":10},
+            {"id":"press","protocol":"simulator","signal":"cycle","every_ms":time::ms(10)},
             {"id":"inspection","protocol":"camera","camera":"sim:0","output":output,
-             "every_ms":100,"timeout_ms":1000,"settings":["Width=64","Height=64"]}
+             "every_ms":time::ms(100),"timeout_ms":time::ms(1000),"settings":["Width=64","Height=64"]}
         ]})
         .to_string(),
     )
@@ -597,7 +597,7 @@ fn camera_files_and_sensor_values_share_the_frame_receive_timeline() {
         "--config",
         "sources.json",
         "--for",
-        "650ms",
+        &time::arg(650),
         "-o",
         "run.jsonl",
     ]);

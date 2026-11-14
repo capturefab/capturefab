@@ -69,6 +69,8 @@ pub(crate) mod storage;
 mod test_cameras;
 #[cfg(test)]
 mod test_io;
+#[cfg(test)]
+mod test_time;
 pub(crate) mod timeseries;
 pub(crate) mod transport;
 pub(crate) mod types;

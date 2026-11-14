@@ -10,24 +10,21 @@ use std::{
     time::{Duration, Instant},
 };
 use support::cli::Home;
+use support::time;
 
 fn listener() -> TcpListener {
     TcpListener::bind("127.0.0.1:0").unwrap()
 }
 fn accept(listener: &TcpListener) -> TcpStream {
     listener.set_nonblocking(true).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + time::secs(5);
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
                 stream.set_nonblocking(false).unwrap();
                 stream.set_nodelay(true).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
+                stream.set_read_timeout(Some(time::secs(3))).unwrap();
+                stream.set_write_timeout(Some(time::secs(3))).unwrap();
                 return stream;
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -129,12 +126,12 @@ fn reply(stream: &mut TcpStream, reference: &[u8], bytes: &[u8], segmented: bool
 fn config(listener: &TcpListener, signals: &Value) -> Value {
     json!({"version":1,"sources":[
         {"id":"plc","protocol":"s7","address":listener.local_addr().unwrap().to_string(),
-         "every_ms":3_600_000,"timeout_ms":1000,"signals":signals},
+         "every_ms":3_600_000,"timeout_ms":time::ms(1000),"signals":signals},
         {"id":"sensor","protocol":"simulator","signal":"tick","every_ms":10}
     ]})
 }
 fn record(home: &Home, config: &Value) -> support::cli::Run {
-    record_for(home, config, "500ms")
+    record_for(home, config, &time::arg(500))
 }
 fn record_for(home: &Home, config: &Value, duration: &str) -> support::cli::Run {
     fs::write(home.path("sources.json"), config.to_string()).unwrap();
@@ -725,12 +722,12 @@ fn text_continuations_and_final_header_checks_share_the_original_deadline() {
                 {"name":"text","db":1,"address":100,"data_type":"wstring","capacity":300}
             ]),
         );
-        config["sources"][0]["timeout_ms"] = json!(250);
+        config["sources"][0]["timeout_ms"] = json!(time::ms(250));
         let server = thread::spawn(move || {
             let mut stream = accept(&listener);
             handshake(&mut stream, 0x0100, 0x0102);
             let reference = read_request(&mut stream, 0x84, 1, 0, 2);
-            thread::sleep(Duration::from_millis(50));
+            thread::sleep(time::millis(50));
             reply(&mut stream, &reference, &[0, 7], false);
             let slot = text_slot(true, 300, &[0, b'A'].repeat(300));
             for (index, bytes) in slot.chunks(222).enumerate() {
@@ -742,22 +739,22 @@ fn text_continuations_and_final_header_checks_share_the_original_deadline() {
                     u16::try_from(bytes.len()).unwrap(),
                 );
                 if index == 0 {
-                    thread::sleep(Duration::from_millis(50));
+                    thread::sleep(time::millis(50));
                 }
                 if index == 1 && !header_delay {
-                    thread::sleep(Duration::from_millis(200));
+                    thread::sleep(time::millis(200));
                     expect_closed(&mut stream);
                     return;
                 }
                 reply(&mut stream, &reference, bytes, false);
             }
             let _ = read_request(&mut stream, 0x84, 1, 100, 4);
-            thread::sleep(Duration::from_millis(200));
+            thread::sleep(time::millis(200));
             expect_closed(&mut stream);
         });
         let start = Instant::now();
         assert_eq!(record(&home, &config).failure(4)["code"], "timeout");
-        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(start.elapsed() < time::secs(2));
         server.join().unwrap();
         assert!(!rows(&home).iter().any(|row| row["source"] == "plc"));
     }
@@ -870,7 +867,7 @@ fn trickling_handshake_cannot_extend_the_total_poll_deadline() {
     let home = Home::new("s7-timeout");
     let listener = listener();
     let mut config = config(&listener, &json!([{"name":"value","db":1,"address":0}]));
-    config["sources"][0]["timeout_ms"] = json!(80);
+    config["sources"][0]["timeout_ms"] = json!(time::ms(80));
     let server = thread::spawn(move || {
         let mut stream = accept(&listener);
         let _ = receive(&mut stream);
@@ -878,13 +875,13 @@ fn trickling_handshake_cannot_extend_the_total_poll_deadline() {
             if stream.write_all(&[byte]).is_err() {
                 break;
             }
-            thread::sleep(Duration::from_millis(30));
+            thread::sleep(time::millis(30));
         }
     });
     let start = Instant::now();
     let error = record(&home, &config).failure(4);
     assert_eq!(error["code"], "timeout");
-    assert!(start.elapsed() < Duration::from_secs(2));
+    assert!(start.elapsed() < time::secs(2));
     server.join().unwrap();
     assert_eq!(rows(&home).last().unwrap()["status"], "failed");
 }

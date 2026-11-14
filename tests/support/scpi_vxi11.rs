@@ -1,12 +1,11 @@
 //! Independent RPC/XDR fixtures from VXI-11 Appendix C and RFC5531 §11.
-use super::{Home, accept, config, decoded, hash, listener, record, samples};
+use super::{Home, accept, config, decoded, hash, listener, record, samples, time};
 use serde_json::{Value, json};
 use std::{
     fs,
     io::{Read as _, Write as _},
     net::TcpStream,
     thread,
-    time::Duration,
 };
 
 const CORE: u32 = 0x0006_07af;
@@ -129,7 +128,7 @@ fn vxi11_end_boundaries_preserve_exact_values_binary_artifacts_and_exports() {
         // A terminated payload still needs the subsequent END confirmation.
         let (xid, requested, _) = read_request(&mut stream);
         assert_eq!(requested, 1);
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(time::millis(10));
         read_response(&mut stream, xid, 4, b"");
         write_query(&mut stream, b"CURVE?");
         let (xid, requested, _) = read_request(&mut stream);
@@ -226,19 +225,19 @@ fn vxi11_link_write_and_all_read_chunks_share_one_timeout() {
         &listener,
         json!([{"name":"value","query":"FETC?","response_terminator":"none"}]),
     );
-    config["sources"][0]["timeout_ms"] = json!(400);
+    config["sources"][0]["timeout_ms"] = json!(time::ms(400));
     let server = thread::spawn(move || {
         let mut stream = accept(&listener);
-        thread::sleep(Duration::from_millis(35));
+        thread::sleep(time::millis(35));
         open_link(&mut stream);
-        thread::sleep(Duration::from_millis(35));
+        thread::sleep(time::millis(35));
         let write_timeout = write_query(&mut stream, b"FETC?\n");
         let (xid, _, first_timeout) = read_request(&mut stream);
-        assert!(first_timeout + 20 < write_timeout);
-        thread::sleep(Duration::from_millis(35));
+        assert!(u64::from(first_timeout) + time::ms(20) < u64::from(write_timeout));
+        thread::sleep(time::millis(35));
         read_response(&mut stream, xid, 0, b"12");
         let (_, _, second_timeout) = read_request(&mut stream);
-        assert!(second_timeout + 20 < first_timeout);
+        assert!(u64::from(second_timeout) + time::ms(20) < u64::from(first_timeout));
         // No response: the core read must expire within the original poll budget.
         assert_eq!(stream.read(&mut [0]).unwrap(), 0);
     });

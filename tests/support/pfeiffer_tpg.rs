@@ -1,6 +1,7 @@
 //! Vendor no-sensor literal and spec-derived read-only TPG mnemonic exchanges.
 //! The peer is a bounded transcript fixture, not a stock/physical controller.
 use super::{Device, Home, accept, assert_unpublished, listener, receive, serial_pair};
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -8,10 +9,10 @@ use std::{
     net::TcpStream,
     sync::atomic::AtomicBool,
     thread,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
-fn expect(port: &mut impl Read, bytes: &[u8], stop: &AtomicBool) {
+fn expect(port: &mut (impl Read + std::os::fd::AsRawFd), bytes: &[u8], stop: &AtomicBool) {
     let mut actual = vec![0; bytes.len()];
     assert!(receive(port, &mut actual, stop));
     assert_eq!(actual, bytes);
@@ -19,7 +20,7 @@ fn expect(port: &mut impl Read, bytes: &[u8], stop: &AtomicBool) {
 fn no_more_tcp(port: &mut TcpStream) {
     // Accepted peers already have a short read timeout. Require closure and
     // reject every extra byte even if Device::finish has set its stop flag.
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + time::secs(1);
     let mut byte = [0];
     loop {
         assert!(
@@ -48,7 +49,7 @@ fn no_more_tcp(port: &mut TcpStream) {
     }
 }
 fn transaction(
-    port: &mut (impl Read + std::io::Write),
+    port: &mut (impl Read + std::io::Write + std::os::fd::AsRawFd),
     command: &[u8],
     reply: &[u8],
     stop: &AtomicBool,
@@ -81,7 +82,7 @@ fn record_for(home: &Home, mut source: Value, duration: &str) -> super::support:
         "--config",
         "sources.json",
         "--for",
-        duration,
+        &super::window(duration),
         "-o",
         "run.jsonl",
     ])
@@ -305,7 +306,10 @@ fn tpg_protocol_failures_publish_no_completed_sibling_and_do_not_send_recovery_c
     }
 }
 
-fn delayed_pressure_reply(port: &mut (impl Read + std::io::Write), stop: &AtomicBool) -> u64 {
+fn delayed_pressure_reply(
+    port: &mut (impl Read + std::io::Write + std::os::fd::AsRawFd),
+    stop: &AtomicBool,
+) -> u64 {
     transaction(
         port,
         b"AYT\r",
@@ -314,12 +318,12 @@ fn delayed_pressure_reply(port: &mut (impl Read + std::io::Write), stop: &Atomic
     );
     transaction(port, b"UNI\r", b"4", stop);
     expect(port, b"PR1\r", stop);
-    thread::sleep(Duration::from_millis(160));
+    thread::sleep(time::millis(160));
     let _ = port.write_all(b"\x06\r\n");
     let mut enquiry = [0];
     if receive(port, &mut enquiry, stop) {
         assert_eq!(enquiry, [0x05]);
-        thread::sleep(Duration::from_millis(160));
+        thread::sleep(time::millis(160));
         let _ = port.write_all(b"0,1.0000E+00\r\n");
     }
     assert!(!receive(port, &mut [0], stop));
@@ -353,7 +357,7 @@ fn tpg_ack_and_body_share_one_poll_deadline() {
             });
             (device, source(&json!(address), "tpg361", 1))
         };
-        configured["timeout_ms"] = json!(if acquisition_cutoff { 1000 } else { 250 });
+        configured["timeout_ms"] = json!(time::ms(if acquisition_cutoff { 1000 } else { 250 }));
         let duration = if acquisition_cutoff { "100ms" } else { "700ms" };
         let run = record_for(&home, configured, duration);
         assert_eq!(run.failure(4)["code"], "timeout");

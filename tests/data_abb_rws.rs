@@ -17,7 +17,10 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use support::cli::{Home, Run};
+use support::{
+    cli::{Home, Run},
+    time,
+};
 
 const USER_ENV: &str = "CAPTUREFAB_ABB_FIXTURE_USER";
 const PASS_ENV: &str = "CAPTUREFAB_ABB_FIXTURE_PASS";
@@ -201,10 +204,10 @@ fn respond(stream: &mut dyn Duplex, response: &Response) -> io::Result<()> {
     stream.write_all(header.as_bytes())?;
     if response.slow {
         let middle = response.body.len() / 2;
-        thread::sleep(Duration::from_millis(75));
+        thread::sleep(time::millis(75));
         stream.write_all(&response.body.as_bytes()[..middle])?;
         stream.flush()?;
-        thread::sleep(Duration::from_millis(75));
+        thread::sleep(time::millis(75));
         stream.write_all(&response.body.as_bytes()[middle..])?;
     } else {
         stream.write_all(response.body.as_bytes())?;
@@ -219,7 +222,7 @@ struct Server {
 }
 fn accepted(listener: &TcpListener, stop: &AtomicBool) -> Option<TcpStream> {
     listener.set_nonblocking(true).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + time::secs(5);
     loop {
         if stop.load(Ordering::SeqCst) {
             return None;
@@ -228,12 +231,8 @@ fn accepted(listener: &TcpListener, stop: &AtomicBool) -> Option<TcpStream> {
             Ok((stream, _)) => {
                 stream.set_nonblocking(false).unwrap();
                 stream.set_nodelay(true).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
+                stream.set_read_timeout(Some(time::secs(3))).unwrap();
+                stream.set_write_timeout(Some(time::secs(3))).unwrap();
                 return Some(stream);
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -289,7 +288,7 @@ impl Server {
         }
     }
     fn source(&self, api: &str, reads: Value) -> Value {
-        let mut source = json!({"id":"robot","protocol":"abb_rws","api":api,"address":self.listener.local_addr().unwrap().to_string(),"host":"controller.example","username_env":USER_ENV,"password_env":PASS_ENV,"every_ms":3_600_000,"timeout_ms":3000});
+        let mut source = json!({"id":"robot","protocol":"abb_rws","api":api,"address":self.listener.local_addr().unwrap().to_string(),"host":"controller.example","username_env":USER_ENV,"password_env":PASS_ENV,"every_ms":3_600_000,"timeout_ms":time::ms(3000)});
         source["reads"] = reads;
         source
     }
@@ -771,8 +770,8 @@ fn rws1_digest_nonce_cookies_full_values_and_exports_survive_two_polls() {
     });
     let home = Home::new("abb-rws1-complete");
     let mut source = server.source("rws1", reads(&first));
-    source["every_ms"] = json!(1000);
-    let result=record(&home,&json!([source,{"id":"cycle","protocol":"simulator","signal":"cycle","every_ms":3_600_000}]),"1900ms").success();
+    source["every_ms"] = json!(time::ms(1000));
+    let result=record(&home,&json!([source,{"id":"cycle","protocol":"simulator","signal":"cycle","every_ms":3_600_000}]),&time::arg(1900)).success();
     let times = server.finish();
     paced(&times);
     assert_eq!(result["samples"], 15);
@@ -834,8 +833,8 @@ fn malformed_late_siblings_and_http_statuses_keep_only_the_prior_complete_poll()
         let home = Home::new("abb-rws-prefix");
         let all = specs("rws1", false);
         let mut source = server.source("rws1", reads(&all[..2]));
-        source["every_ms"] = json!(300);
-        let run = record(&home, &json!([source]), "1s");
+        source["every_ms"] = json!(time::ms(300));
+        let run = record(&home, &json!([source]), &time::arg(1000));
         let error = run.failure(exit);
         server.finish();
         assert_eq!(error["code"], code);
@@ -874,7 +873,7 @@ fn authentication_and_valid_body_progress_share_the_original_poll_deadline() {
         if index == 0 {
             assert!(!request.fields.contains_key("authorization"));
             let mut response = Response::challenge();
-            response.delay = Duration::from_millis(100);
+            response.delay = time::millis(100);
             response
         } else {
             verify_digest(&request, u32::try_from(index).unwrap());
@@ -890,8 +889,8 @@ fn authentication_and_valid_body_progress_share_the_original_poll_deadline() {
     let home = Home::new("abb-rws-deadline");
     let all = specs("rws1", false);
     let mut source = server.source("rws1", reads(&all[..2]));
-    source["timeout_ms"] = json!(250);
-    let error = record(&home, &json!([source]), "1s").failure(4);
+    source["timeout_ms"] = json!(time::ms(250));
+    let error = record(&home, &json!([source]), &time::arg(1000)).failure(4);
     server.finish();
     assert_eq!(error["code"], "timeout");
     assert_eq!(recorded(&home, "failed").len(), 0);
@@ -912,7 +911,7 @@ fn pacing_survives_poll_boundaries_and_failure_never_retries() {
     let all = specs("rws1", false);
     let mut source = server.source("rws1", reads(&all[..1]));
     source["every_ms"] = json!(1);
-    let error = record(&home, &json!([source]), "1s").failure(3);
+    let error = record(&home, &json!([source]), &time::arg(1000)).failure(3);
     let times = server.finish();
     paced(&times);
     assert_eq!(error["code"], "unavailable");
@@ -948,7 +947,7 @@ fn repeated_auth_refusal_is_typed_and_never_downgrades_or_loops() {
     let home = Home::new("abb-rws-auth-rejected");
     let all = specs("rws1", false);
     let source = server.source("rws1", reads(&all[..1]));
-    let run = record(&home, &json!([source]), "1s");
+    let run = record(&home, &json!([source]), &time::arg(1000));
     let error = run.failure(3);
     server.finish();
     assert_eq!(error["code"], "auth_rejected");
@@ -984,7 +983,7 @@ fn invalid_configuration_is_usage_before_output_or_network() {
             source[key].clone_from(value);
         }
         assert_eq!(
-            record(&home, &json!([source]), "1s").failure(2)["code"],
+            record(&home, &json!([source]), &time::arg(1000)).failure(2)["code"],
             "usage"
         );
         assert!(!home.path("run.jsonl").exists());
@@ -999,7 +998,7 @@ fn rws2_without_tls_build_is_unsupported_before_output_or_connect() {
     let home = Home::new("abb-rws-no-tls");
     let source = json!({"id":"robot","protocol":"abb_rws","api":"rws2","address":listener.local_addr().unwrap().to_string(),"username_env":USER_ENV,"password_env":PASS_ENV,"tls":{"server_name":"rws.test"},"reads":[{"signal":"state","resource":"controller_state"}]});
     assert_eq!(
-        record(&home, &json!([source]), "1s").failure(5)["code"],
+        record(&home, &json!([source]), &time::arg(1000)).failure(5)["code"],
         "unsupported"
     );
     assert!(!home.path("run.jsonl").exists());
@@ -1082,7 +1081,7 @@ mod tls {
         );
         let mut source = server.source("rws2", reads(&expected));
         source["tls"] = tls;
-        let result = record(&home, &json!([source]), "1300ms").success();
+        let result = record(&home, &json!([source]), &time::arg(1300)).success();
         let times = server.finish();
         paced(&times);
         assert_eq!(result["samples"], 7);
@@ -1116,7 +1115,7 @@ mod tls {
                 stream.read_exact(&mut [0]).unwrap_err();
             });
             let source = json!({"id":"robot","protocol":"abb_rws","api":"rws2","address":address,"username_env":USER_ENV,"password_env":PASS_ENV,"tls":tls,"every_ms":3_600_000,"reads":[{"signal":"state","resource":"controller_state"}]});
-            let run = record(&home, &json!([source]), "1s");
+            let run = record(&home, &json!([source]), &time::arg(1000));
             let error = run.failure(3);
             server.join().unwrap();
             assert_eq!(error["code"], "auth_rejected");

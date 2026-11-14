@@ -220,7 +220,7 @@ fn exact_selector_rejects_wrong_index_type_namespace_geometry_and_padding() {
 #[test]
 fn indexed_gentl_bindings_cannot_be_silently_overridden_or_upgraded_to_maps() {
     let mut binding = super::super::gentl_selector::Selector {
-        producer: "/mock.cti".into(),
+        producer: std::env::temp_dir().join("mock.cti"),
         interface: "if0".into(),
         device: "dev0".into(),
         stream: None,

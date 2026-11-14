@@ -1,7 +1,7 @@
 //! Independent A2 whole-element literals; transport wrappers reuse bounded peers.
 use super::{
     accept, cleanup, config, listener, read_request, readings, record, register, response, send,
-    support::cli::Home,
+    support::{cli::Home, time},
 };
 use serde_json::{Value, json};
 use std::{
@@ -9,7 +9,6 @@ use std::{
     io::{Read as _, Write as _},
     net::TcpStream,
     thread,
-    time::Duration,
 };
 
 pub(super) fn timer() -> Value {
@@ -254,15 +253,19 @@ fn structured_siblings_share_original_request_and_acquisition_deadlines() {
                 {"name":"first","address":"T4:0"},{"name":"second","address":"C5:0"},{"name":"never","address":"T4:1"}
             ]),
         );
-        cfg["sources"][0]["timeout_ms"] = if acquisition { 1000.into() } else { 250.into() };
+        cfg["sources"][0]["timeout_ms"] = if acquisition {
+            time::ms(1000).into()
+        } else {
+            time::ms(250).into()
+        };
         let worker = thread::spawn(move || {
             let mut stream = accept(&server);
             register(&mut stream);
             let packet = read_request(&mut stream, None, (4, 0x86, 0, 6));
-            thread::sleep(Duration::from_millis(160));
+            thread::sleep(time::millis(160));
             send(&mut stream, &response(&packet, None, &[0; 6]));
             let packet = read_request(&mut stream, None, (5, 0x87, 0, 6));
-            thread::sleep(Duration::from_millis(160));
+            thread::sleep(time::millis(160));
             // A complete response after the original250ms cutoff is never a sample.
             match stream.write_all(&response(&packet, None, &[0; 6])) {
                 Ok(()) => {}
@@ -278,7 +281,7 @@ fn structured_siblings_share_original_request_and_acquisition_deadlines() {
             // Existing cleanup is allowed; a new A2 request is not.
             retirement(&mut stream);
         });
-        let run = record(&home, &cfg, if acquisition { "250ms" } else { "700ms" });
+        let run = record(&home, &cfg, &time::arg(if acquisition { 250 } else { 700 }));
         assert_eq!(run.failure(4)["code"], "timeout");
         worker.join().unwrap();
         assert_eq!(readings(&home), [] as [Value; 0]);

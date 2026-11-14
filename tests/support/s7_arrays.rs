@@ -424,26 +424,27 @@ fn array_continuations_share_the_original_poll_deadline() {
                 {"name":"later","db":1,"address":1000}
             ]),
         );
-        config["sources"][0]["timeout_ms"] = json!(if acquisition_cutoff { 1000 } else { 250 });
+        config["sources"][0]["timeout_ms"] =
+            json!(time::ms(if acquisition_cutoff { 1000 } else { 250 }));
         let server = thread::spawn(move || {
             let mut stream = accept(&listener);
             handshake(&mut stream, 0x0100, 0x0102);
             let reference = read_request(&mut stream, 0x84, 1, 0, 2);
             reply(&mut stream, &reference, &[0, 7], false);
             let reference = read_request(&mut stream, 0x84, 1, 100, 222);
-            thread::sleep(Duration::from_millis(160));
+            thread::sleep(time::millis(160));
             reply_fast(&mut stream, &reference, &[0; 222]);
             drop(read_request(&mut stream, 0x84, 1, 322, 222));
-            thread::sleep(Duration::from_millis(160));
+            thread::sleep(time::millis(160));
             expect_closed(&mut stream);
         });
         let start = Instant::now();
-        let duration = if acquisition_cutoff { "250ms" } else { "500ms" };
+        let duration = &time::arg(if acquisition_cutoff { 250 } else { 500 });
         assert_eq!(
             record_for(&home, &config, duration).failure(4)["code"],
             "timeout"
         );
-        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(start.elapsed() < time::secs(2));
         server.join().unwrap();
         assert!(!rows(&home).iter().any(|row| row["source"] == "plc"));
     }

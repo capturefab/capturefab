@@ -4,6 +4,7 @@ use super::{
     Home, Packet, SESSION, accept, config, listener, path, query, read_request, record, register,
     reply, rows, send, unregister,
 };
+use crate::support::time;
 use base64::Engine as _;
 use serde_json::{Value, json};
 use std::{
@@ -11,7 +12,7 @@ use std::{
     io::{Read as _, Write as _},
     net::TcpStream,
     thread,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 fn member(root: &[u8], name: &[u8], index: Option<u8>) -> Vec<u8> {
@@ -378,7 +379,7 @@ fn length_reread_and_data_continuations_share_the_original_poll_deadline() {
             json!([{"name":"text","tag":"Text","data_type":"logix_string","capacity":5}]),
             None,
         );
-        cfg["sources"][0]["timeout_ms"] = json!(250);
+        cfg["sources"][0]["timeout_ms"] = json!(time::ms(250));
         let server = thread::spawn(move || {
             let mut stream = accept(&listener);
             register(&mut stream);
@@ -388,7 +389,7 @@ fn length_reread_and_data_continuations_share_the_original_poll_deadline() {
                 None,
                 &read_request(&member(&root, b"LEN", None), 1, None),
             );
-            thread::sleep(Duration::from_millis(60));
+            thread::sleep(time::millis(60));
             send(
                 &mut stream,
                 &request,
@@ -400,18 +401,14 @@ fn length_reread_and_data_continuations_share_the_original_poll_deadline() {
                 None,
                 &read_request(&member(&root, b"DATA", Some(0)), 5, None),
             );
-            thread::sleep(Duration::from_millis(60));
+            thread::sleep(time::millis(60));
             send(&mut stream, &request, &reply(0xcc, 6, 0xc2, b"ab")).unwrap();
             let request = query(
                 &mut stream,
                 None,
                 &read_request(&member(&root, b"DATA", Some(0)), 5, Some(2)),
             );
-            thread::sleep(Duration::from_millis(if phase == "data" {
-                160
-            } else {
-                60
-            }));
+            thread::sleep(time::millis(if phase == "data" { 160 } else { 60 }));
             if phase == "reread" {
                 send(&mut stream, &request, &reply(0xd2, 0, 0xc2, b"cZZ")).unwrap();
                 query(
@@ -419,7 +416,7 @@ fn length_reread_and_data_continuations_share_the_original_poll_deadline() {
                     None,
                     &read_request(&member(&root, b"LEN", None), 1, None),
                 );
-                thread::sleep(Duration::from_millis(100));
+                thread::sleep(time::millis(100));
                 // Deliberately leave this response unanswered. A fresh
                 // request budget would wait longer; the original one expires.
             }
@@ -429,7 +426,7 @@ fn length_reread_and_data_continuations_share_the_original_poll_deadline() {
         });
         let began = Instant::now();
         assert_eq!(record(&home, &cfg).failure(4)["code"], "timeout");
-        assert!(began.elapsed() < Duration::from_secs(2));
+        assert!(began.elapsed() < time::secs(2));
         server.join().unwrap();
         failed(&home);
     }

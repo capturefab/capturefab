@@ -2012,7 +2012,7 @@ fn counters_require_one_closed_typed_channel_and_explicit_terminal_requests() {
         let mut missing_timing = good.clone();
         missing_timing.as_object_mut().unwrap().remove("timing");
         serde_json::from_value::<Config>(missing_timing).unwrap_err();
-        let mut continuous = c.clone();
+        let mut continuous = c;
         continuous.timing = Timing::Continuous {
             rate_hz: 1.0,
             max_samples_per_channel: 1,

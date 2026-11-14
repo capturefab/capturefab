@@ -623,7 +623,7 @@ mod tests {
                     "{format:x} at {quality}"
                 );
             }
-            let mut short = frame.clone();
+            let mut short = frame;
             short.data.make_mut().pop();
             assert!(encode(&short, QUALITY).is_err(), "{format:x}");
         }

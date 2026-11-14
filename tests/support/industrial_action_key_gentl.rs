@@ -1,5 +1,6 @@
 //! Actual helper/`GenApi`/source/Saver integration; no physical Action/readiness claim.
 use super::{Home, Run, producer, selector};
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -63,7 +64,7 @@ fn config(home: &Home, sources: &[Value]) {
 fn still(id: &str, camera: &str, extension: &str, key: Option<u32>, every_ms: u64) -> Value {
     let mut source = json!({"id":id,"protocol":"camera","camera":camera,
         "output":format!("{id}-{{seq}}.{extension}"),"warmup_ms":0,
-        "timeout_ms":1500,"every_ms":every_ms});
+        "timeout_ms":time::ms(1500),"every_ms":every_ms});
     if let Some(key) = key {
         source["action_device_key"] = json!(key);
         // Existing local RW node: exercises the real pinned SetValues path,
@@ -114,7 +115,7 @@ impl Recording {
             stdout,
             stderr,
             args: args.iter().map(|arg| (*arg).to_owned()).collect(),
-            deadline: Instant::now() + Duration::from_secs(20),
+            deadline: Instant::now() + time::secs(20),
         }
     }
     fn finish(mut self) -> Run {
@@ -231,7 +232,7 @@ fn industrial_shared_stills_write_real_wo_key_before_real_helper_images_and_expo
             still("png", &camera, "png", None, 3_600_000),
         ],
     );
-    let result = Recording::start(&home, &producer, "2s", None)
+    let result = Recording::start(&home, &producer, &time::arg(2000), None)
         .finish()
         .success();
     assert_eq!(result["samples"], 2);
@@ -271,13 +272,13 @@ fn industrial_helper_epoch_loss_after_saved_pixels_never_reopens_or_reapplies_ke
     config(
         &home,
         &[
-            still("a", &camera, "raw", Some(KEY), 100),
-            still("b", &camera, "raw", None, 100),
+            still("a", &camera, "raw", Some(KEY), time::ms(100)),
+            still("b", &camera, "raw", None, time::ms(100)),
         ],
     );
     let marker = home.path("lose-owned-helper");
-    let mut recording = Recording::start(&home, &producer, "5s", Some(&marker));
-    let until = Instant::now() + Duration::from_secs(4);
+    let mut recording = Recording::start(&home, &producer, &time::arg(5000), Some(&marker));
+    let until = Instant::now() + time::secs(4);
     loop {
         let published = fs::read_to_string(home.path("run.jsonl")).unwrap_or_default();
         if published
@@ -334,11 +335,11 @@ fn industrial_video_and_still_share_one_real_key_owner_and_exact_ffv1_pixels() {
         &home,
         &[
             json!({"id":"video","protocol":"video","camera":camera,"output":"clip.mkv",
-            "codec":"ffv1","fps":5,"warmup_ms":0,"timeout_ms":1500,"action_device_key":KEY,"settings":["Width=3"]}),
-            still("still", &camera, "raw", None, 200),
+            "codec":"ffv1","fps":5,"warmup_ms":0,"timeout_ms":time::ms(1500),"action_device_key":KEY,"settings":["Width=3"]}),
+            still("still", &camera, "raw", None, time::ms(200)),
         ],
     );
-    let result = Recording::start(&home, &producer, "2s", None)
+    let result = Recording::start(&home, &producer, &time::arg(2000), None)
         .finish()
         .success();
     let samples = rows(&home.path("run.jsonl"));
@@ -396,7 +397,7 @@ fn industrial_video_and_still_share_one_real_key_owner_and_exact_ffv1_pixels() {
             .spawn()
             .unwrap(),
     };
-    let status = wait(&mut decoder, Instant::now() + Duration::from_secs(10));
+    let status = wait(&mut decoder, Instant::now() + time::secs(10));
     assert!(
         status.success(),
         "{}",

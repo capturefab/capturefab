@@ -757,7 +757,7 @@ pub(crate) mod tests {
             assert!(allocated >= 1 << 20);
             assert_eq!(frame.allocated_bytes(), allocated);
             assert_eq!(frame.as_ptr(), address);
-            let shared = frame.clone();
+            let shared = frame;
             assert_eq!(shared.allocated_bytes(), allocated);
             assert_eq!(shared.as_ptr(), address);
             assert_eq!(shared, [1, 2, 3]);

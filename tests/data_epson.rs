@@ -15,6 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 use support::cli::{Home, Run};
+use support::time;
 const PASSWORD_ENV: &str = "CAPTUREFAB_EPSON_FIXTURE_PASSWORD";
 const PASSWORD: &str = "fixture-pass-73";
 fn unhex(raw: &str) -> Vec<u8> {
@@ -124,7 +125,7 @@ struct Server {
 }
 fn accepted(listener: &TcpListener, stop: &AtomicBool) -> Option<TcpStream> {
     listener.set_nonblocking(true).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + time::secs(5);
     loop {
         if stop.load(Ordering::SeqCst) {
             return None;
@@ -133,8 +134,8 @@ fn accepted(listener: &TcpListener, stop: &AtomicBool) -> Option<TcpStream> {
             Ok((s, _)) => {
                 s.set_nonblocking(false).unwrap();
                 s.set_nodelay(true).unwrap();
-                s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-                s.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+                s.set_read_timeout(Some(time::secs(3))).unwrap();
+                s.set_write_timeout(Some(time::secs(3))).unwrap();
                 return Some(s);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -152,7 +153,7 @@ fn transmit(stream: &mut TcpStream, reply: &Reply) {
         .chunks(reply.chunk.unwrap_or_else(|| reply.raw.len().max(1)))
     {
         if reply.chunk.is_some() {
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(time::millis(100));
         }
         match stream.write_all(bytes) {
             Ok(()) => {}
@@ -229,7 +230,7 @@ impl Drop for Server {
     }
 }
 fn source(address: SocketAddr, profile: &str, terminator: &str, reads: Vec<Value>) -> Value {
-    let mut value = json!({"id":"robot","protocol":"epson_remote","profile":profile,"address":address.to_string(),"password_env":PASSWORD_ENV,"terminator":terminator,"every_ms":3_600_000,"timeout_ms":1000});
+    let mut value = json!({"id":"robot","protocol":"epson_remote","profile":profile,"address":address.to_string(),"password_env":PASSWORD_ENV,"terminator":terminator,"every_ms":3_600_000,"timeout_ms":time::ms(1000)});
     value["reads"] = Value::Array(reads);
     value
 }
@@ -473,8 +474,8 @@ fn every_qualified_monitor_method_keeps_native_text_windows_and_one_login_across
             terminator,
             cases.iter().map(|c| c.selection.clone()).collect(),
         );
-        config["every_ms"] = json!(300);
-        let report = record(&home, config, "550ms").success();
+        config["every_ms"] = json!(time::ms(300));
+        let report = record(&home, config, &time::arg(550)).success();
         assert_eq!(report["samples"], 2 * n);
         assert_eq!(report["status"], "complete");
         server.finish(1 + 2 * n);
@@ -537,7 +538,7 @@ fn hundred_values_and_full_unsigned_text_are_not_coerced_or_reconstructed() {
         json!({"signal":"robot","resource":"current_robot"}),
     ];
     let config = source(server.address(), "rc_plus_8_0", "crlf", selections.clone());
-    record(&home, config, "500ms").success();
+    record(&home, config, &time::arg(500)).success();
     server.finish(4);
     let rows = samples(&home, "complete");
     assert_eq!(rows.len(), 3);
@@ -623,8 +624,8 @@ fn malformed_late_reply_or_native_error_preserves_prior_complete_poll_and_scrubs
                 json!({"signal":"word","resource":"io_word","address":1}),
             ],
         );
-        config["every_ms"] = json!(300);
-        let run = record(&home, config, "1s");
+        config["every_ms"] = json!(time::ms(300));
+        let run = record(&home, config, &time::arg(1000));
         let error = run.failure(if mode == "timeout" { 4 } else { 1 });
         server.finish(5);
         assert_eq!(
@@ -671,7 +672,7 @@ fn login_native_failures_are_typed_private_and_never_retried_or_logged_out() {
             "crlf",
             vec![json!({"signal":"status","resource":"status"})],
         );
-        let run = record(&home, config, "500ms");
+        let run = record(&home, config, &time::arg(500));
         let error = run.failure(exit);
         server.finish(1);
         assert_eq!(error["code"], kind);
@@ -704,7 +705,7 @@ fn login_and_progressing_read_replies_share_one_original_deadline_without_later_
                 b"\r\n",
             );
             if setup && i == 0 || !setup && i == 1 {
-                reply.delay = Duration::from_millis(100);
+                reply.delay = time::millis(100);
             }
             if setup && i == 1 || !setup && i == 2 {
                 reply.chunk = Some(6);
@@ -722,8 +723,11 @@ fn login_and_progressing_read_replies_share_one_original_deadline_without_later_
                 json!({"signal":"never","resource":"memory_io","address":0}),
             ],
         );
-        config["timeout_ms"] = json!(250);
-        assert_eq!(record(&home, config, "1s").failure(4)["code"], "timeout");
+        config["timeout_ms"] = json!(time::ms(250));
+        assert_eq!(
+            record(&home, config, &time::arg(1000)).failure(4)["code"],
+            "timeout"
+        );
         server.finish(if setup { 2 } else { 3 });
         assert_eq!(samples(&home, "failed").len(), 0);
     }
@@ -855,7 +859,7 @@ fn unsupported_profiles_types_and_injected_selectors_fail_before_output_or_conne
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let config = source(listener.local_addr().unwrap(), profile, "crlf", vec![read]);
         assert_eq!(
-            record(&home, config, "1s").failure(expected_exit)["code"],
+            record(&home, config, &time::arg(1000)).failure(expected_exit)["code"],
             if expected_exit == 5 {
                 "unsupported"
             } else {
@@ -889,7 +893,10 @@ fn unsupported_profiles_types_and_injected_selectors_fail_before_output_or_conne
         for (k, v) in patch.as_object().unwrap() {
             config[k].clone_from(v);
         }
-        assert_eq!(record(&home, config, "1s").failure(2)["code"], "usage");
+        assert_eq!(
+            record(&home, config, &time::arg(1000)).failure(2)["code"],
+            "usage"
+        );
         assert!(!home.path("run.jsonl").exists());
         listener.set_nonblocking(true).unwrap();
         assert_eq!(

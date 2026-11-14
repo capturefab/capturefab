@@ -2,6 +2,7 @@
 //! the independent Robot Raconteur client's login exchange.
 
 use super::{Device, Home, accept, assert_unpublished, listener, receive, support::cli::Run};
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -52,7 +53,7 @@ fn login(stream: &mut TcpStream, stop: &AtomicBool, banner: &[u8], password: &st
 fn source(address: SocketAddr, signals: Value) -> Value {
     let mut config = json!({"id":"vision", "protocol":"cognex_insight", "address":address.to_string(),
         "username_env":USER_ENV, "password_env":PASSWORD_ENV,
-        "timeout_ms":1500, "every_ms":3_600_000});
+        "timeout_ms":time::ms(1500), "every_ms":3_600_000});
     config["signals"] = signals;
     config
 }
@@ -76,7 +77,7 @@ fn record(home: &Home, source: &Value, password: &str, duration: &str) -> Run {
             "--config",
             "sources.json",
             "--for",
-            duration,
+            &super::window(duration),
             "-o",
             "run.jsonl",
         ],
@@ -206,7 +207,7 @@ fn cognex_insight_reads_published_values_with_blank_password_and_preserves_empty
             {"name":"raw", "cell":"ByteCell"}
         ]),
     );
-    cfg["every_ms"] = json!(400);
+    cfg["every_ms"] = json!(time::ms(400));
     let result = record(&home, &cfg, "", "720ms").success();
     assert_eq!(camera.finish(), 8);
     assert_eq!(result["samples"], 8);
@@ -338,18 +339,18 @@ fn cognex_insight_login_and_fragmented_value_share_one_deadline() {
         let mut stream = accept(&listener, &stop).unwrap();
         stream.write_all(MODERN).unwrap();
         expect(&mut stream, &stop, format!("{USER}\r\n").as_bytes());
-        thread::sleep(Duration::from_millis(240));
+        thread::sleep(time::millis(240));
         stream.write_all(b"Password:").unwrap();
         expect(&mut stream, &stop, format!("{PASSWORD}\r\n").as_bytes());
         stream.write_all(b"User Logged In\r\n").unwrap();
         expect(&mut stream, &stop, b"GVOutput\r\n");
         stream.write_all(b"1\r\n15.").unwrap();
-        thread::sleep(Duration::from_millis(240));
+        thread::sleep(time::millis(240));
         let _ = stream.write_all(b"000\r\n");
         1
     });
     let mut cfg = source(address, one_signal());
-    cfg["timeout_ms"] = json!(400);
+    cfg["timeout_ms"] = json!(time::ms(400));
     let run = record(&home, &cfg, PASSWORD, "1s");
     assert_eq!(run.failure(4)["code"], "timeout");
     assert_eq!(camera.finish(), 1);
@@ -398,7 +399,7 @@ fn cognex_insight_bounds_telnet_control_traffic_and_incremental_json() {
                 .collect::<Vec<_>>()
         ),
     );
-    cfg["timeout_ms"] = json!(2500);
+    cfg["timeout_ms"] = json!(time::ms(2500));
     let run = record(&home, &cfg, PASSWORD, "2s");
     assert!(
         run.failure(1)["message"]

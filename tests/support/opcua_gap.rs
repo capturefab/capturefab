@@ -15,6 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::support::time;
+
 const MAX_FRAME: usize = 1 << 20;
 #[derive(Clone, Copy, Debug)]
 pub enum Event {
@@ -71,7 +73,7 @@ impl Proxy {
             trace: Mutex::new(Trace::default()),
             events: tx,
             uri: endpoint.clone(),
-            end: Instant::now() + Duration::from_secs(12),
+            end: Instant::now() + time::secs(12),
         });
         let run = state.clone();
         let worker = thread::spawn(move || {
@@ -86,10 +88,10 @@ impl Proxy {
                             return Err(err());
                         }
                         drop(trace);
-                        let server = TcpStream::connect_timeout(&upstream, Duration::from_secs(2))?;
+                        let server = TcpStream::connect_timeout(&upstream, time::secs(2))?;
                         for socket in [&client, &server] {
                             socket.set_read_timeout(Some(Duration::from_millis(100)))?;
-                            socket.set_write_timeout(Some(Duration::from_millis(300)))?;
+                            socket.set_write_timeout(Some(time::millis(300)))?;
                             socket.set_nodelay(true)?;
                             run.sockets
                                 .lock()
@@ -428,7 +430,7 @@ fn inspect(frame: &mut Vec<u8>, response: bool, state: &State) -> io::Result<Opt
             drop(trace);
             // Deliberately create an observable real receive frontier after the
             // already delivered later Publish, not a fabricated timestamp.
-            thread::sleep(Duration::from_millis(40));
+            thread::sleep(time::millis(40));
             return Ok(Some(Event::Repaired));
         }
     }

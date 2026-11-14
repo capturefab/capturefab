@@ -2,6 +2,7 @@
 //! Mitsubishi `JY997D16901R` §§7.1–7.3 exchanges include the host ACK.
 
 use super::{Device, Home, assert_unpublished, receive, serial_pair};
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{
     fs::{self, File},
@@ -21,7 +22,7 @@ const ACK: &[u8] = b"\x0605FF";
 fn source(device: &str, signals: &Value) -> Value {
     json!({"id":"fx","protocol":"fx_computer_link","device":device,
         "data_bits":8,"parity":"none","unit":5,"every_ms":3_600_000,
-        "timeout_ms":800,"signals":signals})
+        "timeout_ms":time::ms(800),"signals":signals})
 }
 
 fn record(home: &Home, source: &Value) -> super::support::cli::Run {
@@ -37,7 +38,7 @@ fn record(home: &Home, source: &Value) -> super::support::cli::Run {
         "--config",
         "sources.json",
         "--for",
-        "1s",
+        &time::arg(1000),
         "-o",
         "run.jsonl",
     ])
@@ -109,13 +110,13 @@ fn fx_link_replays_mitsubishi_br_wr_and_qr_frames_with_ack() {
             let reply_started = Instant::now();
             send(&mut master, reply);
             expect(&mut master, &stop, ACK);
-            assert!(reply_started.elapsed() >= Duration::from_millis(30));
+            assert!(reply_started.elapsed() >= time::millis(30));
             expect_silence(&mut master, &stop);
             1
         });
         let mut config = source(&device, &json!([signal]));
         config["message_wait_ms"] = json!(wait);
-        config["ack_delay_ms"] = serde_json::from_str("3e1").unwrap();
+        config["ack_delay_ms"] = serde_json::from_str(&format!("{}e1", time::ms(3))).unwrap();
         let run = record(&home, &config);
         assert_eq!(run.success()["samples"], 1);
         assert_eq!(worker.finish(), 1);
@@ -267,11 +268,11 @@ fn fx_link_partial_poll_does_not_get_a_new_deadline_after_ack() {
     let worker = Device::start(move |stop| {
         let _slave = slave;
         expect(&mut master, &stop, WR);
-        thread::sleep(Duration::from_millis(420));
+        thread::sleep(time::millis(420));
         send(&mut master, WORD_REPLY);
         expect(&mut master, &stop, ACK);
         expect(&mut master, &stop, QR);
-        thread::sleep(Duration::from_millis(420));
+        thread::sleep(time::millis(420));
         let _ = master.write_all(WORD_REPLY);
         expect_silence(&mut master, &stop);
         2
@@ -283,7 +284,7 @@ fn fx_link_partial_poll_does_not_get_a_new_deadline_after_ack() {
             {"name":"second","device":"R","address":30000,"elements":2}
         ]),
     );
-    config["timeout_ms"] = json!(700);
+    config["timeout_ms"] = json!(time::ms(700));
     let run = record(&home, &config);
     assert_eq!(run.failure(4)["code"], "timeout");
     assert_eq!(worker.finish(), 2);
@@ -305,7 +306,7 @@ fn fx_link_ack_delay_must_fit_the_poll_deadline() {
         &device,
         &json!([{"name":"timer","device":"TN","address":123,"elements":2}]),
     );
-    config["ack_delay_ms"] = json!(900);
+    config["ack_delay_ms"] = json!(time::ms(900));
     let run = record(&home, &config);
     assert_eq!(run.failure(4)["code"], "timeout");
     assert_eq!(worker.finish(), 1);

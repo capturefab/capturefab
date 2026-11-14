@@ -3,6 +3,7 @@
 use super::{
     Device, Home, accept, assert_unpublished, listener, receive, serial_pair, support::cli::Run,
 };
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -19,14 +20,14 @@ fn cases() -> Vec<Value> {
         .unwrap()
         .clone()
 }
-fn query(port: &mut impl Read, stop: &AtomicBool) {
+fn query(port: &mut (impl Read + std::os::fd::AsRawFd), stop: &AtomicBool) {
     let mut bytes = [0; 4];
     assert!(receive(port, &mut bytes, stop));
     assert_eq!(&bytes, b"\x1bP\r\n");
 }
 
-fn no_more(port: &mut impl Read, stop: &AtomicBool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+fn no_more(port: &mut (impl Read + std::os::fd::AsRawFd), stop: &AtomicBool) {
+    let deadline = Instant::now() + time::secs(10);
     loop {
         match port.read(&mut [0; 1]) {
             Ok(0) => return,
@@ -83,7 +84,7 @@ fn record_sources(home: &Home, sources: &[Value], duration: &str) -> Run {
         "--config",
         "sources.json",
         "--for",
-        duration,
+        &super::window(duration),
         "-o",
         "run.jsonl",
     ])
@@ -239,7 +240,7 @@ fn sbi_nonnumeric_states_keep_one_channel_with_mixed_source_and_exact_exports() 
         3_u64
     });
     let source = configured(
-        json!({"address":address,"format":"sbi22","every_ms":200,"signal":"observation"}),
+        json!({"address":address,"format":"sbi22","every_ms":time::ms(200),"signal":"observation"}),
     );
     let sources = [
         source,
@@ -312,7 +313,7 @@ fn sbi_malformed_replies_fail_atomically_without_retry_and_retain_completed_pref
             assert_eq!(
                 record(
                     &home,
-                    json!({"address":address,"format":"sbi16","every_ms":100}),
+                    json!({"address":address,"format":"sbi16","every_ms":time::ms(100)}),
                     "1s"
                 )
                 .failure(exit)["code"],
@@ -332,15 +333,19 @@ fn sbi_malformed_replies_fail_atomically_without_retry_and_retain_completed_pref
     }
 }
 
-fn delayed_reply(port: &mut (impl Read + io::Write), stop: &AtomicBool, prefix: bool) {
+fn delayed_reply(
+    port: &mut (impl Read + io::Write + std::os::fd::AsRawFd),
+    stop: &AtomicBool,
+    prefix: bool,
+) {
     if prefix {
         query(port, stop);
         port.write_all(b"+   123.56 g  \r\n").unwrap();
     }
     query(port, stop);
-    thread::sleep(Duration::from_millis(140));
+    thread::sleep(time::millis(140));
     let _ = port.write_all(b"+   123.56 g  \r");
-    thread::sleep(Duration::from_millis(140));
+    thread::sleep(time::millis(140));
     let _ = port.write_all(b"\n");
     no_more(port, stop);
 }
@@ -372,8 +377,8 @@ fn sbi_segmented_tcp_and_pty_share_original_request_and_acquisition_deadlines() 
                     (device, json!({"address":address}))
                 };
                 source["format"] = json!("sbi16");
-                source["every_ms"] = json!(100);
-                source["timeout_ms"] = json!(if cutoff { 2000 } else { 250 });
+                source["every_ms"] = json!(time::ms(100));
+                source["timeout_ms"] = json!(time::ms(if cutoff { 2000 } else { 250 }));
                 let duration = if cutoff {
                     if prefix { "320ms" } else { "220ms" }
                 } else {

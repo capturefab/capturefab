@@ -17,7 +17,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use support::cli::Home;
+use support::{cli::Home, time};
 
 const SESSION: u32 = 0x1234_5678;
 const IDENTITY: [u8; 7] = [7, 0, 0, 0x12, 0x34, 0x56, 0x78];
@@ -26,17 +26,13 @@ fn listener() -> TcpListener {
 }
 fn accept(listener: &TcpListener) -> TcpStream {
     listener.set_nonblocking(true).unwrap();
-    let end = Instant::now() + Duration::from_secs(5);
+    let end = Instant::now() + time::secs(5);
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
                 stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
+                stream.set_read_timeout(Some(time::secs(3))).unwrap();
+                stream.set_write_timeout(Some(time::secs(3))).unwrap();
                 stream.set_nodelay(true).unwrap();
                 return stream;
             }
@@ -482,16 +478,16 @@ fn segmentation_and_registration_share_one_poll_deadline() {
         json!([{"name":"words","address":"N7:0","elements":4}]),
     );
     config["sources"].as_array_mut().unwrap().truncate(1);
-    config["sources"][0]["timeout_ms"] = 100.into();
+    config["sources"][0]["timeout_ms"] = time::ms(100).into();
     config["sources"][0]["max_read_bytes"] = 4.into();
     let worker = thread::spawn(move || {
         let mut stream = accept(&server);
         let server_began = Instant::now();
         let registration = receive(&mut stream);
-        thread::sleep(Duration::from_millis(25));
+        thread::sleep(time::millis(25));
         send(&mut stream, &reply(&registration, &[1, 0, 0, 0], SESSION));
         let first = read_request(&mut stream, None, (7, 0x89, 0, 4));
-        thread::sleep(Duration::from_millis(25));
+        thread::sleep(time::millis(25));
         send(&mut stream, &response(&first, None, &[1, 0, 2, 0]));
         let second = read_request(&mut stream, None, (7, 0x89, 2, 4));
         let response = response(&second, None, &[3, 0, 4, 0]);
@@ -499,20 +495,20 @@ fn segmentation_and_registration_share_one_poll_deadline() {
             if stream.write_all(&[byte]).is_err() {
                 break;
             }
-            thread::sleep(Duration::from_millis(5));
+            thread::sleep(time::millis(5));
         }
         server_began.elapsed()
     });
     let began = Instant::now();
-    let run = record(&home, &config, "1s");
+    let run = record(&home, &config, &time::arg(1000));
     assert_ne!(run.code, Some(0));
     assert_eq!(run.json()["error"]["code"], "timeout");
     let server_elapsed = worker.join().unwrap();
     assert!(
-        server_elapsed < Duration::from_millis(250),
+        server_elapsed < time::millis(250),
         "network elapsed={server_elapsed:?}"
     );
-    assert!(began.elapsed() < Duration::from_secs(2));
+    assert!(began.elapsed() < time::secs(2));
     assert_eq!(readings(&home), [] as [Value; 0]);
 }
 
@@ -525,15 +521,15 @@ fn successful_individual_phases_cannot_reset_the_total_deadline() {
         json!([{"name":"words","address":"N7:0","elements":4}]),
     );
     config["sources"].as_array_mut().unwrap().truncate(1);
-    config["sources"][0]["timeout_ms"] = 100.into();
+    config["sources"][0]["timeout_ms"] = time::ms(100).into();
     config["sources"][0]["max_read_bytes"] = 4.into();
     let worker = thread::spawn(move || {
         let mut stream = accept(&server);
         let registration = receive(&mut stream);
-        thread::sleep(Duration::from_millis(65));
+        thread::sleep(time::millis(65));
         send(&mut stream, &reply(&registration, &[1, 0, 0, 0], SESSION));
         let first = read_request(&mut stream, None, (7, 0x89, 0, 4));
-        thread::sleep(Duration::from_millis(65));
+        thread::sleep(time::millis(65));
         if stream
             .write_all(&response(&first, None, &[1, 0, 2, 0]))
             .is_err()
@@ -551,7 +547,7 @@ fn successful_individual_phases_cannot_reset_the_total_deadline() {
         assert_eq!(&pccc[19..], &[7, 0x89, 2, 0]);
         let _ = stream.write_all(&response(&second, None, &[3, 0, 4, 0]));
     });
-    let run = record(&home, &config, "500ms");
+    let run = record(&home, &config, &time::arg(500));
     assert_eq!(run.json()["error"]["code"], "timeout");
     worker.join().unwrap();
     assert_eq!(readings(&home), [] as [Value; 0]);

@@ -16,6 +16,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Timing tests stretch every budget, delay and bound by this factor on the
+  # shared, slower runners (tests/support/time.rs, src/test_time.rs).
+  CAPTUREFAB_TEST_TIME_SCALE: "10"
 
 jobs:
   lint:

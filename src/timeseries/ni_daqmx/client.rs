@@ -23,7 +23,10 @@ fn deadline_error() -> anyhow::Error {
     )
 }
 
-const READ_MARGIN_NS: u64 = 2_000_000;
+/// No read starts this close to the acquisition cutoff: its deadline is
+/// clipped to the cutoff, and a worker round trip on a loaded host can take
+/// longer than a tiny tail, which would fail the whole recording.
+const READ_MARGIN_NS: u64 = 20_000_000;
 fn read_admitted(now: u64, cutoff: u64) -> bool {
     now.checked_add(READ_MARGIN_NS)
         .is_some_and(|next| next < cutoff)

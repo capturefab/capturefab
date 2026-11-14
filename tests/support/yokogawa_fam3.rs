@@ -1,6 +1,7 @@
 //! Yokogawa FA-M3 native TCP fixtures through the CLI. Only the first binary
 //! exchange is a complete published vendor frame (IM34M6P41-01E p.1-6).
 use super::{Device, Home, accept, assert_unpublished, listener, receive};
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{
     fmt::Write as _,
@@ -9,13 +10,13 @@ use std::{
     net::TcpStream,
     sync::atomic::AtomicBool,
     thread,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 const VENDOR_READ: [u8; 12] = [0x11, 1, 0, 8, 0, 0x18, 0, 0, 0, 0xd9, 0, 0x10];
 const VENDOR_WORDS: [u16; 16] = [0xf0a5, 0, 0, 0, 0, 0, 0, 0x9876, 0, 0, 0, 0, 0, 0, 0, 0];
 fn config(address: std::net::SocketAddr, signals: &Value) -> Value {
-    json!({"id":"fam3","protocol":"yokogawa_fam3","address":address.to_string(),"every_ms":3_600_000,"timeout_ms":1000,"signals":signals})
+    json!({"id":"fam3","protocol":"yokogawa_fam3","address":address.to_string(),"every_ms":3_600_000,"timeout_ms":time::ms(1000),"signals":signals})
 }
 fn record(home: &Home, config: &Value) -> super::support::cli::Run {
     record_for(home, config, "1s")
@@ -33,7 +34,7 @@ fn record_for(home: &Home, config: &Value, duration: &str) -> super::support::cl
         "--config",
         "sources.json",
         "--for",
-        duration,
+        &super::window(duration),
         "-o",
         "run.jsonl",
     ])
@@ -97,7 +98,7 @@ fn send(stream: &mut TcpStream, bytes: &[u8]) {
 fn expect_eof(stream: &mut TcpStream) {
     // accept() already installed a short read timeout while the socket was
     // live. BSD can reject a late setsockopt after the client has closed it.
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + time::secs(1);
     loop {
         assert!(
             Instant::now() < deadline,
@@ -436,14 +437,14 @@ fn yokogawa_fam3_fragmented_signal_retains_the_original_deadline() {
         address,
         &json!([{"name":"array","device":"D","address":1,"elements":65}]),
     );
-    cfg["timeout_ms"] = json!(350);
+    cfg["timeout_ms"] = json!(time::ms(350));
     let server = Device::start(move |stop| {
         let mut stream = accept(&listener, &stop).unwrap();
         binary_request(&mut stream, &stop, command(1, 4, 1, false, 64));
-        thread::sleep(Duration::from_millis(220));
+        thread::sleep(time::millis(220));
         send(&mut stream, &response(false, &[0; 128]));
         binary_request(&mut stream, &stop, command(1, 4, 65, false, 1));
-        thread::sleep(Duration::from_millis(220));
+        thread::sleep(time::millis(220));
         let _ = stream.write_all(&response(false, &[0, 1]));
         expect_eof(&mut stream);
         2

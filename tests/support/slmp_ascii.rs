@@ -1,14 +1,13 @@
 //! Mitsubishi `SH-080956ENG-N` §§4.1–4.2 and 5.2 through the real CLI.
 //! Printed pp. 48 and 50 give the M100 and TN100 request and reply data.
 
-use super::{Home, accept, config, listener, record, rows, send};
+use super::{Home, accept, config, listener, record, rows, send, time};
 use serde_json::{Value, json};
 use std::{
     fs,
     io::{Read as _, Write as _},
     net::{TcpListener, TcpStream},
     thread,
-    time::Duration,
 };
 
 const M100: &[u8] = b"500000FF03FF000018000404010001M*0001000008";
@@ -298,15 +297,15 @@ fn slmp_ascii_incomplete_sibling_does_not_extend_the_poll_deadline() {
             {"name":"second","device":"D","address":1}
         ]),
     );
-    cfg["sources"][0]["timeout_ms"] = json!(300);
+    cfg["sources"][0]["timeout_ms"] = json!(time::ms(300));
     let server = thread::spawn(move || {
         let mut stream = accept(&listener);
         expect(&mut stream, D0);
-        thread::sleep(Duration::from_millis(180));
+        thread::sleep(time::millis(180));
         send(&mut stream, D0_REPLY);
         expect(&mut stream, D1);
         send(&mut stream, b"D00000FF03FF0000080000");
-        thread::sleep(Duration::from_millis(180));
+        thread::sleep(time::millis(180));
         drop(stream.write_all(b"0001"));
     });
     assert_eq!(record(&home, &cfg).failure(4)["code"], "timeout");

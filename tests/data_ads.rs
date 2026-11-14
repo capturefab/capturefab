@@ -8,7 +8,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use support::cli::Home;
+use support::{cli::Home, time};
 
 const TARGET: [u8; 8] = [192, 0, 2, 10, 1, 1, 0x53, 3];
 const SOURCE: [u8; 8] = [192, 0, 2, 20, 1, 1, 0x89, 0x80];
@@ -18,18 +18,14 @@ fn listener() -> TcpListener {
 }
 fn accept(listener: &TcpListener) -> TcpStream {
     listener.set_nonblocking(true).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + time::secs(5);
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
                 stream.set_nonblocking(false).unwrap();
                 stream.set_nodelay(true).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
+                stream.set_read_timeout(Some(time::secs(3))).unwrap();
+                stream.set_write_timeout(Some(time::secs(3))).unwrap();
                 return stream;
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -113,7 +109,7 @@ fn config(listener: &TcpListener, signals: &Value) -> Value {
     json!({"version":1,"sources":[
         {"id":"plc","protocol":"ads","address":listener.local_addr().unwrap().to_string(),
          "target_net_id":"192.0.2.10.1.1","source_net_id":"192.0.2.20.1.1",
-         "every_ms":3_600_000,"timeout_ms":1000,"signals":signals},
+         "every_ms":3_600_000,"timeout_ms":time::ms(1000),"signals":signals},
         {"id":"sensor","protocol":"simulator","signal":"tick","every_ms":10}
     ]})
 }
@@ -126,7 +122,7 @@ fn record(home: &Home, config: &Value) -> support::cli::Run {
         "--config",
         "sources.json",
         "--for",
-        "500ms",
+        &time::arg(500),
         "-o",
         "run.jsonl",
     ])
@@ -521,7 +517,7 @@ fn trickled_symbol_lookup_and_multiple_reads_share_one_poll_deadline() {
             json!({"name":"value","index_group":0x4020,"index_offset":0})
         };
         let mut config = config(&listener, &json!([signal]));
-        config["sources"][0]["timeout_ms"] = json!(80);
+        config["sources"][0]["timeout_ms"] = json!(time::ms(80));
         let server = thread::spawn(move || {
             let mut stream = accept(&listener);
             let request = receive(&mut stream, 1, if symbolic { 9 } else { 2 });
@@ -533,12 +529,12 @@ fn trickled_symbol_lookup_and_multiple_reads_share_one_poll_deadline() {
                 if stream.write_all(&[byte]).is_err() {
                     break;
                 }
-                thread::sleep(Duration::from_millis(25));
+                thread::sleep(time::millis(25));
             }
         });
         let start = Instant::now();
         assert_eq!(record(&home, &config).failure(4)["code"], "timeout");
-        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(start.elapsed() < time::secs(2));
         server.join().unwrap();
     }
     let home = Home::new("ads-poll-budget");
@@ -550,14 +546,14 @@ fn trickled_symbol_lookup_and_multiple_reads_share_one_poll_deadline() {
             {"name":"second","index_group":0x4020,"index_offset":2}
         ]),
     );
-    config["sources"][0]["timeout_ms"] = json!(100);
+    config["sources"][0]["timeout_ms"] = json!(time::ms(100));
     let server = thread::spawn(move || {
         let mut stream = accept(&listener);
         let request = read_request(&mut stream, 1, 0x4020, 0, 2);
-        thread::sleep(Duration::from_millis(65));
+        thread::sleep(time::millis(65));
         reply(&mut stream, &request, &[0, 0]);
         let request = read_request(&mut stream, 2, 0x4020, 2, 2);
-        thread::sleep(Duration::from_millis(65));
+        thread::sleep(time::millis(65));
         let packet = response(&request, &read_body(&[0, 0]));
         let mut tcp = vec![0, 0];
         tcp.extend_from_slice(&u32::try_from(packet.len()).unwrap().to_le_bytes());
@@ -646,7 +642,7 @@ fn symbol_cleanup_has_its_own_bounded_deadline() {
     });
     let start = Instant::now();
     assert_eq!(record(&home, &config).failure(4)["code"], "timeout");
-    assert!(start.elapsed() < Duration::from_secs(3));
+    assert!(start.elapsed() < time::secs(3));
     server.join().unwrap();
     assert_eq!(rows(&home).last().unwrap()["status"], "failed");
 }

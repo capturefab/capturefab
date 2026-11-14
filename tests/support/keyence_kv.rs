@@ -2,17 +2,17 @@
 //! are published in the manufacturer's communication manual, printed p. 8-21.
 
 use super::{Device, Home, accept, assert_unpublished, listener};
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{
     fs,
     io::{Read, Write},
     thread,
-    time::Duration,
 };
 
 fn config(address: std::net::SocketAddr, signals: &Value) -> Value {
     json!({"id":"kv","protocol":"keyence_kv","address":address.to_string(),
-        "every_ms":3_600_000,"timeout_ms":800,"signals":signals})
+        "every_ms":3_600_000,"timeout_ms":time::ms(800),"signals":signals})
 }
 
 fn record(home: &Home, cfg: &Value) -> super::support::cli::Run {
@@ -28,7 +28,7 @@ fn record(home: &Home, cfg: &Value) -> super::support::cli::Run {
         "--config",
         "sources.json",
         "--for",
-        "1s",
+        &time::arg(1000),
         "-o",
         "run.jsonl",
     ])
@@ -263,15 +263,15 @@ fn keyence_kv_all_queries_share_original_poll_deadline() {
             {"name":"second","device":"DM","address":1}
         ]),
     );
-    cfg["timeout_ms"] = json!(350);
+    cfg["timeout_ms"] = json!(time::ms(350));
     let server = Device::start(move |stop| {
         let mut stream = accept(&listener, &stop).unwrap();
         expect(&mut stream, b"RD DM0.U\r");
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(time::millis(200));
         send(&mut stream, b"00042\r\n");
         expect(&mut stream, b"RD DM1.U\r");
         stream.write_all(b"000").unwrap();
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(time::millis(200));
         drop(stream.write_all(b"43\r\n"));
         2
     });

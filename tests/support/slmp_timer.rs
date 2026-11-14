@@ -1,6 +1,6 @@
 //! Independent four-word timer and retentive-device CLI checks.
 use super::support::cli::Home;
-use super::{accept, config, listener, receive, record, request, response, rows, send};
+use super::{accept, config, listener, receive, record, request, response, rows, send, time};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use std::fmt::Write as _;
@@ -9,7 +9,6 @@ use std::{
     io::{Read as _, Write as _},
     net::{TcpListener, TcpStream},
     thread,
-    time::Duration,
 };
 const SHA: &str = "fdddd22d455065dbe98e1c443ab13b87e7ec69457919e77c4d42950d45b14442";
 const ROUTE: [u8; 5] = [0, 255, 255, 3, 0];
@@ -389,16 +388,16 @@ fn progressing_long_timer_replies_and_siblings_share_original_deadline() {
             ascii,
             true,
         );
-        c["sources"][0]["timeout_ms"] = json!(250);
+        c["sources"][0]["timeout_ms"] = json!(time::ms(250));
         let server = thread::spawn(move || {
             let mut s = accept(&listener);
             let r = query(&mut s, ascii, true, (0x52, "LTN", 0, 4, false));
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(time::millis(100));
             send(&mut s, &reply_words(&r, ascii, &[1, 2, 3, 4]));
             let r = query(&mut s, ascii, true, (0x5a, "LSTN", 1, 4, false));
             let bytes = reply_words(&r, ascii, &[5, 6, 7, 8]);
             for chunk in bytes.chunks(if ascii { 13 } else { 7 }) {
-                thread::sleep(Duration::from_millis(100));
+                thread::sleep(time::millis(100));
                 match s.write_all(chunk) {
                     Ok(()) => {}
                     Err(e)

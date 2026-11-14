@@ -15,24 +15,21 @@ use std::{
     time::{Duration, Instant},
 };
 use support::cli::{Home, Run};
+use support::time;
 
 fn listener() -> TcpListener {
     TcpListener::bind("127.0.0.1:0").unwrap()
 }
 fn accept(listener: &TcpListener) -> TcpStream {
     listener.set_nonblocking(true).unwrap();
-    let until = Instant::now() + Duration::from_secs(5);
+    let until = Instant::now() + time::secs(5);
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
                 stream.set_nonblocking(false).unwrap();
                 stream.set_nodelay(true).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
+                stream.set_read_timeout(Some(time::secs(3))).unwrap();
+                stream.set_write_timeout(Some(time::secs(3))).unwrap();
                 return stream;
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -44,7 +41,7 @@ fn accept(listener: &TcpListener) -> TcpStream {
     }
 }
 fn query(stream: &mut impl io::Read, expected: &[u8]) {
-    let until = Instant::now() + Duration::from_secs(5);
+    let until = Instant::now() + time::secs(5);
     let mut received = Vec::new();
     while !received.ends_with(b"\n") {
         assert!(received.len() < 8192);
@@ -69,7 +66,7 @@ fn query(stream: &mut impl io::Read, expected: &[u8]) {
 fn config(listener: &TcpListener, signals: Value) -> Value {
     let mut config = json!({"version":1,"sources":[{"id":"instrument","protocol":"scpi",
         "connection":{"transport":"tcp","address":listener.local_addr().unwrap().to_string()},
-        "every_ms":3_600_000,"timeout_ms":1000}]});
+        "every_ms":3_600_000,"timeout_ms":time::ms(1000)}]});
     config["sources"][0]["signals"] = signals;
     config
 }
@@ -85,7 +82,7 @@ fn record_json(home: &Home, config: &str) -> Run {
         "--config",
         "sources.json",
         "--for",
-        "800ms",
+        &time::arg(800),
         "-o",
         "run.jsonl",
     ])
@@ -153,7 +150,7 @@ fn numeric_vectors_raw_legacy_text_sentinels_and_instrument_status_survive_expor
         for (index, (expected, reply)) in replies.iter().enumerate() {
             query(&mut stream, expected);
             if index == replies.len() - 1 {
-                thread::sleep(Duration::from_millis(50));
+                thread::sleep(time::millis(50));
             }
             for fragment in reply.chunks(3) {
                 stream.write_all(fragment).unwrap();
@@ -210,7 +207,7 @@ fn numeric_vectors_raw_legacy_text_sentinels_and_instrument_status_survive_expor
     assert_eq!(rows[7]["value"]["status"], "no_error");
     let first = rows[0]["value"]["received_monotonic_ns"].as_u64().unwrap();
     let last = rows[7]["value"]["received_monotonic_ns"].as_u64().unwrap();
-    assert!(last.saturating_sub(first) >= 40_000_000);
+    assert!(last.saturating_sub(first) >= time::ms(40) * 1_000_000);
     assert!(
         rows.iter()
             .all(|row| row["elapsed_ns"] == rows[0]["elapsed_ns"]
@@ -264,7 +261,7 @@ fn large_definite_blocks_stream_to_raw_artifacts_and_recoverable_metadata() {
             .write_all(b"BYT_NR 2;BN_FMT RI;BYT_OR LSB;XINCR 1.0E-9;YMULT 2.5E-3\n")
             .unwrap();
         query(&mut stream, b"CURVE?\n");
-        thread::sleep(Duration::from_millis(25));
+        thread::sleep(time::millis(25));
         stream.write_all(b":CURVE ").unwrap();
         stream.write_all(header.as_bytes()).unwrap();
         for part in payload.chunks(31_337) {
@@ -488,19 +485,19 @@ fn query_writes_and_all_reply_bytes_share_one_total_deadline() {
             {"name":"second","query":"FETC?"}
         ]),
     );
-    config["sources"][0]["timeout_ms"] = json!(200);
+    config["sources"][0]["timeout_ms"] = json!(time::ms(200));
     let server = thread::spawn(move || {
         let mut stream = accept(&listener);
         query(&mut stream, b"CURVE?\n");
-        thread::sleep(Duration::from_millis(140));
+        thread::sleep(time::millis(140));
         stream.write_all(b"#2100123456789\n").unwrap();
         query(&mut stream, b"FETC?\n");
-        thread::sleep(Duration::from_millis(140));
+        thread::sleep(time::millis(140));
         let _ = stream.write_all(b"1.25\n");
     });
     let began = Instant::now();
     assert_eq!(record(&home, &config).failure(4)["code"], "timeout");
-    assert!(began.elapsed() < Duration::from_secs(2));
+    assert!(began.elapsed() < time::secs(2));
     server.join().unwrap();
     assert_eq!(samples(&home), [] as [Value; 0]);
     assert!(!home.path("deadline.scpi").exists() && !home.path("deadline.scpi.json").exists());
@@ -663,7 +660,7 @@ mod serial {
             master.write_all(b"+.125\r\n").unwrap();
             query(&mut master, b"TRAC:DATA?\n");
             master.write_all(b"+18446744073709551615,-1\n").unwrap();
-            let _ = keep_open.recv_timeout(Duration::from_secs(3));
+            let _ = keep_open.recv_timeout(time::secs(3));
         });
         record_json(
             &home,

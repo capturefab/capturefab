@@ -3,6 +3,7 @@
 //! public-domain SDI-12 v1.4 specification §4.4.12.3.
 
 use super::{Device, Home, assert_unpublished, receive, serial_pair, support::cli::Run};
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{
     fs::{self, File},
@@ -24,7 +25,7 @@ fn expect(port: &mut File, stop: &AtomicBool, expected: &[u8]) {
 fn source(device: &str, signals: &Value) -> Value {
     json!({
         "id":"soil","protocol":"sdi12_serial","device":device,"address":"0","crc":true,
-        "every_ms":3_600_000,"timeout_ms":1000,"signals":signals
+        "every_ms":3_600_000,"timeout_ms":time::ms(1000),"signals":signals
     })
 }
 
@@ -41,7 +42,7 @@ fn record(home: &Home, config: &Value, duration: &str) -> Run {
         "--config",
         "sources.json",
         "--for",
-        duration,
+        &super::window(duration),
         "-o",
         "run.jsonl",
     ])
@@ -50,7 +51,7 @@ fn record(home: &Home, config: &Value, duration: &str) -> Run {
 fn bus(device: &str, sensors: &Value) -> Value {
     json!({
         "id":"soil","protocol":"sdi12_serial","device":device,
-        "every_ms":3_600_000,"timeout_ms":1000,"sensors":sensors
+        "every_ms":3_600_000,"timeout_ms":time::ms(1000),"sensors":sensors
     })
 }
 
@@ -111,14 +112,14 @@ fn shared_bridge_does_not_publish_an_earlier_address_when_a_sibling_fails() {
             master.write_all(b"00001\r\n").unwrap();
             expect(&mut master, &stop, b"0D0!");
             if late {
-                thread::sleep(Duration::from_millis(175));
+                thread::sleep(time::millis(175));
             }
             master.write_all(b"0+1.25\r\n").unwrap();
             expect(&mut master, &stop, b"AMC!");
             master.write_all(b"A0001\r\n").unwrap();
             expect(&mut master, &stop, b"AD0!");
             if late {
-                thread::sleep(Duration::from_millis(230));
+                thread::sleep(time::millis(230));
                 master.write_all(b"A+2.50NIR\r\n").unwrap();
             } else {
                 master.write_all(b"0+2.50@MX\r\n").unwrap();
@@ -133,7 +134,7 @@ fn shared_bridge_does_not_publish_an_earlier_address_when_a_sibling_fails() {
                 {"address":"A","crc":true,"signals":[{"name":"second","index":0}]}
             ]),
         );
-        config["timeout_ms"] = json!(340);
+        config["timeout_ms"] = json!(time::ms(340));
         let error = record(&home, &config, "1s").failure(code);
         assert!(
             error["message"].as_str().unwrap().contains(message),
@@ -234,13 +235,14 @@ fn waits_until_ttt_before_requesting_data_without_a_service_line() {
         let started = Instant::now();
         master.write_all(b"00012\r\n").unwrap();
         expect(&mut master, &stop, b"0D0!");
+        // The reply announces ttt = 001 s, a protocol value that does not scale.
         assert!(started.elapsed() >= Duration::from_secs(1));
         master.write_all(b"0+3.14+2.718IWO\r\n").unwrap();
         assert!(!receive(&mut master, &mut [0], &stop));
         1
     });
     let mut config = source(&device, &json!([{"name":"second","index":1}]));
-    config["timeout_ms"] = json!(1600);
+    config["timeout_ms"] = json!(time::ms(1600));
     assert_eq!(record(&home, &config, "1800ms").success()["samples"], 1);
     assert_eq!(sensor.finish(), 1);
 }
@@ -285,7 +287,7 @@ fn rejects_wrong_station_crc_or_a_late_second_data_response_atomically() {
             master.write_all(b"00359\r\n0\r\n").unwrap();
             expect(&mut master, &stop, b"0D0!");
             if case == "timeout" {
-                thread::sleep(Duration::from_millis(120));
+                thread::sleep(time::millis(120));
             }
             master.write_all(FIRST).unwrap();
             expect(&mut master, &stop, b"0D1!");
@@ -295,7 +297,7 @@ fn rejects_wrong_station_crc_or_a_late_second_data_response_atomically() {
                 "timeout" => {
                     // A per-request timer would incorrectly allow this
                     // complete line. The whole measurement expires first.
-                    thread::sleep(Duration::from_millis(260));
+                    thread::sleep(time::millis(260));
                     master.write_all(LAST).unwrap();
                 }
                 _ => unreachable!(),
@@ -305,7 +307,7 @@ fn rejects_wrong_station_crc_or_a_late_second_data_response_atomically() {
             2
         });
         let mut config = source(&device, &json!([{"name":"first","index":0}]));
-        config["timeout_ms"] = json!(340);
+        config["timeout_ms"] = json!(time::ms(340));
         let error = record(&home, &config, "1s").failure(code);
         assert!(
             error["message"].as_str().unwrap().contains(message),

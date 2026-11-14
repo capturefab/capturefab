@@ -1,6 +1,7 @@
 //! Passive SML on a Unix PTY using an original BSI/FNN-format push frame.
 
 use super::{Device, Home, assert_unpublished, receive, serial_pair, support::cli::Run};
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{
     fs::{self, File},
@@ -31,7 +32,7 @@ const FRAME: [u8; 196] = [
 ];
 
 fn await_terminal(terminal: &File, stop: &AtomicBool) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + time::secs(3);
     while !stop.load(Ordering::Acquire) {
         let mut mode = std::mem::MaybeUninit::<libc::termios>::uninit();
         // SAFETY: live PTY descriptor and writable termios output allocation.
@@ -57,7 +58,7 @@ fn await_terminal(terminal: &File, stop: &AtomicBool) -> bool {
 
 fn source(device: &str) -> Value {
     json!({
-        "id":"meter","protocol":"sml_serial","device":device,"timeout_ms":50,
+        "id":"meter","protocol":"sml_serial","device":device,"timeout_ms":time::ms(50),
         "signals":[
             {"name":"energy","obis":"1-0:1.8.0*255"},
             {"name":"power","obis":"1-0:16.7.0*255"},
@@ -79,7 +80,7 @@ fn record(home: &Home, config: &Value, duration: &str) -> Run {
         "--config",
         "sources.json",
         "--for",
-        duration,
+        &super::window(duration),
         "-o",
         "run.jsonl",
     ])
@@ -97,9 +98,9 @@ fn receives_fragmented_escaped_push_files_without_transmitting() {
         // start marker across two serial receive deadlines.
         master.write_all(b"noise\x1b\x1b\x1b\x00").unwrap();
         master.write_all(&FRAME[..5]).unwrap();
-        thread::sleep(Duration::from_millis(130));
+        thread::sleep(time::millis(130));
         master.write_all(&FRAME[5..136]).unwrap();
-        thread::sleep(Duration::from_millis(90));
+        thread::sleep(time::millis(90));
         let mut tail = FRAME[136..].to_vec();
         tail.extend_from_slice(&FRAME);
         master.write_all(&tail).unwrap();

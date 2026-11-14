@@ -5,11 +5,11 @@ use super::{
     Home, Packet, SESSION, accept, config, listener, path, read_request, receive, record, register,
     rows, rr, send, unregister,
 };
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{
     net::{TcpListener, TcpStream},
     thread,
-    time::Duration,
 };
 
 const TARGET: u32 = 0x7856_3412;
@@ -273,7 +273,7 @@ fn micro800_requires_correlated_open_and_shares_handshake_and_read_deadline() {
         let home = Home::new("micro800-open");
         let listener = listener();
         let mut cfg = source(&listener, json!([{"name":"value","tag":"A"}]));
-        cfg["sources"][0]["timeout_ms"] = json!(700);
+        cfg["sources"][0]["timeout_ms"] = json!(time::ms(700));
         let worker = thread::spawn(move || {
             let mut stream = accept(&listener);
             register(&mut stream);
@@ -283,13 +283,13 @@ fn micro800_requires_correlated_open_and_shares_handshake_and_read_deadline() {
                 "identity" => cip[12] ^= 1,
                 "zero_id" => cip[4..8].fill(0),
                 "app_length" => cip[28] = 1,
-                "deadline" => thread::sleep(Duration::from_millis(400)),
+                "deadline" => thread::sleep(time::millis(400)),
                 _ => unreachable!(),
             }
             send(&mut stream, &request, &rr(&cip)).unwrap();
             if mode == "deadline" {
                 let request = read_tag(&mut stream, 1, &path(b"A", None), 1, 0);
-                thread::sleep(Duration::from_millis(400));
+                thread::sleep(time::millis(400));
                 let response = unit_body(originator, 1, &connected_reply(0, 0xc3, &[42, 0]));
                 drop(send(&mut stream, &request, &response));
             }
@@ -316,7 +316,7 @@ fn micro800_renews_inactive_connection_and_bounds_close_without_reply() {
     let home = Home::new("micro800-idle");
     let listener = listener();
     let mut cfg = source(&listener, json!([{"name":"value","tag":"A"}]));
-    cfg["sources"][0]["every_ms"] = json!(700);
+    cfg["sources"][0]["every_ms"] = json!(time::ms(700));
     let worker = thread::spawn(move || {
         let mut first = accept(&listener);
         let (_, originator) = open(&mut first, 1000);

@@ -12,7 +12,10 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use support::cli::{Home, Run};
+use support::{
+    cli::{Home, Run},
+    time,
+};
 const ARGS: [&str; 9] = [
     "--json",
     "data",
@@ -80,8 +83,13 @@ fn no_control(socket: &UdpSocket) {
         match socket.recv_from(&mut [0; 1]) {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return,
             // A deliberately late fixture send can generate an asynchronous
-            // loopback ICMP error; this is not an incoming control datagram.
-            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
+            // loopback ICMP error (Windows reports it as a reset); this is not an
+            // incoming control datagram.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+                ) => {}
             other => panic!("passive source emitted data or unexpected receive state: {other:?}"),
         }
     }
@@ -107,7 +115,7 @@ fn groups(home: &Home) -> Vec<Value> {
         .collect()
 }
 fn wait(mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(4);
+    let deadline = Instant::now() + time::secs(4);
     while !ready() {
         assert!(
             Instant::now() < deadline,
@@ -124,7 +132,7 @@ fn capture_args(seconds: u64) -> [String; 9] {
         "--config".into(),
         "sources.json".into(),
         "--for".into(),
-        format!("{seconds}s"),
+        time::arg(seconds * 1000),
         "-o".into(),
         "run.jsonl".into(),
     ]
@@ -153,7 +161,7 @@ impl Capture {
         assert!(matches!(seconds, 1 | 3 | 6));
         fs::write(
             home.path("fixture-acquisition-ns"),
-            (seconds * 1_000_000_000).to_string(),
+            time::millis(seconds * 1000).as_nanos().to_string(),
         )
         .unwrap();
         let reservation = socket();
@@ -161,7 +169,7 @@ impl Capture {
         if let Some(context) = context {
             fs::write(home.path("configured-context"), context).unwrap();
         }
-        let mut config = json!({"id":"lidar","protocol":"sick_compact_udp","listen":target,"source_ip":"127.0.0.1","source_port":source.port(),"profile":profile,"stream":stream,"output_directory":"capture","max_bytes":100_000_000,"packets_per_group":1,"timeout_ms":120,"every_ms":3_600_000});
+        let mut config = json!({"id":"lidar","protocol":"sick_compact_udp","listen":target,"source_ip":"127.0.0.1","source_port":source.port(),"profile":profile,"stream":stream,"output_directory":"capture","max_bytes":100_000_000,"packets_per_group":1,"timeout_ms":time::ms(120),"every_ms":3_600_000});
         if context.is_some() {
             config["context"] = json!("configured-context");
         }
@@ -197,7 +205,7 @@ impl Capture {
         (capture, target)
     }
     fn finish(mut self) -> Run {
-        let deadline = Instant::now() + Duration::from_secs(6);
+        let deadline = Instant::now() + time::secs(6);
         while self.0.as_mut().unwrap().try_wait().unwrap().is_none() {
             assert!(
                 Instant::now() < deadline,
@@ -1196,7 +1204,7 @@ fn committed_packets(home: &Home) -> usize {
     packets
 }
 fn wait_credit(home: &Home, required: usize, mode: &str) {
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + time::secs(8);
     loop {
         let observed = committed_packets(home);
         if observed >= required {
@@ -1221,7 +1229,7 @@ fn max32_and_exact_json_group_boundary_keep_pending_packet_order_and_original_cl
             "picoscan150",
             "mixed",
             None,
-            json!({"source_port":null,"packets_per_group":32,"timeout_ms":600}),
+            json!({"source_port":null,"packets_per_group":32,"timeout_ms":time::ms(600)}),
             if mode == "small" { 1 } else { 6 },
         );
         let raw = match mode {
@@ -1299,7 +1307,7 @@ fn cutoff_finish_never_receives_new_encoder_packet() {
     let raw = encoder_raw(case);
     send(&socket, target, &raw);
     wait(|| groups(&home).len() == 1);
-    thread::sleep(Duration::from_millis(1100));
+    thread::sleep(time::millis(1100));
     send(&socket, target, &raw);
     capture.finish().success();
     let values = archive(

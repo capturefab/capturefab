@@ -4,6 +4,7 @@ use super::{
     Home, Packet, SESSION, accept, config, listener, path, query, read_request, record, register,
     reply, rows, rr, send, unregister,
 };
+use crate::support::time;
 use base64::Engine as _;
 use serde_json::{Value, json};
 use std::{
@@ -11,7 +12,7 @@ use std::{
     io::{Read as _, Write as _},
     net::TcpStream,
     thread,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 const VENDOR_REQUEST: &[u8] = &[
@@ -329,7 +330,7 @@ fn malformed_or_incomplete_raw_transfers_rollback_siblings_and_stop_queries() {
 
 #[test]
 fn raw_fragments_share_the_original_sibling_and_acquisition_deadline() {
-    for (name, timeout, duration) in [("request", 250, "1s"), ("acquisition", 3000, "250ms")] {
+    for (name, timeout, duration) in [("request", 250, 1000), ("acquisition", 3000, 250)] {
         let home = Home::new(name);
         let listener = listener();
         let mut cfg = config(
@@ -340,18 +341,18 @@ fn raw_fragments_share_the_original_sibling_and_acquisition_deadline() {
             {"name":"later","tag":"Later"}]),
             None,
         );
-        cfg["sources"][0]["timeout_ms"] = json!(timeout);
+        cfg["sources"][0]["timeout_ms"] = json!(time::ms(timeout));
         let server = thread::spawn(move || {
             let mut stream = accept(&listener);
             register(&mut stream);
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(time::millis(100));
             numeric(&mut stream, None);
             let request = query(
                 &mut stream,
                 None,
                 &read_request(&path(b"Record", None), 1, None),
             );
-            thread::sleep(Duration::from_millis(80));
+            thread::sleep(time::millis(80));
             send(
                 &mut stream,
                 &request,
@@ -363,7 +364,7 @@ fn raw_fragments_share_the_original_sibling_and_acquisition_deadline() {
                 None,
                 &read_request(&path(b"Record", None), 1, Some(2)),
             );
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(time::millis(100));
             no_more(&mut stream);
         });
         fs::write(home.path("sources.json"), cfg.to_string()).unwrap();
@@ -376,14 +377,14 @@ fn raw_fragments_share_the_original_sibling_and_acquisition_deadline() {
                 "--config",
                 "sources.json",
                 "--for",
-                duration,
+                &time::arg(duration),
                 "-o",
                 "run.jsonl"
             ])
             .failure(4)["code"],
             "timeout"
         );
-        assert!(began.elapsed() < Duration::from_secs(2));
+        assert!(began.elapsed() < time::secs(2));
         server.join().unwrap();
         no_samples(&home);
     }

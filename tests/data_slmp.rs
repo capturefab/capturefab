@@ -13,24 +13,21 @@ use std::{
     time::{Duration, Instant},
 };
 use support::cli::Home;
+use support::time;
 
 fn listener() -> TcpListener {
     TcpListener::bind("127.0.0.1:0").unwrap()
 }
 fn accept(listener: &TcpListener) -> TcpStream {
     listener.set_nonblocking(true).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + time::secs(5);
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
                 stream.set_nonblocking(false).unwrap();
                 stream.set_nodelay(true).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
+                stream.set_read_timeout(Some(time::secs(3))).unwrap();
+                stream.set_write_timeout(Some(time::secs(3))).unwrap();
                 return stream;
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -97,7 +94,7 @@ fn send(stream: &mut TcpStream, data: &[u8]) {
 fn config(listener: &TcpListener, signals: &Value) -> Value {
     json!({"version":1,"sources":[
         {"id":"plc","protocol":"slmp","address":listener.local_addr().unwrap().to_string(),
-         "every_ms":3_600_000,"timeout_ms":1000,"signals":signals},
+         "every_ms":3_600_000,"timeout_ms":time::ms(1000),"signals":signals},
         {"id":"sensor","protocol":"simulator","signal":"tick","every_ms":10}
     ]})
 }
@@ -110,7 +107,7 @@ fn record(home: &Home, config: &Value) -> support::cli::Run {
         "--config",
         "sources.json",
         "--for",
-        "500ms",
+        &time::arg(500),
         "-o",
         "run.jsonl",
     ])
@@ -417,7 +414,7 @@ fn trickled_response_and_multiple_reads_share_one_poll_deadline() {
                 {"name":"second","device":"D","address":2}
             ]),
         );
-        config["sources"][0]["timeout_ms"] = json!(100);
+        config["sources"][0]["timeout_ms"] = json!(time::ms(100));
         let server = thread::spawn(move || {
             let mut stream = accept(&listener);
             let read = receive(&mut stream);
@@ -426,19 +423,19 @@ fn trickled_response_and_multiple_reads_share_one_poll_deadline() {
                     if stream.write_all(&[byte]).is_err() {
                         break;
                     }
-                    thread::sleep(Duration::from_millis(25));
+                    thread::sleep(time::millis(25));
                 }
             } else {
-                thread::sleep(Duration::from_millis(65));
+                thread::sleep(time::millis(65));
                 send(&mut stream, &response(&read, 0, &[0, 0]));
                 let read = receive(&mut stream);
-                thread::sleep(Duration::from_millis(65));
+                thread::sleep(time::millis(65));
                 let _ = stream.write_all(&response(&read, 0, &[0, 0]));
             }
         });
         let start = Instant::now();
         assert_eq!(record(&home, &config).failure(4)["code"], "timeout");
-        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(start.elapsed() < time::secs(2));
         server.join().unwrap();
         assert!(!rows(&home).iter().any(|row| row["source"] == "plc"));
     }

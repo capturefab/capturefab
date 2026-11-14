@@ -1,5 +1,6 @@
 //! Real RTU cutoff phases: only a quiet gap before the first request is idle.
 use super::{Device, Home, crc, receive, serial_pair, support::cli::Run};
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{
     fs::{self, File},
@@ -12,7 +13,7 @@ use std::{
 
 fn config(device: &str, signals: &Value) -> Value {
     json!({"version":1,"sources":[{"id":"meter","protocol":"modbus_rtu","device":device,
-        "unit":3,"baud":300,"parity":"none","stop_bits":2,"every_ms":1,"timeout_ms":1000,"signals":signals}]})
+        "unit":3,"baud":300,"parity":"none","stop_bits":2,"every_ms":1,"timeout_ms":time::ms(1000),"signals":signals}]})
 }
 fn record(home: &Home, config: &Value) -> Run {
     fs::write(home.path("sources.json"), config.to_string()).unwrap();
@@ -23,7 +24,7 @@ fn record(home: &Home, config: &Value) -> Run {
         "--config",
         "sources.json",
         "--for",
-        "1s",
+        &time::arg(1000),
         "-o",
         "run.jsonl",
     ])
@@ -60,7 +61,7 @@ fn reply(port: &mut File, value: u16) {
     port.write_all(&response).unwrap();
 }
 fn no_more(port: &mut File, stop: &AtomicBool) {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + time::secs(3);
     while !stop.load(Ordering::Acquire) {
         match port.read(&mut [0]) {
             Ok(0) => return,
@@ -82,7 +83,7 @@ fn no_more(port: &mut File, stop: &AtomicBool) {
     }
 }
 fn hold_until_final_quiet_gap(run: &Path, stop: &AtomicBool) {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + time::secs(3);
     let started = loop {
         assert!(
             !stop.load(Ordering::Acquire),
@@ -101,7 +102,10 @@ fn hold_until_final_quiet_gap(run: &Path, stop: &AtomicBool) {
         );
         thread::sleep(Duration::from_millis(1));
     };
-    let target = started + chrono::Duration::milliseconds(900);
+    // Reply 100 ms before the scaled `--for` cutoff: less than the fixed
+    // 128.3 ms 300-baud quiet gap, which is a wire property and not scaled.
+    let window = i64::try_from(time::ms(1000)).unwrap();
+    let target = started + chrono::Duration::milliseconds(window - 100);
     loop {
         assert!(
             !stop.load(Ordering::Acquire),
@@ -115,7 +119,7 @@ fn hold_until_final_quiet_gap(run: &Path, stop: &AtomicBool) {
             Instant::now() < deadline,
             "wall clock moved during cutoff fixture"
         );
-        thread::sleep(left.to_std().unwrap().min(Duration::from_millis(10)));
+        thread::sleep(left.to_std().unwrap().min(time::millis(10)));
     }
 }
 fn assert_prefix(home: &Home, expected: &[(&str, u16)], status: &str) {

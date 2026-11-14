@@ -383,18 +383,18 @@ fn long_continuations_preserve_request_and_acquisition_deadlines() {
                 {"name":"later","db":1,"address":2000,"data_type":"ltime"}
             ]),
         );
-        config["sources"][0]["timeout_ms"] = json!(if acquisition { 1000 } else { 250 });
+        config["sources"][0]["timeout_ms"] = json!(time::ms(if acquisition { 1000 } else { 250 }));
         let server = thread::spawn(move || {
             let mut stream = accept(&listener);
             handshake_pdu(&mut stream, 0x0100, 0x0102, 241);
             let reference = read_request(&mut stream, 0x84, 1, 0, 223);
-            thread::sleep(Duration::from_millis(160));
+            thread::sleep(time::millis(160));
             reply_fast(&mut stream, &reference, &[0; 223]);
             drop(read_request(&mut stream, 0x84, 1, 223, 223));
-            thread::sleep(Duration::from_millis(160));
+            thread::sleep(time::millis(160));
             expect_closed(&mut stream);
         });
-        let duration = if acquisition { "250ms" } else { "500ms" };
+        let duration = &time::arg(if acquisition { 250 } else { 500 });
         assert_eq!(
             record_for(&home, &config, duration).failure(4)["code"],
             "timeout"

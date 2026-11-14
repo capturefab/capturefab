@@ -3,6 +3,7 @@
 //! emulate a physical UART's bit timing.
 
 use super::{Device, Home, assert_unpublished, receive, serial_pair};
+use crate::support::time;
 use serde_json::{Value, json};
 use std::{
     fs::{self, File},
@@ -41,7 +42,7 @@ fn transmit(port: &mut File, message: &[u8]) {
 
 fn source(device: &str, signals: &Value) -> Value {
     json!({"id":"meter", "protocol":"iec62056_21", "device":device,
-        "timeout_ms":1800, "every_ms":3_600_000, "signals":signals})
+        "timeout_ms":time::ms(1800), "every_ms":3_600_000, "signals":signals})
 }
 
 fn record(home: &Home, config: &Value, duration: &str) -> super::support::cli::Run {
@@ -57,7 +58,7 @@ fn record(home: &Home, config: &Value, duration: &str) -> super::support::cli::R
         "--config",
         "sources.json",
         "--for",
-        duration,
+        &super::window(duration),
         "-o",
         "run.jsonl",
     ])
@@ -171,10 +172,7 @@ fn iec62056_mt174_negotiates_and_resets_baud_on_the_owned_terminal() {
             master.write_all(ACK9600).unwrap();
             let started = Instant::now();
             while speed(&slave) != libc::B9600 {
-                assert!(
-                    started.elapsed() < Duration::from_secs(1),
-                    "baud did not change"
-                );
+                assert!(started.elapsed() < time::secs(1), "baud did not change");
                 thread::sleep(Duration::from_millis(3));
             }
             assert!(
@@ -199,7 +197,7 @@ fn iec62056_mt174_negotiates_and_resets_baud_on_the_owned_terminal() {
         &device,
         &json!([{"name":"energy", "obis":"1.8.0", "format":"decimal"}]),
     );
-    cfg["every_ms"] = json!(1200);
+    cfg["every_ms"] = json!(time::ms(1200));
     cfg["meter_address"] = json!("00001234");
     cfg["maximum_baud"] = serde_json::from_str("1.92e4").unwrap();
     let result = record(&home, &cfg, "2s").success();
@@ -331,7 +329,9 @@ fn iec62056_switch_wait_and_missing_checksum_respect_the_same_poll_deadline() {
             1
         });
         let mut cfg = source(&device, &json!([{"name":"energy", "obis":"1.8.0"}]));
-        cfg["timeout_ms"] = json!(350);
+        // The meter's fixed 200 ms reaction and 205 ms ACK wire time (not
+        // scaled) put any baud switch at 405 ms or later: expire just before.
+        cfg["timeout_ms"] = json!(400);
         cfg["allow_unchecked"] = json!(true);
         let error = record(&home, &cfg, "1s").failure(4);
         assert_eq!(error["code"], "timeout");

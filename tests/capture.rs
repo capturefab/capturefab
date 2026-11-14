@@ -5,7 +5,10 @@ mod support;
 
 use serde_json::{Value, json};
 use std::path::Path;
-use support::cli::{Home, Run};
+use support::{
+    cli::{Home, Run},
+    time,
+};
 
 /// The result keys that say when, not what.
 fn without_timing(mut value: Value) -> Value {
@@ -389,6 +392,10 @@ fn several_cameras_capture_at_once() {
     // moment: their first frames are less than a frame period apart. A
     // busy host can keep either camera's process waiting longer than that,
     // so the closest of a few captures is the one that tells.
+    // The frame period and the bound stretch together with the time scale.
+    let scale = f64::from(u32::try_from(time::scale()).unwrap());
+    let rate = format!("AcquisitionFrameRate={}", 30.0 / scale);
+    let bound = time::ms(40);
     let mut skews = Vec::new();
     let both = loop {
         let both = home.ok(&[
@@ -397,15 +404,17 @@ fn several_cameras_capture_at_once() {
             "sim:0",
             "-c",
             "sim:1",
+            "--set",
+            &rate,
             "-o",
             &format!("both-{}/{{camera}}.png", skews.len()),
         ]);
         skews.push(both["skew_ms"].as_u64().unwrap());
-        if skews.last() < Some(&40) || skews.len() == 3 {
+        if skews.last() < Some(&bound) || skews.len() == 3 {
             break both;
         }
     };
-    assert!(skews.iter().any(|skew| *skew < 40), "{skews:?}: {both}");
+    assert!(skews.iter().any(|skew| *skew < bound), "{skews:?}: {both}");
     let cameras = both["cameras"].as_array().unwrap();
     assert_eq!(cameras.len(), 2);
     assert_eq!(cameras[0]["camera"], "sim:0");
