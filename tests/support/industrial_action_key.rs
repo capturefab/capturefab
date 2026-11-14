@@ -292,6 +292,16 @@ fn setup_failure_cutoff_and_worker_loss_never_reopen_or_repeat_the_key() {
     ] {
         let (home, mut command) = configured(mode, 1000);
         declarations(&home, true, timeout);
+        if mode == "industrial_key_deadline" {
+            // The unkeyed sibling waits on the shared setup with a deadline of
+            // its own. Were it equal, its plain timeout could be reported
+            // before the keyed source's write_key failure on a slow runner.
+            let path = home.path("sources.json");
+            let mut config: Value =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            config["sources"][1]["timeout_ms"] = json!((timeout * 2).min(30_000));
+            fs::write(&path, config.to_string()).unwrap();
+        }
         let window = time::arg(3000);
         let args = [
             "--json",
@@ -312,7 +322,10 @@ fn setup_failure_cutoff_and_worker_loss_never_reopen_or_repeat_the_key() {
             assert_eq!(error["details"]["write_may_have_applied"], true);
         } else if mode == "industrial_key_deadline" {
             assert_eq!(error["code"], "timeout");
-            assert_eq!(error["details"]["initialization_stage"], "write_key");
+            assert_eq!(
+                error["details"]["initialization_stage"], "write_key",
+                "{error}"
+            );
             assert_eq!(error["details"]["write_may_have_applied"], true);
             assert!(began.elapsed() < time::secs(5));
         }

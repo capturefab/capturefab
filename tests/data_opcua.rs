@@ -14,6 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 use support::cli::{Home, Run};
+use support::time;
 
 const SOURCE_TIME: &str = "2026-11-10T12:34:56.123456700Z";
 
@@ -43,7 +44,7 @@ fn configure(home: &Home, source: &Value) {
 }
 
 fn record(home: &Home, password: Option<&str>) -> Run {
-    record_for(home, password, "600ms")
+    record_for(home, password, &time::arg(600))
 }
 
 fn record_for(home: &Home, password: Option<&str>, duration: &str) -> Run {
@@ -133,7 +134,12 @@ fn reads_typed_batches_and_source_timestamps_without_python_on_path() {
         ),
     ];
     let names = expected.iter().map(|(name, _)| *name).collect::<Vec<_>>();
-    configure(&home, &source(&server, &names));
+    let mut config = source(&server, &names);
+    // A poll still running at the cutoff fails the recording by design. Poll
+    // at 0, 250 and 500 (scaled) of the 600 window, so the last read has a
+    // fifth of the window to finish however slow the runner is.
+    config["sampling_ms"] = json!(time::ms(250));
+    configure(&home, &config);
     let result = record(&home, None).success();
     assert_eq!(result["status"], "complete");
     let rows = rows(&home);
@@ -198,7 +204,7 @@ fn signed_encrypted_username_session_requires_the_pinned_certificate() {
     // One authenticated Read per policy verifies the session and value. Its
     // next poll is due after the recording cutoff, keeping this security test
     // independent of final-poll scheduling while preserving every RPC deadline.
-    config["sampling_ms"] = json!(3000);
+    config["sampling_ms"] = json!(time::ms(3000));
     config["username_env"] = json!("CAPTUREFAB_OPCUA_TEST_USER");
     config["password_env"] = json!("CAPTUREFAB_OPCUA_TEST_PASSWORD");
     config["security"] = json!({
@@ -290,11 +296,11 @@ fn sampling_wait_at_acquisition_end_finishes_without_an_extra_poll() {
     let home = Home::new("opcua-native-sampling-end");
     let server = fixture::Server::start(&home.root, vec![("pressure", value(12.5_f64))]);
     let mut config = source(&server, &["pressure"]);
-    config["sampling_ms"] = json!(3000);
+    config["sampling_ms"] = json!(time::ms(3000));
     configure(&home, &config);
     let started = Instant::now();
     let result = record(&home, None).success();
-    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(started.elapsed() < time::secs(2));
     assert_eq!(result["status"], "complete");
     assert_eq!(result["samples"], 1);
     assert_eq!(server.reads.load(Ordering::Relaxed), 1);
