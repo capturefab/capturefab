@@ -515,7 +515,12 @@ impl Backend for Proxy {
     }
     fn finish_stop(&mut self) {
         if let Some(deadline) = self.selection_stop.take() {
-            let _ = self.client.close(deadline);
+            // The frame deadline may be nearly spent by now. Killing the
+            // helper inside the producer's teardown (GCCloseLib) can leave
+            // SDK ownership held, so allow at least the ordinary cleanup time.
+            let _ = self
+                .client
+                .close(deadline.max(Instant::now() + CLEANUP_TIMEOUT));
         }
     }
 }

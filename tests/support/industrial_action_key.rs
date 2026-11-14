@@ -1,6 +1,9 @@
 //! Synthetic worker transcripts qualify coordinator lifecycle, not camera firmware.
 use super::{assert_worker_reaped, configured, monotonic_ns, rows};
-use crate::support::cli::{Home, Run};
+use crate::support::{
+    cli::{Home, Run},
+    time,
+};
 use serde_json::{Value, json};
 use std::{
     fs,
@@ -98,7 +101,7 @@ pub(super) fn worker(mode: &str) -> ! {
                                 .unwrap()
                                 .checked_sub(setup_observed.unwrap())
                                 .unwrap();
-                            assert!(budget <= 2_000_000_000);
+                            assert!(budget <= time::ms(2000) * 1_000_000);
                             let progress = (budget / 4).min(200_000_000);
                             assert!(progress > 0);
                             std::thread::sleep(Duration::from_nanos(progress));
@@ -115,7 +118,10 @@ pub(super) fn worker(mode: &str) -> ! {
                             // exceeds it; the field check detects that renewal.
                             assert!(
                                 command["deadline_ns"].as_u64().unwrap()
-                                    <= setup_observed.unwrap().checked_add(2_000_000_000).unwrap()
+                                    <= setup_observed
+                                        .unwrap()
+                                        .checked_add(time::ms(2000) * 1_000_000)
+                                        .unwrap()
                             );
                         }
                         if mode == "industrial_key_denied" {
@@ -195,12 +201,12 @@ pub(super) fn worker(mode: &str) -> ! {
 fn declarations(home: &Home, two: bool, timeout_ms: u64) {
     let mut sources = vec![
         json!({"id":"a","protocol":"camera","camera":"sim:0","output":"frames/a-{seq}.raw",
-        "action_device_key":17,"settings":["Width=1","Height=1"],"every_ms":10000,"timeout_ms":timeout_ms}),
+        "action_device_key":17,"settings":["Width=1","Height=1"],"every_ms":time::ms(10000),"timeout_ms":timeout_ms}),
     ];
     if two {
         sources.push(
             json!({"id":"b","protocol":"camera","camera":"sim:0","output":"frames/b-{seq}.raw",
-            "settings":["Height=1"],"every_ms":10000,"timeout_ms":timeout_ms}),
+            "settings":["Height=1"],"every_ms":time::ms(10000),"timeout_ms":timeout_ms}),
         );
     }
     fs::write(
@@ -221,7 +227,8 @@ fn operations(home: &Home) -> Vec<String> {
 #[test]
 fn shared_still_sources_assign_one_key_before_both_jobs_without_exporting_it() {
     let (home, mut command) = configured("industrial_key_ok", 1000);
-    declarations(&home, true, 2000);
+    declarations(&home, true, time::ms(2000));
+    let window = time::arg(3000);
     let args = [
         "--json",
         "data",
@@ -229,7 +236,7 @@ fn shared_still_sources_assign_one_key_before_both_jobs_without_exporting_it() {
         "--config",
         "sources.json",
         "--for",
-        "3s",
+        &window,
         "-o",
         "run.jsonl",
     ];
@@ -279,12 +286,13 @@ fn shared_still_sources_assign_one_key_before_both_jobs_without_exporting_it() {
 #[test]
 fn setup_failure_cutoff_and_worker_loss_never_reopen_or_repeat_the_key() {
     for (mode, timeout, exit) in [
-        ("industrial_key_denied", 2000, 3),
-        ("industrial_key_deadline", 2000, 4),
-        ("industrial_key_crash", 2000, 3),
+        ("industrial_key_denied", time::ms(2000), 3),
+        ("industrial_key_deadline", time::ms(2000), 4),
+        ("industrial_key_crash", time::ms(2000), 3),
     ] {
         let (home, mut command) = configured(mode, 1000);
         declarations(&home, true, timeout);
+        let window = time::arg(3000);
         let args = [
             "--json",
             "data",
@@ -292,7 +300,7 @@ fn setup_failure_cutoff_and_worker_loss_never_reopen_or_repeat_the_key() {
             "--config",
             "sources.json",
             "--for",
-            "3s",
+            &window,
             "-o",
             "run.jsonl",
         ];
@@ -306,7 +314,7 @@ fn setup_failure_cutoff_and_worker_loss_never_reopen_or_repeat_the_key() {
             assert_eq!(error["code"], "timeout");
             assert_eq!(error["details"]["initialization_stage"], "write_key");
             assert_eq!(error["details"]["write_may_have_applied"], true);
-            assert!(began.elapsed() < Duration::from_secs(5));
+            assert!(began.elapsed() < time::secs(5));
         }
         let trace = operations(&home);
         assert_eq!(trace.iter().filter(|op| *op == "connect").count(), 1);
@@ -333,7 +341,8 @@ fn setup_failure_cutoff_and_worker_loss_never_reopen_or_repeat_the_key() {
 #[test]
 fn already_saved_capture_drains_after_pinned_schedule_failure() {
     let (home, mut command) = configured("industrial_key_saved_error", 1000);
-    declarations(&home, false, 2000);
+    declarations(&home, false, time::ms(2000));
+    let window = time::arg(3000);
     let args = [
         "--json",
         "data",
@@ -341,7 +350,7 @@ fn already_saved_capture_drains_after_pinned_schedule_failure() {
         "--config",
         "sources.json",
         "--for",
-        "3s",
+        &window,
         "-o",
         "run.jsonl",
     ];

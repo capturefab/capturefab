@@ -6045,9 +6045,10 @@ mod tests {
             camera.registers.insert(HEARTBEAT_TIMEOUT, 3000);
             setup(&mut camera);
             let camera = Arc::new(Mutex::new(camera));
+            // The fake blocks in recv_from and `Drop` wakes it with an empty
+            // datagram. Windows can lose a datagram that arrives as a short
+            // SO_RCVTIMEO fires, so the fake never polls with one.
             let gvcp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-            gvcp.set_read_timeout(Some(Duration::from_millis(5)))
-                .unwrap();
             let stream = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
             let stop = Arc::new(AtomicBool::new(false));
             let SocketAddr::V4(address) = gvcp.local_addr().unwrap() else {
@@ -6065,6 +6066,9 @@ mod tests {
                     let Ok((length, peer)) = server.recv_from(&mut buffer) else {
                         continue;
                     };
+                    if length < 8 {
+                        continue;
+                    }
                     let packet = &buffer[..length];
                     let (command, id) = (be16(packet, 2), be16(packet, 6));
                     let mut outgoing = Vec::new();
@@ -6265,6 +6269,9 @@ mod tests {
     impl Drop for Fake {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Relaxed);
+            if let Ok(waker) = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)) {
+                let _ = waker.send_to(&[], self.address);
+            }
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
             }
@@ -9739,7 +9746,7 @@ mod tests {
                     }
                 }
             });
-            let frame = gige.next_frame(Duration::from_secs(5)).unwrap();
+            let frame = gige.next_frame(crate::test_time::millis(5000)).unwrap();
             sender.join().unwrap();
             assert_eq!(frame.id, block);
             received.push(frame.data.to_vec());
