@@ -325,7 +325,13 @@ fn csp_uses_one_deadline_across_segments_and_closes_on_timeout() {
         let closed = stream.read(&mut [0]);
         assert!(
             matches!(closed, Ok(0))
-                || closed.is_err_and(|error| error.kind() == io::ErrorKind::ConnectionReset)
+                || closed.is_err_and(|error| {
+                    // Windows reports a reset after its late write as aborted.
+                    matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                    )
+                })
         );
     });
     let run = record(&home, &config, &time::arg(2000));
@@ -726,7 +732,13 @@ fn csp_strings_keep_the_original_chunk_deadline_and_reject_small_caps_before_con
         let seen = stream.read(&mut [0]);
         assert!(
             matches!(seen, Ok(0))
-                || seen.is_err_and(|error| error.kind() == io::ErrorKind::ConnectionReset)
+                || seen.is_err_and(|error| {
+                    // Windows reports a reset after its late write as aborted.
+                    matches!(
+                        error.kind(),
+                        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                    )
+                })
         );
     });
     assert_eq!(

@@ -290,10 +290,15 @@ fn micro800_requires_correlated_open_and_shares_handshake_and_read_deadline() {
             if mode == "deadline" {
                 let request = read_tag(&mut stream, 1, &path(b"A", None), 1, 0);
                 thread::sleep(time::millis(400));
+                // The client has given up and unregistered by now. Read that
+                // first: on Windows a write to the closed peer resets the
+                // connection and discards the unread unregister request.
+                unregister(&mut stream);
                 let response = unit_body(originator, 1, &connected_reply(0, 0xc3, &[42, 0]));
                 drop(send(&mut stream, &request, &response));
+            } else {
+                unregister(&mut stream);
             }
-            unregister(&mut stream);
         });
         let run = record(&home, &cfg);
         if mode == "deadline" {

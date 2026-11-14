@@ -28,6 +28,10 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 const CLEANUP_TIMEOUT: Duration = Duration::from_millis(250);
 const NATIVE_EVENT_WAIT: Duration = Duration::from_millis(10);
 const EVENT_REPLY_HEADROOM: Duration = Duration::from_millis(20);
+/// How long after a frame slice's deadline the reply to its short native
+/// wait may still arrive. A missed reply retires the helper, so a loaded host
+/// that merely delays an ordinary SDK timeout must not look like a hung one.
+const EVENT_REPLY_GRACE: Duration = Duration::from_secs(1);
 pub(super) const MAX_XML: usize = 16 * 1024 * 1024;
 pub(super) const MAX_FRAME: usize = 128 * 1024 * 1024;
 
@@ -451,12 +455,15 @@ impl Backend for Proxy {
                 return Err(crate::types::FrameWait.into());
             };
             let began = Instant::now();
+            // The helper answers within its native wait; allow the reply a
+            // bounded grace past the slice so a busy host doesn't retire it.
+            let reply_deadline = deadline.max(began + wait + EVENT_REPLY_GRACE);
             let response = self.client.call(
                 wire::Request::Next {
                     timeout_ms: millis(wait),
                 },
                 Vec::new(),
-                deadline,
+                reply_deadline,
                 MAX_FRAME,
             );
             match response {

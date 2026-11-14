@@ -19,6 +19,8 @@ const HEADER: usize = 16;
 const MAX_DATA: usize = 64 * 1024;
 const MAX_MESSAGE: usize = HEADER + MAX_DATA;
 const MAX_ASYNC: usize = 4096;
+/// How often the asynchronous reader wakes to check for stop.
+const ASYNC_POLL: Duration = Duration::from_millis(100);
 const FIRST_ID: u32 = 0xffff_ff00;
 const UNKNOWN_ID: u32 = u32::MAX;
 
@@ -54,9 +56,11 @@ struct AsyncReader {
 impl AsyncReader {
     fn start(mut stream: TcpStream, wake: TcpStream) -> Result<Self> {
         // This socket has no idle timeout. Shutdown on owner retirement wakes
-        // even a partial header/payload read; the reader runs no user callbacks.
+        // even a partial header/payload read on Unix; Windows does not wake a
+        // blocked receive on shutdown, so the reader also wakes every
+        // `ASYNC_POLL` to check for stop. It runs no user callbacks.
         stream
-            .set_read_timeout(None)
+            .set_read_timeout(Some(ASYNC_POLL))
             .map_err(|error| io_error(&error))?;
         let control = stream.try_clone().map_err(|error| io_error(&error))?;
         let failure = Arc::new(Mutex::new(None));
@@ -502,9 +506,27 @@ fn async_loop(stream: &mut TcpStream, stopped: &AtomicBool) -> Result<()> {
         // its complete header before waiting for any alleged payload, so a
         // terminal or malformed header can immediately wake a stalled query.
         let mut bytes = [0; HEADER];
-        stream
-            .read_exact(&mut bytes)
-            .map_err(|error| io_error(&error))?;
+        let mut filled = 0;
+        while filled < HEADER {
+            if stopped.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            match stream.read(bytes.get_mut(filled..).unwrap_or_default()) {
+                Ok(0) => {
+                    return Err(io_error(&io::Error::from(io::ErrorKind::UnexpectedEof)));
+                }
+                Ok(count) => filled += count,
+                // A wakeup to check for stop, not an idle timeout.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => return Err(io_error(&error)),
+            }
+        }
         let (kind, control, parameter, length) = header(bytes, MAX_ASYNC)?;
         if kind != 20 || parameter != 0 || length != 0 {
             return Err(protocol(&format!(

@@ -715,11 +715,24 @@ fn check_native(samples: &[Value], api: &str, expected: &[ReadSpec]) {
         }
     }
 }
+/// The product spaces RWS sends by at least 50 ms. The fake stamps each
+/// request when its polling accept loop gets to it, which can wake late on a
+/// loaded runner and shorten one gap, so single gaps get that jitter while
+/// the average keeps the full pacing.
 fn paced(times: &[Instant]) {
     for pair in times.windows(2) {
         assert!(
-            pair[1].duration_since(pair[0]) >= Duration::from_millis(45),
-            "RWS sends did not retain50ms pacing"
+            pair[1].duration_since(pair[0]) >= Duration::from_millis(30),
+            "RWS sends did not retain 50ms pacing"
+        );
+    }
+    if let (Some(first), Some(last), Some(gaps)) =
+        (times.first(), times.last(), u32::try_from(times.len()).ok())
+        && gaps > 1
+    {
+        assert!(
+            last.duration_since(*first) >= Duration::from_millis(45) * (gaps - 1),
+            "RWS sends did not retain 50ms pacing on average"
         );
     }
 }

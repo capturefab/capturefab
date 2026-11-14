@@ -326,7 +326,9 @@ fn late_timer_errors_are_atomic_and_previous_polls_still_export() {
                     Err(error)
                         if matches!(
                             error.kind(),
-                            io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe
+                            io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::ConnectionAborted
+                                | io::ErrorKind::BrokenPipe
                         ) => {}
                     other => panic!("unexpected later query: {other:?}"),
                 }

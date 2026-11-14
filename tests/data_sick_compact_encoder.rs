@@ -1240,8 +1240,8 @@ fn max32_and_exact_json_group_boundary_keep_pending_packet_order_and_original_cl
         for sent in 1..=33 {
             send(&socket, target, &raw);
             if mode == "small" {
-                // All 33 tiny datagrams arrive within the fixed 100ms window.
-                thread::sleep(Duration::from_millis(1));
+                // All 33 tiny datagrams go out back to back, so they arrive
+                // within the fixed 100ms window however late a sleep would wake.
             } else if sent % 2 == 0 || sent == 33 {
                 // At most two new UDP datagrams are outstanding. Credit comes
                 // from a verified raw commit footer, never a control ACK or
