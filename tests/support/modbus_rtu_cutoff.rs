@@ -13,7 +13,7 @@ use std::{
 
 fn config(device: &str, signals: &Value) -> Value {
     json!({"version":1,"sources":[{"id":"meter","protocol":"modbus_rtu","device":device,
-        "unit":3,"baud":300,"parity":"none","stop_bits":2,"every_ms":1,"timeout_ms":time::ms(1000),"signals":signals}]})
+        "unit":3,"baud":300,"parity":"even","stop_bits":2,"every_ms":1,"timeout_ms":time::ms(1000),"signals":signals}]})
 }
 fn record(home: &Home, config: &Value) -> Run {
     fs::write(home.path("sources.json"), config.to_string()).unwrap();
@@ -102,10 +102,12 @@ fn hold_until_final_quiet_gap(run: &Path, stop: &AtomicBool) {
         );
         thread::sleep(Duration::from_millis(1));
     };
-    // Reply 100 ms before the scaled `--for` cutoff: less than the fixed
-    // 128.3 ms 300-baud quiet gap, which is a wire property and not scaled.
+    // Reply 125 ms before the scaled `--for` cutoff: just inside the fixed
+    // 140 ms quiet gap (300 baud, 12-bit characters), a wire property that is
+    // not scaled. A sleep never wakes early, so aim near the start of that
+    // window and leave the most room for a slow runner's late wakeup.
     let window = i64::try_from(time::ms(1000)).unwrap();
-    let target = started + chrono::Duration::milliseconds(window - 100);
+    let target = started + chrono::Duration::milliseconds(window - 125);
     loop {
         assert!(
             !stop.load(Ordering::Acquire),
@@ -119,7 +121,20 @@ fn hold_until_final_quiet_gap(run: &Path, stop: &AtomicBool) {
             Instant::now() < deadline,
             "wall clock moved during cutoff fixture"
         );
-        thread::sleep(left.to_std().unwrap().min(time::millis(10)));
+        // A sleep on a loaded runner can overshoot by 100 ms or more, more
+        // than the whole reply window; sleep coarsely only while far away and
+        // spin through the last 300 ms.
+        let spin = chrono::Duration::milliseconds(300);
+        if left > spin {
+            thread::sleep(
+                (left - spin)
+                    .to_std()
+                    .unwrap()
+                    .min(Duration::from_millis(10)),
+            );
+        } else {
+            thread::yield_now();
+        }
     }
 }
 fn assert_prefix(home: &Home, expected: &[(&str, u16)], status: &str) {
@@ -152,8 +167,8 @@ fn rtu_cutoff_before_a_new_poll_request_is_idle_after_one_completed_poll() {
         drop(slave);
         hold_until_final_quiet_gap(&run, &stop);
         reply(&mut master, 7);
-        // At300baud with11bits/character the128.3ms quiet gap cannot fit
-        // in the remaining~100ms. No second request may appear on the wire.
+        // At 300 baud with 12-bit characters the 140 ms quiet gap cannot
+        // fit in the remaining ~125 ms. No second request may appear on the wire.
         no_more(&mut master, &stop);
         1
     });

@@ -13,7 +13,7 @@ use std::{
     io::{Read as _, Write as _},
     os::fd::{AsRawFd as _, FromRawFd as _},
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use support::cli::{Home, Run};
 use support::time;
@@ -104,9 +104,15 @@ impl Terminal {
     }
 
     fn reply(&self, response: &[u8]) {
-        for chunk in response.chunks(11) {
-            (&self.master).write_all(chunk).unwrap();
-            thread::sleep(time::millis(2));
+        // Split each frame once so the reader must join two reads. This pause
+        // is not a timing margin: it stays unscaled, and there is only one per
+        // frame because every sleep can overshoot by 100 ms or more on a
+        // loaded runner, which would otherwise spend the scaled budget.
+        let (head, tail) = response.split_at(response.len().min(11));
+        (&self.master).write_all(head).unwrap();
+        if !tail.is_empty() {
+            thread::sleep(Duration::from_millis(2));
+            (&self.master).write_all(tail).unwrap();
         }
     }
 }

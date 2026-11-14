@@ -271,9 +271,6 @@ impl Peer {
     ) -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         let server = socket.try_clone().unwrap();
-        server
-            .set_read_timeout(Some(Duration::from_millis(20)))
-            .unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
         let wrong = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -282,11 +279,18 @@ impl Peer {
             let mut buffer = vec![0; 65_535];
             let mut seen = Vec::new();
             while !stopped.load(Ordering::SeqCst) {
+                // Block for the whole remaining lifetime rather than polling
+                // with a short receive timeout: Windows leaves a socket
+                // indeterminate after SO_RCVTIMEO expires, and a request
+                // arriving as it fires can be lost. `wake` ends the wait.
+                let left = until.saturating_duration_since(Instant::now());
                 assert!(
-                    Instant::now() < until,
+                    !left.is_zero(),
                     "HSES fixture exceeded its bounded lifetime"
                 );
+                server.set_read_timeout(Some(left)).unwrap();
                 match server.recv_from(&mut buffer) {
+                    Ok((0, _)) => {}
                     Ok((length, peer)) => {
                         assert!(
                             seen.len() < count,
@@ -336,8 +340,17 @@ impl Peer {
         source["reads"] = reads;
         source
     }
-    fn finish(mut self) -> Vec<Seen> {
+    /// Stop the fixture thread and wake its blocking receive with an empty
+    /// datagram, which the thread and the final check both ignore.
+    fn wake(&self) {
         self.stop.store(true, Ordering::SeqCst);
+        let waker = UdpSocket::bind("127.0.0.1:0").unwrap();
+        waker
+            .send_to(&[], self.socket.local_addr().unwrap())
+            .unwrap();
+    }
+    fn finish(mut self) -> Vec<Seen> {
+        self.wake();
         let seen = self.handle.take().unwrap().join().unwrap();
         self.socket.set_nonblocking(true).unwrap();
         let mut extra = [0; 33];
@@ -353,6 +366,7 @@ impl Peer {
                     ) => {}
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return seen,
                 Err(error) => panic!("unexpected final UDP error: {error}"),
+                Ok((0, _)) => {}
                 Ok(_) => panic!("queued unexpected HSES request"),
             }
         }
@@ -361,7 +375,9 @@ impl Peer {
 }
 impl Drop for Peer {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
+        if self.handle.is_some() {
+            self.wake();
+        }
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -634,7 +650,7 @@ fn correlated_malformed_and_remote_status_errors_retain_only_the_prior_poll() {
         }
         let samples = recorded(&home, "failed");
         assert_eq!(samples.len(), 1);
-        check_native(&samples[0], &spec, &seen[0], 2000);
+        check_native(&samples[0], &spec, &seen[0], time::ms(2000));
         exports(&home, &samples, true);
     }
 }
