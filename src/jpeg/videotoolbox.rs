@@ -570,6 +570,7 @@ mod tests {
             _ => unreachable!(),
         };
         Frame {
+            pixel_encoding: None,
             width,
             height,
             pixel_format: format,

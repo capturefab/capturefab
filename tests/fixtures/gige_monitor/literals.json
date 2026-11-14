@@ -1,0 +1,34 @@
+{
+  "provenance": "Existing independent synthetic action_workflow_tests block42 Mono8 literals, frozen before new monitor receiver/unit authoring; no new wire decoder or producer capture.",
+  "pixels_hex": "1021324354657687",
+  "packets": [
+    {
+      "name": "leader",
+      "hex": "0000002a010000000000000100000000000004d2010800010000000400000002000000000000000000000000",
+      "bytes": 44,
+      "sha256": "2b4eb6b38cd0ce9dec30f1e5560d8f616b9cadc335a2e03ef11524a82a248c2a"
+    },
+    {
+      "name": "data",
+      "hex": "0000002a030000011021324354657687",
+      "bytes": 16,
+      "sha256": "f44d6c2f6e60d28b3d863af555e4318ead74b980e9ba2ec58377ba42c8a18f9b"
+    },
+    {
+      "name": "trailer",
+      "hex": "0000002a020000020000000100000002",
+      "bytes": 16,
+      "sha256": "3784168c999a06aac1a143b7b84026d71f47b2bec9a61da3315c92ff193367f7"
+    }
+  ],
+  "fixture_scope": "independent synthetic externally-running multicast controller; standard GVCP reads only; fixed pixel bytes, increment only the BE16 GVSP block-id at offset2 for repeated frames",
+  "initial_registers": {
+    "device_mode": 0,
+    "ccp": 2,
+    "destination": "239.255.42.19",
+    "scps": 1500,
+    "stream_capability": 2147483648,
+    "timestamp_frequency": 1000000000,
+    "payload_size": 8
+  }
+}

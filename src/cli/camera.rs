@@ -11,11 +11,13 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::fmt::Write as _;
+mod action_key;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(crate) enum Kind {
     Gige,
     U3v,
+    Gentl,
     Webcam,
     Onvif,
     Screen,
@@ -59,7 +61,7 @@ impl ListResult {
     pub(super) const FIELDS: &[(&str, &str)] = &[
         (
             "cameras",
-            "[{id,kind:gige|u3v|webcam|screen|onvif|stream|file|sim,vendor,model,serial,address,held_by?:{session,idle_releases_in_s?}}] — pass id to -c; held_by: a session keeps it open, the auto session for idle_releases_in_s more seconds unless used",
+            "[{id,kind:gige|u3v|gentl|webcam|screen|onvif|stream|file|sim,vendor,model,serial,address,held_by?:{session,idle_releases_in_s?}}] — pass id to -c; held_by: a session keeps it open, the auto session for idle_releases_in_s more seconds unless used",
         ),
         (
             "warnings",
@@ -115,6 +117,7 @@ pub(super) fn list(global: &Global, args: &ListArgs) -> Result<Report> {
     let kinds = crate::camera::Kinds {
         gige: all || named(Kind::Gige),
         u3v: all || named(Kind::U3v),
+        gentl: all || named(Kind::Gentl),
         host: all || named(Kind::Webcam) || named(Kind::Screen),
         onvif: all || named(Kind::Onvif),
         sim: named(Kind::Sim),
@@ -128,6 +131,7 @@ pub(super) fn list(global: &Global, args: &ListArgs) -> Result<Report> {
         "webcam" => all || named(Kind::Webcam),
         "gige" => all || named(Kind::Gige),
         "u3v" => all || named(Kind::U3v),
+        "gentl" => all || named(Kind::Gentl),
         "onvif" => all || named(Kind::Onvif),
         _ => all,
     };
@@ -272,6 +276,14 @@ fn info_text(value: &Value) -> String {
     if value.get("serial").is_some() {
         let _ = writeln!(text, "  serial      {}", get("serial"));
     }
+    if value.get("camera_access").is_some() {
+        let _ = writeln!(
+            text,
+            "  access      {} (acquisition: {})",
+            get("camera_access"),
+            get("acquisition_control")
+        );
+    }
     if value.get("width").is_some() {
         let _ = writeln!(
             text,
@@ -387,9 +399,13 @@ pub(super) fn features(global: &Global, args: FeaturesArgs) -> Result<Report> {
                     .unwrap_or_default(),
                 row["access"].as_str().unwrap_or_default().to_owned(),
                 range,
-                row.get("locked_by")
-                    .map(|owner| format!("locked by {}", shown(owner)))
-                    .unwrap_or_default(),
+                if row["writable"] == false {
+                    "read-only monitor; writes disabled".to_owned()
+                } else {
+                    row.get("locked_by")
+                        .map(|owner| format!("locked by {}", shown(owner)))
+                        .unwrap_or_default()
+                },
             ]
         })
         .collect::<Vec<_>>();
@@ -485,11 +501,39 @@ pub(crate) struct SetArgs {
     /// Check every value against the camera and show the writes in order; change nothing
     #[arg(long)]
     pub dry_run: bool,
+    /// Assign only `ActionDeviceKey` without readback or rollback in an existing session.
+    #[arg(long)]
+    pub write_only: bool,
+    /// Bound the WO key operation, including ordering and worker queue waits.
+    #[arg(long, requires = "write_only", value_name = "DUR", value_parser = super::args::duration)]
+    pub write_timeout: Option<std::time::Duration>,
+    /// Populated from clap `ValueSource` by the root CLI parser.
+    #[arg(skip)]
+    pub camera_explicit: bool,
     #[command(flatten)]
     pub keep: KeepArg,
 }
 
+pub(super) const ACTION_KEY_FIELDS: &[(&str, &str)] = &[
+    ("camera", "string — exact owned camera binding"),
+    ("feature", "ActionDeviceKey"),
+    (
+        "write_completed",
+        "true — reported completion, without readable verification",
+    ),
+    ("completion", "native_transport_ack|producer_reported"),
+    ("readback", "unavailable_write_only"),
+    ("rollback", "not_available"),
+    (
+        "scope",
+        "current_control_epoch — not persisted or reapplied after reconnect",
+    ),
+];
+
 pub(super) fn set(global: &Global, args: &SetArgs) -> Result<Report> {
+    if args.write_only {
+        return action_key::set(global, args);
+    }
     let values = args
         .values
         .iter()

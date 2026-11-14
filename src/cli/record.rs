@@ -71,9 +71,9 @@ pub(crate) struct RecordArgs {
     /// How long to wait for the first frame; none waits for a trigger until stopped
     #[arg(long, default_value = "10s", value_name = "DUR", value_parser = super::args::wait)]
     pub timeout: Wait,
-    /// How long a camera that sets its own exposure (a webcam, or ExposureAuto=Continuous; a network stream is already running) may take to settle before recording; 0 records at once
-    #[arg(long, default_value = "2s", value_name = "DUR", value_parser = super::args::duration)]
-    pub warmup: Duration,
+    /// Exposure settling limit (default 2s; none for read-only monitors); 0 records at once
+    #[arg(long, value_name = "DUR", value_parser = super::args::duration)]
+    pub warmup: Option<Duration>,
     /// Leave the recording running in a session and print its job once the first frame is encoded
     #[arg(long)]
     pub background: bool,
@@ -195,11 +195,12 @@ pub(super) fn run(global: &Global, args: &RecordArgs) -> Result<Report> {
         context: std::collections::BTreeMap::new(),
         duration_ms: args.duration.map(millis),
         utc_offset_s: Some(crate::naming::local_offset()),
-        warmup_ms: Some(millis(args.warmup)),
+        warmup_ms: args.warmup.map(millis),
         job: None,
         // A recording this command waits for ends when it goes away.
         lease: !args.background,
         copy: args.copy(),
+        timeline: None,
     };
     // Everything that can be checked here is, before a camera is opened:
     // the request and a taken file; FFmpeg and an encoder for the codec
@@ -235,6 +236,7 @@ pub(super) fn run(global: &Global, args: &RecordArgs) -> Result<Report> {
                 bitrate: args.bitrate(),
                 max_file_bytes,
                 min_free,
+                timeline: None,
             })?;
         }
         Ok(())

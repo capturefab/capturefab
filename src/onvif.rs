@@ -18,6 +18,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs as _, UdpSocket},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use zeroize::Zeroizing;
 
 const MAX_SOAP: usize = 4 * 1024 * 1024;
 const DEVICE_NS: &str = "http://www.onvif.org/ver10/device/wsdl";
@@ -909,6 +910,45 @@ fn validate_credentials(credentials: &Credentials) -> Result<()> {
 fn quoted(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
+
+/// Answers a supported HTTP Digest challenge, without a Basic fallback.
+/// The caller owns nonce-count progression and a fresh, nonempty client nonce.
+pub(crate) fn digest_only_authorization(
+    values: &[String],
+    username: &str,
+    password: &str,
+    method: &str,
+    path: &str,
+    cnonce: &str,
+    nonce_count: u32,
+) -> Result<String> {
+    ensure!(
+        nonce_count != 0
+            && !cnonce.is_empty()
+            && !values.iter().any(|value| value.contains(['\r', '\n']))
+            && ![username, password, method, path, cnonce]
+                .iter()
+                .any(|value| value.chars().any(char::is_control)),
+        "invalid HTTP Digest input"
+    );
+    let challenges = challenges(values)?;
+    let (challenge, hash, sess) = digest_challenge(&challenges)
+        .context("server offers no supported HTTP Digest challenge")?;
+    Ok(digest_authorization(
+        challenge,
+        hash,
+        sess,
+        &DigestRequest {
+            username,
+            password,
+            method,
+            path,
+            cnonce,
+            nonce_count,
+        },
+    ))
+}
+
 /// The Authorization value answering a 401: Digest (RFC 7616) with the
 /// challenge [`digest_challenge`] picks, else Basic when offered.
 fn http_authorization(
@@ -929,10 +969,14 @@ fn http_authorization(
             challenge,
             hash,
             sess,
-            credentials,
-            method,
-            path,
-            cnonce,
+            &DigestRequest {
+                username: &credentials.username,
+                password: &credentials.password,
+                method,
+                path,
+                cnonce,
+                nonce_count: 1,
+            },
         ));
     }
     if challenges
@@ -958,35 +1002,52 @@ fn http_authorization(
     }
     bail!("unsupported ONVIF HTTP authentication method")
 }
+struct DigestRequest<'a> {
+    username: &'a str,
+    password: &'a str,
+    method: &'a str,
+    path: &'a str,
+    cnonce: &'a str,
+    nonce_count: u32,
+}
+
 fn digest_authorization(
     challenge: &Challenge,
     hash: DigestHash,
     sess: bool,
-    credentials: &Credentials,
-    method: &str,
-    path: &str,
-    cnonce: &str,
+    request: &DigestRequest<'_>,
 ) -> String {
     let param = |name: &str| challenge.params.get(name).map(String::as_str);
     let realm = param("realm").unwrap_or_default();
     let nonce = param("nonce").unwrap_or_default();
     let qop = param("qop").is_some();
-    let mut ha1 = hash.hex(&format!(
-        "{}:{realm}:{}",
-        credentials.username, credentials.password
-    ));
+    let DigestRequest {
+        username,
+        password,
+        method,
+        path,
+        cnonce,
+        nonce_count,
+    } = request;
+    let credential_text = Zeroizing::new(format!("{username}:{realm}:{password}"));
+    let mut ha1 = Zeroizing::new(hash.hex(&credential_text));
     if sess {
-        ha1 = hash.hex(&format!("{ha1}:{nonce}:{cnonce}"));
+        let session_text = Zeroizing::new(format!("{}:{nonce}:{cnonce}", *ha1));
+        ha1 = Zeroizing::new(hash.hex(&session_text));
     }
     let ha2 = hash.hex(&format!("{method}:{path}"));
-    let response = if qop {
-        hash.hex(&format!("{ha1}:{nonce}:00000001:{cnonce}:auth:{ha2}"))
+    let response_text = if qop {
+        Zeroizing::new(format!(
+            "{}:{nonce}:{nonce_count:08x}:{cnonce}:auth:{ha2}",
+            *ha1
+        ))
     } else {
-        hash.hex(&format!("{ha1}:{nonce}:{ha2}"))
+        Zeroizing::new(format!("{}:{nonce}:{ha2}", *ha1))
     };
+    let response = hash.hex(&response_text);
     let mut auth = format!(
         "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{response}\", algorithm={}",
-        quoted(&credentials.username),
+        quoted(username),
         quoted(realm),
         quoted(nonce),
         quoted(path),
@@ -995,9 +1056,11 @@ fn digest_authorization(
     if qop {
         let _ = write!(
             auth,
-            ", qop=auth, nc=00000001, cnonce=\"{}\"",
+            ", qop=auth, nc={nonce_count:08x}, cnonce=\"{}\"",
             quoted(cnonce)
         );
+    } else if sess {
+        let _ = write!(auth, ", cnonce=\"{}\"", quoted(cnonce));
     }
     if let Some(opaque) = param("opaque") {
         let _ = write!(auth, ", opaque=\"{}\"", quoted(opaque));
@@ -1734,7 +1797,7 @@ pub(crate) fn connect_with(
     };
     let streams = resolve(&endpoint, credentials.as_ref(), None, timeout).map_err(rekey)?;
     let (profile, backend) = open_stream(&streams, |profile| {
-        let uri = zeroize::Zeroizing::new(authenticated_uri(&profile.uri, credentials.as_ref())?);
+        let uri = Zeroizing::new(authenticated_uri(&profile.uri, credentials.as_ref())?);
         crate::media::open_url(&uri, timeout).map_err(|error| {
             if sent {
                 explain_rtsp_refusal(error, &profile.uri, timeout)
@@ -2255,6 +2318,100 @@ mod tests {
         let mut parsed = challenges(&[authorization.to_owned()]).unwrap();
         assert_eq!(parsed.len(), 1, "{authorization}");
         parsed.remove(0).params
+    }
+    #[test]
+    fn digest_only_matches_rfc2617_and_independent_second_nonce_count() {
+        // RFC 2617 section 3.5; the nc=2 extension was independently calculated
+        // with Python hashlib, not this module's hashing/request helpers.
+        let challenge = [r#"Digest realm="testrealm@host.com", qop="auth,auth-int", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", opaque="5ccc069c403ebaf9f0171e9517f40e41""#.to_owned()];
+        for (count, expected) in [
+            (1, "6629fae49393a05397450978507c4ef1"),
+            (2, "15b6bb427e3fecd23a43cb702ce447d5"),
+        ] {
+            let auth = digest_only_authorization(
+                &challenge,
+                "Mufasa",
+                "Circle Of Life",
+                "GET",
+                "/dir/index.html",
+                "0a4f113b",
+                count,
+            )
+            .unwrap();
+            let fields = digest_response(&auth);
+            assert_eq!(fields["response"], expected);
+            assert_eq!(fields["nc"], format!("{count:08x}"));
+            assert_eq!(fields["qop"], "auth");
+            assert_eq!(fields["cnonce"], "0a4f113b");
+            assert_eq!(fields["opaque"], "5ccc069c403ebaf9f0171e9517f40e41");
+            if count == 1 {
+                let credentials = Credentials {
+                    username: "Mufasa".into(),
+                    password: "Circle Of Life".into(),
+                };
+                assert_eq!(
+                    auth,
+                    http_authorization(
+                        &challenge,
+                        &credentials,
+                        "GET",
+                        "/dir/index.html",
+                        "0a4f113b"
+                    )
+                    .unwrap()
+                );
+            }
+        }
+    }
+    #[test]
+    fn sess_without_qop_emits_the_client_nonce_used_in_ha1() {
+        let challenge = [r#"Digest realm="testrealm@host.com", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", algorithm=MD5-sess"#.to_owned()];
+        let auth = digest_only_authorization(
+            &challenge,
+            "Mufasa",
+            "Circle Of Life",
+            "GET",
+            "/dir/index.html",
+            "0a4f113b",
+            2,
+        )
+        .unwrap();
+        let fields = digest_response(&auth);
+        assert_eq!(fields["response"], "4726bc10c33fa6cb357eb27807b1cce8");
+        assert_eq!(fields["cnonce"], "0a4f113b");
+        assert!(!fields.contains_key("nc"));
+        assert!(!fields.contains_key("qop"));
+        assert_eq!(fields["algorithm"], "MD5-sess");
+    }
+    #[test]
+    fn digest_only_never_falls_back_to_basic_or_reports_credentials() {
+        for value in [
+            "Basic realm=\"robot\"",
+            "Digest realm=\"robot\", nonce=\"n\", algorithm=SHA-1, Basic realm=\"robot\"",
+            "Digest realm=\"robot\", nonce=\"n\", qop=\"auth-int\"",
+            "Digest realm=\"robot\"",
+            "Digest realm=\"unterminated",
+            "Digest realm=\"robot\", nonce=\"n\"\r\nSet-Cookie: secret",
+        ] {
+            let error = digest_only_authorization(
+                &[value.into()],
+                "private-user",
+                "private-password",
+                "GET",
+                "/",
+                "nonce",
+                1,
+            )
+            .unwrap_err();
+            let message = error.to_string();
+            assert!(!message.contains("private-user"));
+            assert!(!message.contains("private-password"));
+        }
+        let challenge = ["Digest realm=\"robot\", nonce=\"n\"".into()];
+        digest_only_authorization(&challenge, "u", "p", "GET", "/", "c", 0).unwrap_err();
+        digest_only_authorization(&challenge, "u", "p", "GET", "/", "", 1).unwrap_err();
+        digest_only_authorization(&challenge, "u\r\n", "p", "GET", "/", "c", 1).unwrap_err();
+        digest_only_authorization(&challenge, "u", "p", "GET", "/\n", "c", 1).unwrap_err();
     }
     #[test]
     fn digest_answers_the_strongest_of_several_challenges() {

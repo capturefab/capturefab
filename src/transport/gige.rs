@@ -4,10 +4,12 @@
 //! protocols (also documented in Aravis' protocol headers). This implementation
 //! does not link to, embed, or translate Aravis code.
 #![deny(clippy::missing_const_for_fn)]
+use super::chunks::{ByteOrder, ChunkData, ImageLayout};
 use crate::copies::Site;
 use crate::framebuf::{PoolVec, pool};
 use crate::types::{
     Backend, CameraInfo, Categorized, Frame, RegisterIo, Transport, TransportStats,
+    control_remaining,
 };
 use crate::xml_cache;
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
@@ -15,12 +17,30 @@ use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::{Cursor, ErrorKind, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+pub(crate) mod action_workflow_tests;
 #[cfg(any(test, target_os = "linux"))]
 mod batch;
+pub(crate) mod bootstrap;
+pub(crate) mod monitor;
+mod multipart;
+mod ownership;
+use ownership::Lease;
+
+/// Whether the native controller permanently retired this ownership epoch.
+pub(crate) fn ownership_retired(error: &anyhow::Error) -> bool {
+    ownership::retired(error)
+}
+mod xml_http;
+
+/// Shared bounded retrieval for vendor-advertised plain HTTP XML locations.
+pub(super) fn fetch_xml_http(url: &str, timeout: Duration) -> Result<(String, Vec<u8>)> {
+    xml_http::get(url, timeout)
+}
 
 const GVCP_PORT: u16 = 3956;
 const DISCOVERY: u16 = 0x0002;
@@ -36,6 +56,12 @@ const GVCP_CAPABILITY: u32 = 0x0934;
 const GVCP_CONFIGURATION: u32 = 0x0954;
 const PENDING_TIMEOUT: u32 = 0x0958;
 const HEARTBEAT_TIMEOUT: u32 = 0x0938;
+const PRIMARY_PORT: u32 = 0x0a04;
+const PRIMARY_IP: u32 = 0x0a14;
+const SWITCHOVER_KEY: u32 = 0x095c;
+const OWNER_ENDPOINT: u32 = 0x0800_0000;
+const DISABLE_CAPABILITY: u32 = 0x2000_0000;
+const HEARTBEAT_DISABLE: u32 = 0x1;
 const TIMESTAMP_HIGH: u32 = 0x093c;
 const TIMESTAMP_LOW: u32 = 0x0940;
 /// Timestamp control (bit 30 latches the clock) and the latched value.
@@ -186,6 +212,10 @@ impl std::fmt::Display for GvcpStatus {
     }
 }
 impl std::error::Error for GvcpStatus {}
+
+pub(crate) fn bootstrap_status(status: u16) -> anyhow::Error {
+    GvcpStatus(status).into()
+}
 
 /// A rejected GVCP command still establishes that the camera replied. Preserve
 /// that distinction through contextual errors from repeated network probes.
@@ -397,7 +427,38 @@ pub(crate) fn discover_until(
     Ok(cameras.into_values().collect())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Permit {
+    Normal,
+    Probe,
+    Managed,
+    Claim,
+    Release,
+}
+struct ControlReply {
+    payload: Vec<u8>,
+    first_send: u64,
+}
+pub(crate) fn managed_range(address: u32, length: usize) -> bool {
+    let end = u64::from(address) + length as u64;
+    [
+        HEARTBEAT_TIMEOUT,
+        GVCP_CONFIGURATION,
+        CONTROL_PRIVILEGE,
+        SWITCHOVER_KEY,
+    ]
+    .into_iter()
+    .any(|register| u64::from(register) < end && u64::from(register) + 4 > u64::from(address))
+}
 struct Control {
+    lease: Option<Arc<Lease>>,
+    owner_endpoint: Option<SocketAddrV4>,
+    // Scoped only while the caller owns the Control mutex; heartbeat never inherits it.
+    operation_deadline: Option<Instant>,
+    disable_supported: bool,
+    register_order_known: bool,
+    #[cfg(test)]
+    lease_clock: Option<Arc<std::sync::atomic::AtomicU64>>,
     socket: UdpSocket,
     timeout: Duration,
     next_id: u16,
@@ -422,6 +483,13 @@ impl Control {
             .connect(address)
             .context("routing GVCP socket to camera")?;
         Ok(Self {
+            lease: None,
+            owner_endpoint: None,
+            operation_deadline: None,
+            disable_supported: false,
+            register_order_known: false,
+            #[cfg(test)]
+            lease_clock: None,
             socket,
             timeout: bounded_timeout(timeout),
             next_id: 1,
@@ -445,39 +513,156 @@ impl Control {
         self.timeout.max(self.retry_wait() * 3)
     }
     fn transact(&mut self, command: u16, payload: &[u8]) -> Result<Vec<u8>> {
+        self.transact_owned(command, payload, Permit::Normal)
+            .map(|reply| reply.payload)
+    }
+    fn check_operation(&self) -> Result<()> {
+        self.operation_deadline
+            .map_or(Ok(()), |stop| control_remaining(stop).map(|_| ()))
+    }
+    // Apply the caller's cap to kernel send-buffer waits too. Socket options
+    // are local state; restore them before releasing the exclusive Control lock.
+    fn with_send_deadline<T>(&self, action: impl FnOnce() -> Result<T>) -> Result<T> {
+        let Some(deadline) = self.operation_deadline else {
+            return action();
+        };
+        let mut left = control_remaining(deadline)?;
+        if let Some(lease) = &self.lease
+            && let Some(remaining) = lease.remaining()?
+        {
+            left = left.min(remaining);
+        }
+        let previous = self.socket.write_timeout()?;
+        self.socket.set_write_timeout(Some(left))?;
+        let result = action();
+        let restored = self
+            .socket
+            .set_write_timeout(previous)
+            .context("restoring GVCP send timeout");
+        match (result, restored) {
+            (Err(error), Err(restoration)) => Err(error.context(format!(
+                "GVCP local timeout restoration also failed: {restoration:#}"
+            ))),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Ok(value), Ok(())) => {
+                self.check_operation()?;
+                Ok(value)
+            }
+        }
+    }
+    fn transact_owned(
+        &mut self,
+        command: u16,
+        payload: &[u8],
+        permit: Permit,
+    ) -> Result<ControlReply> {
+        let lease = self.lease.clone();
+        if lease.is_some() {
+            if command == WRITE_MEMORY {
+                ensure!(payload.len() >= 4, "invalid memory write request");
+                if managed_range(be32(payload, 0), payload.len() - 4) {
+                    return Err(Categorized::error(
+                        crate::types::ErrorKind::Unsupported,
+                        "mixed or memory-level controller-register writes are unsupported; write one complete managed register",
+                    ));
+                }
+            }
+            if command == WRITE_REGISTER {
+                ensure!(
+                    payload.len().is_multiple_of(8),
+                    "invalid register write request"
+                );
+                for pair in payload.as_chunks::<8>().0 {
+                    if managed_range(be32(pair, 0), 4) && permit == Permit::Normal {
+                        return Err(Categorized::error(
+                            crate::types::ErrorKind::Unsupported,
+                            "controller-register writes require a verified ownership transition",
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(lease) = &lease {
+            lease.check()?;
+            if permit == Permit::Normal && lease.needs_probe(self.command_time())? {
+                self.probe_owner()?;
+            }
+        }
+        self.check_operation()?;
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
         let packet = command_packet(command, id, 1, payload)?;
         let retry_wait = self.retry_wait();
         let start = Instant::now();
-        let mut deadline = start + self.command_time();
+        let command_deadline = start + self.command_time();
+        let mut deadline = self
+            .operation_deadline
+            .map_or(command_deadline, |stop| stop.min(command_deadline));
+        let pending_deadline = self.pending_limit.map_or(command_deadline, |limit| {
+            command_deadline.max(start + limit)
+        });
         let limit = self
-            .pending_limit
-            .map_or(deadline, |limit| deadline.max(start + limit));
+            .operation_deadline
+            .map_or(pending_deadline, |stop| stop.min(pending_deadline));
         let mut buffer = [0u8; 2048];
-        for attempt in 0..3 {
+        let mut first_send = None;
+        for attempt in 0..if matches!(permit, Permit::Release | Permit::Claim) {
+            1
+        } else {
+            3
+        } {
             if Instant::now() >= deadline {
                 break;
             }
-            if let Err(error) = self.socket.send(&packet) {
-                let context = crate::network::with_local_network_hint(
-                    "sending GVCP command",
-                    &error,
-                    self.socket.peer_addr().ok().map(|peer| peer.ip()),
-                );
-                return Err(anyhow::Error::new(error).context(context));
-            }
+            let sent = self.with_send_deadline(|| {
+                self.check_operation()?;
+                let sent = lease.as_ref().map_or(Ok(0), |lease| lease.send_clock())?;
+                // Release is final even if this send or its ACK fails. A second
+                // datagram could reach a camera already claimed by another app.
+                if permit == Permit::Release
+                    && let Some(lease) = &lease
+                {
+                    lease.release()?;
+                }
+                self.socket.send(&packet).map_err(|error| {
+                    // SO_SNDTIMEO commonly reports EAGAIN/WouldBlock. Under a
+                    // scoped blocking socket this is the bounded send timeout.
+                    let error = if self.operation_deadline.is_some() && is_receive_timeout(&error) {
+                        std::io::Error::new(ErrorKind::TimedOut, error)
+                    } else {
+                        error
+                    };
+                    let context = crate::network::with_local_network_hint(
+                        "sending GVCP command",
+                        &error,
+                        self.socket.peer_addr().ok().map(|peer| peer.ip()),
+                    );
+                    anyhow::Error::new(error).context(context)
+                })?;
+                Ok(sent)
+            })?;
+            first_send.get_or_insert(sent);
             let mut attempt_deadline = (Instant::now() + retry_wait).min(deadline);
             loop {
-                let remaining = attempt_deadline.saturating_duration_since(Instant::now());
+                let mut remaining = attempt_deadline.saturating_duration_since(Instant::now());
+                if permit != Permit::Release
+                    && let Some(lease) = &lease
+                    && let Some(left) = lease.remaining()?
+                {
+                    remaining = remaining.min(left);
+                }
                 if remaining.is_zero() {
                     break;
                 }
                 self.socket.set_read_timeout(Some(remaining))?;
                 match self.socket.recv(&mut buffer) {
                     Ok(length) => {
-                        // Unrelated, stale and truncated packets cannot complete
-                        // a command, nor extend its absolute deadline.
+                        self.check_operation()?;
+                        if permit != Permit::Release
+                            && let Some(lease) = &lease
+                        {
+                            lease.check()?;
+                        }
                         if length < 8 || be16(&buffer[..length], 6) != id {
                             continue;
                         }
@@ -489,7 +674,10 @@ impl Control {
                             return Err(GvcpStatus(ack.status).into());
                         }
                         if ack.command == PENDING_ACK {
-                            // Reserved(16), then the time to completion in ms.
+                            ensure!(
+                                permit != Permit::Release,
+                                "release did not complete synchronously"
+                            );
                             ensure!(ack.payload.len() == 4, "invalid pending acknowledgement");
                             let completion = Duration::from_millis(u64::from(be16(ack.payload, 2)));
                             attempt_deadline =
@@ -497,7 +685,10 @@ impl Control {
                             deadline = deadline.max(attempt_deadline);
                             continue;
                         }
-                        return Ok(ack.payload.to_vec());
+                        return Ok(ControlReply {
+                            payload: ack.payload.to_vec(),
+                            first_send: first_send.unwrap_or(sent),
+                        });
                     }
                     Err(error) if is_receive_timeout(&error) => break,
                     Err(error) if error.kind() == ErrorKind::Interrupted => {}
@@ -515,11 +706,71 @@ impl Control {
                 break;
             }
         }
+        if permit != Permit::Release
+            && let Some(lease) = &lease
+        {
+            lease.check()?;
+        }
+        self.check_operation()?;
         Err(GvcpTimeout {
             command,
             waited: start.elapsed(),
         }
         .into())
+    }
+    fn read_register_owned(&mut self, address: u32) -> Result<(u32, u64)> {
+        let reply = self.transact_owned(READ_REGISTER, &address.to_be_bytes(), Permit::Probe)?;
+        ensure!(
+            reply.payload.len() == 4,
+            "invalid register read acknowledgement"
+        );
+        Ok((be32(&reply.payload, 0), reply.first_send))
+    }
+    fn probe_owner(&mut self) -> Result<()> {
+        let Some(lease) = self.lease.clone() else {
+            return Ok(());
+        };
+        let result = (|| -> Result<()> {
+            let (privilege, sent) = self.read_register_owned(CONTROL_PRIVILEGE)?;
+            if privilege != 2 {
+                return Err(lease.retire("privilege_changed", format!("camera controller privilege changed to 0x{privilege:08x}; retiring this connection")));
+            }
+            if let Some(expected) = self.owner_endpoint {
+                let (port, _) = self.read_register_owned(PRIMARY_PORT)?;
+                let (ip, _) = self.read_register_owned(PRIMARY_IP)?;
+                if port & 0xffff != u32::from(expected.port()) || ip != u32::from(*expected.ip()) {
+                    return Err(lease.retire("owner_endpoint", "camera reports a different or absent controller endpoint; retiring this connection"));
+                }
+            }
+            if self.disable_supported {
+                let (configuration, _) = self.read_register_owned(GVCP_CONFIGURATION)?;
+                if (configuration & HEARTBEAT_DISABLE != 0) != lease.disabled() {
+                    return Err(lease.retire("heartbeat_state", "camera heartbeat-disable state changed unexpectedly; retiring this connection"));
+                }
+            }
+            lease.renew(sent)
+        })();
+        if let Err(error) = result {
+            // A caller cutoff does not contradict previously verified Disabled
+            // ownership. The independent heartbeat continues its normal checks.
+            let caller_expired = self
+                .operation_deadline
+                .is_some_and(|stop| Instant::now() >= stop);
+            if caller_expired {
+                lease.check()?;
+                return Err(error);
+            }
+            if lease.disabled() && !ownership_retired(&error) {
+                return Err(lease.retire(
+                    "owner_unverified",
+                    format!(
+                        "disabled camera controller ownership could not be verified: {error:#}"
+                    ),
+                ));
+            }
+            return Err(error);
+        }
+        Ok(())
     }
     fn read_register(&mut self, address: u32) -> Result<u32> {
         ensure!(address.is_multiple_of(4), "unaligned GVCP register address");
@@ -527,25 +778,162 @@ impl Control {
         ensure!(ack.len() == 4, "invalid register read acknowledgement");
         Ok(be32(&ack, 0))
     }
-    fn write_register(&mut self, address: u32, value: u32) -> Result<()> {
-        ensure!(address.is_multiple_of(4), "unaligned GVCP register address");
+    fn prepare_managed(&mut self) -> Result<()> {
+        if let Some(lease) = self.lease.clone()
+            && lease.needs_probe(self.command_time())?
+        {
+            self.probe_owner()?;
+        }
+        Ok(())
+    }
+    fn write_raw(&mut self, address: u32, value: u32, permit: Permit) -> Result<()> {
         let mut payload = address.to_be_bytes().to_vec();
         payload.extend(value.to_be_bytes());
-        let ack = self.transact(WRITE_REGISTER, &payload)?;
+        let ack = self
+            .transact_owned(WRITE_REGISTER, &payload, permit)?
+            .payload;
         ensure!(ack.len() == 4, "invalid register write acknowledgement");
-        // The data index identifies the number of register pairs processed.
         ensure!(
             be32(&ack, 0) == 1,
             "camera did not acknowledge the register write"
         );
         Ok(())
     }
-    fn release(&mut self, heartbeat_timeout: u32) {
-        if let Some(configuration) = self.restore_configuration.take() {
-            let _ = self.write_register(GVCP_CONFIGURATION, configuration);
+    fn write_register(&mut self, address: u32, value: u32) -> Result<()> {
+        ensure!(address.is_multiple_of(4), "unaligned GVCP register address");
+        let Some(lease) = self.lease.clone() else {
+            return self.write_raw(address, value, Permit::Normal);
+        };
+        lease.check()?;
+        match address {
+            CONTROL_PRIVILEGE => match value {
+                0 => self.final_release(),
+                2 => {
+                    self.prepare_managed()?;
+                    self.write_raw(address, value, Permit::Managed)
+                }
+                _ => Err(Categorized::error(
+                    crate::types::ErrorKind::Unsupported,
+                    "changing controller mode or switchover/keyed privilege is unsupported on an owned connection",
+                )),
+            },
+            HEARTBEAT_TIMEOUT => {
+                if value == 0 {
+                    return Err(Categorized::error(
+                        crate::types::ErrorKind::Unsupported,
+                        "a positive verified heartbeat timeout is required",
+                    ));
+                }
+                if !lease.disabled() {
+                    if lease.timeout_ms() != Some(value) {
+                        return Err(Categorized::error(
+                            crate::types::ErrorKind::Unsupported,
+                            "changing a finite heartbeat timeout is unsupported; the actual camera timeout is retained",
+                        ));
+                    }
+                    self.prepare_managed()?;
+                    return self.write_raw(address, value, Permit::Managed);
+                }
+                self.prepare_managed()?;
+                let write = self.write_raw(address, value, Permit::Managed);
+                if let Err(error) = write {
+                    lease.timer_changed(None)?;
+                    return Err(error);
+                }
+                let actual = self.read_register_owned(address).map(|(value, _)| value);
+                lease.timer_changed(actual.as_ref().ok().copied().filter(|value| *value != 0))?;
+                let actual = actual?;
+                ensure!(
+                    actual != 0,
+                    "camera returned a zero heartbeat timeout; finite re-enable permission was removed"
+                );
+                Ok(())
+            }
+            GVCP_CONFIGURATION => {
+                let (old, _) = self.read_register_owned(address)?;
+                let was_disabled = old & HEARTBEAT_DISABLE != 0;
+                let disabling = value & HEARTBEAT_DISABLE != 0;
+                if was_disabled != lease.disabled() {
+                    return Err(lease.retire(
+                        "heartbeat_state",
+                        "camera heartbeat mode differs from the verified controller state",
+                    ));
+                }
+                if disabling && !self.disable_supported {
+                    return Err(Categorized::error(
+                        crate::types::ErrorKind::Unsupported,
+                        "camera does not advertise heartbeat-disable support",
+                    ));
+                }
+                if was_disabled && !disabling {
+                    lease.begin_enabling()?;
+                }
+                if !was_disabled && disabling {
+                    self.probe_owner()?;
+                }
+                let result = (|| -> Result<()> {
+                    self.write_raw(address, value, Permit::Managed)?;
+                    let (actual, _) = self.read_register_owned(address)?;
+                    if actual & HEARTBEAT_DISABLE != value & HEARTBEAT_DISABLE {
+                        return Err(lease.retire(
+                            "heartbeat_state_unverified",
+                            "camera did not confirm the requested heartbeat mode",
+                        ));
+                    }
+                    if !was_disabled && disabling {
+                        lease.enter_disabled()?;
+                    }
+                    if was_disabled && !disabling {
+                        lease.finish_enabling()?;
+                        self.probe_owner()?;
+                    }
+                    Ok(())
+                })();
+                result.map_err(|error| {
+                    if ownership_retired(&error) || was_disabled == disabling {
+                        error
+                    } else {
+                        lease.retire(
+                            "heartbeat_state_unverified",
+                            format!("camera heartbeat mode could not be confirmed: {error:#}"),
+                        )
+                    }
+                })
+            }
+            SWITCHOVER_KEY => Err(Categorized::error(
+                crate::types::ErrorKind::Unsupported,
+                "controller switchover keys are unsupported on an owned connection",
+            )),
+            _ => self.write_raw(address, value, Permit::Normal),
         }
-        let _ = self.write_register(HEARTBEAT_TIMEOUT, heartbeat_timeout);
-        let _ = self.write_register(CONTROL_PRIVILEGE, 0);
+    }
+    fn final_release(&mut self) -> Result<()> {
+        let Some(lease) = self.lease.clone() else {
+            return self.write_raw(CONTROL_PRIVILEGE, 0, Permit::Release);
+        };
+        lease.check()?;
+        self.prepare_managed()?;
+        let restored = (|| -> Result<()> {
+            if let Some(configuration) = self.restore_configuration.take() {
+                let current = self.read_register(GVCP_CONFIGURATION)?;
+                let restored = (current & !0x2) | (configuration & 0x2);
+                if restored != current {
+                    self.write_register(GVCP_CONFIGURATION, restored)?;
+                }
+            }
+            Ok(())
+        })();
+        // No operation, restoration or retry follows this release request.
+        let released = self
+            .write_raw(CONTROL_PRIVILEGE, 0, Permit::Release)
+            .context(
+                "controller release was not confirmed; this connection sends no release retry",
+            );
+        restored?;
+        released
+    }
+    fn release(&mut self, _heartbeat_timeout: u32) {
+        let _ = self.final_release();
     }
 
     fn read_aligned(&mut self, address: u32, length: usize) -> Result<Vec<u8>> {
@@ -654,6 +1042,27 @@ impl Control {
         let (base, size, skip) = memory_range(address, data.len())?;
         if size == 0 {
             return Ok(());
+        }
+        if self.lease.is_some() && managed_range(base, size) {
+            if skip != 0 || data.len() != 4 || size != 4 {
+                return Err(Categorized::error(
+                    crate::types::ErrorKind::Unsupported,
+                    "partial or mixed controller-register memory writes are unsupported",
+                ));
+            }
+            if !self.legacy_registers && !self.register_order_known {
+                return Err(Categorized::error(
+                    crate::types::ErrorKind::Unsupported,
+                    "controller-register memory byte order is unknown",
+                ));
+            }
+            let bytes: [u8; 4] = data.try_into().context("incomplete managed register")?;
+            let value = if !self.legacy_registers && self.little_endian {
+                u32::from_le_bytes(bytes)
+            } else {
+                u32::from_be_bytes(bytes)
+            };
+            return self.write_register(base, value);
         }
         if skip == 0 && size == data.len() {
             return self.write_aligned(base, data);
@@ -773,84 +1182,68 @@ fn probe_network_at(address: SocketAddrV4, timeout: Duration) -> Result<Ipv4Addr
 const HEARTBEAT_RETRY: Duration = Duration::from_millis(50);
 
 struct Heartbeat {
-    shutdown: Arc<(Mutex<bool>, Condvar)>,
-    failure: Arc<Mutex<Option<String>>>,
+    lease: Arc<Lease>,
     thread: Option<JoinHandle<()>>,
 }
 impl Heartbeat {
-    /// Read the control privilege every `period`, the controller's
-    /// heartbeat. The camera lets its controller go only once no command
-    /// has reached it for its heartbeat timeout, `lost_after`, so a read
-    /// that goes unanswered, as on a link busy with the stream, is sent
-    /// again at once, and fails the camera only once none was answered
-    /// for that long; a camera that says the privilege is gone fails it
-    /// at once.
-    fn start(control: Arc<Mutex<Control>>, period: Duration, lost_after: Duration) -> Result<Self> {
-        let shutdown = Arc::new((Mutex::new(false), Condvar::new()));
-        let failure = Arc::new(Mutex::new(None));
-        let worker_shutdown = shutdown.clone();
-        let worker_failure = failure.clone();
+    fn start(control: Arc<Mutex<Control>>) -> Result<Self> {
+        let lease = control
+            .lock()
+            .map_err(|_| anyhow!("GVCP mutex poisoned"))?
+            .lease
+            .clone()
+            .context("controller lease was not initialized")?;
+        let worker_lease = lease.clone();
         let thread = thread::Builder::new()
             .name("capturefab-gige-heartbeat".into())
             .spawn(move || {
-                let (lock, wake) = &*worker_shutdown;
-                let mut answered = Instant::now();
-                let mut wait = period;
+                let (lock, wake) = &*worker_lease.wake;
+                let mut wait = worker_lease.period();
                 loop {
-                    let stop = lock
+                    let state = lock
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let (stop, _) = wake
-                        .wait_timeout_while(stop, wait, |stop| !*stop)
+                    let generation = state.generation;
+                    let (state, _) = wake
+                        .wait_timeout_while(state, wait, |state| {
+                            !state.stop && state.generation == generation
+                        })
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if *stop {
+                    if state.stop {
                         break;
                     }
-                    drop(stop);
+                    drop(state);
+                    if worker_lease.check().is_err() {
+                        break;
+                    }
                     let result = control
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .read_register(CONTROL_PRIVILEGE);
-                    wait = period;
-                    let error = match result {
-                        Ok(value) if value & 3 != 0 => {
-                            answered = Instant::now();
-                            None
-                        }
-                        Ok(_) => Some("camera controller privilege was lost".to_owned()),
-                        Err(_) if answered.elapsed() < lost_after => {
-                            wait = HEARTBEAT_RETRY;
-                            continue;
-                        }
-                        Err(error) => Some(format!("camera heartbeat failed: {error:#}")),
+                        .probe_owner();
+                    if worker_lease.check().is_err() {
+                        break;
+                    }
+                    wait = if result.is_ok() {
+                        worker_lease.period()
+                    } else {
+                        HEARTBEAT_RETRY.min(worker_lease.period())
                     };
-                    *worker_failure
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = error;
                 }
             })
             .context("starting GigE heartbeat thread")?;
         Ok(Self {
-            shutdown,
-            failure,
+            lease,
             thread: Some(thread),
         })
     }
     fn check(&self) -> Result<()> {
-        if let Some(error) = &*self
-            .failure
-            .lock()
-            .map_err(|_| anyhow!("heartbeat mutex poisoned"))?
-        {
-            bail!("{error}");
-        }
-        Ok(())
+        self.lease.check()
     }
     fn shutdown(&mut self) {
-        let (lock, wake) = &*self.shutdown;
-        *lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        let (lock, wake) = &*self.lease.wake;
+        lock.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stop = true;
         wake.notify_all();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -882,6 +1275,9 @@ struct GigE {
     heartbeat_timeout: u32,
     resend: bool,
     big_endian_mono16: bool,
+    multipart_projection: bool,
+    /// Vendor layouts qualified from real identity and static XML before streaming.
+    pixel_encodings: Vec<crate::types::PixelEncoding>,
     stream_source: OnceCell<Option<SocketAddr>>,
     packet_size: PacketSize,
     stats: TransportStats,
@@ -912,31 +1308,97 @@ fn big_endian_mono16(vendor: &str, model: &str) -> bool {
         && ["Blackfly BFLY-PGE-31S4M", "Blackfly BFLY-PGE-14S2C"].contains(&model)
 }
 fn connect(address: SocketAddrV4, timeout: Duration) -> Result<GigE> {
-    let mut control = Control::connect(address, timeout)?;
+    connect_control(Control::connect(address, timeout)?)
+}
+fn connect_control(mut control: Control) -> Result<GigE> {
+    let address = match control.socket.peer_addr()? {
+        SocketAddr::V4(address) => address,
+        SocketAddr::V6(_) => bail!("camera control peer is not IPv4"),
+    };
     let host_ip = match control.socket.local_addr()? {
         SocketAddr::V4(address) => *address.ip(),
         SocketAddr::V6(_) => bail!("camera control route is not IPv4"),
     };
-    if control.read_register(CONTROL_PRIVILEGE)? & 3 != 0 {
+    if control.read_register(CONTROL_PRIVILEGE)? != 0 {
         return Err(Categorized::new(
             crate::types::ErrorKind::CameraBusy,
             "camera is controlled by another application; disconnect it first",
         )
         .into());
     }
-    control
-        .write_register(CONTROL_PRIVILEGE, 2)
-        .context("acquiring camera controller privilege")?;
-    // Initialization after acquisition must release privilege on every error.
-    let initialized = (|| -> Result<(u32, Duration, u64, bool)> {
-        ensure!(
-            control.read_register(CONTROL_PRIVILEGE)? & 3 != 0,
-            "camera did not grant controller privilege"
+    let heartbeat_timeout = control.read_register(HEARTBEAT_TIMEOUT)?;
+    ensure!(
+        heartbeat_timeout != 0,
+        "camera heartbeat timeout is zero; no finite controller lease can be verified"
+    );
+    let capability = control.read_register(GVCP_CAPABILITY).ok();
+    control.disable_supported = capability.is_some_and(|bits| bits & DISABLE_CAPABILITY != 0);
+    let disabled = if control.disable_supported {
+        control.read_register(GVCP_CONFIGURATION)? & HEARTBEAT_DISABLE != 0
+    } else {
+        false
+    };
+    if capability.is_some_and(|bits| bits & OWNER_ENDPOINT != 0) {
+        control.owner_endpoint = match control.socket.local_addr()? {
+            SocketAddr::V4(address) => Some(address),
+            SocketAddr::V6(_) => None,
+        };
+    }
+    let lease = Lease::claiming(heartbeat_timeout, disabled)?;
+    #[cfg(test)]
+    let lease = control.lease_clock.as_ref().map_or(lease, |clock| {
+        Lease::claiming_for_test(heartbeat_timeout, disabled, clock.clone())
+    });
+    control.lease = Some(lease);
+    if let Err(error) = control.write_raw(CONTROL_PRIVILEGE, 2, Permit::Claim) {
+        let _ = control.lease.as_ref().expect("claim lease").retire(
+            "claim_unverified",
+            format!("camera controller acquisition was not confirmed: {error:#}"),
         );
-        control.little_endian = control
-            .read_register(DEVICE_MODE)
-            .is_ok_and(|mode| mode & 0x8000_0000 == 0);
-        let capability = control.read_register(GVCP_CAPABILITY).ok();
+        return Err(
+            error.context("acquiring camera controller privilege; no unverified release was sent")
+        );
+    }
+    // Setup cleanup releases only while this acquisition still has proof.
+    let initialized = (|| -> Result<(u32, Duration, u64, bool)> {
+        control.probe_owner()?;
+        let lease = control.lease.as_ref().expect("claim lease").clone();
+        if disabled {
+            lease.finish_claim()?;
+        }
+        let initial_readback = control
+            .read_register_owned(HEARTBEAT_TIMEOUT)
+            .map(|(value, _)| value);
+        if disabled {
+            lease.timer_changed(
+                initial_readback
+                    .as_ref()
+                    .ok()
+                    .copied()
+                    .filter(|value| *value != 0),
+            )?;
+            let value = initial_readback?;
+            ensure!(
+                value != 0,
+                "camera returned a zero heartbeat timeout after acquisition"
+            );
+        } else {
+            let value = initial_readback.map_err(|error| {
+                lease.retire(
+                    "initial_timeout_unverified",
+                    format!(
+                        "camera heartbeat timeout readback failed during acquisition: {error:#}"
+                    ),
+                )
+            })?;
+            if value != heartbeat_timeout {
+                return Err(lease.retire("initial_timeout_changed", "camera heartbeat timeout changed during acquisition; this ownership epoch cannot be verified"));
+            }
+            lease.finish_claim()?;
+        }
+        let device_mode = control.read_register(DEVICE_MODE);
+        control.register_order_known = device_mode.is_ok();
+        control.little_endian = device_mode.is_ok_and(|mode| mode & 0x8000_0000 == 0);
         let resend = capability.is_some_and(|bits| bits & 0x4 != 0);
         control.write_memory = capability.is_none_or(|bits| bits & 0x2 != 0);
         let response = match control.read_register(PENDING_TIMEOUT) {
@@ -952,17 +1414,8 @@ fn connect(address: SocketAddrV4, timeout: Duration) -> Result<GigE> {
         {
             control.restore_configuration = Some(configuration);
         }
-        let heartbeat_timeout = control.read_register(HEARTBEAT_TIMEOUT)?;
         control.response = response;
-        let command_ms = u32::try_from(control.command_time().as_millis())
-            .context("GVCP command timeout exceeds the heartbeat register range")?;
-        let heartbeat_ms = heartbeat_timeout
-            .max(3000)
-            .max(command_ms.saturating_mul(2).saturating_add(1000));
-        control.write_register(HEARTBEAT_TIMEOUT, heartbeat_ms)?;
-        // The command in flight holds the heartbeat back, so pending commands
-        // must finish well within the heartbeat timeout.
-        control.pending_limit = Some(Duration::from_millis(u64::from(heartbeat_ms) * 2 / 3));
+        control.pending_limit = Some(Duration::from_millis(u64::from(heartbeat_timeout) * 2 / 3));
         let timestamp_frequency = match (
             control.read_register(TIMESTAMP_HIGH),
             control.read_register(TIMESTAMP_LOW),
@@ -970,26 +1423,23 @@ fn connect(address: SocketAddrV4, timeout: Duration) -> Result<GigE> {
             (Ok(high), Ok(low)) => (u64::from(high) << 32) | u64::from(low),
             _ => 0,
         };
+        control.lease.as_ref().expect("claim lease").check()?;
         Ok((
             heartbeat_timeout,
-            Duration::from_millis(u64::from(heartbeat_ms)),
+            Duration::from_millis(u64::from(heartbeat_timeout)),
             timestamp_frequency,
             resend,
         ))
     })();
-    let (heartbeat_timeout, lost_after, timestamp_frequency, resend) = match initialized {
+    let (heartbeat_timeout, _lost_after, timestamp_frequency, resend) = match initialized {
         Ok(values) => values,
         Err(error) => {
-            if let Some(configuration) = control.restore_configuration.take() {
-                let _ = control.write_register(GVCP_CONFIGURATION, configuration);
-            }
-            let _ = control.write_register(CONTROL_PRIVILEGE, 0);
+            control.release(heartbeat_timeout);
             return Err(error);
         }
     };
     let control = Arc::new(Mutex::new(control));
-    let period = (lost_after / 3).clamp(Duration::from_millis(100), Duration::from_secs(1));
-    let heartbeat = match Heartbeat::start(control.clone(), period, lost_after) {
+    let heartbeat = match Heartbeat::start(control.clone()) {
         Ok(heartbeat) => heartbeat,
         Err(error) => {
             if let Ok(mut control) = control.lock() {
@@ -1007,6 +1457,8 @@ fn connect(address: SocketAddrV4, timeout: Duration) -> Result<GigE> {
         heartbeat_timeout,
         resend,
         big_endian_mono16: false,
+        multipart_projection: false,
+        pixel_encodings: Vec::new(),
         stream_source: OnceCell::new(),
         packet_size: PacketSize::Untested,
         stats: TransportStats::default(),
@@ -1016,7 +1468,49 @@ fn connect(address: SocketAddrV4, timeout: Duration) -> Result<GigE> {
     })
 }
 
+impl GigE {
+    fn control_until<T>(
+        &self,
+        deadline: Instant,
+        action: impl FnOnce(&mut Control) -> Result<T>,
+    ) -> Result<T> {
+        self.heartbeat.check()?;
+        let mut control = loop {
+            control_remaining(deadline)?;
+            match self.control.try_lock() {
+                Ok(control) => break control,
+                Err(std::sync::TryLockError::Poisoned(_)) => bail!("GVCP mutex poisoned"),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    thread::sleep(control_remaining(deadline)?.min(Duration::from_millis(1)));
+                }
+            }
+        };
+        self.heartbeat.check()?;
+        control_remaining(deadline)?;
+        let previous = control.operation_deadline.replace(deadline);
+        let result = action(&mut control);
+        control.operation_deadline = previous;
+        match result {
+            Ok(value) => {
+                control_remaining(deadline)?;
+                Ok(value)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
 impl RegisterIo for GigE {
+    fn read_memory_until(
+        &mut self,
+        address: u64,
+        length: usize,
+        deadline: Instant,
+    ) -> Result<Vec<u8>> {
+        self.control_until(deadline, |control| control.read_bytes(address, length))
+    }
+    fn write_memory_until(&mut self, address: u64, data: &[u8], deadline: Instant) -> Result<()> {
+        self.control_until(deadline, |control| control.write_bytes(address, data))
+    }
     fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
         self.heartbeat.check()?;
         self.control
@@ -1033,14 +1527,68 @@ impl RegisterIo for GigE {
     }
 }
 impl Backend for GigE {
+    fn configure_pixel_encodings(
+        &mut self,
+        encodings: &[crate::types::PixelEncoding],
+    ) -> Result<()> {
+        ensure!(
+            self.stream.is_none() && encodings.len() <= crate::types::LucidPixelFormat::ALL.len(),
+            "invalid GigE pixel encoding configuration"
+        );
+        for &encoding in encodings {
+            ensure!(
+                matches!(encoding, crate::types::PixelEncoding::Lucid { .. })
+                    && encoding.namespace().is_none(),
+                Categorized::error(
+                    crate::types::ErrorKind::Unsupported,
+                    "native GigE accepts only qualified LUCID vendor layouts"
+                )
+            );
+            encoding.check(encoding.code())?;
+        }
+        self.pixel_encodings = encodings.to_vec();
+        Ok(())
+    }
+    fn enable_multipart_projection(&mut self) -> Result<()> {
+        self.heartbeat.check()?;
+        self.multipart_projection = true;
+        if let Some(stream) = self.stream.as_mut() {
+            stream.assembler.multipart_projection = true;
+        }
+        Ok(())
+    }
     fn xml(&mut self) -> Result<String> {
         if let Some(xml) = &self.xml_cache {
             return Ok(xml.clone());
         }
         let mut errors = Vec::new();
+        let mut first_typed_failure = None;
         for url_address in [0x200, 0x400] {
             let result = (|| -> Result<String> {
                 let url = fixed_text(&self.read_memory(url_address, 512)?);
+                if !url
+                    .split_once(':')
+                    .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("local"))
+                {
+                    let timeout = self
+                        .control
+                        .lock()
+                        .map_err(|_| anyhow!("GVCP mutex poisoned"))?
+                        .timeout;
+                    let (name, data) = fetch_xml_http(&url, timeout)?;
+                    let identity = self.read_memory(0x48, 0x60)?;
+                    // HTTP has no camera-memory tail to cheaply validate a cache
+                    // entry. Download afresh and key the decoded cache by all
+                    // fetched bytes, so a changed vendor file cannot stay stale.
+                    let key = xml_cache::key(&[url.as_bytes(), &identity, &data]);
+                    self.xml_key = Some(key.clone());
+                    if let Some(xml) = xml_cache::load(&key) {
+                        return Ok(xml);
+                    }
+                    let xml = decode_xml(&name, data)?;
+                    xml_cache::store(&key, &xml);
+                    return Ok(xml);
+                }
                 let local = parse_local_url(&url)?;
                 // The URL (a SHA-1 in its query where the device gives one),
                 // the vendor, model and device version, and the end of the
@@ -1067,10 +1615,25 @@ impl Backend for GigE {
                     self.xml_cache = Some(xml.clone());
                     return Ok(xml);
                 }
-                Err(error) => errors.push(format!("URL at 0x{url_address:x}: {error:#}")),
+                Err(error) => {
+                    errors.push(format!(
+                        "URL at 0x{url_address:x}: {}",
+                        xml_diagnostic(&error)
+                    ));
+                    if first_typed_failure.is_none()
+                        && crate::types::classify(&error).kind
+                            != crate::types::ErrorKind::OperationFailed
+                    {
+                        first_typed_failure = Some(error);
+                    }
+                }
             }
         }
-        bail!("unable to load camera GenICam XML: {}", errors.join("; "))
+        let message = format!("unable to load camera GenICam XML: {}", errors.join("; "));
+        if let Some(error) = first_typed_failure {
+            return Err(error.context(message));
+        }
+        bail!("{message}")
     }
     fn forget_xml(&mut self) -> bool {
         self.xml_cache = None;
@@ -1108,6 +1671,7 @@ impl Backend for GigE {
             source = *self
                 .stream_source
                 .get_or_init(|| stream_source(&mut control, self.camera_ip));
+            self.heartbeat.check()?;
             traverse(&socket, source);
             let original = control.read_register(STREAM_PACKET_SIZE)?;
             let mut test =
@@ -1163,11 +1727,14 @@ impl Backend for GigE {
                     .into(),
             );
         }
+        self.heartbeat.check()?;
         let mut assembler =
             Assembler::new(payload_size, packet_size as usize, self.timestamp_frequency);
         assembler.resend = self.resend;
+        assembler.multipart_projection = self.multipart_projection;
         assembler.big_endian = big_endian;
         assembler.big_endian_mono16 = self.big_endian_mono16;
+        assembler.pixel_encodings.clone_from(&self.pixel_encodings);
         assembler.stats = TransportStats {
             packet_size: Some(packet_size),
             receive_buffer_bytes: receive_buffer.map(|bytes| bytes as u64),
@@ -1184,8 +1751,9 @@ impl Backend for GigE {
             scratch: Vec::new(),
             scatter: scatter(std::env::var_os(SCATTER_ENV).as_deref()),
             #[cfg(any(test, target_os = "linux"))]
-            batch: cfg!(target_os = "linux")
-                .then(|| batch::Batch::new((packet_size as usize).clamp(576, 65_536))),
+            batch: cfg!(target_os = "linux").then(|| {
+                batch::Batch::new((packet_size as usize).max(multipart::MAX_METADATA_DATAGRAM))
+            }),
             #[cfg(target_os = "linux")]
             predicted: Vec::new(),
             timeout: POLL,
@@ -1193,11 +1761,13 @@ impl Backend for GigE {
             next_traversal: Instant::now() + TRAVERSAL,
             request_id: 0,
             assembler,
+            lease: Some(self.heartbeat.lease.clone()),
         });
         Ok(())
     }
     #[deny(clippy::significant_drop_tightening)]
     fn optimize_network(&mut self, payload_size: usize) -> Result<crate::network::NetworkTuning> {
+        self.heartbeat.check()?;
         ensure!(
             self.stream.is_none(),
             "stop GigE receiving before optimizing the network"
@@ -1241,6 +1811,7 @@ impl Backend for GigE {
                 let source = self
                     .stream_source
                     .get_or_init(|| stream_source(&mut control, self.camera_ip));
+                self.heartbeat.check()?;
                 traverse(&socket, *source);
                 let negotiated = ladder(
                     |size| {
@@ -1331,6 +1902,7 @@ impl Backend for GigE {
         }
         loop {
             if let Some(frame) = stream.assembler.ready.pop_front() {
+                self.heartbeat.check()?;
                 return Ok(frame);
             }
             if now >= stream.next_poll {
@@ -1338,6 +1910,7 @@ impl Backend for GigE {
                 stream.assembler.poll(now);
                 stream.flush();
                 if now >= stream.next_traversal {
+                    self.heartbeat.check()?;
                     traverse(&stream.socket, stream.source);
                     stream.next_traversal = now + TRAVERSAL;
                 }
@@ -1359,7 +1932,10 @@ impl Backend for GigE {
                 Ok(Some(result)) => {
                     stream.flush();
                     match result {
-                        Ok(Some(frame)) => return Ok(frame),
+                        Ok(Some(frame)) => {
+                            self.heartbeat.check()?;
+                            return Ok(frame);
+                        }
                         Ok(None) => {}
                         Err(error)
                             if error.downcast_ref::<Categorized>().is_some_and(|error| {
@@ -1399,6 +1975,12 @@ impl Backend for GigE {
         }
         Ok(())
     }
+    fn stop_after_frame_error(&self) -> bool {
+        self.heartbeat.lease.is_retired()
+    }
+    fn terminal_error(&self) -> Option<anyhow::Error> {
+        self.heartbeat.lease.check().err()
+    }
     fn stats(&self) -> Option<TransportStats> {
         Some(
             self.stream
@@ -1408,6 +1990,9 @@ impl Backend for GigE {
         )
     }
     fn buffered_frames(&mut self) -> u32 {
+        if self.heartbeat.check().is_err() {
+            return 0;
+        }
         let camera = IpAddr::V4(self.camera_ip);
         self.stream
             .as_mut()
@@ -1650,6 +2235,37 @@ struct LocalUrl {
     address: u64,
     length: usize,
 }
+/// Keep diagnostics from two untrusted device URLs within the worker protocol's
+/// line budget without flattening the separately retained typed cause.
+fn xml_diagnostic(error: &anyhow::Error) -> String {
+    use std::fmt::Write as _;
+    #[derive(Default)]
+    struct Text {
+        text: String,
+        truncated: bool,
+    }
+    impl std::fmt::Write for Text {
+        fn write_str(&mut self, text: &str) -> std::fmt::Result {
+            if self.truncated {
+                return Err(std::fmt::Error);
+            }
+            let mut end = text.len().min(4096usize.saturating_sub(self.text.len()));
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.text.push_str(text.get(..end).ok_or(std::fmt::Error)?);
+            if end < text.len() {
+                self.truncated = true;
+                self.text.push('…');
+                return Err(std::fmt::Error);
+            }
+            Ok(())
+        }
+    }
+    let mut text = Text::default();
+    let _ = write!(&mut text, "{error:#}");
+    text.text
+}
 fn parse_local_url(url: &str) -> Result<LocalUrl> {
     let (scheme, remainder) = url
         .split_once(':')
@@ -1744,6 +2360,7 @@ fn decode_xml(name: &str, data: Vec<u8>) -> Result<String> {
 }
 
 struct Stream {
+    lease: Option<Arc<Lease>>,
     socket: UdpSocket,
     gvcp: SocketAddr,
     source: Option<SocketAddr>,
@@ -1931,6 +2548,13 @@ impl Stream {
         for (block, extended, first, last) in self.assembler.requests.drain(..) {
             self.request_id = self.request_id.wrapping_add(1).max(1);
             let packet = resend_packet(self.request_id, block, extended, first, last);
+            if self
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.check().is_err())
+            {
+                break;
+            }
             let _ = self.socket.send_to(&packet, self.gvcp);
         }
     }
@@ -1938,6 +2562,7 @@ impl Stream {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ImageLeader {
+    payload_type: u16,
     width: u32,
     height: u32,
     pixel_format: u32,
@@ -1946,14 +2571,14 @@ struct ImageLeader {
     x_padding: usize,
     y_padding: usize,
     wire_bytes: usize,
-    /// Chunk data follows the image (`GigE` Vision 2 extended chunk mode).
+    /// The image is followed by chunks (legacy type 5 or extended image mode).
     chunks: bool,
 }
 impl ImageLeader {
     fn parse(data: &[u8], payload_limit: usize) -> Result<Self> {
         ensure!(data.len() >= 36, "truncated GVSP image leader");
         let payload_type = be16(data, 2);
-        if payload_type & !0x4000 != 1 {
+        if !matches!(payload_type, 1 | 5 | 0x4001) {
             return Err(unsupported_payload(payload_type));
         }
         let pixel_format = be32(data, 12);
@@ -1961,9 +2586,15 @@ impl ImageLeader {
         let height = be32(data, 20);
         let bits_per_pixel = (pixel_format >> 16) & 0xff;
         ensure!(
-            width > 0 && height > 0 && bits_per_pixel > 0 && bits_per_pixel <= 64,
+            width > 0
+                && height > 0
+                && ((1..=64).contains(&bits_per_pixel)
+                    || pixel_format == crate::frame::COORD3D_ABC32F),
             "invalid GVSP image dimensions or pixel format"
         );
+        if let Some(format) = crate::frame::bicolor::Format::from_code(pixel_format) {
+            format.validate_width(width)?;
+        }
         let row_bits = u64::from(width) * u64::from(bits_per_pixel);
         let row_bytes = row_bits.div_ceil(8);
         let x_padding = be16(data, 32);
@@ -1988,6 +2619,7 @@ impl ImageLeader {
             "GVSP image exceeds configured payload size ({smallest} > {payload_limit})"
         );
         Ok(Self {
+            payload_type,
             width,
             height,
             pixel_format,
@@ -1997,7 +2629,7 @@ impl ImageLeader {
             y_padding: usize::from(y_padding),
             wire_bytes: usize::try_from(wire_bytes.min(payload_limit as u64))
                 .context("GVSP payload exceeds host address size")?,
-            chunks: payload_type & 0x4000 != 0,
+            chunks: payload_type != 1,
         })
     }
     /// The fewest bytes that hold `height` lines.
@@ -2014,7 +2646,7 @@ impl ImageLeader {
 fn unsupported_payload(payload_type: u16) -> anyhow::Error {
     let (name, hint) = match payload_type & 0x3fff {
         _ if payload_type & 0x8000 != 0 => ("device-specific", "select image acquisition"),
-        0x0004 | 0x0005 => ("chunk data", "disable chunk mode"),
+        0x0004 | 0x0005 => ("chunk data", "select image extended chunk mode"),
         0x0006 => ("JPEG", "select an uncompressed pixel format"),
         0x0007 => ("JPEG 2000", "select an uncompressed pixel format"),
         0x0008 => ("H.264", "select an uncompressed pixel format"),
@@ -2035,6 +2667,7 @@ struct GvspPacket<'a> {
     frame: u64,
     id: u32,
     kind: u8,
+    part_count: u8,
     extended: bool,
     data: Data<'a>,
 }
@@ -2079,6 +2712,7 @@ fn parse_header(packet: &[u8]) -> Result<(usize, GvspPacket<'static>)> {
         frame,
         id,
         kind: ((info >> 24) & 0x7f) as u8,
+        part_count: packet[7],
         extended,
         data: Data::Landed(0),
     };
@@ -2111,7 +2745,9 @@ struct PartialFrame {
     extended: bool,
     last_packet: Instant,
     leader: Option<ImageLeader>,
-    trailer: Option<(u32, u32)>,
+    trailer: Option<ImageTrailer>,
+    chunks: Option<ChunkData>,
+    multipart: Option<Box<multipart::MultipartFrame>>,
     packets: Option<usize>,
     /// The frame's buffer, taken from the pool when its leader or first
     /// payload packet arrives. Only the bytes of the packets received are
@@ -2128,6 +2764,12 @@ struct PartialFrame {
 }
 impl PartialFrame {
     fn ready(&self) -> bool {
+        if let Some(multipart) = &self.multipart {
+            return multipart.is_prepared()
+                && multipart.has_trailer()
+                && multipart.coverage_complete()
+                && Some(self.count) == self.packets;
+        }
         // A frame can end early; without its trailer only a full-height
         // frame is known to be complete.
         self.leader.as_ref().is_some_and(|leader| {
@@ -2139,20 +2781,50 @@ impl PartialFrame {
     }
     /// Some cameras send a leader at acquisition start or as soon as they are
     /// armed for a trigger, long before the image data.
-    const fn awaits_data(&self) -> bool {
-        self.leader.is_some() && self.count == 0 && self.trailer.is_none()
+    fn awaits_data(&self) -> bool {
+        self.has_leader() && self.count == 0 && !self.has_trailer()
     }
+    fn has_leader(&self) -> bool {
+        self.multipart.as_deref().map_or_else(
+            || self.leader.is_some(),
+            multipart::MultipartFrame::has_leader,
+        )
+    }
+    fn has_trailer(&self) -> bool {
+        self.multipart.as_deref().map_or_else(
+            || self.trailer.is_some(),
+            multipart::MultipartFrame::has_trailer,
+        )
+    }
+}
+/// A qualified vendor layout for this code. Its documented byte order is
+/// little-endian, so a big-endian stream stays opaque and untagged.
+fn encoding_for(
+    encodings: &[crate::types::PixelEncoding],
+    big_endian: bool,
+    pixel_format: u32,
+) -> Option<crate::types::PixelEncoding> {
+    if big_endian {
+        return None;
+    }
+    encodings
+        .iter()
+        .copied()
+        .find(|encoding| encoding.check(pixel_format).is_ok())
 }
 /// Bytes per sample of the formats made only of 16- or 32-bit samples, which
 /// a big-endian stream sends most significant byte first.
-const fn sample_bytes(pixel_format: u32) -> Option<usize> {
+pub(super) const fn sample_bytes(pixel_format: u32) -> Option<usize> {
     match (pixel_format >> 16, pixel_format) {
+        // Unpacked BiColor10/12 carry two individual16-bit components,
+        // not one32-bit word. BiColor8's two byte components stay unswapped.
+        (_, 0x0220_00a7 | 0x0220_00a9 | 0x0220_00ab | 0x0220_00ad) => Some(2),
         // RGBa12p and BGRa12p pack 12-bit samples.
         (_, 0x0230_0062 | 0x0230_004f) => None,
         // Coord3D_AC32f (also planar) overrides the ordinary 16-bit layout.
         (_, 0x0240_00c2 | 0x0240_00c3) | (0x0120 | 0x0260, _) => Some(4),
         // Coord3D_AC16, also planar, and ordinary 16-bit layouts.
-        (_, 0x0220_00bb | 0x0220_00bc) | (0x0110 | 0x0230 | 0x0240, _) => Some(2),
+        (_, crate::frame::COORD3D_AC16 | 0x0220_00bc) | (0x0110 | 0x0230 | 0x0240, _) => Some(2),
         _ => None,
     }
 }
@@ -2181,13 +2853,76 @@ fn missing(received: &[u64], packets: Option<usize>) -> Vec<(u32, u32)> {
 /// The leader gives the most lines a frame can have; line-scan cameras end a
 /// frame early (frame active triggers, line timeout) and report the lines
 /// they sent in the trailer.
-fn check_trailer(leader: &ImageLeader, block_size: usize, (id, height): (u32, u32)) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ImageTrailer {
+    payload_type: u16,
+    id: u32,
+    height: u32,
+    /// Reported chunk payload length and its XML chunk layout identifier.
+    chunks: Option<(usize, u32)>,
+}
+impl ImageTrailer {
+    fn parse(id: u32, data: &[u8]) -> Result<Self> {
+        ensure!(id > 1, "invalid GVSP image trailer");
+        Ok(Self {
+            id,
+            ..Self::parse_body(data)?
+        })
+    }
+    /// The trailer body also appears inside an All-in datagram, with no
+    /// separate trailer packet ID. Only ordinary transmission uses `id`.
+    fn parse_body(data: &[u8]) -> Result<Self> {
+        ensure!(data.len() >= 8, "invalid GVSP image trailer");
+        let payload_type = be16(data, 2);
+        ensure!(
+            matches!(payload_type, 1 | 5 | 0x4001),
+            "GVSP trailer is not a supported image"
+        );
+        let legacy_chunks = payload_type == 5;
+        let chunks = if payload_type == 1 {
+            None
+        } else {
+            ensure!(data.len() >= 16, "truncated GVSP extended chunk trailer");
+            Some((
+                usize::try_from(be32(data, if legacy_chunks { 4 } else { 8 }))
+                    .context("GVSP chunk length exceeds host address size")?,
+                be32(data, 12),
+            ))
+        };
+        Ok(Self {
+            payload_type,
+            id: 0,
+            height: be32(data, if legacy_chunks { 8 } else { 4 }),
+            chunks,
+        })
+    }
+}
+fn check_trailer_image(leader: &ImageLeader, trailer: ImageTrailer) -> Result<()> {
+    let ImageTrailer {
+        height,
+        chunks,
+        payload_type,
+        ..
+    } = trailer;
+    ensure!(
+        leader.payload_type == payload_type,
+        "GVSP leader and trailer payload types disagree"
+    );
+    ensure!(
+        leader.chunks == chunks.is_some(),
+        "GVSP leader and trailer disagree about chunk data"
+    );
     ensure!(
         (1..=leader.height).contains(&height),
         "GVSP trailer height {height} does not fit the leader's {}",
         leader.height
     );
-    let packets = id as usize - 1;
+    Ok(())
+}
+fn check_trailer(leader: &ImageLeader, block_size: usize, trailer: ImageTrailer) -> Result<()> {
+    check_trailer_image(leader, trailer)?;
+    let height = trailer.height;
+    let packets = trailer.id as usize - 1;
     let most = (leader.row_bytes + leader.x_padding) * height as usize + leader.y_padding;
     ensure!(
         packets * block_size >= leader.image_bytes(height)
@@ -2270,6 +3005,8 @@ struct Assembler {
     /// The camera kept `GevSCPSBigEndian` set: 16-bit samples arrive swapped.
     big_endian: bool,
     big_endian_mono16: bool,
+    multipart_projection: bool,
+    pixel_encodings: Vec<crate::types::PixelEncoding>,
     budget: Budget,
     blocks: Blocks,
     stats: TransportStats,
@@ -2295,6 +3032,8 @@ impl Assembler {
             resend: false,
             big_endian: false,
             big_endian_mono16: false,
+            multipart_projection: false,
+            pixel_encodings: Vec::new(),
             budget: Budget {
                 tokens: RESEND_BUDGET,
                 at: Instant::now(),
@@ -2404,7 +3143,10 @@ impl Assembler {
         scratch: &mut Vec<u8>,
         now: Instant,
     ) -> Result<Option<Frame>> {
-        if let Some(packet) = Self::lands(slot, (header, received, truncated)) {
+        if truncated {
+            return Ok(None);
+        }
+        if let Some(packet) = Self::lands(slot, (header, received, false)) {
             return self.take(packet, now);
         }
         // At most one packet: a resend, a reorder, a leader or a trailer.
@@ -2425,8 +3167,8 @@ impl Assembler {
                 self.frames.len(),
                 frame.bytes,
                 frame.count,
-                frame.leader.is_some(),
-                frame.trailer.is_some(),
+                frame.has_leader(),
+                frame.has_trailer(),
                 self.stats.incomplete_frames
             ),
             Some(_) => format!(
@@ -2478,9 +3220,19 @@ impl Assembler {
             "GVSP camera error status 0x{:04x}",
             packet.status
         );
+        if packet.kind == 4 {
+            return self.insert_all_in(index, packet, now);
+        }
+        if packet.kind == multipart::CONTENT || multipart::is_metadata(packet) {
+            return self.insert_multipart(index, packet, now);
+        }
+        ensure!(
+            index.is_none_or(|index| self.frames[index].multipart.is_none()),
+            "GVSP block mixes multipart and ordinary packets"
+        );
         ensure!(
             (1..=3).contains(&packet.kind),
-            "unsupported GVSP packet content {}; multipart/GenDC/all-in packets are not supported",
+            "unsupported GVSP packet content {}; select ordinary image or supported multipart transmission",
             packet.kind
         );
         let (block_size, max_packets) =
@@ -2501,6 +3253,14 @@ impl Assembler {
             1 => {
                 ensure!(packet.id == 0, "GVSP leader packet ID must be zero");
                 let leader = ImageLeader::parse(packet.data.bytes(), self.payload_limit)?;
+                ensure!(
+                    !self.big_endian
+                        || crate::frame::packed_coordinate_group(leader.pixel_format).is_none(),
+                    Categorized::error(
+                        crate::types::ErrorKind::Unsupported,
+                        "GVSP packed coordinates require little-endian packing"
+                    )
+                );
                 if let Some(previous) = &frame.leader {
                     ensure!(previous == &leader, "conflicting duplicate GVSP leader");
                 } else {
@@ -2531,12 +3291,7 @@ impl Assembler {
             }
             2 => {
                 let data = packet.data.bytes();
-                ensure!(
-                    packet.id > 1 && data.len() >= 8,
-                    "invalid GVSP image trailer"
-                );
-                ensure!(be16(data, 2) & !0x4000 == 1, "GVSP trailer is not an image");
-                let trailer = (packet.id, be32(data, 4));
+                let trailer = ImageTrailer::parse(packet.id, data)?;
                 if let Some(previous) = frame.trailer {
                     ensure!(previous == trailer, "conflicting duplicate GVSP trailer");
                 } else {
@@ -2594,7 +3349,9 @@ impl Assembler {
                     ensure!(
                         length == block_size
                             || (frame.end <= offset
-                                && frame.trailer.is_none_or(|(id, _)| id == packet.id + 1)),
+                                && frame
+                                    .trailer
+                                    .is_none_or(|trailer| trailer.id == packet.id + 1)),
                         "GVSP payload packet is short but not the last"
                     );
                     if length < block_size {
@@ -2619,17 +3376,289 @@ impl Assembler {
                 }
             }
         }
-        if let (Some(leader), Some((_, height)), Some(packets)) =
+        if let (Some(leader), Some(trailer), Some(packets)) =
             (&frame.leader, frame.trailer, frame.packets)
             && bit(
                 &frame.received,
                 u32::try_from(packets).context("frame packet count exceeds wire ID range")?,
             )
         {
+            let height = trailer.height;
             ensure!(
                 frame.end >= leader.image_bytes(height),
                 "GVSP payload ends before the trailer's {height} lines"
             );
+        }
+        if frame.ready()
+            && frame.chunks.is_none()
+            && let (Some(leader), Some(trailer)) = (&frame.leader, frame.trailer)
+            && let Some((reported_length, layout_id)) = trailer.chunks
+        {
+            let end = frame.end.min(self.payload_limit);
+            let min_image = leader.image_bytes(trailer.height) + leader.y_padding;
+            let max_image =
+                (leader.row_bytes + leader.x_padding) * trailer.height as usize + leader.y_padding;
+            // An image-extended-chunk block can report the whole payload.
+            // Require exact image geometry and corroborate it with the
+            // first image chunk's tag. Also accept suffix-length trailers.
+            let total_length = reported_length == end && min_image == max_image;
+            if leader.payload_type == 5 {
+                // Legacy extended-chunk trailers report the complete payload,
+                // not a suffix length. The image's first footer must also
+                // corroborate its exact geometry before bytes become pixels.
+                ensure!(
+                    total_length,
+                    "GVSP legacy chunk payload length or image boundary is inconsistent"
+                );
+            }
+            let image_bytes = if total_length {
+                min_image
+            } else {
+                end.checked_sub(reported_length)
+                    .context("GVSP chunk length exceeds payload")?
+            };
+            ensure!(
+                (min_image..=max_image).contains(&image_bytes),
+                "GVSP chunk boundary does not match image dimensions"
+            );
+            let data = frame.data.as_ref().context("GVSP frame buffer missing")?;
+            let mut chunks = ChunkData::parse(
+                &data[..end],
+                image_bytes,
+                image_bytes,
+                ByteOrder::Big,
+                layout_id,
+            )?;
+            ensure!(
+                !total_length
+                    || chunks
+                        .entries
+                        .first()
+                        .is_some_and(|image| { image.offset == 0 && image.length == image_bytes }),
+                "GVSP total-length chunk payload lacks its first image tag"
+            );
+            let pixel_encoding =
+                encoding_for(&self.pixel_encodings, self.big_endian, leader.pixel_format);
+            chunks.image_layout = Some(ImageLayout {
+                pixel_encoding,
+                offset: 0,
+                pfnc_code: pixel_encoding.is_none().then_some(leader.pixel_format),
+                width: leader.width,
+                height: trailer.height,
+                row_bytes: leader.row_bytes,
+                row_stride: leader.row_bytes + leader.x_padding,
+                padding_y: leader.y_padding,
+                byte_order: Some(
+                    if self.big_endian || (self.big_endian_mono16 && leader.pixel_format == MONO16)
+                    {
+                        ByteOrder::Big
+                    } else {
+                        ByteOrder::Little
+                    },
+                ),
+                continuous_packing: image_bytes < max_image,
+            });
+            frame.chunks = Some(chunks);
+        }
+        let complete = frame.due && frame.ready();
+        if packet.kind == 2 {
+            self.trigger(index, now);
+        } else if complete {
+            self.complete(index);
+        }
+        Ok(())
+    }
+    /// Complete an unchunked All-in IMAGE datagram.
+    ///
+    /// The common header is followed by the image leader, trailer and
+    /// payload, in that order (upstream Wireshark's `dissect_packet_all_in`).
+    /// The packet ID never places bytes, sizes packet maps or requests packets.
+    fn insert_all_in(
+        &mut self,
+        index: Option<usize>,
+        packet: GvspPacket<'_>,
+        now: Instant,
+    ) -> Result<()> {
+        ensure!(
+            index.is_none(),
+            "GVSP block mixes All-in and separate packets"
+        );
+        let (datagram_body, _) =
+            self.limits[usize::from(packet.extended)].context("invalid GVSP packet size")?;
+        let bytes = packet.data.bytes();
+        ensure!(
+            bytes.len() <= datagram_body,
+            "GVSP All-in exceeds negotiated packet size"
+        );
+        let (metadata, pixels) = bytes
+            .split_first_chunk::<44>()
+            .context("truncated GVSP All-in image metadata")?;
+        ensure!(
+            be16(metadata, 2) == 1,
+            Categorized::error(
+                crate::types::ErrorKind::Unsupported,
+                "GVSP All-in supports only unchunked IMAGE payloads"
+            )
+        );
+        ensure!(
+            metadata[0] == 0,
+            Categorized::error(
+                crate::types::ErrorKind::Unsupported,
+                "GVSP All-in requires a single image field"
+            )
+        );
+        let leader = ImageLeader::parse(&metadata[..36], self.payload_limit)?;
+        ensure!(
+            be16(metadata, 38) == 1,
+            "GVSP leader and trailer payload types disagree"
+        );
+        let trailer = ImageTrailer::parse_body(&metadata[36..44])?;
+        check_trailer_image(&leader, trailer)?;
+        ensure!(
+            !self.big_endian
+                || crate::frame::packed_coordinate_group(leader.pixel_format).is_none(),
+            Categorized::error(
+                crate::types::ErrorKind::Unsupported,
+                "GVSP packed coordinates require little-endian packing"
+            )
+        );
+        let least = leader
+            .image_bytes(trailer.height)
+            .checked_add(leader.y_padding)
+            .context("GVSP All-in image size overflow")?;
+        let most = (leader.row_bytes + leader.x_padding)
+            .checked_mul(trailer.height as usize)
+            .and_then(|size| size.checked_add(leader.y_padding))
+            .context("GVSP All-in image size overflow")?;
+        ensure!(
+            pixels.len() <= self.payload_limit && (pixels.len() == least || pixels.len() == most),
+            "GVSP All-in payload length does not match image geometry"
+        );
+        // All bounds and trailer consistency are proved before allocation or
+        // insertion. No packet-ID inference, reserved bytes or unreceived
+        // tails are needed for this self-contained datagram.
+        let Data::Bytes(_, site) = packet.data else {
+            anyhow::bail!("GVSP All-in datagram was not reconstructed from a predicted slot");
+        };
+        let mut data = pool().take_stale(pixels.len());
+        crate::copies::record(site, pixels.len());
+        data.copy_from_slice(pixels);
+        self.copied.0 += 1;
+        self.copied.1 += pixels.len() as u64;
+        let index = self.create(packet.frame, packet.extended, 0, now);
+        let frame = &mut self.frames[index];
+        frame.leader = Some(leader);
+        frame.trailer = Some(trailer);
+        frame.data = Some(data);
+        frame.end = pixels.len();
+        // There are zero separately transmitted DATA packets in this mode.
+        // Finalize now through the ordinary row/packing/word normalization.
+        frame.packets = Some(0);
+        self.complete(index);
+        Ok(())
+    }
+
+    fn insert_multipart(
+        &mut self,
+        index: Option<usize>,
+        packet: GvspPacket<'_>,
+        now: Instant,
+    ) -> Result<()> {
+        ensure!(
+            packet.extended,
+            Categorized::error(
+                crate::types::ErrorKind::Unsupported,
+                "GVSP multipart requires extended IDs"
+            )
+        );
+        let (image_block, _) = self.limits[1].context("invalid GVSP packet size")?;
+        let block_size = image_block
+            .checked_sub(multipart::FRAGMENT_HEADER)
+            .filter(|size| *size > 0)
+            .context("invalid GVSP multipart packet size")?;
+        // Every datagram contributes at least one byte. Small last packets
+        // are valid in every part, so the ordinary stride bound cannot be
+        // used here.
+        let max_packets = self.payload_limit.min(MAX_FRAME_PACKETS);
+        ensure!(
+            packet.id as usize <= max_packets + 1,
+            "GVSP multipart packet ID exceeds payload bounds"
+        );
+        let index = index.unwrap_or_else(|| {
+            let index = self.create(packet.frame, true, max_packets, now);
+            self.frames[index].multipart = Some(Box::default());
+            index
+        });
+        let frame = &mut self.frames[index];
+        let state = frame
+            .multipart
+            .as_mut()
+            .context("GVSP block mixes ordinary and multipart packets")?;
+        frame.last_packet = now;
+        match packet.kind {
+            1 => {
+                let order = if self.big_endian {
+                    Some(ByteOrder::Big)
+                } else if self.big_endian_mono16 {
+                    None
+                } else {
+                    Some(ByteOrder::Little)
+                };
+                state.receive_leader(
+                    packet,
+                    self.payload_limit,
+                    order,
+                    self.multipart_projection,
+                )?;
+                set_bit(&mut frame.received, 0);
+            }
+            2 => {
+                let packets = (packet.id as usize).saturating_sub(1);
+                ensure!(
+                    frame.packets.is_none_or(|known| known == packets),
+                    "GVSP multipart trailer ID disagrees with payload count"
+                );
+                state.receive_trailer(packet.id, packet.data.bytes())?;
+                frame.packets = Some(packets);
+                set_bit(&mut frame.received, packet.id);
+            }
+            _ => {
+                ensure!(
+                    packet.id as usize <= max_packets
+                        && frame
+                            .packets
+                            .is_none_or(|packets| packet.id as usize <= packets),
+                    "GVSP multipart fragment ID lies beyond payload"
+                );
+                let accepted = state.receive_fragment(
+                    packet,
+                    block_size,
+                    self.payload_limit,
+                    bit(&frame.received, packet.id),
+                )?;
+                if accepted > 0 {
+                    set_bit(&mut frame.received, packet.id);
+                    frame.count += 1;
+                    frame.bytes += accepted;
+                    self.copied.0 += 1;
+                    self.copied.1 += accepted as u64;
+                    if bit(&frame.requested, packet.id) {
+                        self.stats.resend_recovered += 1;
+                    }
+                }
+            }
+        }
+        if state.coverage_complete() && frame.count == state.highest as usize {
+            // With all part bytes and no ID gaps, the next ID is the
+            // trailer. This lets the usual resend policy request it.
+            frame.packets.get_or_insert(frame.count);
+        }
+        if state.has_leader() && state.has_trailer() && Some(frame.count) == frame.packets {
+            ensure!(
+                state.coverage_complete(),
+                "GVSP multipart contains a byte coverage hole"
+            );
+            state.prepare(frame.block, self.timestamp_frequency)?;
         }
         let complete = frame.due && frame.ready();
         if packet.kind == 2 {
@@ -2653,6 +3682,8 @@ impl Assembler {
             last_packet: now,
             leader: None,
             trailer: None,
+            chunks: None,
+            multipart: None,
             packets: None,
             data: None,
             received: vec![0; (max_packets + 2).div_ceil(64)],
@@ -2667,7 +3698,7 @@ impl Assembler {
         self.frames.len() - 1
     }
     /// Whether a frame needs `poll` for resends and expiry.
-    const fn in_flight(&self) -> bool {
+    fn in_flight(&self) -> bool {
         match self.frames.as_slice() {
             [] => false,
             [frame] => !frame.awaits_data(),
@@ -2721,7 +3752,7 @@ impl Assembler {
         // may not have been sent yet: line-scan cameras pause between lines and
         // can end a frame early. That run is requested only while it is short,
         // and then the frame waits for its data or `FRAME_IDLE`.
-        if frame.trailer.is_none()
+        if !frame.has_trailer()
             && frame.packets.is_some()
             && (frame.rounds >= RESEND_ROUNDS || excessive(&runs))
         {
@@ -2775,9 +3806,22 @@ impl Assembler {
         let frame = self.frames.remove(0);
         self.close(frame.block);
         self.stats.lost_frames += self.blocks.delivered(frame.block, frame.extended);
+        if let Some(multipart) = frame.multipart {
+            self.ready.push_back(multipart.finish());
+            return;
+        }
         let leader = frame.leader.expect("complete frames have a leader");
-        let height = frame.trailer.map_or(leader.height, |(_, height)| height);
+        let height = frame
+            .trailer
+            .map_or(leader.height, |trailer| trailer.height);
         let mut data = frame.data.unwrap_or_else(|| pool().take_stale(0));
+        let mut chunks = frame.chunks;
+        let image_end = chunks
+            .as_ref()
+            .map_or(frame.end, |chunks| chunks.image_bytes);
+        if let Some(chunks) = &mut chunks {
+            data = chunks.retain(data);
+        }
         let stride = leader.row_bytes + leader.x_padding;
         if leader.x_padding > 0 {
             crate::copies::record(
@@ -2795,12 +3839,11 @@ impl Assembler {
         // byte-aligned rows. Normalize that unambiguous layout for Frame's
         // row-based consumers. A full-sized payload remains line-padded:
         // its length cannot establish whether extra bytes are transport
-        // padding, and chunk payloads do not expose the image boundary here.
+        // padding. A chunk trailer gives the image's boundary explicitly.
         let line_bytes = leader.row_bytes * height as usize;
         if leader.x_padding == 0
-            && !leader.chunks
             && line_bytes <= MAX_PAYLOAD
-            && frame.end == leader.image_bytes(height) + leader.y_padding
+            && image_end == leader.image_bytes(height) + leader.y_padding
             && leader.image_bytes(height) < line_bytes
             && crate::frame::lsb_packed(leader.pixel_format)
         {
@@ -2842,15 +3885,25 @@ impl Assembler {
         // nanoseconds; the host time of the frame still says when it came.
         let device_ts_ns = (self.timestamp_frequency != 0)
             .then(|| ticks_ns(leader.timestamp, self.timestamp_frequency));
+        let pixel_encoding =
+            encoding_for(&self.pixel_encodings, self.big_endian, leader.pixel_format);
         self.ready.push_back(Frame {
+            pixel_encoding,
+            device_timestamp: Some(crate::types::DeviceTimestamp {
+                ticks: leader.timestamp,
+                frequency_hz: (self.timestamp_frequency != 0).then_some(self.timestamp_frequency),
+            }),
             id: frame.block,
             width: leader.width,
             height,
             pixel_format: leader.pixel_format,
             device_ts_ns,
             wall_ms: 0,
+            received_monotonic_ns: None,
             data: data.freeze(),
             jpeg: None,
+            chunks: chunks.map(Into::into),
+            multipart: None,
         });
     }
 }
@@ -2933,10 +3986,1910 @@ mod tests {
         assembler
     }
 
+    /// Synthetic All-in IMAGE fixture, not a device capture.
+    ///
+    /// Wireshark cd59fea3baff8444a2645ba928e6967673c5b54a
+    /// `dissect_packet_all_in`: 36-byte leader, 8-byte trailer, then image bytes.
+    fn all_in_image(block: u64, extended: bool, id: u32, bytes: &[u8]) -> Vec<u8> {
+        let body = [leader(2, 2, MONO8), trailer(2), bytes.to_vec()].concat();
+        gvsp(block, id, 4, extended, &body)
+    }
+
+    #[test]
+    fn all_in_literal_image_normalizes_padding_and_words_for_lossless_stills() {
+        // The literal intentionally gives the common header a nonzero maximum
+        // packet ID. This receiver never uses it as a DATA offset or count.
+        // This is an independent synthetic layout fixture, not captured hardware.
+        #[rustfmt::skip]
+        const PACKET: [u8; 70] = [
+            0x00,0x00,0x00,0x2a,0x04,0xff,0xff,0xff,
+            0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x04,0xd2,0x01,0x10,0x00,0x07,
+            0x00,0x00,0x00,0x03,0x00,0x00,0x00,0x02,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x02,0x00,0x02,
+            0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x02,
+            0x01,0x02,0x03,0x04,0x05,0x06,0xfa,0xfb,
+            0x07,0x08,0x09,0x0a,0x0b,0x0c,0xfc,0xfd,0xfe,0xff,
+        ];
+        let mut assembler = Assembler::new(128, 1500, 1_000_000);
+        assembler.big_endian = true;
+        let frame = assembler.push(&PACKET).unwrap().unwrap();
+        let expected = [2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11];
+        assert_eq!(
+            (frame.id, frame.width, frame.height, frame.pixel_format),
+            (42, 3, 2, MONO16)
+        );
+        assert_eq!(frame.data.as_ref(), expected);
+        assert_eq!(frame.device_ts_ns, Some(1_234_000));
+        let clock = frame.device_timestamp.unwrap();
+        assert_eq!((clock.ticks, clock.frequency_hz), (1234, Some(1_000_000)));
+        assert!(frame.chunks.is_none() && frame.multipart.is_none());
+        assert_eq!(frame.buffer_bytes(), frame.data.allocated_bytes());
+        assert!(
+            frame.buffer_bytes() >= 18,
+            "the retained allocation includes wire padding"
+        );
+        assert_eq!(assembler.copied, (1, 18));
+        assert!(assembler.frames.is_empty() && assembler.requests.is_empty());
+        assert_eq!(crate::frame::encode(&frame, "raw").unwrap(), expected);
+        let png = crate::frame::encode(&frame, "png").unwrap();
+        let mut reader = png::Decoder::new(Cursor::new(png)).read_info().unwrap();
+        let mut decoded = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut decoded).unwrap();
+        assert_eq!(
+            (info.width, info.height, info.bit_depth),
+            (3, 2, png::BitDepth::Sixteen)
+        );
+        assert_eq!(
+            &decoded[..info.buffer_size()],
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        );
+        // Later pool users cannot mutate an image retained by a saver or inspector.
+        let held = frame.clone();
+        drop(frame);
+        for block in 43..48 {
+            let next = assembler
+                .push(&all_in_image(block, false, 0, &[99; 4]))
+                .unwrap()
+                .unwrap();
+            assert_eq!(next.data.as_ref(), [99; 4]);
+        }
+        assert_eq!(held.data.as_ref(), expected);
+    }
+
+    #[test]
+    fn all_in_documented_balluff_minimum_roi_fits_only_a_large_enough_datagram() {
+        // Balluff X106C's published model list: Width min 376, Height min 4,
+        // BayerRG8 and SCPS1500..8176. This is synthetic geometry evidence,
+        // not a captured Balluff stream or a hardware qualification claim.
+        let pixels = image(376, 4);
+        let body = [leader(376, 4, 0x0108_0009), trailer(4), pixels.clone()].concat();
+        for extended in [false, true] {
+            let packet = gvsp(42, 0, 4, extended, &body);
+            let mut too_small = Assembler::new(pixels.len(), 1500, 0);
+            let error = too_small.push(&packet).unwrap_err();
+            assert!(error.to_string().contains("negotiated packet size"));
+            assert_eq!(too_small.copied, (0, 0));
+            let mut exact = Assembler::new(pixels.len(), packet.len() + 28, 0);
+            let frame = exact.push(&packet).unwrap().unwrap();
+            assert_eq!(
+                (frame.width, frame.height, frame.pixel_format),
+                (376, 4, 0x0108_0009)
+            );
+            assert_eq!(frame.data.as_ref(), pixels);
+            assert_eq!(exact.copied, (1, 1504));
+        }
+    }
+
+    #[test]
+    fn all_in_common_ids_never_size_packet_maps_or_generate_resends() {
+        for extended in [false, true] {
+            let mut assembler = Assembler::new(4, 1500, 0);
+            assembler.resend = true;
+            let block = if extended { 0x1_0000_002a } else { 42 };
+            let id = if extended { u32::MAX } else { 0x00ff_ffff };
+            let packet = all_in_image(block, extended, id, &[1, 2, 3, 4]);
+            let frame = assembler.push(&packet).unwrap().unwrap();
+            assert_eq!((frame.id, frame.data.as_ref()), (block, &[1, 2, 3, 4][..]));
+            assert_eq!(frame.device_ts_ns, None);
+            assert_eq!(frame.device_timestamp.unwrap().frequency_hz, None);
+            assert!(assembler.push(&packet).unwrap().is_none());
+            // A duplicate's packet ID is equally irrelevant after block delivery.
+            assert!(
+                assembler
+                    .push(&all_in_image(block, extended, 0, &[9; 4]))
+                    .unwrap()
+                    .is_none()
+            );
+            assembler.poll(Instant::now() + FRAME_IDLE);
+            assert!(
+                assembler.frames.is_empty()
+                    && assembler.ready.is_empty()
+                    && assembler.requests.is_empty()
+            );
+            assert_eq!(
+                (
+                    assembler.stats.packets_received,
+                    assembler.stats.resend_requested
+                ),
+                (3, 0)
+            );
+            assert_eq!(assembler.copied, (1, 4));
+            assert_eq!(assembler.stats.incomplete_frames, 0);
+        }
+    }
+
+    #[test]
+    fn all_in_rejects_malformed_or_unsupported_frames_atomically_and_recovers() {
+        for (mode, message) in [
+            (0, "truncated GVSP All-in"),
+            (1, "unchunked IMAGE"),
+            (2, "unchunked IMAGE"),
+            (3, "payload types disagree"),
+            (4, "height 0"),
+            (5, "height 3"),
+            (6, "does not match image geometry"),
+            (7, "does not match image geometry"),
+            (8, "configured payload size"),
+            (9, "negotiated packet size"),
+            (10, "single image field"),
+            (11, "configured payload size"),
+        ] {
+            let mut assembler = Assembler::new(
+                if mode == 8 { 3 } else { 128 },
+                if mode == 9 { 64 } else { 1500 },
+                0,
+            );
+            let mut packet = all_in_image(42, false, 0, &[1, 2, 3, 4]);
+            match mode {
+                0 => packet.truncate(8 + 43),
+                1 => packet[10..12].copy_from_slice(&5u16.to_be_bytes()),
+                2 => packet[10..12].copy_from_slice(&0x4001u16.to_be_bytes()),
+                3 => packet[46..48].copy_from_slice(&5u16.to_be_bytes()),
+                4 => packet[48..52].fill(0),
+                5 => packet[48..52].copy_from_slice(&3u32.to_be_bytes()),
+                6 => {
+                    packet.pop();
+                }
+                7 => packet.push(5),
+                8 | 9 => {}
+                10 => packet[8] = 0x11,
+                11 => packet[24..28].copy_from_slice(&u32::MAX.to_be_bytes()),
+                _ => unreachable!(),
+            }
+            let error = assembler.push(&packet).unwrap_err();
+            assert!(
+                error.to_string().contains(message),
+                "mode {mode}: {error:#}"
+            );
+            assert!(assembler.frames.is_empty() && assembler.ready.is_empty());
+            assert_eq!(assembler.copied, (0, 0));
+            // Match the receiver's configured payload ceiling in the recovery image.
+            let packets = frame_packets(43, false, 1, 2, if mode == 9 { 28 } else { 1464 });
+            let frame = packets
+                .iter()
+                .find_map(|packet| assembler.push(packet).unwrap())
+                .unwrap();
+            assert_eq!((frame.id, frame.data.as_ref()), (43, &[0, 7][..]));
+        }
+    }
+
+    #[test]
+    fn all_in_accepts_only_an_exact_received_delivered_image_span() {
+        let mut body = leader(2, 4, MONO8);
+        body.extend(trailer(2));
+        body.extend([1, 2, 3, 4]);
+        let mut assembler = Assembler::new(8, 1500, 0);
+        let frame = assembler
+            .push(&gvsp(42, 0, 4, true, &body))
+            .unwrap()
+            .unwrap();
+        assert_eq!((frame.width, frame.height), (2, 2));
+        assert_eq!(frame.data.as_ref(), [1, 2, 3, 4]);
+        assert_eq!(assembler.copied, (1, 4));
+        assert!(frame.data.allocated_bytes() >= 4);
+        // No leader-maximum tail is published when it was not in the datagram.
+        let mut continuous = leader(5, 2, 0x010c_0047);
+        continuous.extend(trailer(2));
+        continuous.extend([
+            0x21, 0x43, 0x65, 0x87, 0xa9, 0xcb, 0xed, 0x0f, 0x21, 0x43, 0x65, 0x87, 0xa9, 0xcb,
+            0xed,
+        ]);
+        let mut assembler = Assembler::new(16, 1500, 0);
+        let frame = assembler
+            .push(&gvsp(43, 0, 4, false, &continuous))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            frame.data.len(),
+            16,
+            "existing row normalization expands the exact 15-byte packed stream"
+        );
+        crate::frame::validate_source(&frame).unwrap();
+        let mut big = Assembler::new(16, 1500, 0);
+        big.big_endian = true;
+        continuous[12..16].copy_from_slice(&crate::frame::COORD3D_C12P.to_be_bytes());
+        let error = big.push(&gvsp(44, 0, 4, false, &continuous)).unwrap_err();
+        assert_eq!(
+            crate::types::classify(&error).kind,
+            crate::types::ErrorKind::Unsupported
+        );
+        assert!(error.to_string().contains("little-endian packing"));
+        assert_eq!(big.copied, (0, 0));
+    }
+
+    #[test]
+    fn all_in_batches_reconstruct_before_replacing_an_ordinary_receive_owner() {
+        let mut packets = frame_packets(41, true, 4, 2, 16);
+        packets.truncate(1);
+        packets.push(all_in_image(42, true, u32::MAX, &[1, 2, 3, 4]));
+        packets.extend(frame_packets(41, true, 4, 2, 16).into_iter().skip(1));
+        packets.extend(frame_packets(43, true, 2, 2, 16));
+        packets.push(all_in_image(44, true, 0, &[5, 6, 7, 8]));
+        let expected = vec![
+            (42, vec![1, 2, 3, 4]),
+            (43, image(2, 2)),
+            (44, vec![5, 6, 7, 8]),
+        ];
+        for batch_size in [None, Some(0_usize), Some(1), Some(3), Some(31)] {
+            let mut assembler = Assembler::new(8, 1500, 0);
+            let mut random = |_: usize| batch_size.unwrap_or_default();
+            let frames = assembled(
+                &mut assembler,
+                &packets,
+                batch_size.map(|_| &mut random as &mut dyn FnMut(usize) -> usize),
+            );
+            assert_eq!(frames, expected, "batch size {batch_size:?}");
+            assert_eq!(assembler.stats.incomplete_frames, 1);
+            assert!(assembler.frames.is_empty());
+        }
+        let mut assembler = Assembler::new(8, 1500, 0);
+        assembler
+            .push(&gvsp(42, 0, 1, true, &leader(2, 2, MONO8)))
+            .unwrap();
+        let error = assembler
+            .push(&all_in_image(42, true, 0, &[1, 2, 3, 4]))
+            .unwrap_err();
+        assert!(error.to_string().contains("mixes All-in and separate"));
+        assert!(assembler.frames.is_empty() && assembler.ready.is_empty());
+    }
+
+    #[test]
+    fn all_in_truncated_receive_never_publishes_a_clipped_prefix() {
+        let packet = all_in_image(42, true, 0, &[1, 2, 3, 4]);
+        for predicted in [false, true] {
+            let mut assembler = Assembler::new(8, 1500, 0);
+            if predicted {
+                assembler
+                    .push(&gvsp(41, 0, 1, true, &leader(4, 2, MONO8)))
+                    .unwrap();
+            }
+            let mut batch = batch::Batch::new(1500);
+            let slots: Vec<_> = assembler.predict_run(1).collect();
+            let base = if predicted {
+                assembler.newest_buffer().unwrap()
+            } else {
+                std::ptr::null_mut()
+            };
+            if let Some(slot) = slots.first() {
+                batch.headers[0][..slot.header].copy_from_slice(&packet[..slot.header]);
+                let rest = &packet[slot.header..];
+                let in_slot = rest.len().min(slot.len);
+                assembler.slot_mut(slot).unwrap()[..in_slot].copy_from_slice(&rest[..in_slot]);
+                batch.rests[0][..rest.len() - in_slot].copy_from_slice(&rest[in_slot..]);
+            } else {
+                batch.rests[0][..packet.len()].copy_from_slice(&packet);
+            }
+            assert!(
+                batch
+                    .take(
+                        &mut assembler,
+                        (&slots, base),
+                        &[batch::Received {
+                            len: packet.len(),
+                            truncated: true,
+                            from_camera: true
+                        }],
+                        Site::GvspFallback,
+                        Instant::now()
+                    )
+                    .is_none()
+            );
+            assert!(assembler.ready.is_empty());
+            assert_eq!(assembler.copied, (0, 0));
+            let frame = assembler.push(&packet).unwrap().unwrap();
+            assert_eq!(frame.data.as_ref(), [1, 2, 3, 4]);
+        }
+    }
+
+    #[test]
+    fn all_in_fake_camera_stream_captures_frames_without_packet_resends() {
+        for extended in [false, true] {
+            let (fake, mut gige) = streaming(|camera| {
+                camera.registers.insert(GVCP_CAPABILITY, 0x4);
+            });
+            let destination = fake.camera.lock().unwrap().destination();
+            let first = all_in_image(
+                42,
+                extended,
+                if extended { u32::MAX } else { 0x00ff_ffff },
+                &[1, 2, 3, 4],
+            );
+            fake.stream.send_to(&first, destination).unwrap();
+            let frame = gige.next_frame(Duration::from_secs(2)).unwrap();
+            assert_eq!((frame.id, frame.width, frame.height), (42, 2, 2));
+            assert_eq!(frame.data.as_ref(), [1, 2, 3, 4]);
+            fake.stream.send_to(&first, destination).unwrap();
+            fake.stream
+                .send_to(&all_in_image(43, extended, 0, &[5, 6, 7, 8]), destination)
+                .unwrap();
+            let second = gige.next_frame(Duration::from_secs(2)).unwrap();
+            assert_eq!(second.id, 43);
+            assert_eq!(second.data.as_ref(), [5, 6, 7, 8]);
+            assert_eq!(frame.data.as_ref(), [1, 2, 3, 4]);
+            let raw = crate::frame::encode_parts(&frame, "raw", None, None).unwrap();
+            assert_eq!(
+                raw.parts()[0].as_ptr(),
+                frame.data.as_ptr(),
+                "RAW capture borrows the received owner"
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let output = dir.path().join("captured.raw");
+            let stored = crate::storage::save_parts(
+                &raw.parts(),
+                &output,
+                crate::storage::SyncMode::Off,
+                Some(0),
+                true,
+            )
+            .unwrap();
+            assert_eq!(stored.bytes, 4);
+            assert!(stored.sha256.is_some());
+            assert_eq!(std::fs::read(&output).unwrap(), [1, 2, 3, 4]);
+            let error = crate::storage::save_parts(
+                &raw.parts(),
+                &output,
+                crate::storage::SyncMode::Off,
+                Some(0),
+                false,
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<crate::storage::OutputExists>()
+                    .is_some()
+            );
+            assert_eq!(std::fs::read(&output).unwrap(), [1, 2, 3, 4]);
+            assert_eq!(fake.camera.lock().unwrap().requests, Vec::new());
+            let stats = gige.stats().unwrap();
+            assert_eq!((stats.resend_requested, stats.incomplete_frames), (0, 0));
+            gige.stop().unwrap();
+            assert_eq!(fake.register(STREAM_PORT), 0);
+            drop(gige);
+            assert_eq!(fake.register(CONTROL_PRIVILEGE), 0);
+        }
+    }
+
+    // Independently authored wire fixture with unequal part dimensions.
+    // Packet order is deliberately different from component order.
+    fn multipart_packets(block: u64, data_size: usize) -> (Vec<Vec<u8>>, [Vec<u8>; 4]) {
+        multipart_packets_with_confidence(block, data_size, false)
+    }
+
+    fn multipart_packets_with_confidence(
+        block: u64,
+        data_size: usize,
+        wide_confidence: bool,
+    ) -> (Vec<Vec<u8>>, [Vec<u8>; 4]) {
+        let confidence = if wide_confidence {
+            0x0110_00c7
+        } else {
+            0x0108_00c6
+        };
+        let confidence_bytes = if wide_confidence { 646 } else { 323 };
+        let descriptors = [
+            (5u16, 0x0110_00b8u32, 17u32, 19u32),
+            (1, MONO8, 33, 21),
+            (9, confidence, 17, 19),
+            (1, 0x8108_0001, 17, 19),
+        ];
+        let parts = [
+            (0..646u32)
+                .map(|i| (i * 3).to_le_bytes()[0])
+                .collect::<Vec<_>>(),
+            image(33, 21),
+            (0..confidence_bytes)
+                .map(|i: u32| (i * 5).to_le_bytes()[0])
+                .collect(),
+            (0..323u32).map(|i| (i * 11).to_le_bytes()[0]).collect(),
+        ];
+        let packets = multipart_wire_packets(block, data_size, &descriptors, &parts, &[1, 0, 3, 2]);
+        (packets, parts)
+    }
+
+    fn multipart_wire_packets(
+        block: u64,
+        data_size: usize,
+        descriptors: &[(u16, u32, u32, u32)],
+        parts: &[Vec<u8>],
+        order: &[usize],
+    ) -> Vec<Vec<u8>> {
+        let mut head = vec![0, 0, 0, 10];
+        head.extend(9876u64.to_be_bytes());
+        let mut tail = vec![0, 0, 0, 10];
+        for (index, ((kind, format, width, height), samples)) in
+            descriptors.iter().copied().zip(parts).enumerate()
+        {
+            let length = u64::try_from(samples.len()).unwrap().to_be_bytes();
+            head.extend(kind.to_be_bytes());
+            head.extend_from_slice(&length[2..]);
+            head.extend(format.to_be_bytes());
+            head.extend([0, 0, u8::try_from(index).unwrap(), 0]);
+            head.extend(0u32.to_be_bytes());
+            head.extend(1u16.to_be_bytes());
+            head.extend(3u16.to_be_bytes());
+            head.extend(width.to_be_bytes());
+            head.extend(height.to_be_bytes());
+            head.extend([0; 16]);
+            tail.extend(kind.to_be_bytes());
+            tail.extend_from_slice(&length[2..]);
+            tail.extend(height.to_be_bytes());
+            tail.extend([0; 4]);
+        }
+        let mut leader = gvsp(block, 0, 1, true, &head);
+        leader[7] = u8::try_from(parts.len()).unwrap();
+        let mut packets = vec![leader];
+        for &part in order {
+            let base: usize = parts[..part].iter().map(Vec::len).sum();
+            for (index, fragment) in parts[part].chunks(data_size).enumerate() {
+                let end = index * data_size + fragment.len() == parts[part].len();
+                let mut data = vec![u8::try_from(part).unwrap(), if end { 0x41 } else { 0 }];
+                let address = u64::try_from(base + index * data_size)
+                    .unwrap()
+                    .to_be_bytes();
+                data.extend_from_slice(&address[2..]);
+                data.extend_from_slice(fragment);
+                packets.push(gvsp(
+                    block,
+                    u32::try_from(packets.len()).unwrap(),
+                    7,
+                    true,
+                    &data,
+                ));
+            }
+        }
+        packets.push(gvsp(
+            block,
+            u32::try_from(packets.len()).unwrap(),
+            2,
+            true,
+            &tail,
+        ));
+        packets
+    }
+
+    fn assert_multipart_capture(frame: &Frame, parts: &[Vec<u8>; 4]) {
+        assert_eq!(
+            (frame.width, frame.height, frame.pixel_format),
+            (33, 21, MONO8)
+        );
+        assert_eq!(frame.data.as_ref(), parts[1]);
+        assert_eq!(frame.device_timestamp.unwrap().ticks, 9876);
+        assert!(frame.chunks.is_none());
+        let archive = frame.multipart.as_ref().unwrap();
+        assert_eq!(archive.payload.as_ref(), parts.concat());
+        assert_eq!(archive.layout.selected, 1);
+        let layout = serde_json::to_value(&archive.layout).unwrap();
+        assert_eq!(layout["data_type_namespace"], "gvsp");
+        assert!(layout.get("original_buffer_bytes").is_none());
+        assert_eq!(layout["original_filled_bytes"], parts.concat().len());
+        let mut address = 0;
+        for (index, (part, samples)) in layout["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(parts)
+            .enumerate()
+        {
+            assert_eq!(part["index"], index);
+            assert_eq!(part["stored_offset"], address);
+            assert_eq!(part["gvsp"]["address_offset"], address);
+            assert_eq!(part["length"], samples.len());
+            assert_eq!(part["data_type"], [5, 1, 9, 1][index]);
+            assert_eq!(
+                part["format"],
+                [0x0110_00b8, MONO8, 0x0108_00c6, 0x8108_0001][index]
+            );
+            assert!(part.get("original_offset").is_none());
+            assert!(part.get("namespace").is_none());
+            assert_eq!(part["source_id"], index);
+            assert_eq!(part["purpose_id"], 1);
+            assert_eq!(part["region_id"], 3);
+            assert_eq!(part["gvsp"]["x_padding"], 0);
+            address += samples.len();
+        }
+    }
+
+    #[test]
+    fn exact_index_admission_requires_all_packets_and_never_exposes_an_ordinary_representative() {
+        use crate::transport::multipart::GvspPartFormat;
+        for format in [MONO8, RGB8] {
+            let component = if format == MONO8 { 1 } else { 3 };
+            let parts = [
+                [10, 20].repeat(component),
+                [30, 40, 50, 60].repeat(component),
+                vec![0xab],
+            ];
+            let descriptors = [(1, format, 2, 1), (1, format, 2, 2), (1, 0x8108_0001, 1, 1)];
+            let size = parts.concat().len();
+            let mut packets =
+                multipart_wire_packets(117, 2 * component, &descriptors, &parts, &[1, 0, 2]);
+            // Purpose/source/region are deliberately distinct; ordinal selection never aliases them.
+            packets[0][46] = 68;
+            packets[0][94] = 68;
+            packets[0][100..102].copy_from_slice(&65_281u16.to_be_bytes());
+            let mut closed = Assembler::new(size, 576, 0);
+            let error = closed.push(&packets[0]).unwrap_err();
+            assert_eq!(
+                crate::types::classify(&error).kind,
+                crate::types::ErrorKind::Unsupported
+            );
+            let start = Instant::now();
+            let mut assembler = Assembler::new(size, 576, 0);
+            assembler.multipart_projection = true;
+            assembler.resend = true;
+            for index in [5, 2, 0, 4, 1] {
+                assert!(assembler.push_at(&packets[index], start).unwrap().is_none());
+            }
+            assembler.poll(start + RESEND_IDLE);
+            assert!(
+                assembler
+                    .requests
+                    .iter()
+                    .any(|&(block, _, first, last)| block == 117 && first <= 3 && last >= 3)
+            );
+            let recovered = assembler.stats.resend_recovered;
+            let mut resent = packets[3].clone();
+            resent[..2].copy_from_slice(&0x0100u16.to_be_bytes());
+            let frame = assembler
+                .push_at(&resent, start + RESEND_IDLE)
+                .unwrap()
+                .unwrap();
+            assert_eq!(assembler.stats.resend_recovered, recovered + 1);
+            assert!(crate::frame::selection_required(&frame));
+            crate::frame::rgb(&frame).unwrap_err();
+            serde_json::to_value(&frame).unwrap_err();
+            let selection = if format == MONO8 {
+                GvspPartFormat::Mono8
+            } else {
+                GvspPartFormat::Rgb8
+            };
+            selection.project(&frame).unwrap_err();
+            let selected = selection.project_index(&frame, Some(1)).unwrap();
+            assert_eq!(selected.data.as_ref(), parts[1]);
+            assert_eq!(
+                selected.multipart.as_ref().unwrap().payload.as_ref(),
+                parts.concat()
+            );
+            assert_eq!(
+                selected.multipart.as_ref().unwrap().layout.parts[1].purpose_id,
+                Some(65_281)
+            );
+            assert_eq!((selected.width, selected.height), (2, 2));
+        }
+    }
+
+    #[test]
+    fn duplicate_scalar_native_parts_require_selection_before_inspect_or_frame_serde() {
+        use crate::transport::multipart::GvspPartFormat;
+        let parts = [vec![0x12, 0x34], vec![0x56, 0x78]];
+        let packets = multipart_wire_packets(
+            118,
+            8,
+            &[(5, 0x0110_00b8, 1, 1), (5, 0x0110_00b8, 1, 1)],
+            &parts,
+            &[0, 1],
+        );
+        let mut assembler = Assembler::new(4, 576, 0);
+        let frame = packets
+            .iter()
+            .find_map(|packet| assembler.push(packet).unwrap())
+            .unwrap();
+        assert!(crate::frame::selection_required(&frame));
+        serde_json::to_value(&frame).unwrap_err();
+        crate::inspect::inspect(
+            &frame,
+            crate::camera_profile::CameraKind::AreaScan,
+            None,
+            0,
+            crate::inspect::PreviewFormat::Png,
+        )
+        .unwrap_err();
+        GvspPartFormat::Coord3dC16.project(&frame).unwrap_err();
+        let selected = GvspPartFormat::Coord3dC16
+            .project_index(&frame, Some(1))
+            .unwrap();
+        assert_eq!(selected.data.as_ref(), parts[1]);
+        assert!(!crate::frame::selection_required(&selected));
+    }
+
+    #[test]
+    fn multipart_wire_packed_range_keeps_payload_and_png_sample_depth() {
+        use crate::frame::{COORD3D_C10P, COORD3D_C12P};
+        use crate::transport::multipart::GvspPartFormat;
+        // PFNC LSB bytes computed from these sample codes independently of
+        // the row decoder. Two rows expose any accidental stride changes.
+        let cases = [
+            (
+                GvspPartFormat::Coord3dC10p,
+                COORD3D_C10P,
+                4u32,
+                10u8,
+                [0x00, 0x04, 0x50, 0xd5, 0xff, 0x01, 0x8e, 0xa4, 0xaa, 0xff].as_slice(),
+                [0u16, 1, 0x155, 0x3ff, 0x201, 0x123, 0x2aa, 0x3fe].as_slice(),
+            ),
+            (
+                GvspPartFormat::Coord3dC12p,
+                COORD3D_C12P,
+                2,
+                12,
+                [0xbc, 0x3a, 0x12, 0x01, 0xf0, 0xff].as_slice(),
+                [0xabcu16, 0x123, 1, 0xfff].as_slice(),
+            ),
+        ];
+        for (format, code, width, bits, packed, samples) in cases {
+            for reflectance in [true, false] {
+                let parts = [packed.to_vec(), vec![42, 43]];
+                let descriptors = [(5, code, width, 2), (1, MONO8, 1, 2)];
+                let count = if reflectance { 2 } else { 1 };
+                let packets = multipart_wire_packets(
+                    55,
+                    520,
+                    &descriptors[..count],
+                    &parts[..count],
+                    &[0, 1][..count],
+                );
+                let mut assembler = Assembler::new(12, 576, 0);
+                let frame = packets
+                    .iter()
+                    .find_map(|packet| assembler.push(packet).unwrap())
+                    .unwrap();
+                assert_eq!(frame.pixel_format, if reflectance { MONO8 } else { code });
+                let selected = format.project(&frame).unwrap();
+                assert_eq!(
+                    (selected.width, selected.height, selected.pixel_format),
+                    (width, 2, code)
+                );
+                assert_eq!(crate::frame::encode(&selected, "raw").unwrap(), packed);
+                let archive = selected.multipart.as_ref().unwrap();
+                assert_eq!(archive.layout.selected, 0);
+                assert_eq!(archive.payload.as_ref(), parts[..count].concat());
+                assert!(crate::auto::meter(&selected).is_none());
+
+                let png = crate::frame::encode(&selected, "png").unwrap();
+                let mut reader = png::Decoder::new(png.as_slice()).read_info().unwrap();
+                let mut bytes = vec![0; reader.output_buffer_size()];
+                let image = reader.next_frame(&mut bytes).unwrap();
+                assert_eq!(image.bit_depth, png::BitDepth::Sixteen);
+                assert_eq!(image.color_type, png::ColorType::Grayscale);
+                assert_eq!(reader.info().sbit.as_deref(), Some([bits].as_slice()));
+                let expected: Vec<u8> = samples
+                    .iter()
+                    .flat_map(|sample| (sample << (16 - bits)).to_be_bytes())
+                    .collect();
+                assert_eq!(&bytes[..image.buffer_size()], expected);
+                let gray: Vec<u8> = samples
+                    .iter()
+                    .map(|sample| u8::try_from(sample >> (bits - 8)).unwrap())
+                    .collect();
+                assert_eq!(crate::frame::gray8(&selected).unwrap().unwrap(), gray);
+                assert_eq!(crate::frame::sample_bits(code), Some(u32::from(bits)));
+            }
+        }
+    }
+
+    #[test]
+    fn multipart_wire_packed_range_rejects_unaligned_or_unconfirmed_packing() {
+        use crate::frame::{COORD3D_C10P, COORD3D_C12P};
+        for (code, width, payload, big, unknown, expected) in [
+            (COORD3D_C10P, 3, 4, false, false, "byte-aligned rows"),
+            (COORD3D_C12P, 1, 2, false, false, "byte-aligned rows"),
+            (COORD3D_C12P, 2, 3, true, false, "little-endian packing"),
+            (COORD3D_C10P, 4, 5, false, true, "little-endian packing"),
+        ] {
+            let packets =
+                multipart_wire_packets(56, 520, &[(5, code, width, 1)], &[vec![0; payload]], &[0]);
+            let mut assembler = Assembler::new(payload, 576, 0);
+            assembler.big_endian = big;
+            assembler.big_endian_mono16 = unknown;
+            let error = assembler.push(&packets[0]).unwrap_err();
+            assert_eq!(
+                crate::types::error_transport_code(&error),
+                Some("unsupported")
+            );
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn ordinary_wire_packed_range_uses_the_same_typed_samples() {
+        use crate::frame::COORD3D_C12P;
+        let mut assembler = Assembler::new(6, 576, 0);
+        let header = gvsp(57, 0, 1, true, &leader(2, 2, COORD3D_C12P));
+        assert!(assembler.push(&header).unwrap().is_none());
+        let pixels = [0xbc, 0x3a, 0x12, 0x01, 0xf0, 0xff];
+        assert!(
+            assembler
+                .push(&gvsp(57, 1, 3, true, &pixels))
+                .unwrap()
+                .is_none()
+        );
+        let frame = assembler
+            .push(&gvsp(57, 2, 2, true, &trailer(2)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.data.as_ref(), pixels);
+        assert_eq!(frame.pixel_format, COORD3D_C12P);
+        assert_eq!(
+            crate::frame::gray8(&frame).unwrap().unwrap(),
+            [0xab, 0x12, 0, 0xff]
+        );
+        assert!(crate::auto::meter(&frame).is_none());
+        assembler.big_endian = true;
+        let error = assembler
+            .push(&gvsp(58, 0, 1, true, &leader(2, 2, COORD3D_C12P)))
+            .unwrap_err();
+        assert_eq!(
+            crate::types::error_transport_code(&error),
+            Some("unsupported")
+        );
+    }
+
+    #[test]
+    fn multipart_wire_abc16_preserves_each_unsigned_word_and_original_components() {
+        use crate::frame::COORD3D_ABC16;
+        use crate::transport::multipart::GvspPartFormat;
+        let words = [0, 1, u16::MAX, 0x8000, 0xfffe, 0x1234];
+        let normalized: Vec<_> = words.into_iter().flat_map(u16::to_le_bytes).collect();
+        for (big_endian, cloud_first) in [(false, false), (true, false), (true, true)] {
+            let cloud: Vec<_> = if big_endian {
+                words.into_iter().flat_map(u16::to_be_bytes).collect()
+            } else {
+                normalized.clone()
+            };
+            let mono = if big_endian {
+                vec![0x12, 0x34]
+            } else {
+                vec![0x34, 0x12]
+            };
+            let mut parts = [mono, cloud];
+            let mut descriptors = [(1, MONO16, 1, 1), (5, COORD3D_ABC16, 2, 1)];
+            if cloud_first {
+                parts.swap(0, 1);
+                descriptors.swap(0, 1);
+            }
+            let packets = multipart_wire_packets(59, 520, &descriptors, &parts, &[1, 0]);
+            let mut assembler = Assembler::new(14, 576, 0);
+            assembler.big_endian = big_endian;
+            let frame = packets
+                .iter()
+                .find_map(|packet| assembler.push(packet).unwrap())
+                .unwrap();
+            let selected = GvspPartFormat::Coord3dAbc16.project(&frame).unwrap();
+            assert_eq!(
+                (selected.width, selected.height, selected.pixel_format),
+                (2, 1, COORD3D_ABC16)
+            );
+            assert_eq!(selected.data.as_ref(), normalized);
+            let archive = selected.multipart.as_ref().unwrap();
+            assert_eq!(archive.layout.selected, u32::from(!cloud_first));
+            assert_eq!(archive.payload.as_ref(), parts.concat());
+            assert_eq!(
+                archive.payload.as_ptr(),
+                frame.multipart.as_ref().unwrap().payload.as_ptr()
+            );
+            if cloud_first {
+                assert_eq!(selected.data.as_ptr(), frame.data.as_ptr());
+            }
+            assert!(crate::auto::meter(&selected).is_none());
+        }
+    }
+
+    #[test]
+    fn qualified_lucid_abcy16_keeps_little_endian_words_and_big_endian_stays_opaque() {
+        use crate::types::LucidPixelFormat;
+        const ABCY16: u32 = 0x8240_0403;
+        // Two pixels of asymmetric A, B, C, Y words, each low byte first on the wire.
+        let wire = [
+            0x34, 0x12, 0x00, 0x80, 0xfe, 0xff, 0x01, 0x00, //
+            0xff, 0xff, 0x00, 0x00, 0xcd, 0xab, 0x00, 0x7f,
+        ];
+        for (big_endian, qualified, tagged) in [
+            (false, true, true),
+            (false, false, false),
+            (true, true, false),
+        ] {
+            let mut assembler = Assembler::new(16, 576, 0);
+            assembler.big_endian = big_endian;
+            if qualified {
+                assembler.pixel_encodings = vec![LucidPixelFormat::Coord3dAbcy16.encoding(None)];
+            }
+            assert!(
+                assembler
+                    .push(&gvsp(61, 0, 1, true, &leader(2, 1, ABCY16)))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                assembler
+                    .push(&gvsp(61, 1, 3, true, &wire))
+                    .unwrap()
+                    .is_none()
+            );
+            let frame = assembler
+                .push(&gvsp(61, 2, 2, true, &trailer(1)))
+                .unwrap()
+                .unwrap();
+            // No swap: neither a qualified nor an opaque custom code is reinterpreted.
+            assert_eq!(frame.data.as_ref(), wire.as_slice());
+            assert_eq!(frame.pixel_format, ABCY16);
+            assert_eq!(
+                frame.pixel_encoding,
+                tagged.then(|| LucidPixelFormat::Coord3dAbcy16.encoding(None))
+            );
+            assert_eq!(crate::frame::is_measurement_frame(&frame), tagged);
+            if tagged {
+                assert_eq!(crate::frame::frame_format_name(&frame), "Coord3D_ABCY16");
+                assert!(crate::auto::meter(&frame).is_none());
+                crate::frame::encode_parts(&frame, "raw", None, None).unwrap();
+                for format in ["png", "jpeg"] {
+                    crate::frame::encode_parts(&frame, format, None, None).unwrap_err();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_wire_abc16_swaps_two_byte_words_without_interpreting_codes() {
+        use crate::frame::COORD3D_ABC16;
+        let words = [0, 1, u16::MAX, 0x8000, 0xfffe, 0x1234];
+        let expected: Vec<_> = words.into_iter().flat_map(u16::to_le_bytes).collect();
+        let mut assembler = Assembler::new(12, 576, 0);
+        assembler.big_endian = true;
+        let wire: Vec<_> = words.into_iter().flat_map(u16::to_be_bytes).collect();
+        assert!(
+            assembler
+                .push(&gvsp(60, 0, 1, true, &leader(2, 1, COORD3D_ABC16)))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            assembler
+                .push(&gvsp(60, 1, 3, true, &wire))
+                .unwrap()
+                .is_none()
+        );
+        let frame = assembler
+            .push(&gvsp(60, 2, 2, true, &trailer(1)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.data.as_ref(), expected);
+        assert_eq!(frame.pixel_format, COORD3D_ABC16);
+        assert!(frame.multipart.is_none());
+        assert!(crate::auto::meter(&frame).is_none());
+    }
+
+    #[test]
+    fn multipart_wire_abc32f_preserves_each_word_and_original_components() {
+        use crate::frame::COORD3D_ABC32F;
+        use crate::transport::multipart::GvspPartFormat;
+        let words = [
+            0x3f80_0001u32,
+            0x8000_0000,
+            0x7fc0_1234,
+            0xbf80_0001,
+            0xff80_0000,
+            0x0000_0000,
+        ];
+        let normalized: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        for (big_endian, cloud_first) in [(false, false), (true, false), (true, true)] {
+            let cloud: Vec<_> = if big_endian {
+                words.into_iter().flat_map(u32::to_be_bytes).collect()
+            } else {
+                normalized.clone()
+            };
+            let mono = if big_endian {
+                vec![0x12, 0x34]
+            } else {
+                vec![0x34, 0x12]
+            };
+            let mut parts = [mono, cloud];
+            let mut descriptors = [(1, MONO16, 1, 1), (5, COORD3D_ABC32F, 2, 1)];
+            if cloud_first {
+                parts.swap(0, 1);
+                descriptors.swap(0, 1);
+            }
+            let packets = multipart_wire_packets(53, 520, &descriptors, &parts, &[1, 0]);
+            let mut assembler = Assembler::new(26, 576, 0);
+            assembler.big_endian = big_endian;
+            let frame = packets
+                .iter()
+                .find_map(|packet| assembler.push(packet).unwrap())
+                .unwrap();
+            assert_eq!(frame.pixel_format, descriptors[0].1);
+            let selected = GvspPartFormat::Coord3dAbc32f.project(&frame).unwrap();
+            assert_eq!(
+                (selected.width, selected.height, selected.pixel_format),
+                (2, 1, COORD3D_ABC32F)
+            );
+            assert_eq!(selected.data.as_ref(), normalized);
+            let archive = selected.multipart.as_ref().unwrap();
+            assert_eq!(archive.layout.selected, u32::from(!cloud_first));
+            assert_eq!(archive.payload.as_ref(), parts.concat());
+            assert_eq!(
+                archive.payload.as_ptr(),
+                frame.multipart.as_ref().unwrap().payload.as_ptr()
+            );
+            if cloud_first {
+                assert_eq!(selected.data.as_ptr(), frame.data.as_ptr());
+            }
+            assert!(crate::auto::meter(&selected).is_none());
+        }
+    }
+
+    #[test]
+    fn multipart_wire_abc32f_refuses_wrong_type_length_and_duplicates() {
+        use crate::frame::COORD3D_ABC32F;
+        use crate::transport::multipart::GvspPartFormat;
+        for (kind, size, count, expected) in [
+            (6, 12, 2, "required wire type"),
+            (5, 11, 2, "exact geometry"),
+            (5, 12, 3, "multiple Coord3D_ABC32f parts"),
+        ] {
+            let descriptors = [
+                (1, MONO16, 1, 1),
+                (kind, COORD3D_ABC32F, 1, 1),
+                (5, COORD3D_ABC32F, 1, 1),
+            ];
+            let parts = [vec![0x34, 0x12], vec![0x89; size], vec![0x45; 12]];
+            let packets = multipart_wire_packets(
+                54,
+                520,
+                &descriptors[..count],
+                &parts[..count],
+                &[0, 1, 2][..count],
+            );
+            let mut assembler = Assembler::new(26, 576, 0);
+            let frame = packets
+                .iter()
+                .find_map(|packet| assembler.push(packet).unwrap())
+                .unwrap();
+            assert_eq!(
+                frame.multipart.as_ref().unwrap().payload.as_ref(),
+                parts[..count].concat()
+            );
+            let error = GvspPartFormat::Coord3dAbc32f.project(&frame).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn multipart_wire_neutral_mono16_preserves_samples_and_purpose_ids() {
+        use crate::transport::multipart::GvspPartFormat;
+        let little = [0x34, 0x12, 0xff, 0xff];
+        let big = [0x12, 0x34, 0xff, 0xff];
+        for (purpose, big_endian, with_intensity) in [
+            (0u16, false, true),
+            (1, true, false),
+            (4, false, false),
+            (6, true, false),
+        ] {
+            let parts = [
+                if big_endian { big } else { little }.to_vec(),
+                vec![0x80, 0xff],
+                vec![7],
+            ];
+            let descriptors = [(1, MONO16, 2, 1), (9, 0x0108_00c6, 2, 1), (1, MONO8, 1, 1)];
+            let count = if with_intensity { 3 } else { 2 };
+            let mut packets = multipart_wire_packets(
+                50,
+                520,
+                &descriptors[..count],
+                &parts[..count],
+                &[1, 0, 2][..count],
+            );
+            packets[0][52..54].copy_from_slice(&purpose.to_be_bytes());
+            let mut assembler = Assembler::new(7, 576, 0);
+            assembler.big_endian = big_endian;
+            let frame = packets
+                .iter()
+                .find_map(|packet| assembler.push(packet).unwrap())
+                .unwrap();
+            let archive = frame.multipart.as_ref().unwrap();
+            assert_eq!(archive.layout.selected, if with_intensity { 2 } else { 0 });
+            assert_eq!(archive.layout.parts[0].purpose_id, Some(u64::from(purpose)));
+            assert_eq!(archive.payload.as_ref(), parts[..count].concat());
+            let selected = GvspPartFormat::Mono16.project(&frame).unwrap();
+            let saved = selected.multipart.as_ref().unwrap();
+            assert_eq!(saved.layout.selected, 0);
+            assert_eq!(saved.payload.as_ptr(), archive.payload.as_ptr());
+            assert_eq!(
+                saved.layout.byte_order,
+                Some(if big_endian {
+                    ByteOrder::Big
+                } else {
+                    ByteOrder::Little
+                })
+            );
+            assert_eq!(selected.data.as_ref(), little);
+            assert_eq!(selected.pixel_format, MONO16);
+            if !with_intensity {
+                assert_eq!(selected.data.as_ptr(), frame.data.as_ptr());
+            }
+            assert!(crate::auto::meter(&selected).is_none());
+            let inspection = crate::inspect::inspect(
+                &selected,
+                crate::camera_profile::CameraKind::AreaScan,
+                None,
+                crate::inspect::default_edge(),
+                crate::inspect::PreviewFormat::Png,
+            )
+            .unwrap();
+            assert!(inspection.measurements.exposure.is_none());
+            assert!(inspection.measurements.focus.is_none());
+            assert!(inspection.measurements.notes[0].contains("purpose is unspecified"));
+
+            let png = crate::frame::encode(&selected, "png").unwrap();
+            let mut reader = png::Decoder::new(Cursor::new(png)).read_info().unwrap();
+            let mut bytes = vec![0; reader.output_buffer_size()];
+            let image = reader.next_frame(&mut bytes).unwrap();
+            assert_eq!(image.bit_depth, png::BitDepth::Sixteen);
+            assert_eq!(image.color_type, png::ColorType::Grayscale);
+            assert_eq!(&bytes[..image.buffer_size()], &big);
+        }
+    }
+
+    #[test]
+    fn multipart_wire_neutral_mono16_requires_one_exact_2d_part() {
+        use crate::transport::multipart::GvspPartFormat;
+        let parts = [vec![0x34, 0x12], vec![0xff, 0xff], vec![7]];
+        for (kinds, count, expected) in [
+            ([5, 9], 3, "required wire type"),
+            ([1, 1], 2, "multiple Mono16 parts"),
+        ] {
+            let descriptors = [
+                (kinds[0], MONO16, 1, 1),
+                (kinds[1], MONO16, 1, 1),
+                (1, MONO8, 1, 1),
+            ];
+            let mut packets = multipart_wire_packets(
+                51,
+                520,
+                &descriptors[..count],
+                &parts[..count],
+                &[0, 1, 2][..count],
+            );
+            packets[0][52..54].copy_from_slice(&4u16.to_be_bytes());
+            packets[0][100..102].copy_from_slice(&6u16.to_be_bytes());
+            let mut assembler = Assembler::new(5, 576, 0);
+            let frame = packets
+                .iter()
+                .find_map(|packet| assembler.push(packet).unwrap())
+                .unwrap();
+            if count == 3 {
+                assert_eq!(frame.data.as_ref(), &[7]);
+            }
+            assert_eq!(
+                frame.multipart.as_ref().unwrap().payload.as_ref(),
+                parts[..count].concat()
+            );
+            let error = GvspPartFormat::Mono16.project(&frame).unwrap_err();
+            assert_eq!(
+                crate::types::error_transport_code(&error),
+                Some("unsupported")
+            );
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+
+        let packets = multipart_wire_packets(52, 520, &[(1, MONO16, 1, 1)], &parts[..1], &[0]);
+        let mut assembler = Assembler::new(2, 576, 0);
+        assembler.big_endian_mono16 = true;
+        let error = assembler.push(&packets[0]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("sample byte order is unavailable")
+        );
+    }
+
+    #[test]
+    fn multipart_wire_keeps_measurement_only_blocks_and_reuses_the_representative() {
+        use crate::transport::multipart::GvspPartFormat;
+        let parts = [
+            vec![0x12, 0x34, 0xff, 0xff],
+            vec![0x80, 0xff],
+            vec![0x43, 0x21, 0xaa],
+        ];
+        let packets = multipart_wire_packets(
+            47,
+            520,
+            &[
+                (5, 0x0110_00b8, 2, 1),
+                (9, 0x0108_00c6, 2, 1),
+                (0x8000, 0, 0, 0),
+            ],
+            &parts,
+            &[1, 0, 2],
+        );
+        let mut assembler = Assembler::new(9, 576, 1_000_000);
+        assembler.big_endian = true;
+        for index in [1, 3, 0, 2] {
+            assert!(assembler.push(&packets[index]).unwrap().is_none());
+        }
+        let frame = assembler.push(&packets[4]).unwrap().unwrap();
+        let archive = frame.multipart.as_ref().unwrap();
+        assert_eq!(
+            archive.layout.selected_native_part_format(),
+            Some(GvspPartFormat::Coord3dC16)
+        );
+        assert_eq!(archive.layout.byte_order, Some(ByteOrder::Big));
+        assert_eq!(archive.payload.as_ref(), parts.concat());
+        assert_eq!(frame.data.as_ref(), &[0x34, 0x12, 0xff, 0xff]);
+        assert_eq!(
+            (frame.width, frame.height, frame.pixel_format),
+            (2, 1, 0x0110_00b8)
+        );
+        let range = GvspPartFormat::Coord3dC16.project(&frame).unwrap();
+        let confidence = GvspPartFormat::Confidence8.project(&frame).unwrap();
+        assert_eq!(range.data.as_ptr(), frame.data.as_ptr());
+        assert_eq!(confidence.data.as_ref(), &[0x80, 0xff]);
+        assert_eq!(
+            confidence.multipart.as_ref().unwrap().payload.as_ptr(),
+            archive.payload.as_ptr()
+        );
+        assert!(crate::auto::meter(&range).is_none());
+        assert!(crate::auto::meter(&confidence).is_none());
+
+        let mut bad_trailer = packets[4].clone();
+        bad_trailer[32..36].fill(0);
+        let mut assembler = Assembler::new(9, 576, 0);
+        assembler.big_endian = true;
+        for packet in &packets[..4] {
+            assert!(assembler.push(packet).unwrap().is_none());
+        }
+        let error = assembler.push(&bad_trailer).unwrap_err();
+        assert!(error.to_string().contains("trailer height"));
+        assert!(assembler.ready.is_empty());
+    }
+
+    #[test]
+    fn multipart_wire_measurement_representative_does_not_resolve_a_duplicate() {
+        use crate::transport::multipart::GvspPartFormat;
+        let parts = [vec![0x34, 0x12], vec![0x78, 0x56]];
+        let packets = multipart_wire_packets(
+            48,
+            520,
+            &[(5, 0x0110_00b8, 1, 1), (5, 0x0110_00b8, 1, 1)],
+            &parts,
+            &[0, 1],
+        );
+        let mut assembler = Assembler::new(4, 576, 0);
+        let frame = packets
+            .iter()
+            .find_map(|packet| assembler.push(packet).unwrap())
+            .unwrap();
+        assert_eq!(
+            frame.multipart.as_ref().unwrap().payload.as_ref(),
+            parts.concat()
+        );
+        assert_eq!(frame.data.as_ref(), parts[0]);
+        let error = GvspPartFormat::Coord3dC16.project(&frame).unwrap_err();
+        assert_eq!(
+            crate::types::error_transport_code(&error),
+            Some("unsupported")
+        );
+        assert!(error.to_string().contains("multiple Coord3D_C16 parts"));
+    }
+
+    #[test]
+    fn multipart_wire_selects_scalar_parts_with_exact_sample_order() {
+        use crate::transport::multipart::GvspPartFormat;
+        for (wide_confidence, big_endian, confidence, expected_confidence) in [
+            (false, true, GvspPartFormat::Confidence8, [0, 5, 10, 15]),
+            (true, true, GvspPartFormat::Confidence16, [5, 0, 15, 10]),
+            (true, false, GvspPartFormat::Confidence16, [0, 5, 10, 15]),
+        ] {
+            let (packets, parts) = multipart_packets_with_confidence(44, 520, wide_confidence);
+            let mut assembler = Assembler::new(3000, 576, 0);
+            assembler.big_endian = big_endian;
+            let frame = packets
+                .iter()
+                .find_map(|packet| assembler.push(packet).unwrap())
+                .unwrap();
+            assert_eq!(frame.data.as_ref(), parts[1]);
+            let archive = frame.multipart.as_ref().unwrap();
+            let range = GvspPartFormat::Coord3dC16.project(&frame).unwrap();
+            let confidence = confidence.project(&frame).unwrap();
+            assert_eq!(
+                (range.width, range.height, range.pixel_format),
+                (17, 19, 0x0110_00b8)
+            );
+            assert_eq!(
+                &range.data[..4],
+                if big_endian {
+                    &[3, 0, 9, 6]
+                } else {
+                    &[0, 3, 6, 9]
+                }
+            );
+            assert_eq!(&confidence.data[..4], &expected_confidence);
+            assert_eq!((confidence.width, confidence.height), (17, 19));
+            let inspection = crate::inspect::inspect(
+                &confidence,
+                crate::camera_profile::CameraKind::AreaScan,
+                None,
+                crate::inspect::default_edge(),
+                crate::inspect::PreviewFormat::Png,
+            )
+            .unwrap();
+            assert!(inspection.measurements.exposure.is_none());
+            assert!(inspection.measurements.focus.is_none());
+            assert!(inspection.measurements.notes[0].contains("contains measurement samples"));
+            for (selected, index) in [(range, 0), (confidence, 2)] {
+                let retained = selected.multipart.as_ref().unwrap();
+                assert_eq!(retained.layout.selected, index);
+                assert_eq!(
+                    retained.layout.data_type_namespace,
+                    Some(crate::transport::multipart::PartTypeNamespace::Gvsp)
+                );
+                assert_eq!(retained.payload.as_ptr(), archive.payload.as_ptr());
+                assert_eq!(retained.payload.as_ref(), parts.concat());
+                retained.layout.validate(retained.payload.len()).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn multipart_wire_rejects_stale_ambiguous_and_inexact_scalar_selection() {
+        use crate::transport::multipart::GvspPartFormat;
+        for (mode, expected) in [
+            (0, "multiple Coord3D_C16 parts"),
+            (1, "required wire type"),
+            (2, "unpadded samples"),
+            (3, "exact geometry"),
+            (4, "sample byte order is unavailable"),
+        ] {
+            let (mut packets, parts) = multipart_packets(45, 520);
+            let mut assembler = Assembler::new(2400, 576, 0);
+            // The original packet archive is valid in each case. Only the
+            // selected map's identity or sample interpretation is invalid.
+            match mode {
+                0 => {
+                    packets[0][176..178].copy_from_slice(&5u16.to_be_bytes());
+                    packets[0][184..188].copy_from_slice(&0x0110_00b8u32.to_be_bytes());
+                    packets[7][72..74].copy_from_slice(&5u16.to_be_bytes());
+                }
+                1 => {
+                    packets[0][32..34].copy_from_slice(&1u16.to_be_bytes());
+                    packets[7][24..26].copy_from_slice(&1u16.to_be_bytes());
+                }
+                2 => packets[0][72..74].copy_from_slice(&1u16.to_be_bytes()),
+                3 => packets[0][56..60].copy_from_slice(&16u32.to_be_bytes()),
+                4 => assembler.big_endian_mono16 = true,
+                _ => unreachable!(),
+            }
+            let frame = packets
+                .iter()
+                .find_map(|packet| assembler.push(packet).unwrap())
+                .unwrap();
+            let error = GvspPartFormat::Coord3dC16.project(&frame).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "mode {mode}: {error:#}"
+            );
+            assert_eq!(frame.data.as_ref(), parts[1]);
+            assert_eq!(frame.multipart.unwrap().payload.as_ref(), parts.concat());
+        }
+    }
+
+    // Independently authored variable-height wire fixture. Addresses stay at
+    // leader maxima; the trailer reports only each actually sent prefix.
+    fn shortened_multipart_packets(
+        block: u64,
+        rows: usize,
+        big: bool,
+    ) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let words = [
+            0x1234u16, 0xffff, 0, 0x8001, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+        ];
+        let range: Vec<_> = words
+            .into_iter()
+            .flat_map(|word| {
+                if big {
+                    word.to_be_bytes()
+                } else {
+                    word.to_le_bytes()
+                }
+            })
+            .collect();
+        let maxima = [
+            range,
+            (1u8..=20).collect(),
+            vec![0xa1, 0xb2, 0xc3, 0xd4, 0xe5],
+        ];
+        let parts = vec![
+            maxima[0][..rows * 8].to_vec(),
+            maxima[1][..rows * 4].to_vec(),
+            maxima[2].clone(),
+        ];
+        let descriptors = [
+            (5, 0x0110_00b8, 4, 5),
+            (1, MONO8, 4, 5),
+            (0x8001, 0x8108_0123, 0, 0),
+        ];
+        let full = multipart_wire_packets(block, 8, &descriptors, &maxima, &[1, 0, 2]);
+        let mut packets = vec![full[0].clone()];
+        for part in [1usize, 0, 2] {
+            let base: usize = maxima[..part].iter().map(Vec::len).sum();
+            for (index, bytes) in parts[part].chunks(8).enumerate() {
+                let mut data = vec![
+                    u8::try_from(part).unwrap(),
+                    if (index + 1) * 8 >= parts[part].len() {
+                        0x41
+                    } else {
+                        0
+                    },
+                ];
+                let address = u64::try_from(base + index * 8).unwrap().to_be_bytes();
+                data.extend_from_slice(&address[2..]);
+                data.extend_from_slice(bytes);
+                packets.push(gvsp(
+                    block,
+                    u32::try_from(packets.len()).unwrap(),
+                    7,
+                    true,
+                    &data,
+                ));
+            }
+        }
+        let mut tail = full.last().unwrap()[20..].to_vec();
+        for part in 0..3 {
+            let length = u64::try_from(parts[part].len()).unwrap().to_be_bytes();
+            tail[4 + part * 16 + 2..4 + part * 16 + 8].copy_from_slice(&length[2..]);
+            if part != 2 {
+                tail[4 + part * 16 + 8..4 + part * 16 + 12]
+                    .copy_from_slice(&u32::try_from(rows).unwrap().to_be_bytes());
+            }
+        }
+        packets.push(gvsp(
+            block,
+            u32::try_from(packets.len()).unwrap(),
+            2,
+            true,
+            &tail,
+        ));
+        (packets, parts)
+    }
+
+    #[test]
+    fn shortened_multipart_prefixes_keep_wire_addresses_exact_pixels_and_maximum_allocation() {
+        use crate::transport::multipart::GvspPartFormat;
+        for big in [false, true] {
+            for rows in [2usize, 5] {
+                let (packets, parts) = shortened_multipart_packets(61, rows, big);
+                for reorder in [false, true] {
+                    let mut assembler = Assembler::new(65, 64, 1_000_000);
+                    assembler.big_endian = big;
+                    let order = if reorder {
+                        let mut order: Vec<_> = (0..packets.len()).rev().collect();
+                        order.insert(2, 1);
+                        order
+                    } else {
+                        (0..packets.len()).collect()
+                    };
+                    let mut delivered = None;
+                    for index in order {
+                        if let Some(frame) = assembler.push(&packets[index]).unwrap() {
+                            assert!(delivered.replace(frame).is_none());
+                        }
+                    }
+                    let frame = delivered.unwrap();
+                    assert_eq!(
+                        (frame.width, frame.height, frame.pixel_format),
+                        (4, u32::try_from(rows).unwrap(), MONO8)
+                    );
+                    assert_eq!(frame.data.as_ref(), parts[1]);
+                    let archive = frame.multipart.as_ref().unwrap();
+                    assert_eq!(archive.payload.as_ref(), parts.concat());
+                    assert_eq!(archive.payload.len(), rows * 12 + 5);
+                    assert!(archive.payload.allocated_bytes() >= 65);
+                    assert!(
+                        frame.buffer_bytes()
+                            >= archive.payload.allocated_bytes() + frame.data.allocated_bytes()
+                    );
+                    let layout = serde_json::to_value(&archive.layout).unwrap();
+                    assert_eq!(layout["original_filled_bytes"], rows * 12 + 5);
+                    assert_eq!(layout["parts"][0]["height"], 5);
+                    assert_eq!(layout["parts"][0]["delivered_height"], rows);
+                    assert_eq!(layout["parts"][1]["gvsp"]["address_offset"], 40);
+                    assert_eq!(layout["parts"][1]["stored_offset"], rows * 8);
+                    assert_eq!(layout["parts"][2]["gvsp"]["address_offset"], 60);
+                    assert_eq!(layout["parts"][2]["stored_offset"], rows * 12);
+                    if rows == 2 {
+                        assert_eq!(layout["parts"][0]["gvsp"]["declared_length"], 40);
+                        assert_eq!(layout["parts"][1]["gvsp"]["declared_length"], 20);
+                    } else {
+                        assert!(layout["parts"][0]["gvsp"].get("declared_length").is_none());
+                        assert!(layout["parts"][1]["gvsp"].get("declared_length").is_none());
+                    }
+                    assert!(layout["parts"][2]["gvsp"].get("declared_length").is_none());
+                    let range = GvspPartFormat::Coord3dC16.project(&frame).unwrap();
+                    assert_eq!(
+                        (range.width, range.height),
+                        (4, u32::try_from(rows).unwrap())
+                    );
+                    let expected: Vec<_> = if big {
+                        parts[0]
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .flat_map(|word| [word[1], word[0]])
+                            .collect()
+                    } else {
+                        parts[0].clone()
+                    };
+                    assert_eq!(range.data.as_ref(), expected);
+                    assert_eq!(
+                        range.multipart.as_ref().unwrap().payload.as_ptr(),
+                        archive.payload.as_ptr()
+                    );
+                    assert!(crate::auto::meter(&range).is_none());
+                    GvspPartFormat::Confidence8.project(&frame).unwrap_err();
+                    assert_eq!(archive.payload.as_ref(), parts.concat());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shortened_multipart_resend_requires_every_packet_and_trailer_before_publication() {
+        let (packets, parts) = shortened_multipart_packets(62, 2, false);
+        let start = Instant::now();
+        let mut assembler = Assembler::new(65, 64, 0);
+        assembler.resend = true;
+        for index in [5, 4, 2, 0, 1] {
+            assert!(assembler.push_at(&packets[index], start).unwrap().is_none());
+        }
+        assembler.poll(start + RESEND_IDLE);
+        assert!(assembler.ready.is_empty());
+        let recovered_before_resend = assembler.stats.resend_recovered;
+        assert!(
+            assembler
+                .requests
+                .iter()
+                .any(|&(block, extended, first, last)| block == 62
+                    && extended
+                    && first <= 3
+                    && last >= 3)
+        );
+        let mut resent = packets[3].clone();
+        resent[..2].copy_from_slice(&0x0100u16.to_be_bytes());
+        let frame = assembler
+            .push_at(&resent, start + RESEND_IDLE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.multipart.unwrap().payload.as_ref(), parts.concat());
+        assert_eq!(
+            assembler.stats.resend_recovered,
+            recovered_before_resend + 1
+        );
+        assert_eq!(assembler.stats.incomplete_frames, 0);
+
+        let mut no_trailer = Assembler::new(65, 64, 0);
+        no_trailer.resend = true;
+        for packet in &packets[..packets.len() - 1] {
+            assert!(no_trailer.push_at(packet, start).unwrap().is_none());
+        }
+        no_trailer.poll(start + RESEND_IDLE);
+        assert!(no_trailer.ready.is_empty());
+        assert!(no_trailer.frames[0].packets.is_none());
+    }
+
+    #[test]
+    fn shortened_multipart_byte_aligned_packed_rows_remain_exact() {
+        use crate::{frame::COORD3D_C12P, transport::multipart::GvspPartFormat};
+        let row = [0xbc, 0x3a, 0x12, 0x01, 0xf0, 0xff];
+        let parts = [row.repeat(2), vec![1, 2, 3, 4, 5, 6, 7, 8]];
+        let descriptors = [(5, COORD3D_C12P, 4, 2), (1, MONO8, 4, 2)];
+        let mut packets = multipart_wire_packets(65, 8, &descriptors, &parts, &[1, 0]);
+        // Replace only the leader maxima; payload addresses stay in its
+        // maximum-size block, while the trailer retains the actual two rows.
+        packets[0][34..40].copy_from_slice(&30u64.to_be_bytes()[2..]);
+        packets[0][60..64].copy_from_slice(&5u32.to_be_bytes());
+        packets[0][82..88].copy_from_slice(&20u64.to_be_bytes()[2..]);
+        packets[0][108..112].copy_from_slice(&5u32.to_be_bytes());
+        packets[1][22..28].copy_from_slice(&30u64.to_be_bytes()[2..]);
+        let mut assembler = Assembler::new(50, 64, 0);
+        let frame = packets
+            .iter()
+            .find_map(|packet| assembler.push(packet).unwrap())
+            .unwrap();
+        let selected = GvspPartFormat::Coord3dC12p.project(&frame).unwrap();
+        assert_eq!(
+            (selected.width, selected.height, selected.pixel_format),
+            (4, 2, COORD3D_C12P)
+        );
+        assert_eq!(selected.data.as_ref(), parts[0]);
+        let archive = selected.multipart.unwrap();
+        assert_eq!(archive.payload.as_ref(), parts.concat());
+        assert_eq!(archive.layout.parts[1].gvsp.unwrap().address_offset, 30);
+        assert_eq!(archive.layout.parts[1].stored_offset, 12);
+    }
+
+    #[test]
+    fn shortened_multipart_complete_prefixes_still_require_all_ids_and_one_trailer() {
+        let (mut packets, _) = shortened_multipart_packets(66, 2, false);
+        // Every actual byte arrives, but ID3 never does. The receiver must
+        // retain the gap instead of materializing a complete-looking archive.
+        for packet in &mut packets[3..] {
+            let id = be32(packet, 16) + 1;
+            packet[16..20].copy_from_slice(&id.to_be_bytes());
+        }
+        let start = Instant::now();
+        let mut assembler = Assembler::new(65, 64, 0);
+        assembler.resend = true;
+        for packet in &packets {
+            assert!(assembler.push_at(packet, start).unwrap().is_none());
+        }
+        assert!(
+            assembler.frames[0]
+                .multipart
+                .as_ref()
+                .unwrap()
+                .coverage_complete()
+        );
+        assert!(
+            !assembler.frames[0]
+                .multipart
+                .as_ref()
+                .unwrap()
+                .is_prepared()
+        );
+        assembler.poll(start + RESEND_IDLE);
+        assert!(assembler.ready.is_empty());
+        assert!(
+            assembler
+                .requests
+                .iter()
+                .any(|&(block, extended, first, last)| block == 66
+                    && extended
+                    && first <= 3
+                    && last >= 3)
+        );
+
+        let (packets, _) = shortened_multipart_packets(67, 2, false);
+        let mut assembler = Assembler::new(65, 64, 0);
+        assert!(assembler.push(&packets[0]).unwrap().is_none());
+        assert!(assembler.push(&packets[5]).unwrap().is_none());
+        let mut duplicate = packets[5].clone();
+        duplicate[36] ^= 1;
+        let error = assembler.push(&duplicate).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("conflicting duplicate GVSP multipart trailer")
+        );
+        assert!(assembler.ready.is_empty());
+        assert!(assembler.frames.is_empty());
+    }
+
+    #[test]
+    fn shortened_multipart_rejects_unreceived_holes_received_tails_and_bad_extents() {
+        for (mode, message) in [
+            (0, "coverage hole"),
+            (1, "overlapping"),
+            (2, "outside a delivered prefix"),
+            (3, "outside a delivered prefix"),
+            (4, "trailer disagrees"),
+            (5, "trailer disagrees"),
+            (6, "exact geometry"),
+            (7, "trailer height"),
+            (8, "trailer disagrees"),
+            (9, "part count"),
+            (10, "opaque parts"),
+            (11, "unpadded"),
+            (12, "supported unpadded row format"),
+            (13, "exact geometry"),
+            (14, "block address range"),
+            (15, "conflicting duplicate"),
+            (16, "byte-aligned rows"),
+        ] {
+            let (mut packets, _) = shortened_multipart_packets(63, 2, false);
+            let mut order: Vec<_> = (0..packets.len()).collect();
+            match mode {
+                0 => {
+                    packets[2].pop();
+                }
+                1 => packets[3][22..28].copy_from_slice(&7u64.to_be_bytes()[2..]),
+                2 | 3 => {
+                    packets[3][22..28].copy_from_slice(&32u64.to_be_bytes()[2..]);
+                    if mode == 3 {
+                        order = vec![0, 5, 1, 2, 3, 4];
+                    }
+                }
+                4 => packets[5][26..32].copy_from_slice(&41u64.to_be_bytes()[2..]),
+                5 => packets[5][32..36].copy_from_slice(&6u32.to_be_bytes()),
+                6 => packets[5][26..32].copy_from_slice(&15u64.to_be_bytes()[2..]),
+                7 => packets[5][32..36].fill(0),
+                8 => packets[5][24..26].copy_from_slice(&6u16.to_be_bytes()),
+                9 => {
+                    let length = packets[5].len() - 16;
+                    packets[5].truncate(length);
+                }
+                10 => packets[5][58..64].copy_from_slice(&4u64.to_be_bytes()[2..]),
+                11 => packets[0][72..74].copy_from_slice(&1u16.to_be_bytes()),
+                12 => packets[0][40..44].copy_from_slice(&0x8110_00b8u32.to_be_bytes()),
+                13 => packets[5][26..32].copy_from_slice(&40u64.to_be_bytes()[2..]),
+                14 => packets[1][22..28].copy_from_slice(&16u64.to_be_bytes()[2..]),
+                15 => {
+                    let mut duplicate = packets[2].clone();
+                    duplicate[28] ^= 1;
+                    packets.insert(3, duplicate);
+                    order = (0..packets.len()).collect();
+                }
+                16 => {
+                    packets[0][40..44].copy_from_slice(&crate::frame::COORD3D_C12P.to_be_bytes());
+                    packets[0][56..60].copy_from_slice(&3u32.to_be_bytes());
+                }
+                _ => unreachable!(),
+            }
+            let mut assembler = Assembler::new(65, 64, 0);
+            let error = order
+                .into_iter()
+                .find_map(|index| match assembler.push(&packets[index]) {
+                    Ok(frame) => {
+                        assert!(frame.is_none(), "mode {mode} published");
+                        None
+                    }
+                    Err(error) => Some(error),
+                })
+                .unwrap();
+            assert!(
+                error.to_string().contains(message),
+                "mode {mode}: {error:#}"
+            );
+            assert_eq!(
+                crate::types::classify(&error).kind,
+                if matches!(mode, 2 | 3 | 10..=12 | 16) {
+                    crate::types::ErrorKind::Unsupported
+                } else {
+                    crate::types::ErrorKind::OperationFailed
+                }
+            );
+            assert!(assembler.ready.is_empty());
+            assert!(assembler.frames.is_empty());
+            let recovered = frame_packets(64, true, 2, 2, 16)
+                .iter()
+                .find_map(|packet| assembler.push(packet).unwrap())
+                .unwrap();
+            assert_eq!(recovered.id, 64);
+            assert!(recovered.multipart.is_none());
+        }
+    }
+
+    #[test]
+    fn multipart_reordered_leader_trailer_and_short_part_tails_keep_every_sample() {
+        let (packets, parts) = multipart_packets(41, 520);
+        let start = Instant::now();
+        let mut assembler = Assembler::new(2400, 576, 1_000_000);
+        assembler.resend = true;
+        // Before the leader: a short tail and its exact duplicate, then the
+        // trailer. The header must still be acquired, and only ID 3 is missing.
+        for index in [2, 2, 7, 6, 0, 4, 5, 1] {
+            assert!(assembler.push_at(&packets[index], start).unwrap().is_none());
+            assert!(assembler.predict().is_none());
+        }
+        let recovered = assembler.stats.resend_recovered;
+        let mut resent = packets[3].clone();
+        resent[..2].copy_from_slice(&0x0100u16.to_be_bytes());
+        let frame = assembler.push_at(&resent, start).unwrap().unwrap();
+        assert_eq!(frame.id, 41);
+        assert_eq!(frame.device_ts_ns, Some(9_876_000));
+        assert_multipart_capture(&frame, &parts);
+        assert!(
+            assembler
+                .requests
+                .iter()
+                .any(|&(block, extended, first, last)| {
+                    block == 41 && extended && first <= 3 && last >= 3
+                })
+        );
+        assert_eq!(assembler.stats.resend_recovered, recovered + 1);
+        assert_eq!(assembler.stats.incomplete_frames, 0);
+    }
+
+    #[test]
+    fn multipart_wire_rejects_holes_overlaps_and_contradictory_metadata() {
+        for (mode, message) in [
+            (0, "coverage hole"),
+            (1, "overlapping"),
+            (2, "block address range"),
+            (3, "trailer disagrees"),
+            (4, "unknown part"),
+            (5, "part count"),
+            (6, "conflicting duplicate"),
+            (7, "mixes multipart and ordinary"),
+            (8, "intensity size disagrees"),
+        ] {
+            let (mut packets, _) = multipart_packets(42, 520);
+            let mut assembler = Assembler::new(2400, 576, 0);
+            match mode {
+                0 => {
+                    packets[2].pop();
+                }
+                1 => {
+                    // Tail begins one byte before the end of ID 1.
+                    let address = (646u64 + 519).to_be_bytes();
+                    packets[2][22..28].copy_from_slice(&address[2..]);
+                }
+                2 => {
+                    // Part 1's packet address cannot restart at the part's
+                    // local zero. That address belongs to part 0.
+                    packets[1][22..28].fill(0);
+                }
+                3 => packets[7][25] ^= 1,
+                4 => packets[1][20] = 7,
+                5 => packets[0][7] = 5,
+                6 => {
+                    let mut duplicate = packets[1].clone();
+                    duplicate[28] ^= 1;
+                    packets.insert(2, duplicate);
+                }
+                7 => packets[1][4] = 0x83,
+                8 => packets[0][107] ^= 1,
+                _ => unreachable!(),
+            }
+            let error = packets
+                .iter()
+                .find_map(|packet| match assembler.push(packet) {
+                    Ok(frame) => {
+                        assert!(frame.is_none(), "mode {mode} published a partial archive");
+                        None
+                    }
+                    Err(error) => Some(error),
+                })
+                .unwrap();
+            assert!(
+                error.to_string().contains(message),
+                "mode {mode}: {error:#}"
+            );
+            assert!(assembler.ready.is_empty());
+            assert!(assembler.frames.is_empty());
+            let recovered = frame_packets(43, true, 2, 2, 528)
+                .iter()
+                .find_map(|packet| assembler.push(packet).unwrap())
+                .expect("ordinary image recovers on the next block");
+            assert_eq!(recovered.id, 43);
+            assert!(recovered.multipart.is_none());
+        }
+    }
+
+    #[test]
+    fn multipart_wire_refuses_ambiguous_or_unsupported_layouts() {
+        for (mode, message) in [
+            (0, "exactly one ordinary intensity"),
+            (1, "single top-down zone"),
+            (5, "single top-down zone"),
+            (2, "chunks"),
+            (3, "extended IDs"),
+            (4, "size disagrees with its exact geometry"),
+        ] {
+            let (mut packets, _) = multipart_packets(44, 520);
+            let mut assembler = Assembler::new(2400, 576, 0);
+            match mode {
+                0 => packets[0][184..188].copy_from_slice(&MONO8.to_be_bytes()),
+                1 => packets[0][47] = 1,
+                5 => packets[0][48] = 0x80,
+                2 => packets[0][22] = 0x40,
+                3 => packets[0] = gvsp(44, 0, 1, false, &packets[0][20..]),
+                4 => {
+                    assembler.push(&packets[0]).unwrap();
+                    // First part reports one fewer delivered line.
+                    packets[7][35] ^= 1;
+                }
+                _ => unreachable!(),
+            }
+            let error = assembler
+                .push(&packets[if mode == 4 { 7 } else { 0 }])
+                .unwrap_err();
+            assert_eq!(
+                crate::types::classify(&error).kind,
+                if mode == 4 {
+                    crate::types::ErrorKind::OperationFailed
+                } else {
+                    crate::types::ErrorKind::Unsupported
+                }
+            );
+            assert!(
+                error.to_string().contains(message),
+                "mode {mode}: {error:#}"
+            );
+            assert!(assembler.ready.is_empty());
+        }
+    }
+
+    #[test]
+    fn multipart_batch_never_accounts_for_truncated_payload() {
+        let (packets, parts) = multipart_packets(45, 520);
+        let mut assembler = Assembler::new(2400, 576, 0);
+        for (index, packet) in packets.iter().enumerate() {
+            if index != 3 {
+                assert!(assembler.push(packet).unwrap().is_none());
+            }
+        }
+        let mut batch = batch::Batch::new(multipart::MAX_METADATA_DATAGRAM);
+        let len = packets[3].len();
+        batch.rests[0][..len].copy_from_slice(&packets[3]);
+        assert!(
+            batch
+                .take(
+                    &mut assembler,
+                    (&[], std::ptr::null()),
+                    &[batch::Received {
+                        len,
+                        truncated: true,
+                        from_camera: true
+                    }],
+                    Site::GvspFallback,
+                    Instant::now(),
+                )
+                .is_none()
+        );
+        assert_multipart_capture(&assembler.push(&packets[3]).unwrap().unwrap(), &parts);
+    }
+
+    #[test]
+    fn fake_camera_multipart_resend_uses_extended_block_and_packet_ids() {
+        let (fake, mut gige) = streaming(|camera| {
+            camera.registers.insert(GVCP_CAPABILITY, 0x4);
+            camera.resend_status = 0x0100;
+        });
+        let block = 0x1_0000_0046;
+        let block_size = (fake.register(STREAM_PACKET_SIZE) & 0xffff) as usize - 56;
+        let (packets, parts) = multipart_packets(block, block_size);
+        let destination = {
+            let mut camera = fake.camera.lock().unwrap();
+            camera.frames.insert(block, packets.clone());
+            camera.destination()
+        };
+        for (index, packet) in packets.iter().enumerate() {
+            if index != 2 {
+                fake.stream.send_to(packet, destination).unwrap();
+            }
+        }
+        let frame = gige.next_frame(Duration::from_secs(2)).unwrap();
+        assert_eq!(frame.id, block);
+        assert_multipart_capture(&frame, &parts);
+        let requests = &fake.camera.lock().unwrap().requests;
+        assert!(requests.iter().any(|(request, _)| {
+            *request == resend_packet(be16(request, 6), block, true, 2, 2)
+        }));
+        assert_eq!(gige.stats().unwrap().resend_recovered, 1);
+    }
+
     const WIDTH: u32 = 200;
     const HEIGHT: u32 = 40;
     #[derive(Default)]
     struct FakeCamera {
+        enforce_owner: bool,
+        owner: Option<SocketAddrV4>,
+        commands: Vec<(u16, SocketAddr)>,
+        release_replacement: Option<SocketAddrV4>,
+        drop_claim_ack: bool,
+        claim_replacement: Option<SocketAddrV4>,
+        jump_on_read: Option<(u32, Arc<std::sync::atomic::AtomicU64>, u64)>,
+        jump_on_claim: Option<(Arc<std::sync::atomic::AtomicU64>, u64)>,
         registers: HashMap<u32, u32>,
         unreadable: Vec<u32>,
         path_mtu: u32,
@@ -2961,6 +5914,26 @@ mod tests {
         scps_writes: Vec<u32>,
     }
     impl FakeCamera {
+        fn controller_write(&mut self, peer: SocketAddrV4, address: u32, value: u32) -> u16 {
+            if !self.enforce_owner {
+                return 0;
+            }
+            if address == CONTROL_PRIVILEGE && value == 2 && self.owner.is_none() {
+                self.owner = Some(peer);
+                self.registers.insert(PRIMARY_PORT, u32::from(peer.port()));
+                self.registers.insert(PRIMARY_IP, u32::from(*peer.ip()));
+            }
+            if self.owner != Some(peer) {
+                return 0x8006;
+            }
+            if address == CONTROL_PRIVILEGE && value == 0 {
+                self.owner = None;
+                self.registers.insert(PRIMARY_PORT, 0);
+                self.registers.insert(PRIMARY_IP, 0);
+            }
+            0
+        }
+
         fn register(&self, address: u32) -> u32 {
             self.registers.get(&address).copied().unwrap_or_default()
         }
@@ -3065,6 +6038,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut camera = FakeCamera::default();
+            camera.registers.insert(HEARTBEAT_TIMEOUT, 3000);
             setup(&mut camera);
             let camera = Arc::new(Mutex::new(camera));
             let gvcp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -3091,11 +6065,18 @@ mod tests {
                     let (command, id) = (be16(packet, 2), be16(packet, 6));
                     let mut outgoing = Vec::new();
                     let mut camera = state.lock().unwrap();
+                    camera.commands.push((command, peer));
                     let reply = match command {
                         READ_REGISTER => {
                             let addresses: Vec<u32> =
                                 packet[8..].chunks(4).map(|a| be32(a, 0)).collect();
                             camera.register_reads.extend(&addresses);
+                            if let Some((address, clock, value)) = &camera.jump_on_read
+                                && camera.owner.is_some()
+                                && addresses.contains(address)
+                            {
+                                clock.store(*value, Ordering::SeqCst);
+                            }
                             if addresses.iter().any(|a| camera.unreadable.contains(a)) {
                                 Some(ack(command + 1, id, 0x8003, &[]))
                             } else {
@@ -3106,12 +6087,66 @@ mod tests {
                                 Some(ack(command + 1, id, 0, &values))
                             }
                         }
-                        WRITE_REGISTER => Some(
-                            match camera.write(be32(packet, 8), be32(packet, 12), &mut outgoing) {
-                                0 => ack(command + 1, id, 0, &1u32.to_be_bytes()),
-                                status => ack(command + 1, id, status, &[]),
-                            },
-                        ),
+                        WRITE_REGISTER => {
+                            let (address, value) = (be32(packet, 8), be32(packet, 12));
+                            let SocketAddr::V4(peer) = peer else {
+                                unreachable!()
+                            };
+                            let access = camera.controller_write(peer, address, value);
+                            let status = if access == 0 {
+                                camera.write(address, value, &mut outgoing)
+                            } else {
+                                access
+                            };
+                            if address == CONTROL_PRIVILEGE
+                                && value == 2
+                                && let Some((clock, value)) = &camera.jump_on_claim
+                            {
+                                clock.store(*value, Ordering::SeqCst);
+                            }
+                            if address == CONTROL_PRIVILEGE
+                                && value == 0
+                                && status == 0
+                                && let Some(replacement) = camera.release_replacement
+                            {
+                                camera.owner = Some(replacement);
+                                camera.registers.insert(CONTROL_PRIVILEGE, 2);
+                                camera
+                                    .registers
+                                    .insert(PRIMARY_PORT, u32::from(replacement.port()));
+                                camera
+                                    .registers
+                                    .insert(PRIMARY_IP, u32::from(*replacement.ip()));
+                                None
+                            } else if address == CONTROL_PRIVILEGE
+                                && value == 2
+                                && camera.drop_claim_ack
+                            {
+                                if let Some(replacement) = camera.claim_replacement {
+                                    // Adversarial hidden timeout/owner change,
+                                    // restored to the value read before claim.
+                                    let old = camera.register(HEARTBEAT_TIMEOUT);
+                                    camera.registers.insert(HEARTBEAT_TIMEOUT, 100);
+                                    camera.owner = Some(replacement);
+                                    camera
+                                        .registers
+                                        .insert(PRIMARY_PORT, u32::from(replacement.port()));
+                                    camera
+                                        .registers
+                                        .insert(PRIMARY_IP, u32::from(*replacement.ip()));
+                                    camera.registers.insert(HEARTBEAT_TIMEOUT, old);
+                                }
+                                None
+                            } else {
+                                let acknowledged = 1u32.to_be_bytes();
+                                Some(ack(
+                                    command + 1,
+                                    id,
+                                    status,
+                                    if status == 0 { &acknowledged } else { &[] },
+                                ))
+                            }
+                        }
                         READ_MEMORY => {
                             let (address, length) = (be32(packet, 8), be32(packet, 12));
                             camera.memory_reads.push((address, length as usize));
@@ -3408,6 +6443,210 @@ mod tests {
         });
         (address, worker)
     }
+
+    #[test]
+    fn scoped_gvcp_sends_bound_kernel_wait_and_restore_the_previous_socket_option() {
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let SocketAddr::V4(address) = server.local_addr().unwrap() else {
+            unreachable!()
+        };
+        let mut control = Control::connect(address, Duration::from_secs(1)).unwrap();
+        for previous in [None, Some(Duration::from_secs(2))] {
+            control.socket.set_write_timeout(previous).unwrap();
+            let previous = control.socket.write_timeout().unwrap();
+            control.operation_deadline = Some(Instant::now() + Duration::from_secs(1));
+            let error = control
+                .with_send_deadline(|| -> Result<()> {
+                    let scoped = control
+                        .socket
+                        .write_timeout()?
+                        .context("scoped kernel send timeout")?;
+                    ensure!(
+                        scoped > Duration::ZERO && scoped <= Duration::from_secs(1),
+                        "socket send timeout outside caller cap"
+                    );
+                    Err(Categorized::error(
+                        crate::types::ErrorKind::PermissionDenied,
+                        "original send failure",
+                    ))
+                })
+                .unwrap_err();
+            assert_eq!(
+                crate::types::classify(&error).kind,
+                crate::types::ErrorKind::PermissionDenied
+            );
+            assert_eq!(control.socket.write_timeout().unwrap(), previous);
+            control.with_send_deadline(|| Ok(())).unwrap();
+            assert_eq!(control.socket.write_timeout().unwrap(), previous);
+        }
+        let (lease, _) = Lease::testing(500, false);
+        control.lease = Some(lease);
+        control.operation_deadline = Some(Instant::now() + Duration::from_secs(1));
+        control
+            .with_send_deadline(|| {
+                let timeout = control
+                    .socket
+                    .write_timeout()?
+                    .context("finite lease send cap")?;
+                ensure!(
+                    timeout <= Duration::from_millis(500),
+                    "send wait exceeded finite lease proof"
+                );
+                Ok(())
+            })
+            .unwrap();
+        control.lease = None;
+        control.operation_deadline = Some(Instant::now());
+        let mut invoked = false;
+        let error = control
+            .with_send_deadline(|| {
+                invoked = true;
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(
+            crate::types::classify(&error).kind,
+            crate::types::ErrorKind::Timeout
+        );
+        assert!(!invoked);
+        control.operation_deadline = None;
+        control.socket.set_write_timeout(None).unwrap();
+        control
+            .with_send_deadline(|| {
+                ensure!(
+                    control.socket.write_timeout()?.is_none(),
+                    "ordinary send inherited scoped timeout"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+    #[test]
+    fn named_register_deadline_caps_pending_ack_and_late_control_reply() {
+        for pending in [None, Some(1000)] {
+            let (address, camera) = slow_camera(pending, Duration::from_millis(600));
+            let mut control = Control::connect(address, Duration::from_secs(2)).unwrap();
+            control.pending_limit = Some(Duration::from_secs(10));
+            control.operation_deadline = Some(Instant::now() + Duration::from_millis(500));
+            let error = control.read_register(0x100).unwrap_err();
+            assert_eq!(
+                crate::types::classify(&error).kind,
+                crate::types::ErrorKind::Timeout
+            );
+            assert_eq!(camera.join().unwrap(), 1, "no resend after caller cutoff");
+        }
+    }
+    #[test]
+    fn named_register_multichunk_read_and_write_share_one_cutoff() {
+        for write in [false, true] {
+            let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            server
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let SocketAddr::V4(address) = server.local_addr().unwrap() else {
+                unreachable!()
+            };
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let camera = thread::spawn(move || {
+                let mut buffer = [0; 2048];
+                let mut requests = Vec::new();
+                for index in 0..2 {
+                    let (length, peer) = server.recv_from(&mut buffer).unwrap();
+                    let id = be16(&buffer, 6);
+                    let command = be16(&buffer, 2);
+                    let address = be32(&buffer, 8);
+                    requests.push((command, address));
+                    assert_eq!(command, if write { WRITE_MEMORY } else { READ_MEMORY });
+                    let payload = if write {
+                        assert_eq!(length, 12 + MEMORY_CHUNK);
+                        vec![0; 4]
+                    } else {
+                        let mut bytes = address.to_be_bytes().to_vec();
+                        bytes.resize(4 + MEMORY_CHUNK, 0x80);
+                        bytes
+                    };
+                    if index == 1 {
+                        thread::sleep(
+                            deadline.saturating_duration_since(Instant::now())
+                                + Duration::from_millis(2),
+                        );
+                    }
+                    server
+                        .send_to(&ack(command + 1, id, 0, &payload), peer)
+                        .unwrap();
+                }
+                server
+                    .set_read_timeout(Some(Duration::from_millis(50)))
+                    .unwrap();
+                let error = server.recv_from(&mut buffer).unwrap_err();
+                assert!(
+                    is_receive_timeout(&error),
+                    "no third chunk/retry after cutoff: {error}"
+                );
+                requests
+            });
+            let mut control = Control::connect(address, Duration::from_secs(1)).unwrap();
+            control.response = Duration::from_secs(1);
+            control.operation_deadline = Some(deadline);
+            let error = if write {
+                control
+                    .write_bytes(0x1000, &[0xff; MEMORY_CHUNK * 3])
+                    .unwrap_err()
+            } else {
+                control.read_bytes(0x1000, MEMORY_CHUNK * 3).unwrap_err()
+            };
+            assert_eq!(
+                crate::types::classify(&error).kind,
+                crate::types::ErrorKind::Timeout
+            );
+            assert_eq!(
+                camera.join().unwrap(),
+                vec![
+                    (if write { WRITE_MEMORY } else { READ_MEMORY }, 0x1000),
+                    (
+                        if write { WRITE_MEMORY } else { READ_MEMORY },
+                        0x1000 + u32::try_from(MEMORY_CHUNK).unwrap()
+                    )
+                ]
+            );
+        }
+    }
+    #[test]
+    fn named_register_mutex_wait_expires_without_leaking_deadline_to_heartbeat() {
+        let (fake, mut gige) = streaming(|_| {});
+        let control = gige.control.clone();
+        let held = control.lock().unwrap();
+        let error = gige
+            .read_memory_until(0x100, 4, Instant::now() + Duration::from_millis(10))
+            .unwrap_err();
+        assert_eq!(
+            crate::types::classify(&error).kind,
+            crate::types::ErrorKind::Timeout
+        );
+        assert!(held.operation_deadline.is_none());
+        drop(held);
+        gige.read_memory_until(0x100, 4, Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        assert!(control.lock().unwrap().operation_deadline.is_none());
+        gige.read_memory(0x100, 4).unwrap();
+        let before = fake.camera.lock().unwrap().register_writes.len();
+        let error = gige
+            .write_memory_until(
+                u64::from(HEARTBEAT_TIMEOUT),
+                &500u32.to_be_bytes(),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap_err();
+        assert_eq!(
+            crate::types::classify(&error).kind,
+            crate::types::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            fake.camera.lock().unwrap().register_writes.len(),
+            before,
+            "named I/O retains managed-register gates"
+        );
+    }
     #[test]
     fn pending_acks_extend_commands_up_to_the_heartbeat_safe_limit() {
         for limited in [false, true] {
@@ -3449,7 +6688,9 @@ mod tests {
     }
     #[test]
     fn connect_enables_pending_acks_and_restores_the_configuration() {
-        for (capability, configuration) in [(0x20, 0x3), (0x0, 0x1)] {
+        for (capability, configuration) in
+            [(DISABLE_CAPABILITY | 0x20, 0x3), (DISABLE_CAPABILITY, 0x1)]
+        {
             let fake = Fake::new(|camera| {
                 camera.registers.insert(GVCP_CAPABILITY, capability);
                 camera.registers.insert(GVCP_CONFIGURATION, 0x1);
@@ -3457,13 +6698,13 @@ mod tests {
             });
             let gige = connect(fake.address, Duration::from_millis(200)).unwrap();
             assert_eq!(fake.register(GVCP_CONFIGURATION), configuration);
-            // Three attempts each wait the response time plus a margin, and
-            // the heartbeat timeout covers two such commands.
-            assert_eq!(fake.register(HEARTBEAT_TIMEOUT), 13_600);
+            // Keep the actual timer; command retries/pending waits are
+            // clamped separately rather than silently enlarging the lease.
+            assert_eq!(fake.register(HEARTBEAT_TIMEOUT), 3000);
             let control = gige.control.lock().unwrap();
             assert_eq!(control.response, Duration::from_secs(2));
             assert_eq!(control.command_time(), Duration::from_millis(6300));
-            assert_eq!(control.pending_limit, Some(Duration::from_millis(9066)));
+            assert_eq!(control.pending_limit, Some(Duration::from_millis(2000)));
             drop(control);
             drop(gige);
             assert_eq!(fake.register(GVCP_CONFIGURATION), 0x1);
@@ -3721,6 +6962,178 @@ mod tests {
         }
     }
     #[test]
+    fn http_xml_is_fetched_fresh_and_failed_http_falls_back_to_local() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        use std::net::TcpListener;
+        fn put(camera: &mut FakeCamera, address: u32, bytes: &[u8]) {
+            for (index, chunk) in bytes.chunks(4).enumerate() {
+                let mut word = [0; 4];
+                word[..chunk.len()].copy_from_slice(chunk);
+                camera.registers.insert(
+                    address + u32::try_from(index).unwrap() * 4,
+                    u32::from_be_bytes(word),
+                );
+            }
+        }
+        for fallback in [false, true] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}/camera.xml", listener.local_addr().unwrap());
+            let first = "<RegisterDescription SchemaMajorVersion=\"1\" SchemaMinorVersion=\"1\" MajorVersion=\"1\"/>";
+            let second = first.replace("MajorVersion=\"1\"/>", "MajorVersion=\"2\"/>");
+            let fake = Fake::new(|camera| {
+                put(camera, 0x200, url.as_bytes());
+                if fallback {
+                    put(
+                        camera,
+                        0x400,
+                        format!("Local:Camera.xml;10000;{:x}", first.len()).as_bytes(),
+                    );
+                    put(camera, 0x1_0000, first.as_bytes());
+                }
+            });
+            let served = second.clone();
+            let worker = thread::spawn(move || {
+                for xml in if fallback {
+                    vec![None]
+                } else {
+                    vec![Some(first), Some(served.as_str())]
+                } {
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                                assert!(
+                                    Instant::now() < deadline,
+                                    "GigE XML HTTP request did not arrive"
+                                );
+                                thread::sleep(Duration::from_millis(2));
+                            }
+                            Err(error) => panic!("{error}"),
+                        }
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut request = String::new();
+                    loop {
+                        let mut line = String::new();
+                        assert!(reader.read_line(&mut line).unwrap() > 0);
+                        request.push_str(&line);
+                        if line == "\r\n" {
+                            break;
+                        }
+                    }
+                    assert!(request.starts_with("GET /camera.xml HTTP/1.1\r\n"));
+                    if let Some(xml) = xml {
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{xml}",
+                            xml.len()
+                        )
+                        .unwrap();
+                    } else {
+                        stream
+                            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                            .unwrap();
+                    }
+                }
+            });
+            let mut gige = connect(fake.address, Duration::from_secs(1)).unwrap();
+            assert_eq!(gige.xml().unwrap(), first);
+            if !fallback {
+                assert!(gige.forget_xml());
+                assert_eq!(gige.xml().unwrap(), second);
+            }
+            worker.join().unwrap();
+        }
+    }
+    #[test]
+    fn xml_url_failures_preserve_the_first_typed_cause_and_bounded_diagnostics() {
+        use std::io::{BufRead as _, BufReader, Write as _};
+        use std::net::TcpListener;
+        for kind in [
+            crate::types::ErrorKind::Unsupported,
+            crate::types::ErrorKind::AuthRequired,
+            crate::types::ErrorKind::Timeout,
+        ] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let scheme = if kind == crate::types::ErrorKind::Unsupported {
+                "https"
+            } else {
+                "http"
+            };
+            let url = format!("{scheme}://{}/camera.xml", listener.local_addr().unwrap());
+            let fake = Fake::new(|camera| {
+                for (index, chunk) in url.as_bytes().chunks(4).enumerate() {
+                    let mut word = [0; 4];
+                    word[..chunk.len()].copy_from_slice(chunk);
+                    camera.registers.insert(
+                        0x200 + u32::try_from(index).unwrap() * 4,
+                        u32::from_be_bytes(word),
+                    );
+                }
+            });
+            let (stop, wait) = std::sync::mpsc::channel();
+            let worker = thread::spawn(move || {
+                if kind == crate::types::ErrorKind::Unsupported {
+                    return;
+                }
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "GigE XML HTTP request did not arrive"
+                            );
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => panic!("{error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                if kind == crate::types::ErrorKind::AuthRequired {
+                    stream
+                        .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                        .unwrap();
+                } else {
+                    wait.recv_timeout(Duration::from_secs(3)).unwrap();
+                }
+            });
+            let mut gige = connect(fake.address, Duration::from_millis(80)).unwrap();
+            let error = gige.xml().unwrap_err();
+            let _ = stop.send(());
+            worker.join().unwrap();
+            assert_eq!(crate::types::classify(&error).kind, kind, "{error:#}");
+            let message = error.to_string();
+            assert!(
+                message.contains("URL at 0x200") && message.contains("URL at 0x400"),
+                "{message}"
+            );
+        }
+        let error = anyhow!("{}", "相机".repeat(100_000));
+        let bounded = xml_diagnostic(&error);
+        assert!(bounded.len() <= 4096 + '…'.len_utf8());
+        assert!(bounded.ends_with('…'));
+    }
+    #[test]
     fn reordered_frames_duplicates_and_extended_ids() {
         for extended in [false, true] {
             let id = if extended { 0x1_0000_0001 } else { 15 };
@@ -3747,9 +7160,36 @@ mod tests {
             let frame = assembler.push(&first).unwrap().unwrap();
             assert_eq!(frame.data, (1..=16).collect::<Vec<_>>());
             assert_eq!(frame.device_ts_ns, Some(1_234_000_000));
+            assert_eq!(
+                frame.device_timestamp,
+                Some(crate::types::DeviceTimestamp {
+                    ticks: 1234,
+                    frequency_hz: Some(1000),
+                })
+            );
             assert_eq!(frame.id, id);
             assert!(assembler.push(&first).unwrap().is_none());
         }
+    }
+    #[test]
+    fn an_unknown_clock_frequency_preserves_exact_ticks_without_nanoseconds() {
+        let mut assembler = Assembler::new(1, 44, 0);
+        let mut metadata = leader(1, 1, MONO8);
+        metadata[4..12].copy_from_slice(&u64::MAX.to_be_bytes());
+        assembler.push(&gvsp(1, 0, 1, false, &metadata)).unwrap();
+        assembler.push(&gvsp(1, 1, 3, false, &[7])).unwrap();
+        let frame = assembler
+            .push(&gvsp(1, 2, 2, false, &trailer(1)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.device_ts_ns, None);
+        assert_eq!(
+            frame.device_timestamp,
+            Some(crate::types::DeviceTimestamp {
+                ticks: u64::MAX,
+                frequency_hz: None,
+            })
+        );
     }
     #[test]
     fn rgb_and_row_padding() {
@@ -4528,6 +7968,21 @@ mod tests {
                 .find_map(|packet| assembler.push(packet).unwrap())
                 .unwrap();
             assert_eq!((frame.height, frame.data.to_vec()), (2, pixels.clone()));
+            let chunks = frame.chunks.unwrap();
+            assert_eq!(
+                (chunks.layout_id, chunks.byte_order),
+                (Some(1), Some(ByteOrder::Big))
+            );
+            assert_eq!(&*chunks.payload, &payload);
+            assert_eq!(chunks.image_bytes, 16);
+            assert_eq!(
+                chunks.entries,
+                vec![super::super::chunks::Chunk {
+                    id: 0x0a5a_0001,
+                    offset: 16,
+                    length: 8
+                }]
+            );
         }
         let start = Instant::now();
         let mut assembler = Assembler::new(32, 44, 0);
@@ -4537,6 +7992,22 @@ mod tests {
         assembler.poll(start + RESEND_IDLE);
         assert!(assembler.ready.is_empty());
         assert!(assembler.push(&packets[5]).unwrap().is_some());
+
+        // Chunk lengths and extended trailer fields are validated before
+        // any image can be delivered, including a reordered leader.
+        for chunk_bytes in [7u32, 17, u32::MAX] {
+            let mut wrong_tail = tail.clone();
+            wrong_tail[8..12].copy_from_slice(&chunk_bytes.to_be_bytes());
+            let mut assembler = Assembler::new(32, 44, 0);
+            for packet in &packets[..5] {
+                assembler.push(packet).unwrap();
+            }
+            assembler
+                .push(&gvsp(3, 5, 2, false, &wrong_tail))
+                .unwrap_err();
+            assert!(assembler.ready.is_empty());
+        }
+        ImageTrailer::parse(5, &tail[..8]).unwrap_err();
 
         for (payload_type, name) in [
             (0x0004, "chunk data"),
@@ -4555,6 +8026,501 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn manta_g125b_captured_legacy_chunk_headers_keep_their_wire_field_order() {
+        // Captured headers only; no camera payload is available in this source.
+        // Allied Vision Manta G-125B, GV 1.2, firmware 00.01.44.28514.
+        // Provenance: viva-genicam cdfedcc9d52694b1f471029bf585b0e50d04073b,
+        // crates/viva-gige/src/gvsp.rs, a_gige_vision_1_extended_chunk_block_is_an_image_with_chunks.
+        #[rustfmt::skip]
+        const LEADER: [u8; 44] = [
+            0x00,0x00,0x00,0x01,0x01,0x00,0x00,0x00,
+            0x00,0x01,0x00,0x05,0x00,0x00,0x00,0x2e,
+            0xf1,0xc1,0x84,0xe8,0x01,0x08,0x00,0x01,
+            0x00,0x00,0x05,0x0c,0x00,0x00,0x03,0xc4,
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+            0x00,0x00,0x00,0x00,
+        ];
+        #[rustfmt::skip]
+        const TRAILER: [u8; 24] = [
+            0x00,0x00,0x00,0x01,0x02,0x00,0x03,0x54,
+            0x00,0x00,0x00,0x05,0x00,0x13,0x01,0x68,
+            0x00,0x00,0x03,0xc4,0x00,0x00,0x00,0x01,
+        ];
+        let head = parse_gvsp(&LEADER, Site::GvspAssemble).unwrap();
+        let tail = parse_gvsp(&TRAILER, Site::GvspAssemble).unwrap();
+        assert_eq!((head.frame, head.id, head.extended), (1, 0, false));
+        assert_eq!((tail.frame, tail.id, tail.extended), (1, 852, false));
+        let leader = ImageLeader::parse(head.data.bytes(), 1_245_544).unwrap();
+        let trailer = ImageTrailer::parse(tail.id, tail.data.bytes()).unwrap();
+        assert_eq!(
+            (leader.width, leader.height, leader.pixel_format),
+            (1292, 964, MONO8)
+        );
+        assert_eq!(leader.payload_type, 5);
+        assert!(leader.chunks);
+        assert_eq!(trailer.height, 964);
+        assert_eq!(trailer.chunks, Some((1_245_544, 1)));
+        check_trailer(&leader, 1464, trailer).unwrap();
+    }
+
+    // An independently constructed small body using the proved legacy envelope:
+    // 18 image/padding bytes + image footer + eight-byte chunk + chunk footer.
+    fn legacy_chunk_fixture() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let mut metadata = leader(3, 2, MONO16);
+        metadata[2..4].copy_from_slice(&5u16.to_be_bytes());
+        metadata[32..34].copy_from_slice(&2u16.to_be_bytes());
+        metadata[34..36].copy_from_slice(&2u16.to_be_bytes());
+        let mut payload = Vec::new();
+        for row in [[0x0102u16, 0x0304, 0x0506], [0x0708, 0x090a, 0x0b0c]] {
+            payload.extend(row.into_iter().flat_map(u16::to_be_bytes));
+            payload.extend([0xfa, 0xfb]);
+        }
+        payload.extend([0xfc, 0xfd]);
+        payload.extend(1u32.to_be_bytes());
+        payload.extend(18u32.to_be_bytes());
+        payload.extend(u64::MAX.to_be_bytes());
+        payload.extend(0x3e8u32.to_be_bytes());
+        payload.extend(8u32.to_be_bytes());
+        let mut tail = vec![0, 0, 0, 5];
+        tail.extend(42u32.to_be_bytes());
+        tail.extend(2u32.to_be_bytes());
+        tail.extend(7u32.to_be_bytes());
+        (metadata, payload, tail)
+    }
+
+    #[test]
+    fn legacy_chunk_capture_retains_exact_bytes_with_reordering_and_resend() {
+        for extended in [false, true] {
+            for delivery in 0..3 {
+                let (metadata, payload, tail) = legacy_chunk_fixture();
+                let mut packets = vec![gvsp(7, 0, 1, extended, &metadata)];
+                for (index, bytes) in payload.chunks(8).enumerate() {
+                    packets.push(gvsp(
+                        7,
+                        u32::try_from(index + 1).unwrap(),
+                        3,
+                        extended,
+                        bytes,
+                    ));
+                }
+                packets.push(gvsp(7, 7, 2, extended, &tail));
+                let mut assembler = Assembler::new(42, if extended { 56 } else { 44 }, 0);
+                assembler.big_endian = true;
+                assembler.resend = delivery == 2;
+                let start = Instant::now();
+                let order = if delivery == 1 {
+                    vec![7, 6, 3, 1, 1, 4, 2, 0, 5]
+                } else {
+                    (0..packets.len())
+                        .filter(|index| delivery != 2 || *index != 2)
+                        .collect()
+                };
+                let mut frame = None;
+                for index in order {
+                    if let Some(complete) = assembler.push_at(&packets[index], start).unwrap() {
+                        assert!(frame.replace(complete).is_none());
+                    }
+                }
+                if delivery == 2 {
+                    assert!(frame.is_none());
+                    assembler.poll(start + RESEND_IDLE);
+                    assert!(
+                        assembler
+                            .requests
+                            .iter()
+                            .any(|(block, ids, first, last)| *block == 7
+                                && *ids == extended
+                                && *first <= 2
+                                && *last >= 2)
+                    );
+                    let mut resent = packets[2].clone();
+                    resent[..2].copy_from_slice(&0x0100u16.to_be_bytes());
+                    frame = assembler.push_at(&resent, start + RESEND_IDLE).unwrap();
+                    assert_eq!(assembler.stats.resend_recovered, 1);
+                }
+                let frame = frame.unwrap();
+                assert_eq!(
+                    (frame.width, frame.height, frame.pixel_format),
+                    (3, 2, MONO16)
+                );
+                assert_eq!(frame.data.as_ref(), [2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11]);
+                let chunks = frame.chunks.unwrap();
+                assert_eq!(chunks.payload.as_ref(), payload);
+                assert_eq!((chunks.image_bytes, chunks.payload_bytes), (18, 42));
+                assert_eq!(
+                    (chunks.layout_id, chunks.byte_order),
+                    (Some(7), Some(ByteOrder::Big))
+                );
+                assert_eq!(
+                    chunks
+                        .entries
+                        .iter()
+                        .map(|chunk| (chunk.id, chunk.offset, chunk.length))
+                        .collect::<Vec<_>>(),
+                    [(1, 0, 18), (0x3e8, 26, 8)]
+                );
+                let layout = chunks.image_layout.unwrap();
+                assert_eq!(
+                    (
+                        layout.height,
+                        layout.row_bytes,
+                        layout.row_stride,
+                        layout.padding_y
+                    ),
+                    (2, 6, 8, 2)
+                );
+                assert_eq!(layout.byte_order, Some(ByteOrder::Big));
+                // This XML is synthetic, not a claim about the Manta's legacy
+                // ancillary field meanings or whether its XML has chunk ports.
+                let map = crate::genicam::NodeMap::parse(concat!(
+                    "<RegisterDescription><Category Name='Root'><pFeature>Counter</pFeature></Category>",
+                    "<IntReg Name='Counter'><pPort>Chunk</pPort><Address>0</Address><Length>8</Length><AccessMode>RO</AccessMode><Sign>Unsigned</Sign><Endianess>BigEndian</Endianess></IntReg>",
+                    "<Port Name='Chunk'><ChunkID>3e8</ChunkID></Port></RegisterDescription>"
+                )).unwrap();
+                let values = map.chunk_values(&chunks, &crate::genicam::ChunkContext::default());
+                assert_eq!(values["values"]["Counter"], u64::MAX);
+                assert_eq!(values["errors"], serde_json::json!({}));
+                assert_eq!(chunks.payload.as_ref(), payload);
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_chunk_capture_rejects_inconsistent_envelopes_and_recovers() {
+        for mode in 0..9 {
+            let (mut metadata, mut payload, mut tail) = legacy_chunk_fixture();
+            match mode {
+                0 => tail[4..8].copy_from_slice(&41u32.to_be_bytes()),
+                1 => tail[4..8].copy_from_slice(&43u32.to_be_bytes()),
+                2 => tail[4..8].copy_from_slice(&24u32.to_be_bytes()),
+                3 => tail[8..12].copy_from_slice(&3u32.to_be_bytes()),
+                4 => payload[22..26].copy_from_slice(&17u32.to_be_bytes()),
+                5 => payload[38..42].copy_from_slice(&u32::MAX.to_be_bytes()),
+                6 => {
+                    tail[2..4].copy_from_slice(&0x4001u16.to_be_bytes());
+                    tail[4..8].copy_from_slice(&2u32.to_be_bytes());
+                    tail[8..12].copy_from_slice(&42u32.to_be_bytes());
+                }
+                7 => metadata[2..4].copy_from_slice(&0x4005u16.to_be_bytes()),
+                8 => {
+                    drop(payload.drain(18..26));
+                    tail[4..8].copy_from_slice(&34u32.to_be_bytes());
+                }
+                _ => unreachable!(),
+            }
+            let mut assembler = Assembler::new(42, 44, 0);
+            let attempt = std::iter::once(gvsp(7, 0, 1, false, &metadata))
+                .chain(payload.chunks(8).enumerate().map(|(index, bytes)| {
+                    gvsp(7, u32::try_from(index + 1).unwrap(), 3, false, bytes)
+                }))
+                .chain(std::iter::once(gvsp(
+                    7,
+                    u32::try_from(payload.len().div_ceil(8) + 1).unwrap(),
+                    2,
+                    false,
+                    &tail,
+                )))
+                .try_for_each(|packet| {
+                    assembler
+                        .push(&packet)
+                        .map(|frame| assert!(frame.is_none()))
+                });
+            let error = attempt.unwrap_err();
+            let expected = match mode {
+                0..=2 => "legacy chunk payload length or image boundary",
+                3 => "trailer height",
+                4 => "chunk overlaps image data",
+                5 => "chunk length exceeds payload",
+                6 => "payload types disagree",
+                7 => "unsupported GVSP payload type",
+                8 => "total-length chunk payload lacks its first image tag",
+                _ => unreachable!(),
+            };
+            assert!(
+                error.to_string().contains(expected),
+                "mode {mode}: {error:#}"
+            );
+            assert_eq!(
+                crate::types::classify(&error).kind,
+                if mode == 7 {
+                    crate::types::ErrorKind::Unsupported
+                } else {
+                    crate::types::ErrorKind::OperationFailed
+                }
+            );
+            assert!(assembler.ready.is_empty());
+            // The malformed block is retired; the next ordinary frame works.
+            assert!(
+                assembler
+                    .push(&gvsp(8, 0, 1, false, &leader(3, 2, MONO8)))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                assembler
+                    .push(&gvsp(8, 1, 3, false, &[1, 2, 3, 4, 5, 6]))
+                    .unwrap()
+                    .is_none()
+            );
+            let recovered = assembler
+                .push(&gvsp(8, 2, 2, false, &trailer(2)))
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovered.data.as_ref(), [1, 2, 3, 4, 5, 6]);
+            assert!(recovered.chunks.is_none());
+        }
+        for size in [8, 12, 15] {
+            let (_, _, tail) = legacy_chunk_fixture();
+            ImageTrailer::parse(7, &tail[..size]).unwrap_err();
+        }
+    }
+
+    #[test]
+    fn chunk_capture_preserves_wire_padding_and_big_endian_pixels() {
+        let mut metadata = leader(3, 2, MONO16);
+        metadata[2..4].copy_from_slice(&0x4001u16.to_be_bytes());
+        metadata[32..34].copy_from_slice(&2u16.to_be_bytes());
+        metadata[34..36].copy_from_slice(&2u16.to_be_bytes());
+        let samples = [0x0102u16, 0x0304, 0x0506, 0x0708, 0x090a, 0x0b0c];
+        let mut wire = Vec::new();
+        for row in samples.chunks(3) {
+            wire.extend(row.iter().flat_map(|value| value.to_be_bytes()));
+            wire.extend([0xfa, 0xfb]);
+        }
+        wire.extend([0xfc, 0xfd]);
+        wire.extend(0x1122_3344_5566_7788u64.to_be_bytes());
+        wire.extend(99u32.to_be_bytes());
+        wire.extend(8u32.to_be_bytes());
+        let mut tail = vec![0, 0, 0x40, 1];
+        tail.extend(2u32.to_be_bytes());
+        tail.extend(16u32.to_be_bytes());
+        tail.extend(7u32.to_be_bytes());
+        let mut assembler = Assembler::new(wire.len(), 44, 0);
+        assembler.big_endian = true;
+        assembler.push(&gvsp(4, 0, 1, false, &metadata)).unwrap();
+        for (index, packet) in wire.chunks(8).enumerate() {
+            assembler
+                .push(&gvsp(
+                    4,
+                    u32::try_from(index + 1).unwrap(),
+                    3,
+                    false,
+                    packet,
+                ))
+                .unwrap();
+        }
+        let frame = assembler
+            .push(&gvsp(4, 6, 2, false, &tail))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            frame.data.to_vec(),
+            samples
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>()
+        );
+        let chunks = frame.chunks.unwrap();
+        assert_eq!(&*chunks.payload, &wire);
+        assert_eq!(chunks.image_bytes, 18);
+        let layout = chunks.image_layout.unwrap();
+        assert_eq!(
+            (layout.row_bytes, layout.row_stride, layout.padding_y),
+            (6, 8, 2)
+        );
+        assert_eq!(layout.byte_order, Some(ByteOrder::Big));
+    }
+    #[test]
+    fn native_coord3d_preserves_float_words_and_the_original_chunk_payload() {
+        use crate::frame::COORD3D_ABC32F;
+
+        let words = [
+            0x3f80_0000u32,
+            0x8000_0000,
+            0x7eff_ffff,
+            0x7fc0_2345,
+            0x0000_0000,
+            0xbf80_0000,
+            0x4030_2010,
+            0x8000_0001,
+            0xffc0_6789,
+            0x0000_0001,
+            0x3d01_2345,
+            0xbe98_7654,
+        ];
+        let normalized: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        for extended in [false, true] {
+            for big in [false, true] {
+                for chunk_length in [None, Some(false), Some(true)] {
+                    let mut head = leader(2, 2, COORD3D_ABC32F);
+                    head[32..34].copy_from_slice(&4u16.to_be_bytes());
+                    head[34..36].copy_from_slice(&2u16.to_be_bytes());
+                    let mut tail = trailer(2);
+                    let mut wire = Vec::new();
+                    for row in words.as_chunks::<6>().0 {
+                        for word in row {
+                            wire.extend(if big {
+                                word.to_be_bytes()
+                            } else {
+                                word.to_le_bytes()
+                            });
+                        }
+                        wire.extend([0xfa, 0xfb, 0xfc, 0xfd]);
+                    }
+                    wire.extend([0xee, 0xef]);
+                    let image_bytes = u32::try_from(wire.len()).unwrap();
+                    if let Some(total) = chunk_length {
+                        head[2] = 0x40;
+                        tail[2] = 0x40;
+                        wire.extend(1u32.to_be_bytes());
+                        wire.extend(image_bytes.to_be_bytes());
+                        wire.extend(0x0123_4567_89ab_cdefu64.to_be_bytes());
+                        wire.extend(0x0a5a_0001u32.to_be_bytes());
+                        wire.extend(8u32.to_be_bytes());
+                        let wire_bytes = u32::try_from(wire.len()).unwrap();
+                        let reported = if total {
+                            wire_bytes
+                        } else {
+                            wire_bytes - image_bytes
+                        };
+                        tail.extend(reported.to_be_bytes());
+                        tail.extend(7u32.to_be_bytes());
+                    }
+                    let mut assembler =
+                        Assembler::new(wire.len(), if extended { 80 } else { 68 }, 1_000_000);
+                    assembler.big_endian = big;
+                    assembler.push(&gvsp(15, 0, 1, extended, &head)).unwrap();
+                    for (index, bytes) in wire.chunks(32).enumerate() {
+                        assert!(
+                            assembler
+                                .push(&gvsp(
+                                    15,
+                                    u32::try_from(index + 1).unwrap(),
+                                    3,
+                                    extended,
+                                    bytes
+                                ))
+                                .unwrap()
+                                .is_none()
+                        );
+                    }
+                    let id = u32::try_from(wire.len().div_ceil(32) + 1).unwrap();
+                    let frame = assembler
+                        .push(&gvsp(15, id, 2, extended, &tail))
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        (frame.width, frame.height, frame.pixel_format),
+                        (2, 2, COORD3D_ABC32F)
+                    );
+                    assert_eq!(frame.data.as_ref(), normalized);
+                    assert_eq!(frame.device_timestamp.unwrap().ticks, 1234);
+                    assert_eq!(frame.device_ts_ns, Some(1_234_000));
+                    assert_eq!(frame.chunks.is_some(), chunk_length.is_some());
+                    if let Some(chunks) = frame.chunks {
+                        let layout = chunks.image_layout.unwrap();
+                        assert_eq!(
+                            (layout.row_bytes, layout.row_stride, layout.padding_y),
+                            (24, 28, 2)
+                        );
+                        assert_eq!(
+                            layout.byte_order,
+                            Some(if big {
+                                ByteOrder::Big
+                            } else {
+                                ByteOrder::Little
+                            })
+                        );
+                        assert_eq!(chunks.payload.as_ref(), wire);
+                        assert_eq!(chunks.image_bytes, 58);
+                        assert_eq!(
+                            chunks
+                                .entries
+                                .iter()
+                                .map(|chunk| (chunk.id, chunk.offset, chunk.length))
+                                .collect::<Vec<_>>(),
+                            [(1, 0, 58), (0x0a5a_0001, 66, 8)]
+                        );
+                    }
+                }
+            }
+        }
+        let profile = ImageLeader::parse(&leader(8, 1, COORD3D_ABC32F), 96).unwrap();
+        assert_eq!(profile.row_bytes, 96);
+        ImageLeader::parse(&leader(2, 2, COORD3D_ABC32F), 47).unwrap_err();
+        ImageLeader::parse(&leader(2, 2, 0x0260_00c1), 48).unwrap_err();
+        ImageLeader::parse(&leader(2, 2, MONO8), 4).unwrap();
+    }
+
+    #[test]
+    fn native_coord3d_ac16_profiles_preserve_each_coordinate_word() {
+        const AC16: u32 = 0x0220_00bb;
+        let expected = [0x34, 0x12, 0xdc, 0xfe, 0xff, 0xff, 0x01, 0x80];
+        for (big, wire) in [
+            (false, expected),
+            (true, [0x12, 0x34, 0xfe, 0xdc, 0xff, 0xff, 0x80, 0x01]),
+        ] {
+            let mut assembler = Assembler::new(wire.len(), 56, 1_000_000);
+            assembler.big_endian = big;
+            assembler
+                .push(&gvsp(19, 0, 1, true, &leader(2, 1, AC16)))
+                .unwrap();
+            assert!(
+                assembler
+                    .push(&gvsp(19, 1, 3, true, &wire))
+                    .unwrap()
+                    .is_none()
+            );
+            let frame = assembler
+                .push(&gvsp(19, 2, 2, true, &trailer(1)))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (frame.width, frame.height, frame.pixel_format),
+                (2, 1, AC16)
+            );
+            assert_eq!(frame.data.as_ref(), expected);
+            assert_eq!(frame.device_ts_ns, Some(1_234_000));
+        }
+    }
+
+    #[test]
+    fn total_length_chunk_trailers_require_a_valid_first_image_tag() {
+        for tagged in [false, true] {
+            let mut head = leader(8, 1, MONO8);
+            head[2] = 0x40;
+            let mut wire = image(8, 1);
+            if tagged {
+                wire.extend(1u32.to_be_bytes());
+                wire.extend(8u32.to_be_bytes());
+            }
+            wire.extend([3, 4, 5, 6]);
+            wire.extend(9u32.to_be_bytes());
+            wire.extend(4u32.to_be_bytes());
+            let mut tail = trailer(1);
+            tail[2] = 0x40;
+            tail.extend(u32::try_from(wire.len()).unwrap().to_be_bytes());
+            tail.extend(1u32.to_be_bytes());
+            let mut assembler = Assembler::new(wire.len(), 68, 0);
+            assembler.push(&gvsp(5, 0, 1, false, &head)).unwrap();
+            assembler.push(&gvsp(5, 1, 3, false, &wire)).unwrap();
+            let result = assembler.push(&gvsp(5, 2, 2, false, &tail));
+            if tagged {
+                let frame = result.unwrap().unwrap();
+                assert_eq!(frame.data.as_ref(), image(8, 1));
+                assert_eq!(frame.chunks.unwrap().payload.as_ref(), wire);
+            } else {
+                let error = result.unwrap_err();
+                assert!(
+                    error.to_string().contains("lacks its first image tag"),
+                    "{error}"
+                );
+                assert!(assembler.ready.is_empty());
+            }
+        }
+    }
+
     #[test]
     fn receive_buffer_requests_halve_on_errors_and_note_small_buffers() {
         let mut sizes = Vec::new();
@@ -4585,11 +8551,39 @@ mod tests {
         let wanted = 8 << 20;
         set_receive_buffer(&socket, wanted).unwrap();
         let got = socket2::SockRef::from(&socket).recv_buffer_size().unwrap();
-        // SAFETY: geteuid only reads this process's effective user.
         #[cfg(target_os = "linux")]
-        if unsafe { libc::geteuid() } == 0 {
-            // Linux doubles what it is asked for, for its own bookkeeping.
-            assert!(got >= wanted, "{got}");
+        {
+            use std::os::fd::AsRawFd as _;
+            let probe = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let reference = socket2::SockRef::from(&probe);
+            reference.set_recv_buffer_size(wanted).unwrap();
+            let ordinary = reference.recv_buffer_size().unwrap();
+            let size = libc::c_int::try_from(wanted).unwrap();
+            // Root inside a container can lack CAP_NET_ADMIN, while a non-root
+            // process can hold it. Probe the operation rather than the UID.
+            // SAFETY: probe stays live and setsockopt reads one initialized int.
+            let forced = unsafe {
+                libc::setsockopt(
+                    probe.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUFFORCE,
+                    (&raw const size).cast(),
+                    libc::socklen_t::try_from(size_of::<libc::c_int>()).unwrap(),
+                )
+            } == 0;
+            if forced {
+                let capped = crate::host::memory_budget().map_or(wanted, |budget| {
+                    wanted.min(usize::try_from(budget / 16).unwrap_or(usize::MAX))
+                });
+                // Production caps its forced request to the host's memory share.
+                // Linux doubles that request for its bookkeeping.
+                assert!(got >= capped, "{got} < {capped}");
+            } else {
+                assert_eq!(
+                    got, ordinary,
+                    "unprivileged socket must use the ordinary fallback"
+                );
+            }
         }
         assert!(got > 0);
     }
@@ -5033,82 +9027,44 @@ mod tests {
         assert_eq!(gige.device_time_ns(), None);
     }
     #[test]
-    fn heartbeats_fail_only_once_the_camera_would_let_go() {
+    fn heartbeats_recover_only_before_the_old_proof_deadline() {
         let fake = Fake::new(|camera| {
             camera.registers.insert(CONTROL_PRIVILEGE, 2);
         });
-        let control = Control::connect(fake.address, Duration::from_millis(100)).unwrap();
-        let lost_after = Duration::from_secs(2);
-        let heartbeat = Heartbeat::start(
-            Arc::new(Mutex::new(control)),
-            Duration::from_millis(20),
-            lost_after,
-        )
-        .unwrap();
-        let answering = |answers: bool| {
-            let mut camera = fake.camera.lock().unwrap();
-            camera
-                .unreadable
-                .retain(|address| *address != CONTROL_PRIVILEGE);
-            if !answers {
-                camera.unreadable.push(CONTROL_PRIVILEGE);
-            }
-        };
-        thread::sleep(Duration::from_millis(100));
-        heartbeat.check().unwrap();
-        // Unanswered for a while, as on a busy link: the camera still
-        // counts this controller as its own.
-        answering(false);
-        let silent = Instant::now();
-        thread::sleep(Duration::from_millis(200));
-        heartbeat.check().unwrap();
-        let reads = || fake.camera.lock().unwrap().register_reads.len();
-        let before = reads();
-        // Each unanswered read waits out its control timeout, which a slow
-        // host stretches, so wait for the repeats rather than a fixed time.
-        let deadline = Instant::now() + Duration::from_millis(900);
-        while reads() <= before + 1 && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(20));
-        }
-        assert!(
-            reads() > before + 1,
-            "an unanswered heartbeat is sent again"
-        );
-        // Unanswered for the camera's heartbeat timeout: it let go.
-        let failed = loop {
-            if let Err(error) = heartbeat.check() {
-                break error;
-            }
-            assert!(silent.elapsed() < Duration::from_secs(10), "never failed");
-            thread::sleep(Duration::from_millis(20));
-        };
-        assert!(silent.elapsed() >= lost_after / 2, "{:?}", silent.elapsed());
-        assert!(
-            failed.to_string().starts_with("camera heartbeat failed"),
-            "{failed:#}"
-        );
-        // Answered again, it holds.
-        answering(true);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while heartbeat.check().is_err() {
-            assert!(Instant::now() < deadline, "never recovered");
-            thread::sleep(Duration::from_millis(20));
-        }
-        // A camera that says the privilege is gone fails it at once.
+        let mut control = Control::connect(fake.address, Duration::from_millis(30)).unwrap();
+        let (lease, now) = Lease::testing(300, false);
+        control.lease = Some(lease);
+        let control = Arc::new(Mutex::new(control));
+        let heartbeat = Heartbeat::start(control.clone()).unwrap();
         fake.camera
             .lock()
             .unwrap()
-            .registers
-            .insert(CONTROL_PRIVILEGE, 0);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let lost = loop {
-            if let Err(error) = heartbeat.check() {
-                break error;
-            }
-            assert!(Instant::now() < deadline, "privilege loss unnoticed");
-            thread::sleep(Duration::from_millis(20));
-        };
-        assert!(lost.to_string().contains("privilege was lost"), "{lost:#}");
+            .unreadable
+            .push(CONTROL_PRIVILEGE);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while fake.camera.lock().unwrap().register_reads.is_empty() {
+            assert!(Instant::now() < deadline, "heartbeat did not run");
+            thread::sleep(Duration::from_millis(5));
+        }
+        heartbeat.check().unwrap();
+        fake.camera.lock().unwrap().unreadable.clear();
+        thread::sleep(Duration::from_millis(60));
+        heartbeat.check().unwrap();
+        // Hold the I/O lock while advancing proof, so an already sent
+        // datagram cannot race the no-future-send assertion.
+        let transaction = control.lock().unwrap();
+        now.store(1_300_000_000, Ordering::SeqCst);
+        let failed = heartbeat.check().unwrap_err();
+        assert!(ownership_retired(&failed));
+        drop(transaction);
+        let reads = fake.camera.lock().unwrap().register_reads.len();
+        // A replacement controller reports the same global CCP=2.
+        thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            heartbeat.check().unwrap_err().to_string(),
+            failed.to_string()
+        );
+        assert_eq!(fake.camera.lock().unwrap().register_reads.len(), reads);
     }
     #[test]
     fn an_idle_stream_sleeps_until_the_timeout_and_polls_a_frame_in_flight() {
@@ -5282,6 +9238,12 @@ mod tests {
             (rgba16, 1, true, false, 2),
             (coord3d_ac16, 3, true, false, 2),
             (coord3d_c32f, 3, true, false, 4),
+            (0x0210_00a5, 6, true, false, 1),
+            (0x0210_00a6, 6, true, false, 1),
+            (0x0220_00a7, 3, true, false, 2),
+            (0x0220_00a9, 3, true, false, 2),
+            (0x0220_00ab, 3, true, false, 2),
+            (0x0220_00ad, 3, true, false, 2),
             // Two-component 32-bit coordinates share the 0x0240 size code
             // with four-component 16-bit color: the exact format wins.
             (0x0240_00c2, 1, true, false, 4),
@@ -5341,7 +9303,7 @@ mod tests {
         assert_eq!(gige.stats().unwrap().packets_received, 15);
     }
     #[test]
-    fn connect_reads_resend_capability_and_restores_the_heartbeat_timeout() {
+    fn connect_reads_resend_capability_and_retains_the_actual_heartbeat_timeout() {
         for (capability, unreadable, resend) in
             [(0x4, false, true), (0x0, false, false), (0x4, true, false)]
         {
@@ -5354,7 +9316,7 @@ mod tests {
             });
             let gige = connect(fake.address, Duration::from_millis(200)).unwrap();
             assert_eq!(gige.resend, resend);
-            assert_eq!(fake.register(HEARTBEAT_TIMEOUT), 3000);
+            assert_eq!(fake.register(HEARTBEAT_TIMEOUT), 1000);
             assert_eq!(gige.stats(), Some(TransportStats::default()));
             drop(gige);
             assert_eq!(
@@ -5709,14 +9671,66 @@ mod tests {
                 destination = Some(to);
             });
             order(&mut packets);
-            // Sent while the frame is received, a few packets at a time, so
-            // a small socket buffer (Linux's default is about 200 KiB) never
-            // overflows.
+            // Send while receiving, with no assumption about the VM's CPU
+            // share. A fixed sleep can still overflow a capped receive queue
+            // when the receiver is descheduled beside other large frame tests.
             let (source, destination) = (fake.stream.try_clone().unwrap(), destination.unwrap());
+            #[cfg(target_os = "linux")]
+            let (receiver, burst) = {
+                let socket = &gige.stream.as_ref().unwrap().socket;
+                let capacity = socket2::SockRef::from(socket).recv_buffer_size().unwrap();
+                // Linux includes bookkeeping in SO_RCVBUF; leave another
+                // factor of two for skb overhead and any requested resends.
+                (
+                    socket.try_clone().unwrap(),
+                    (capacity / (4 * BLOCK)).clamp(1, 8),
+                )
+            };
+            #[cfg(not(target_os = "linux"))]
+            let burst = 8;
             let sender = thread::spawn(move || {
+                #[cfg(target_os = "linux")]
+                let deadline = Instant::now() + Duration::from_secs(5);
                 for (i, packet) in packets.iter().enumerate() {
                     source.send_to(packet, destination).unwrap();
-                    if i % 8 == 7 {
+                    // Do not wait after the final burst: next_frame can return
+                    // while a late duplicate/resend is still queued, and its
+                    // caller joins this sender before beginning another read.
+                    if (i + 1).is_multiple_of(burst) && i + 1 < packets.len() {
+                        #[cfg(target_os = "linux")]
+                        {
+                            use std::os::fd::AsRawFd as _;
+                            loop {
+                                assert!(
+                                    Instant::now() < deadline,
+                                    "loopback receiver did not drain its socket queue"
+                                );
+                                let mut byte = [0u8];
+                                // MSG_DONTWAIT applies to this call only:
+                                // set_nonblocking would also alter the cloned
+                                // receiver descriptor used by next_frame.
+                                // SAFETY: receiver stays live and recv can write
+                                // at most the one byte in this valid allocation.
+                                let queued = unsafe {
+                                    libc::recv(
+                                        receiver.as_raw_fd(),
+                                        byte.as_mut_ptr().cast(),
+                                        byte.len(),
+                                        libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                                    )
+                                };
+                                if queued < 0 {
+                                    let error = std::io::Error::last_os_error();
+                                    if error.kind() == ErrorKind::WouldBlock {
+                                        break;
+                                    }
+                                    assert_eq!(error.kind(), ErrorKind::Interrupted, "{error}");
+                                    continue;
+                                }
+                                thread::sleep(Duration::from_micros(100));
+                            }
+                        }
+                        #[cfg(not(target_os = "linux"))]
                         thread::sleep(Duration::from_micros(300));
                     }
                 }
@@ -5911,6 +9925,561 @@ mod tests {
                 cpu.as_secs_f64() * 1e3 / f64::from(received),
                 gige.stream.as_ref().unwrap().assembler.copied,
             );
+        }
+    }
+    fn controlled_clock(gige: &mut GigE) -> Arc<std::sync::atomic::AtomicU64> {
+        gige.heartbeat.shutdown();
+        let timeout = gige.heartbeat.lease.timeout_ms().unwrap();
+        let disabled = gige.heartbeat.lease.disabled();
+        let (lease, now) = Lease::testing(timeout, disabled);
+        gige.control.lock().unwrap().lease = Some(lease.clone());
+        gige.heartbeat.lease = lease.clone();
+        if let Some(stream) = &mut gige.stream {
+            stream.lease = Some(lease);
+        }
+        now
+    }
+    #[test]
+    fn expired_controller_never_mutates_or_resends_to_a_replacement_owner() {
+        let (fake, mut gige) = streaming(|camera| {
+            camera.enforce_owner = true;
+            camera.registers.insert(GVCP_CAPABILITY, 0x4);
+        });
+        fake.send(901, true, &[]);
+        let captured = gige.next_frame(Duration::from_secs(2)).unwrap();
+        let original = captured.data.as_ref().to_vec();
+        let now = controlled_clock(&mut gige);
+        let replacement = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 62222);
+        {
+            let mut camera = fake.camera.lock().unwrap();
+            camera.owner = Some(replacement);
+            camera.registers.insert(CONTROL_PRIVILEGE, 2);
+            camera.registers.insert(STREAM_PORT, 32123);
+            camera.registers.insert(GVCP_CONFIGURATION, 0x40);
+            camera.registers.insert(HEARTBEAT_TIMEOUT, 1234);
+            camera.commands.clear();
+            camera.register_writes.clear();
+        }
+        now.store(4_000_000_000, Ordering::SeqCst);
+        let error = gige.next_frame(Duration::from_millis(10)).unwrap_err();
+        assert!(ownership_retired(&error));
+        assert_eq!(
+            crate::types::classify(&error).kind,
+            crate::types::ErrorKind::Disconnected
+        );
+        assert!(ownership_retired(&gige.read_memory(0x100, 4).unwrap_err()));
+        assert!(ownership_retired(
+            &gige.write_memory(0x100, &[1, 2, 3, 4]).unwrap_err()
+        ));
+        assert!(ownership_retired(&gige.start(8000).unwrap_err()));
+        assert!(ownership_retired(&gige.optimize_network(8000).unwrap_err()));
+        assert_eq!(gige.device_time_ns(), None);
+        assert_eq!(gige.buffered_frames(), 0);
+        let stream = gige.stream.as_mut().unwrap();
+        stream.assembler.requests.push((902, true, 1, 2));
+        stream.flush();
+        assert!(ownership_retired(&gige.stop().unwrap_err()));
+        drop(gige);
+        let camera = fake.camera.lock().unwrap();
+        assert!(
+            camera.commands.is_empty(),
+            "stale commands: {:?}",
+            camera.commands
+        );
+        assert_eq!(camera.register_writes, Vec::new());
+        assert_eq!(camera.owner, Some(replacement));
+        assert_eq!(camera.register(STREAM_PORT), 32123);
+        assert_eq!(camera.register(GVCP_CONFIGURATION), 0x40);
+        assert_eq!(camera.register(HEARTBEAT_TIMEOUT), 1234);
+        assert_eq!(captured.data.as_ref(), original);
+    }
+    #[test]
+    fn advertised_owner_endpoint_is_full_tuple_and_never_a_fallback() {
+        for mismatch in ["port", "ip", "zero", "ccp_zero", "switchover", "unreadable"] {
+            let fake = Fake::new(|camera| {
+                camera.enforce_owner = true;
+                camera.registers.insert(GVCP_CAPABILITY, OWNER_ENDPOINT);
+            });
+            let mut gige = connect(fake.address, Duration::from_millis(100)).unwrap();
+            let now = controlled_clock(&mut gige);
+            {
+                let mut camera = fake.camera.lock().unwrap();
+                match mismatch {
+                    "port" => {
+                        let port = camera.register(PRIMARY_PORT);
+                        camera.registers.insert(PRIMARY_PORT, port + 1);
+                    }
+                    "ip" => {
+                        camera
+                            .registers
+                            .insert(PRIMARY_IP, u32::from(Ipv4Addr::new(127, 0, 0, 2)));
+                    }
+                    "zero" => {
+                        camera.registers.insert(PRIMARY_PORT, 0);
+                        camera.registers.insert(PRIMARY_IP, 0);
+                    }
+                    "ccp_zero" => {
+                        camera.registers.insert(CONTROL_PRIVILEGE, 0);
+                    }
+                    "switchover" => {
+                        camera.registers.insert(CONTROL_PRIVILEGE, 6);
+                    }
+                    _ => {
+                        camera.unreadable.push(PRIMARY_PORT);
+                    }
+                }
+                camera.commands.clear();
+            }
+            let error = gige.control.lock().unwrap().probe_owner().unwrap_err();
+            if mismatch == "unreadable" {
+                assert_eq!(error.downcast_ref::<GvcpStatus>().unwrap().0, 0x8003);
+            } else {
+                assert!(ownership_retired(&error));
+            }
+            // A missing advertised field never renews the old finite proof.
+            if mismatch == "unreadable" {
+                now.store(4_000_000_000, Ordering::SeqCst);
+            }
+            assert!(ownership_retired(&gige.heartbeat.check().unwrap_err()));
+            fake.camera
+                .lock()
+                .unwrap()
+                .registers
+                .insert(CONTROL_PRIVILEGE, 2);
+            assert!(ownership_retired(&gige.heartbeat.check().unwrap_err()));
+            let before = fake.camera.lock().unwrap().commands.len();
+            drop(gige);
+            assert_eq!(fake.camera.lock().unwrap().commands.len(), before);
+        }
+    }
+    #[test]
+    fn late_initial_claim_never_grants_disabled_or_releases_an_unknown_owner() {
+        for (disabled, late_readback) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let now = Arc::new(std::sync::atomic::AtomicU64::new(1_000_000_000));
+            let fake = Fake::new(|camera| {
+                camera.enforce_owner = true;
+                camera.registers.insert(HEARTBEAT_TIMEOUT, 500);
+                camera.registers.insert(GVCP_CAPABILITY, DISABLE_CAPABILITY);
+                camera
+                    .registers
+                    .insert(GVCP_CONFIGURATION, u32::from(disabled));
+                if late_readback {
+                    camera.jump_on_read = Some((
+                        if disabled {
+                            GVCP_CONFIGURATION
+                        } else {
+                            HEARTBEAT_TIMEOUT
+                        },
+                        now.clone(),
+                        1_500_000_000,
+                    ));
+                } else {
+                    camera.jump_on_claim = Some((now.clone(), 1_500_000_000));
+                }
+            });
+            let mut control = Control::connect(fake.address, Duration::from_millis(100)).unwrap();
+            control.lease_clock = Some(now);
+            let Err(error) = connect_control(control) else {
+                panic!("late claim was accepted");
+            };
+            assert!(ownership_retired(&error), "{error:#}");
+            let camera = fake.camera.lock().unwrap();
+            assert_eq!(camera.register_writes, [(CONTROL_PRIVILEGE, 2)]);
+            assert_eq!(
+                camera
+                    .commands
+                    .iter()
+                    .filter(|(command, _)| *command == WRITE_REGISTER)
+                    .count(),
+                1
+            );
+        }
+    }
+    #[test]
+    fn late_ccp_reply_and_pending_ack_cannot_renew_the_old_proof() {
+        let fake = Fake::new(|camera| {
+            camera.enforce_owner = true;
+        });
+        let mut gige = connect(fake.address, Duration::from_millis(100)).unwrap();
+        let now = controlled_clock(&mut gige);
+        fake.camera.lock().unwrap().jump_on_read = Some((CONTROL_PRIVILEGE, now, 4_000_000_000));
+        let error = gige.control.lock().unwrap().probe_owner().unwrap_err();
+        assert!(ownership_retired(&error));
+        let reads = fake.camera.lock().unwrap().commands.len();
+        drop(gige);
+        assert_eq!(fake.camera.lock().unwrap().commands.len(), reads);
+        drop(fake);
+
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(80)))
+            .unwrap();
+        let SocketAddr::V4(address) = socket.local_addr().unwrap() else {
+            unreachable!()
+        };
+        let (lease, now) = Lease::testing(2000, false);
+        let server = thread::spawn(move || {
+            let mut request = [0u8; 128];
+            let (_, peer) = socket.recv_from(&mut request).unwrap();
+            let id = be16(&request, 6);
+            let pending = ack(PENDING_ACK, id, 0, &[0, 0, 3, 232]);
+            now.store(3_000_000_000, Ordering::SeqCst);
+            socket.send_to(&pending, peer).unwrap();
+            socket
+                .send_to(&ack(READ_REGISTER + 1, id, 0, &2u32.to_be_bytes()), peer)
+                .unwrap();
+            let error = socket.recv_from(&mut request).unwrap_err();
+            assert!(is_receive_timeout(&error));
+        });
+        let mut control = Control::connect(address, Duration::from_millis(100)).unwrap();
+        control.lease = Some(lease);
+        assert!(ownership_retired(
+            &control.read_register(0x100).unwrap_err()
+        ));
+        assert!(ownership_retired(
+            &control.write_register(0x100, 1).unwrap_err()
+        ));
+        control.release(2000);
+        server.join().unwrap();
+    }
+    #[test]
+    fn full_command_budget_refreshes_before_a_clipped_long_call() {
+        let fake = Fake::new(|camera| {
+            camera.registers.insert(CONTROL_PRIVILEGE, 2);
+            camera.registers.insert(0x100, 42);
+        });
+        let mut control = Control::connect(fake.address, Duration::from_millis(900)).unwrap();
+        let (lease, now) = Lease::testing(1000, false);
+        now.store(1_300_000_000, Ordering::SeqCst);
+        control.lease = Some(lease.clone());
+        assert_eq!(control.read_register(0x100).unwrap(), 42);
+        assert_eq!(
+            fake.camera.lock().unwrap().register_reads,
+            [CONTROL_PRIVILEGE, 0x100]
+        );
+        assert_eq!(
+            lease.remaining().unwrap(),
+            Some(Duration::from_millis(1000))
+        );
+    }
+    #[test]
+    fn finite_timer_and_partial_or_mixed_managed_writes_fail_before_wire() {
+        let fake = Fake::new(|camera| {
+            camera.enforce_owner = true;
+        });
+        let mut gige = connect(fake.address, Duration::from_millis(100)).unwrap();
+        let _ = controlled_clock(&mut gige);
+        let mut control = gige.control.lock().unwrap();
+        fake.camera.lock().unwrap().commands.clear();
+        for value in [0, 500, 4000] {
+            let error = control
+                .write_register(HEARTBEAT_TIMEOUT, value)
+                .unwrap_err();
+            assert_eq!(
+                crate::types::classify(&error).kind,
+                crate::types::ErrorKind::Unsupported
+            );
+        }
+        for value in [1, 3, 6, 0x1234_0002] {
+            let error = control
+                .write_register(CONTROL_PRIVILEGE, value)
+                .unwrap_err();
+            assert_eq!(
+                crate::types::classify(&error).kind,
+                crate::types::ErrorKind::Unsupported
+            );
+        }
+        for (address, data) in [
+            (u64::from(HEARTBEAT_TIMEOUT), vec![1]),
+            (u64::from(HEARTBEAT_TIMEOUT) - 4, vec![0; 8]),
+            (u64::from(CONTROL_PRIVILEGE) + 1, vec![0; 3]),
+        ] {
+            let error = control.write_bytes(address, &data).unwrap_err();
+            assert_eq!(
+                crate::types::classify(&error).kind,
+                crate::types::ErrorKind::Unsupported
+            );
+        }
+        let error = control.write_register(SWITCHOVER_KEY, 12).unwrap_err();
+        assert_eq!(
+            crate::types::classify(&error).kind,
+            crate::types::ErrorKind::Unsupported
+        );
+        assert_eq!(fake.camera.lock().unwrap().commands, Vec::new());
+        drop(control);
+    }
+    #[test]
+    fn managed_whole_memory_words_follow_verified_device_order() {
+        for (legacy, little) in [(true, false), (true, true), (false, false), (false, true)] {
+            let fake = Fake::new(|camera| {
+                camera.enforce_owner = true;
+                camera.little_endian = little;
+                camera
+                    .registers
+                    .insert(DEVICE_MODE, if little { 0 } else { 0x8000_0000 });
+            });
+            let mut gige = connect(fake.address, Duration::from_millis(100)).unwrap();
+            let now = controlled_clock(&mut gige);
+            let mut control = gige.control.lock().unwrap();
+            control.legacy_registers = legacy;
+            fake.camera.lock().unwrap().register_writes.clear();
+            let bytes = if !legacy && little {
+                3000u32.to_le_bytes()
+            } else {
+                3000u32.to_be_bytes()
+            };
+            now.store(1_500_000_000, Ordering::SeqCst);
+            control
+                .write_bytes(u64::from(HEARTBEAT_TIMEOUT), &bytes)
+                .unwrap();
+            assert_eq!(
+                control.lease.as_ref().unwrap().remaining().unwrap(),
+                Some(Duration::from_millis(2500))
+            );
+            let camera = fake.camera.lock().unwrap();
+            assert_eq!(camera.register_writes, [(HEARTBEAT_TIMEOUT, 3000)]);
+            assert_eq!(camera.memory_writes, Vec::new());
+            drop(camera);
+            drop(control);
+        }
+    }
+    #[test]
+    fn disabled_wire_transition_retains_shadow_and_owned_release() {
+        let fake = Fake::new(|camera| {
+            camera.enforce_owner = true;
+            camera
+                .registers
+                .insert(GVCP_CAPABILITY, DISABLE_CAPABILITY | OWNER_ENDPOINT);
+        });
+        let mut gige = connect(fake.address, Duration::from_millis(100)).unwrap();
+        let now = controlled_clock(&mut gige);
+        let mut control = gige.control.lock().unwrap();
+        control
+            .write_register(GVCP_CONFIGURATION, HEARTBEAT_DISABLE)
+            .unwrap();
+        assert!(control.lease.as_ref().unwrap().disabled());
+        now.store(1_100_000_000, Ordering::SeqCst);
+        control.write_register(GVCP_CONFIGURATION, 0).unwrap();
+        assert!(!control.lease.as_ref().unwrap().disabled());
+        control
+            .write_register(GVCP_CONFIGURATION, HEARTBEAT_DISABLE)
+            .unwrap();
+        now.store(5_000_000_000, Ordering::SeqCst);
+        control.probe_owner().unwrap();
+        let before = fake.camera.lock().unwrap().register_writes.len();
+        let error = control.write_register(GVCP_CONFIGURATION, 0).unwrap_err();
+        assert_eq!(
+            crate::types::classify(&error).kind,
+            crate::types::ErrorKind::Unsupported
+        );
+        assert_eq!(fake.camera.lock().unwrap().register_writes.len(), before);
+        // A timeout read error removes finite permission, while the verified
+        // disabled owner can still deliberately release once.
+        fake.camera
+            .lock()
+            .unwrap()
+            .unreadable
+            .push(HEARTBEAT_TIMEOUT);
+        let error = control.write_register(HEARTBEAT_TIMEOUT, 500).unwrap_err();
+        assert_eq!(error.downcast_ref::<GvcpStatus>().unwrap().0, 0x8003);
+        assert!(control.lease.as_ref().unwrap().disabled());
+        assert_eq!(control.lease.as_ref().unwrap().timeout_ms(), None);
+        control.write_register(CONTROL_PRIVILEGE, 0).unwrap();
+        assert_eq!(fake.register(CONTROL_PRIVILEGE), 0);
+        drop(control);
+    }
+    #[test]
+    fn raw_release_restores_only_owned_bits_before_one_lost_ack_and_new_owner() {
+        let fake = Fake::new(|camera| {
+            camera.enforce_owner = true;
+            camera
+                .registers
+                .insert(GVCP_CAPABILITY, DISABLE_CAPABILITY | OWNER_ENDPOINT | 0x20);
+            camera
+                .registers
+                .insert(GVCP_CONFIGURATION, HEARTBEAT_DISABLE);
+        });
+        let mut gige = connect(fake.address, Duration::from_millis(90)).unwrap();
+        let _ = controlled_clock(&mut gige);
+        let replacement = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 62223);
+        {
+            let mut camera = fake.camera.lock().unwrap();
+            camera.registers.insert(GVCP_CONFIGURATION, 0x43);
+            camera.release_replacement = Some(replacement);
+            camera.commands.clear();
+            camera.register_writes.clear();
+        }
+        let mut control = gige.control.lock().unwrap();
+        let error = control.write_register(CONTROL_PRIVILEGE, 0).unwrap_err();
+        assert!(error.downcast_ref::<GvcpTimeout>().is_some());
+        assert!(ownership_retired(
+            &control.read_register(CONTROL_PRIVILEGE).unwrap_err()
+        ));
+        drop(control);
+        drop(gige);
+        let camera = fake.camera.lock().unwrap();
+        assert_eq!(
+            camera.register_writes,
+            [(GVCP_CONFIGURATION, 0x41), (CONTROL_PRIVILEGE, 0)]
+        );
+        assert_eq!(camera.commands.last().unwrap().0, WRITE_REGISTER);
+        assert_eq!(
+            camera
+                .commands
+                .iter()
+                .filter(|(command, _)| *command == WRITE_REGISTER)
+                .count(),
+            2
+        );
+        assert_eq!(camera.owner, Some(replacement));
+        assert_eq!(camera.register(GVCP_CONFIGURATION), 0x41);
+        assert_eq!(camera.register(CONTROL_PRIVILEGE), 2);
+    }
+    #[test]
+    fn lost_claim_ack_never_reclaims_or_cleans_up_a_hidden_new_owner() {
+        let now = Arc::new(std::sync::atomic::AtomicU64::new(1_000_000_000));
+        let replacement = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 62224);
+        let fake = Fake::new(|camera| {
+            camera.enforce_owner = true;
+            camera.drop_claim_ack = true;
+            camera.claim_replacement = Some(replacement);
+            camera.jump_on_claim = Some((now.clone(), 1_200_000_000));
+        });
+        let mut control = Control::connect(fake.address, Duration::from_millis(90)).unwrap();
+        control.lease_clock = Some(now);
+        let Err(error) = connect_control(control) else {
+            panic!("unconfirmed claim was accepted");
+        };
+        assert!(error.downcast_ref::<GvcpTimeout>().is_some(), "{error:#}");
+        let camera = fake.camera.lock().unwrap();
+        assert_eq!(camera.register(HEARTBEAT_TIMEOUT), 3000);
+        assert_eq!(camera.owner, Some(replacement));
+        assert_eq!(camera.register(CONTROL_PRIVILEGE), 2);
+        assert_eq!(camera.register_writes, [(CONTROL_PRIVILEGE, 2)]);
+        assert_eq!(
+            camera
+                .commands
+                .iter()
+                .filter(|(command, _)| *command == WRITE_REGISTER)
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn ids_custom_codes_do_not_gain_native_gvsp_wire_semantics() {
+        for code in [
+            0x4000_000f_u32,
+            0x4000_001f,
+            0x4000_0001,
+            0x4000_0011,
+            0x4000_0002,
+            0x4000_0012,
+            0x4000_0003,
+            0x4000_0013,
+            0x4000_0004,
+            0x4000_0014,
+        ] {
+            for payload in [1_u16, 5, 0x4001] {
+                let mut bytes = leader(4, 2, code);
+                bytes[2..4].copy_from_slice(&payload.to_be_bytes());
+                assert!(
+                    ImageLeader::parse(&bytes, 128)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("pixel format")
+                );
+            }
+            let body = [leader(4, 2, code), trailer(2), vec![0; 12]].concat();
+            let packet = gvsp(42, 0x00ff_ffff, 4, false, &body);
+            let mut assembler = Assembler::new(128, 1500, 0);
+            assert!(
+                assembler
+                    .push(&packet)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("pixel format")
+            );
+            assert!(assembler.frames.is_empty() && assembler.ready.is_empty());
+            assert_eq!(assembler.copied, (0, 0));
+            let frame = frame_packets(43, false, 2, 2, 1464)
+                .iter()
+                .find_map(|packet| assembler.push(packet).unwrap())
+                .unwrap();
+            assert_eq!(frame.data, image(2, 2));
+            assert!(frame.pixel_encoding.is_none());
+        }
+    }
+
+    #[test]
+    fn packed_bicolor_reordered_packets_and_resend_keep_exact_native_bytes() {
+        let literal: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/bicolor/packed-literals.json"
+        ))
+        .unwrap();
+        for (case, codes) in [
+            (0, [0x0214_00a8, 0x0214_00aa]),
+            (1, [0x0218_00ac, 0x0218_00ae]),
+        ] {
+            let case = &literal["cases"][case];
+            let raw = crate::types::decode_hex(case["tight_hex"].as_str().unwrap(), 128).unwrap();
+            let width = u32::try_from(case["width"].as_u64().unwrap()).unwrap();
+            assert!(raw.len() > 16);
+            for code in codes {
+                for big in [false, true] {
+                    assert_eq!(sample_bytes(code), None);
+                    let start = Instant::now();
+                    let mut assembler = Assembler::new(raw.len(), 44, 0);
+                    assembler.big_endian = big;
+                    assembler.resend = true;
+                    let packets = [
+                        gvsp(1, 0, 1, false, &leader(width, 2, code)),
+                        gvsp(1, 1, 3, false, &raw[..8]),
+                        gvsp(1, 2, 3, false, &raw[8..16]),
+                        gvsp(1, 3, 3, false, &raw[16..]),
+                        gvsp(1, 4, 2, false, &trailer(2)),
+                    ];
+                    for index in [0, 3, 1, 4] {
+                        assert!(assembler.push_at(&packets[index], start).unwrap().is_none());
+                    }
+                    assembler.poll(start + RESEND_IDLE);
+                    assert!(assembler.ready.is_empty());
+                    assert!(
+                        assembler
+                            .requests
+                            .iter()
+                            .any(|&(block, extended, first, last)| block == 1
+                                && !extended
+                                && first <= 2
+                                && last >= 2)
+                    );
+                    let recovered = assembler.stats.resend_recovered;
+                    let mut resent = packets[2].clone();
+                    resent[..2].copy_from_slice(&0x0100_u16.to_be_bytes());
+                    let frame = assembler
+                        .push_at(&resent, start + RESEND_IDLE)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        (frame.width, frame.height, frame.pixel_format),
+                        (width, 2, code)
+                    );
+                    assert_eq!(frame.data.as_ref(), raw);
+                    crate::frame::validate_source(&frame).unwrap();
+                    assert_eq!(assembler.stats.resend_recovered, recovered + 1);
+                    assert!(assembler.frames.is_empty());
+                }
+            }
+        }
+        for (width, height) in [(1, 1), (3, 1), (3, 2)] {
+            for code in [0x0214_00a8, 0x0214_00aa] {
+                let error = ImageLeader::parse(&leader(width, height, code), 64).unwrap_err();
+                assert_eq!(
+                    crate::types::classify(&error).kind,
+                    crate::types::ErrorKind::Unsupported
+                );
+            }
         }
     }
 }

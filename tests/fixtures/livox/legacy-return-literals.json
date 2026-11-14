@@ -1,0 +1,347 @@
+{
+  "schema": 1,
+  "provenance": "Independent hand-selected native values packed from manufacturer legacy v5 field tables; frozen before legacy decoder work; not SDK/device capture",
+  "primary_revision": "3e9ef1d90391a038c6a59dfe154fab65df31e915",
+  "note": "first_records preserve wire record/return grouping. Native ordinary XYZ remains signed mm. Single spherical records are depth/theta/phi/reflection/tag; dual/triple spherical record angles precede shared depth/reflection/tag groups. Zero tails are exact record extents, not payload padding.",
+  "recipes": {
+    "legacy_type_2": {
+      "header_hex": "0501027f420000c00002efcdab89674523f1",
+      "prefix_hex": "18fcffffd007000048f4ffff11e40000008000000000ffffff7fff3f",
+      "zero_tail_bytes": 1316,
+      "bytes": 1362,
+      "sha256": "baf631ea2b1d7c4cab37ef90c952575fdc4d153c3e07a77d8d34b5c54c756314",
+      "expected": {
+        "data_type": 2,
+        "status_raw": 3221225538,
+        "timestamp_type": 0,
+        "timestamp_word_raw": 17375808098319191535,
+        "native": {
+          "layout": "cartesian_i32",
+          "record_count": 96,
+          "returns_per_record": 1,
+          "coordinate_unit_mm": 1,
+          "first_records": [
+            [
+              [
+                -1000,
+                2000,
+                -3000,
+                17,
+                228
+              ]
+            ],
+            [
+              [
+                -2147483648,
+                0,
+                2147483647,
+                255,
+                63
+              ]
+            ]
+          ],
+          "zero_records": 94
+        }
+      }
+    },
+    "legacy_type_3": {
+      "header_hex": "0501027f420000c00003efcdab89674523f1",
+      "prefix_hex": "40e201005046a08c42e42a0000000100ffff1100",
+      "zero_tail_bytes": 940,
+      "bytes": 978,
+      "sha256": "38a4543d7eea9e7b72e0ebf5e3482830a8992a43f83f9396b55b167cb19d92a9",
+      "expected": {
+        "data_type": 3,
+        "status_raw": 3221225538,
+        "timestamp_type": 0,
+        "timestamp_word_raw": 17375808098319191535,
+        "native": {
+          "layout": "spherical",
+          "record_count": 96,
+          "returns_per_record": 1,
+          "first_angles": [
+            [
+              18000,
+              36000
+            ],
+            [
+              1,
+              65535
+            ]
+          ],
+          "first_records": [
+            [
+              [
+                123456,
+                66,
+                228
+              ]
+            ],
+            [
+              [
+                42,
+                17,
+                0
+              ]
+            ]
+          ],
+          "zero_records": 94,
+          "angles_within_nominal_prefix": [
+            true,
+            false
+          ]
+        }
+      }
+    },
+    "legacy_type_4": {
+      "header_hex": "0501027f420000c00004efcdab89674523f1",
+      "prefix_hex": "18fcffffd007000048f4ffff11e40000008000000000ffffff7fff3f00000000000000000000000000ff01000000feffffff030000008055",
+      "zero_tail_bytes": 1288,
+      "bytes": 1362,
+      "sha256": "fd76589e07e7e7780a075977de87831e92b79c85cfa1543ff690638334878fd6",
+      "expected": {
+        "data_type": 4,
+        "status_raw": 3221225538,
+        "timestamp_type": 0,
+        "timestamp_word_raw": 17375808098319191535,
+        "native": {
+          "layout": "cartesian_i32",
+          "record_count": 48,
+          "returns_per_record": 2,
+          "coordinate_unit_mm": 1,
+          "first_records": [
+            [
+              [
+                -1000,
+                2000,
+                -3000,
+                17,
+                228
+              ],
+              [
+                -2147483648,
+                0,
+                2147483647,
+                255,
+                63
+              ]
+            ],
+            [
+              [
+                0,
+                0,
+                0,
+                0,
+                255
+              ],
+              [
+                1,
+                -2,
+                3,
+                128,
+                85
+              ]
+            ]
+          ],
+          "zero_records": 46
+        }
+      }
+    },
+    "legacy_type_5": {
+      "header_hex": "0501027f420000c00005efcdab89674523f1",
+      "prefix_hex": "5046a08c40e2010042e40000000000ff0100ffff2a0000001100010000008055",
+      "zero_tail_bytes": 736,
+      "bytes": 786,
+      "sha256": "1f63ac86af04f5c3d242ad569fdf0ad9d4fbd309c9d69094659ca20532cc1da0",
+      "expected": {
+        "data_type": 5,
+        "status_raw": 3221225538,
+        "timestamp_type": 0,
+        "timestamp_word_raw": 17375808098319191535,
+        "native": {
+          "layout": "spherical",
+          "record_count": 48,
+          "returns_per_record": 2,
+          "first_angles": [
+            [
+              18000,
+              36000
+            ],
+            [
+              1,
+              65535
+            ]
+          ],
+          "first_records": [
+            [
+              [
+                123456,
+                66,
+                228
+              ],
+              [
+                0,
+                0,
+                255
+              ]
+            ],
+            [
+              [
+                42,
+                17,
+                0
+              ],
+              [
+                1,
+                128,
+                85
+              ]
+            ]
+          ],
+          "zero_records": 46,
+          "angles_within_nominal_prefix": [
+            true,
+            false
+          ]
+        }
+      }
+    },
+    "legacy_type_7": {
+      "header_hex": "0501027f420000c00007efcdab89674523f1",
+      "prefix_hex": "18fcffffd007000048f4ffff11e40000008000000000ffffff7fff3f00000000000000000000000000ff01000000feffffff030000008055fcffffff05000000faffffff0180ffffff7f000000802a00000042a1",
+      "zero_tail_bytes": 1176,
+      "bytes": 1278,
+      "sha256": "4e29ad4a204d0485e6c9468068312506e1d00aac03884b2d5ddd6e8ebe62d859",
+      "expected": {
+        "data_type": 7,
+        "status_raw": 3221225538,
+        "timestamp_type": 0,
+        "timestamp_word_raw": 17375808098319191535,
+        "native": {
+          "layout": "cartesian_i32",
+          "record_count": 30,
+          "returns_per_record": 3,
+          "coordinate_unit_mm": 1,
+          "first_records": [
+            [
+              [
+                -1000,
+                2000,
+                -3000,
+                17,
+                228
+              ],
+              [
+                -2147483648,
+                0,
+                2147483647,
+                255,
+                63
+              ],
+              [
+                0,
+                0,
+                0,
+                0,
+                255
+              ]
+            ],
+            [
+              [
+                1,
+                -2,
+                3,
+                128,
+                85
+              ],
+              [
+                -4,
+                5,
+                -6,
+                1,
+                128
+              ],
+              [
+                2147483647,
+                -2147483648,
+                42,
+                66,
+                161
+              ]
+            ]
+          ],
+          "zero_records": 28
+        }
+      }
+    },
+    "legacy_type_8": {
+      "header_hex": "0501027f420000c00008efcdab89674523f1",
+      "prefix_hex": "5046a08c40e2010042e40000000000ffffffffffff3f0100ffff2a00000011000100000080550000000000a1",
+      "zero_tail_bytes": 616,
+      "bytes": 678,
+      "sha256": "8825e8b32ab4168e49403bcd07f3b9e32fb37a08737afe9c5e38186bf455bc76",
+      "expected": {
+        "data_type": 8,
+        "status_raw": 3221225538,
+        "timestamp_type": 0,
+        "timestamp_word_raw": 17375808098319191535,
+        "native": {
+          "layout": "spherical",
+          "record_count": 30,
+          "returns_per_record": 3,
+          "first_angles": [
+            [
+              18000,
+              36000
+            ],
+            [
+              1,
+              65535
+            ]
+          ],
+          "first_records": [
+            [
+              [
+                123456,
+                66,
+                228
+              ],
+              [
+                0,
+                0,
+                255
+              ],
+              [
+                4294967295,
+                255,
+                63
+              ]
+            ],
+            [
+              [
+                42,
+                17,
+                0
+              ],
+              [
+                1,
+                128,
+                85
+              ],
+              [
+                0,
+                0,
+                161
+              ]
+            ]
+          ],
+          "zero_records": 28,
+          "angles_within_nominal_prefix": [
+            true,
+            false
+          ]
+        }
+      }
+    }
+  }
+}

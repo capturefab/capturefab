@@ -932,6 +932,7 @@ impl Va {
             .collect();
         let gray: Vec<u8> = rgb.chunks(3).map(|p| p[1]).collect();
         let frame = |format, data: Vec<u8>| Frame {
+            pixel_encoding: None,
             width,
             height,
             pixel_format: format,

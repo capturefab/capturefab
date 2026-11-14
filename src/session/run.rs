@@ -65,6 +65,17 @@ struct LineRef<'a> {
 }
 
 /// Run as a camera worker; `args` follow `__worker`.
+/// Give an isolated native helper its private protocol output before loading
+/// vendor code, whose prints must never reach the framed protocol pipe.
+#[cfg(any(
+    feature = "gentl",
+    feature = "usb",
+    all(feature = "ni-daqmx", any(target_os = "linux", windows))
+))]
+pub(crate) fn protocol_output() -> Result<std::fs::File> {
+    platform::protocol_output()
+}
+
 pub(crate) fn run_worker(args: impl Iterator<Item = std::ffi::OsString>) -> Result<()> {
     crate::host::return_freed_frames();
     let args = arguments(args)?;

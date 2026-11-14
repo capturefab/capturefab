@@ -1,0 +1,1815 @@
+{
+  "schema": 1,
+  "status": "independent_predecoder_hand_recipes",
+  "not_device_captures": true,
+  "construction": "literal LE fields + explicit sparse native words/repeated rows; zlib CRC32 and hashlib metadata only; no product imports",
+  "ksy_commit": "7ea18d7afce430a3ec02b1c20ca57aa86392809a",
+  "prior_corpus_sha256": "4773e8ee8313727aa2fcf8cdf755c28eb4fcf74b1928add0e88c9e17f50ba119",
+  "cases": [
+    {
+      "name": "lrs_v3_two_unequal_modules",
+      "telegram_type": 1,
+      "telegram_version": 3,
+      "recipe": [
+        {
+          "field": "complete_frame_without_crc",
+          "hex": "0202020201000000010000000000000008070605040302010300000046000000000000000000000005000000000000002a0000000100000001000000010000006400000000000000c800000000000000000000800000803f000000407c000000000100000700010000000000000005000000000000002a0000000200000002000000010000002c0100000000000090010000000000005e01000000000000c20100000000000000000000000000800000803f000080bf00000040000000c000000000000303000a0014000040010b0015000140020c0016000240030d001700034004"
+        }
+      ],
+      "field_wire_ranges": [
+        {
+          "field": "complete_frame_without_crc",
+          "wire_byte_range": [
+            0,
+            226
+          ]
+        }
+      ],
+      "crc32": 386306855,
+      "crc32_le_hex": "27930617",
+      "packet_bytes": 230,
+      "packet_sha256": "14d65b697e77e07fcaf32e70ae852a7d34d3a66ce7cf203b7df52debece3c271",
+      "oracle": {
+        "independent_source_corpus_sha256": "4773e8ee8313727aa2fcf8cdf755c28eb4fcf74b1928add0e88c9e17f50ba119",
+        "source_case": "v3_two_unequal_modules",
+        "native": {
+          "telegram_type": 1,
+          "telegram_counter": 1,
+          "transmit_timestamp_raw": 72623859790382856,
+          "transmit_timestamp_basis": "unix_microseconds_declared",
+          "version": 3,
+          "size_module_0": 70,
+          "modules": [
+            {
+              "segment_counter": 0,
+              "frame_number": 5,
+              "sender_id": 42,
+              "line_count": 1,
+              "beams_per_line": 1,
+              "echoes_per_beam": 1,
+              "timestamp_start_raw": [
+                100
+              ],
+              "timestamp_stop_raw": [
+                200
+              ],
+              "line_timestamp_basis": "device_timebase_microseconds_declared",
+              "phi_words": [
+                2147483648
+              ],
+              "theta_start_words": [
+                1065353216
+              ],
+              "theta_stop_words": [
+                1073741824
+              ],
+              "next_module_size": 124,
+              "reserved_raw": [
+                0,
+                0
+              ],
+              "echo_mask_raw": 1,
+              "beam_mask_raw": 0,
+              "present_echo_fields": [
+                "distance_raw"
+              ],
+              "present_beam_fields": [],
+              "distance_relation": {
+                "unit": "mm",
+                "basis": "raw_for_v3_or_raw_times_module_scale_for_v4"
+              },
+              "echo_values": [
+                {
+                  "beam": 0,
+                  "line": 0,
+                  "echo": 0,
+                  "distance_raw": 7
+                }
+              ],
+              "beam_values": [],
+              "module_bytes": 70
+            },
+            {
+              "segment_counter": 1,
+              "frame_number": 5,
+              "sender_id": 42,
+              "line_count": 2,
+              "beams_per_line": 2,
+              "echoes_per_beam": 1,
+              "timestamp_start_raw": [
+                300,
+                400
+              ],
+              "timestamp_stop_raw": [
+                350,
+                450
+              ],
+              "line_timestamp_basis": "device_timebase_microseconds_declared",
+              "phi_words": [
+                0,
+                2147483648
+              ],
+              "theta_start_words": [
+                1065353216,
+                3212836864
+              ],
+              "theta_stop_words": [
+                1073741824,
+                3221225472
+              ],
+              "next_module_size": 0,
+              "reserved_raw": [
+                0,
+                0
+              ],
+              "echo_mask_raw": 3,
+              "beam_mask_raw": 3,
+              "present_echo_fields": [
+                "distance_raw",
+                "rssi_raw"
+              ],
+              "present_beam_fields": [
+                "properties_raw",
+                "azimuth_raw"
+              ],
+              "distance_relation": {
+                "unit": "mm",
+                "basis": "raw_for_v3_or_raw_times_module_scale_for_v4"
+              },
+              "echo_values": [
+                {
+                  "beam": 0,
+                  "line": 0,
+                  "echo": 0,
+                  "distance_raw": 10,
+                  "rssi_raw": 20
+                },
+                {
+                  "beam": 0,
+                  "line": 1,
+                  "echo": 0,
+                  "distance_raw": 11,
+                  "rssi_raw": 21
+                },
+                {
+                  "beam": 1,
+                  "line": 0,
+                  "echo": 0,
+                  "distance_raw": 12,
+                  "rssi_raw": 22
+                },
+                {
+                  "beam": 1,
+                  "line": 1,
+                  "echo": 0,
+                  "distance_raw": 13,
+                  "rssi_raw": 23
+                }
+              ],
+              "beam_values": [
+                {
+                  "beam": 0,
+                  "line": 0,
+                  "azimuth_raw": 16384,
+                  "properties_raw": 1,
+                  "reflector": true,
+                  "property_reserved_bits_masked": 0
+                },
+                {
+                  "beam": 0,
+                  "line": 1,
+                  "azimuth_raw": 16385,
+                  "properties_raw": 2,
+                  "reflector": false,
+                  "property_reserved_bits_masked": 2
+                },
+                {
+                  "beam": 1,
+                  "line": 0,
+                  "azimuth_raw": 16386,
+                  "properties_raw": 3,
+                  "reflector": true,
+                  "property_reserved_bits_masked": 2
+                },
+                {
+                  "beam": 1,
+                  "line": 1,
+                  "azimuth_raw": 16387,
+                  "properties_raw": 4,
+                  "reflector": false,
+                  "property_reserved_bits_masked": 4
+                }
+              ],
+              "module_bytes": 124
+            }
+          ],
+          "source_time": "omitted",
+          "clock_sync": "not_verified"
+        }
+      },
+      "packet_hex": "0202020201000000010000000000000008070605040302010300000046000000000000000000000005000000000000002a0000000100000001000000010000006400000000000000c800000000000000000000800000803f000000407c000000000100000700010000000000000005000000000000002a0000000200000002000000010000002c0100000000000090010000000000005e01000000000000c20100000000000000000000000000800000803f000080bf00000040000000c000000000000303000a0014000040010b0015000140020c0016000240030d00170003400427930617"
+    },
+    {
+      "name": "lrs_v4_two_unequal_modules",
+      "telegram_type": 1,
+      "telegram_version": 4,
+      "recipe": [
+        {
+          "field": "complete_frame_without_crc",
+          "hex": "0202020201000000010000000000000008070605040302010400000049000000000000000000000005000000000000002a0000000100000001000000020000006400000000000000c800000000000000000000800000803f000000400000803e7a0000000000010081010000000000000005000000000000002a0000000200000001000000020000002c0100000000000090010000000000005e01000000000000c20100000000000000000000000000800000803f000080bf00000040000000c00000803f00000000000303000a0014000b0015000100400c0016000d001700020140"
+        }
+      ],
+      "field_wire_ranges": [
+        {
+          "field": "complete_frame_without_crc",
+          "wire_byte_range": [
+            0,
+            227
+          ]
+        }
+      ],
+      "crc32": 680875121,
+      "crc32_le_hex": "71549528",
+      "packet_bytes": 231,
+      "packet_sha256": "26d3ace80e4611742bd2c84c1ab10104d6561b53d502b0a9ce6eebe5399e09b7",
+      "oracle": {
+        "independent_source_corpus_sha256": "4773e8ee8313727aa2fcf8cdf755c28eb4fcf74b1928add0e88c9e17f50ba119",
+        "source_case": "v4_two_unequal_modules",
+        "native": {
+          "telegram_type": 1,
+          "telegram_counter": 1,
+          "transmit_timestamp_raw": 72623859790382856,
+          "transmit_timestamp_basis": "unix_microseconds_declared",
+          "version": 4,
+          "size_module_0": 73,
+          "modules": [
+            {
+              "segment_counter": 0,
+              "frame_number": 5,
+              "sender_id": 42,
+              "line_count": 1,
+              "beams_per_line": 1,
+              "echoes_per_beam": 2,
+              "timestamp_start_raw": [
+                100
+              ],
+              "timestamp_stop_raw": [
+                200
+              ],
+              "line_timestamp_basis": "device_timebase_microseconds_declared",
+              "phi_words": [
+                2147483648
+              ],
+              "theta_start_words": [
+                1065353216
+              ],
+              "theta_stop_words": [
+                1073741824
+              ],
+              "next_module_size": 122,
+              "reserved_raw": [
+                0,
+                0
+              ],
+              "echo_mask_raw": 0,
+              "beam_mask_raw": 1,
+              "present_echo_fields": [],
+              "present_beam_fields": [
+                "properties_raw"
+              ],
+              "distance_relation": {
+                "unit": "mm",
+                "basis": "raw_for_v3_or_raw_times_module_scale_for_v4"
+              },
+              "echo_values": [],
+              "beam_values": [
+                {
+                  "beam": 0,
+                  "line": 0,
+                  "properties_raw": 129,
+                  "reflector": true,
+                  "property_reserved_bits_masked": 128
+                }
+              ],
+              "distance_scale_word": 1048576000,
+              "module_bytes": 73
+            },
+            {
+              "segment_counter": 1,
+              "frame_number": 5,
+              "sender_id": 42,
+              "line_count": 2,
+              "beams_per_line": 1,
+              "echoes_per_beam": 2,
+              "timestamp_start_raw": [
+                300,
+                400
+              ],
+              "timestamp_stop_raw": [
+                350,
+                450
+              ],
+              "line_timestamp_basis": "device_timebase_microseconds_declared",
+              "phi_words": [
+                0,
+                2147483648
+              ],
+              "theta_start_words": [
+                1065353216,
+                3212836864
+              ],
+              "theta_stop_words": [
+                1073741824,
+                3221225472
+              ],
+              "next_module_size": 0,
+              "reserved_raw": [
+                0,
+                0
+              ],
+              "echo_mask_raw": 3,
+              "beam_mask_raw": 3,
+              "present_echo_fields": [
+                "distance_raw",
+                "rssi_raw"
+              ],
+              "present_beam_fields": [
+                "properties_raw",
+                "azimuth_raw"
+              ],
+              "distance_relation": {
+                "unit": "mm",
+                "basis": "raw_for_v3_or_raw_times_module_scale_for_v4"
+              },
+              "echo_values": [
+                {
+                  "beam": 0,
+                  "line": 0,
+                  "echo": 0,
+                  "distance_raw": 10,
+                  "rssi_raw": 20
+                },
+                {
+                  "beam": 0,
+                  "line": 0,
+                  "echo": 1,
+                  "distance_raw": 11,
+                  "rssi_raw": 21
+                },
+                {
+                  "beam": 0,
+                  "line": 1,
+                  "echo": 0,
+                  "distance_raw": 12,
+                  "rssi_raw": 22
+                },
+                {
+                  "beam": 0,
+                  "line": 1,
+                  "echo": 1,
+                  "distance_raw": 13,
+                  "rssi_raw": 23
+                }
+              ],
+              "beam_values": [
+                {
+                  "beam": 0,
+                  "line": 0,
+                  "azimuth_raw": 16384,
+                  "properties_raw": 1,
+                  "reflector": true,
+                  "property_reserved_bits_masked": 0
+                },
+                {
+                  "beam": 0,
+                  "line": 1,
+                  "azimuth_raw": 16385,
+                  "properties_raw": 2,
+                  "reflector": false,
+                  "property_reserved_bits_masked": 2
+                }
+              ],
+              "distance_scale_word": 1065353216,
+              "module_bytes": 122
+            }
+          ],
+          "source_time": "omitted",
+          "clock_sync": "not_verified"
+        }
+      },
+      "packet_hex": "0202020201000000010000000000000008070605040302010400000049000000000000000000000005000000000000002a0000000100000001000000020000006400000000000000c800000000000000000000800000803f000000400000803e7a0000000000010081010000000000000005000000000000002a0000000200000001000000020000002c0100000000000090010000000000005e01000000000000c20100000000000000000000000000800000803f000080bf00000040000000c00000803f00000000000303000a0014000b0015000100400c0016000d00170002014071549528"
+    },
+    {
+      "name": "lrs_full_9000_v3",
+      "telegram_type": 1,
+      "telegram_version": 3,
+      "recipe": [
+        {
+          "field": "header",
+          "hex": "02020202010000000100000000000000ffffffffffffffff030000009c0f0200"
+        },
+        {
+          "field": "module_metadata",
+          "hex": "1032547698badcfe08070605040302014433221101000000282300000300000008070605040302011032547698badcfe00000080000080bf0000803f00000000a503035a"
+        },
+        {
+          "field": "record_first",
+          "hex": "0100ff00ffff010002000300004081"
+        },
+        {
+          "field": "record_second",
+          "hex": "2a002b002c002d002e002f00325402"
+        },
+        {
+          "field": "zero_middle_records",
+          "repeat_hex": "000000000000000000000000000000",
+          "repeat": 8997
+        },
+        {
+          "field": "record_last",
+          "hex": "3412cdab0000ffffffff0000fffffe"
+        }
+      ],
+      "field_wire_ranges": [
+        {
+          "field": "header",
+          "wire_byte_range": [
+            0,
+            32
+          ]
+        },
+        {
+          "field": "module_metadata",
+          "wire_byte_range": [
+            32,
+            100
+          ]
+        },
+        {
+          "field": "record_first",
+          "wire_byte_range": [
+            100,
+            115
+          ]
+        },
+        {
+          "field": "record_second",
+          "wire_byte_range": [
+            115,
+            130
+          ]
+        },
+        {
+          "field": "zero_middle_records",
+          "wire_byte_range": [
+            130,
+            135085
+          ]
+        },
+        {
+          "field": "record_last",
+          "wire_byte_range": [
+            135085,
+            135100
+          ]
+        }
+      ],
+      "crc32": 1947751513,
+      "crc32_le_hex": "59541874",
+      "packet_bytes": 135104,
+      "packet_sha256": "91ab7e8dd1ab861c53580336094124c90578ce353525715b43f5059c2f390190",
+      "oracle": {
+        "module_bytes": 135068,
+        "module_index": 0,
+        "line_count": 1,
+        "beams_per_line": 9000,
+        "echoes_per_beam": 3,
+        "record_stride": 15,
+        "record_data_start": 100,
+        "echo_stride": 4,
+        "distance_word_offset": 0,
+        "rssi_word_offset": 2,
+        "properties_offset": 14,
+        "azimuth_offset": 12,
+        "prefix_echo_pairs": [
+          [
+            [
+              1,
+              255
+            ],
+            [
+              65535,
+              1
+            ],
+            [
+              2,
+              3
+            ]
+          ],
+          [
+            [
+              42,
+              43
+            ],
+            [
+              44,
+              45
+            ],
+            [
+              46,
+              47
+            ]
+          ]
+        ],
+        "suffix_echo_pairs": [
+          [
+            [
+              4660,
+              43981
+            ],
+            [
+              0,
+              65535
+            ],
+            [
+              65535,
+              0
+            ]
+          ]
+        ],
+        "prefix_properties": [
+          129,
+          2
+        ],
+        "suffix_properties": [
+          254
+        ],
+        "prefix_azimuth": [
+          16384,
+          21554
+        ],
+        "suffix_azimuth": [
+          65535
+        ],
+        "zero_middle_records": 8997,
+        "timestamp_start_raw": [
+          72623859790382856
+        ],
+        "timestamp_stop_raw": [
+          18364758544493064720
+        ],
+        "phi_words": [
+          2147483648
+        ],
+        "theta_start_words": [
+          3212836864
+        ],
+        "theta_stop_words": [
+          1065353216
+        ],
+        "distance_scale_word": null,
+        "echo_mask_raw": 3,
+        "beam_mask_raw": 3,
+        "reserved_raw": [
+          165,
+          90
+        ]
+      }
+    },
+    {
+      "name": "lrs_full_9000_v4",
+      "telegram_type": 1,
+      "telegram_version": 4,
+      "recipe": [
+        {
+          "field": "header",
+          "hex": "02020202010000000100000000000000ffffffffffffffff04000000a00f0200"
+        },
+        {
+          "field": "module_metadata",
+          "hex": "1032547698badcfe08070605040302014433221101000000282300000300000008070605040302011032547698badcfe00000080000080bf0000803f0000004000000000a503035a"
+        },
+        {
+          "field": "record_first",
+          "hex": "0100ff00ffff010002000300810040"
+        },
+        {
+          "field": "record_second",
+          "hex": "2a002b002c002d002e002f00023254"
+        },
+        {
+          "field": "zero_middle_records",
+          "repeat_hex": "000000000000000000000000000000",
+          "repeat": 8997
+        },
+        {
+          "field": "record_last",
+          "hex": "3412cdab0000ffffffff0000feffff"
+        }
+      ],
+      "field_wire_ranges": [
+        {
+          "field": "header",
+          "wire_byte_range": [
+            0,
+            32
+          ]
+        },
+        {
+          "field": "module_metadata",
+          "wire_byte_range": [
+            32,
+            104
+          ]
+        },
+        {
+          "field": "record_first",
+          "wire_byte_range": [
+            104,
+            119
+          ]
+        },
+        {
+          "field": "record_second",
+          "wire_byte_range": [
+            119,
+            134
+          ]
+        },
+        {
+          "field": "zero_middle_records",
+          "wire_byte_range": [
+            134,
+            135089
+          ]
+        },
+        {
+          "field": "record_last",
+          "wire_byte_range": [
+            135089,
+            135104
+          ]
+        }
+      ],
+      "crc32": 3305167943,
+      "crc32_le_hex": "47dc00c5",
+      "packet_bytes": 135108,
+      "packet_sha256": "039dd64f10d8c36f5f8a72476b38aa6d06d1e3098224927ff913458c02dd5a59",
+      "oracle": {
+        "module_bytes": 135072,
+        "module_index": 0,
+        "line_count": 1,
+        "beams_per_line": 9000,
+        "echoes_per_beam": 3,
+        "record_stride": 15,
+        "record_data_start": 104,
+        "echo_stride": 4,
+        "distance_word_offset": 0,
+        "rssi_word_offset": 2,
+        "properties_offset": 12,
+        "azimuth_offset": 13,
+        "prefix_echo_pairs": [
+          [
+            [
+              1,
+              255
+            ],
+            [
+              65535,
+              1
+            ],
+            [
+              2,
+              3
+            ]
+          ],
+          [
+            [
+              42,
+              43
+            ],
+            [
+              44,
+              45
+            ],
+            [
+              46,
+              47
+            ]
+          ]
+        ],
+        "suffix_echo_pairs": [
+          [
+            [
+              4660,
+              43981
+            ],
+            [
+              0,
+              65535
+            ],
+            [
+              65535,
+              0
+            ]
+          ]
+        ],
+        "prefix_properties": [
+          129,
+          2
+        ],
+        "suffix_properties": [
+          254
+        ],
+        "prefix_azimuth": [
+          16384,
+          21554
+        ],
+        "suffix_azimuth": [
+          65535
+        ],
+        "zero_middle_records": 8997,
+        "timestamp_start_raw": [
+          72623859790382856
+        ],
+        "timestamp_stop_raw": [
+          18364758544493064720
+        ],
+        "phi_words": [
+          2147483648
+        ],
+        "theta_start_words": [
+          3212836864
+        ],
+        "theta_stop_words": [
+          1065353216
+        ],
+        "distance_scale_word": 1073741824,
+        "echo_mask_raw": 3,
+        "beam_mask_raw": 3,
+        "reserved_raw": [
+          165,
+          90
+        ]
+      }
+    },
+    {
+      "name": "multiscan200_type6_small_all_channels",
+      "telegram_type": 6,
+      "telegram_version": 1,
+      "recipe": [
+        {
+          "field": "standard_header",
+          "hex": "0202020206000000feffffffffffffff0807060504030201010000009b000000d4c3b2a1"
+        },
+        {
+          "field": "segment_metadata",
+          "hex": "181716151413121128272625242322210000000001000100010002010004030c0000803e07a500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005a"
+        },
+        {
+          "field": "ambient_light_data",
+          "encoding": "u16_le",
+          "count": 1,
+          "prefix": [
+            0
+          ],
+          "fill": 0,
+          "suffix": []
+        },
+        {
+          "field": "elevation_angles",
+          "encoding": "ieee_u32_le",
+          "count": 1,
+          "prefix": [
+            2147483648
+          ],
+          "fill": 0,
+          "suffix": []
+        },
+        {
+          "field": "azimuth_angles",
+          "encoding": "ieee_u32_le",
+          "count": 1,
+          "prefix": [
+            1056964608
+          ],
+          "fill": 0,
+          "suffix": []
+        },
+        {
+          "field": "relative_time_stamps",
+          "encoding": "u32_le",
+          "count": 1,
+          "prefix": [
+            0
+          ],
+          "fill": 0,
+          "suffix": []
+        },
+        {
+          "field": "column_properties",
+          "encoding": "u16_le",
+          "count": 1,
+          "prefix": [
+            32769
+          ],
+          "fill": 0,
+          "suffix": []
+        },
+        {
+          "field": "distance",
+          "encoding": "u16_le",
+          "count": 2,
+          "prefix": [
+            1,
+            65535
+          ],
+          "fill": 0,
+          "suffix": []
+        },
+        {
+          "field": "intensity_packed",
+          "hex": "23c1ab"
+        },
+        {
+          "field": "pulse_width",
+          "encoding": "u8",
+          "count": 2,
+          "prefix": [
+            1,
+            2
+          ],
+          "fill": 0,
+          "suffix": []
+        },
+        {
+          "field": "echo_properties",
+          "encoding": "u8",
+          "count": 2,
+          "prefix": [
+            129,
+            2
+          ],
+          "fill": 0,
+          "suffix": []
+        }
+      ],
+      "field_wire_ranges": [
+        {
+          "field": "standard_header",
+          "wire_byte_range": [
+            0,
+            36
+          ]
+        },
+        {
+          "field": "segment_metadata",
+          "wire_byte_range": [
+            36,
+            164
+          ]
+        },
+        {
+          "field": "ambient_light_data",
+          "wire_byte_range": [
+            164,
+            166
+          ]
+        },
+        {
+          "field": "elevation_angles",
+          "wire_byte_range": [
+            166,
+            170
+          ]
+        },
+        {
+          "field": "azimuth_angles",
+          "wire_byte_range": [
+            170,
+            174
+          ]
+        },
+        {
+          "field": "relative_time_stamps",
+          "wire_byte_range": [
+            174,
+            178
+          ]
+        },
+        {
+          "field": "column_properties",
+          "wire_byte_range": [
+            178,
+            180
+          ]
+        },
+        {
+          "field": "distance",
+          "wire_byte_range": [
+            180,
+            184
+          ]
+        },
+        {
+          "field": "intensity_packed",
+          "wire_byte_range": [
+            184,
+            187
+          ]
+        },
+        {
+          "field": "pulse_width",
+          "wire_byte_range": [
+            187,
+            189
+          ]
+        },
+        {
+          "field": "echo_properties",
+          "wire_byte_range": [
+            189,
+            191
+          ]
+        }
+      ],
+      "crc32": 4284966656,
+      "crc32_le_hex": "006767ff",
+      "packet_bytes": 195,
+      "packet_sha256": "bfde7547c6b6cd033a5de4b22693eec109017b8552c2cbb51184d899d8d5731a",
+      "oracle": {
+        "C": 1,
+        "L": 1,
+        "E": 2,
+        "A": 1,
+        "N": 2,
+        "payload_length": 155,
+        "data_content_echo": 7,
+        "reserved_payload_hex": "a500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005a",
+        "distance_scale_word": 1048576000,
+        "number_of_interlace_steps": 4,
+        "current_interlace_index": 3,
+        "scan_configuration_identifier": 12,
+        "flat_native_order_ambient": "wire_flat_order_unqualified",
+        "rssi_declared_samples": 2,
+        "rssi_declared_sample_bits": 24,
+        "rssi_available_bits": 24,
+        "rssi_policy": "opaque_no_values_or_padding_inferred",
+        "nominal_column_sample_bit_ranges_not_parser_byte_ranges": []
+      },
+      "packet_hex": "0202020206000000feffffffffffffff0807060504030201010000009b000000d4c3b2a1181716151413121128272625242322210000000001000100010002010004030c0000803e07a500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005a0000000000800000003f0000000001800100ffff23c1ab01028102006767ff"
+    },
+    {
+      "name": "multiscan200_type6_cross_column_opaque",
+      "telegram_type": 6,
+      "telegram_version": 1,
+      "recipe": [
+        {
+          "field": "standard_header",
+          "hex": "0202020206000000feffffffffffffff080706050403020101000000b9000000d4c3b2a1"
+        },
+        {
+          "field": "segment_metadata",
+          "hex": "181716151413121128272625242322210000000002000200010003000004030c0000803e07a500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005a"
+        },
+        {
+          "field": "ambient_light_data",
+          "encoding": "u16_le",
+          "count": 0,
+          "prefix": [],
+          "fill": 0,
+          "suffix": []
+        },
+        {
+          "field": "elevation_angles",
+          "encoding": "ieee_u32_le",
+          "count": 1,
+          "prefix": [
+            2147483648
+          ],
+          "fill": 0,
+          "suffix": []
+        },
+        {
+          "field": "azimuth_angles",
+          "encoding": "ieee_u32_le",
+          "count": 2,
+          "prefix": [
+            1056964608,
+            3204448256
+          ],
+          "fill": 0,
+          "suffix": []
+        },
+        {
+          "field": "relative_time_stamps",
+          "encoding": "u32_le",
+          "count": 2,
+          "prefix": [
+            0,
+            1
+          ],
+          "fill": 0,
+          "suffix": []
+        },
+        {
+          "field": "column_properties",
+          "encoding": "u16_le",
+          "count": 2,
+          "prefix": [
+            32769,
+            2
+          ],
+          "fill": 0,
+          "suffix": []
+        },
+        {
+          "field": "distance",
+          "encoding": "u16_le",
+          "count": 6,
+          "prefix": [
+            1,
+            65535,
+            0,
+            4660,
+            42,
+            43981
+          ],
+          "fill": 0,
+          "suffix": []
+        },
+        {
+          "field": "intensity_packed",
+          "hex": "23c1ab56f4de892701"
+        },
+        {
+          "field": "pulse_width",
+          "encoding": "u8",
+          "count": 6,
+          "prefix": [
+            1,
+            2
+          ],
+          "fill": 0,
+          "suffix": [
+            255
+          ]
+        },
+        {
+          "field": "echo_properties",
+          "encoding": "u8",
+          "count": 6,
+          "prefix": [
+            129,
+            2,
+            255,
+            0,
+            128,
+            7
+          ],
+          "fill": 0,
+          "suffix": []
+        }
+      ],
+      "field_wire_ranges": [
+        {
+          "field": "standard_header",
+          "wire_byte_range": [
+            0,
+            36
+          ]
+        },
+        {
+          "field": "segment_metadata",
+          "wire_byte_range": [
+            36,
+            164
+          ]
+        },
+        {
+          "field": "ambient_light_data",
+          "wire_byte_range": [
+            164,
+            164
+          ]
+        },
+        {
+          "field": "elevation_angles",
+          "wire_byte_range": [
+            164,
+            168
+          ]
+        },
+        {
+          "field": "azimuth_angles",
+          "wire_byte_range": [
+            168,
+            176
+          ]
+        },
+        {
+          "field": "relative_time_stamps",
+          "wire_byte_range": [
+            176,
+            184
+          ]
+        },
+        {
+          "field": "column_properties",
+          "wire_byte_range": [
+            184,
+            188
+          ]
+        },
+        {
+          "field": "distance",
+          "wire_byte_range": [
+            188,
+            200
+          ]
+        },
+        {
+          "field": "intensity_packed",
+          "wire_byte_range": [
+            200,
+            209
+          ]
+        },
+        {
+          "field": "pulse_width",
+          "wire_byte_range": [
+            209,
+            215
+          ]
+        },
+        {
+          "field": "echo_properties",
+          "wire_byte_range": [
+            215,
+            221
+          ]
+        }
+      ],
+      "crc32": 351489978,
+      "crc32_le_hex": "ba4ff314",
+      "packet_bytes": 225,
+      "packet_sha256": "3d3c607a246a8430b5068ed998db607263fc135fb4ff9d7435852ce44f5a1dae",
+      "oracle": {
+        "C": 2,
+        "L": 1,
+        "E": 3,
+        "A": 0,
+        "N": 6,
+        "payload_length": 185,
+        "data_content_echo": 7,
+        "reserved_payload_hex": "a500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005a",
+        "distance_scale_word": 1048576000,
+        "number_of_interlace_steps": 4,
+        "current_interlace_index": 3,
+        "scan_configuration_identifier": 12,
+        "flat_native_order_ambient": "wire_flat_order_unqualified",
+        "rssi_declared_samples": 6,
+        "rssi_declared_sample_bits": 72,
+        "rssi_available_bits": 72,
+        "rssi_policy": "opaque_no_values_or_padding_inferred",
+        "nominal_column_sample_bit_ranges_not_parser_byte_ranges": [
+          [
+            0,
+            36
+          ],
+          [
+            36,
+            72
+          ]
+        ]
+      },
+      "packet_hex": "0202020206000000feffffffffffffff080706050403020101000000b9000000d4c3b2a1181716151413121128272625242322210000000002000200010003000004030c0000803e07a500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005a000000800000003f000000bf0000000001000000018002000100ffff000034122a00cdab23c1ab56f4de8927010102000000ff8102ff008007ba4ff314"
+    },
+    {
+      "name": "multiscan200_type6_odd_count_opaque",
+      "telegram_type": 6,
+      "telegram_version": 1,
+      "recipe": [
+        {
+          "field": "standard_header",
+          "hex": "0202020206000000feffffffffffffff08070605040302010100000098000000d4c3b2a1"
+        },
+        {
+          "field": "segment_metadata",
+          "hex": "181716151413121128272625242322210000000001000100010003000004030c0000803e01a500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005a"
+        },
+        {
+          "field": "ambient_light_data",
+          "encoding": "u16_le",
+          "count": 0,
+          "prefix": [],
+          "fill": 0,
+          "suffix": []
+        },
+        {
+          "field": "elevation_angles",
+          "encoding": "ieee_u32_le",
+          "count": 1,
+          "prefix": [
+            2147483648
+          ],
+          "fill": 0,
+          "suffix": []
+        },
+        {
+          "field": "azimuth_angles",
+          "encoding": "ieee_u32_le",
+          "count": 1,
+          "prefix": [
+            1056964608
+          ],
+          "fill": 0,
+          "suffix": []
+        },
+        {
+          "field": "relative_time_stamps",
+          "encoding": "u32_le",
+          "count": 1,
+          "prefix": [
+            0
+          ],
+          "fill": 0,
+          "suffix": []
+        },
+        {
+          "field": "column_properties",
+          "encoding": "u16_le",
+          "count": 1,
+          "prefix": [
+            32769
+          ],
+          "fill": 0,
+          "suffix": []
+        },
+        {
+          "field": "distance",
+          "encoding": "u16_le",
+          "count": 3,
+          "prefix": [
+            1,
+            65535,
+            0
+          ],
+          "fill": 0,
+          "suffix": []
+        },
+        {
+          "field": "intensity_packed",
+          "hex": "23c1ab56"
+        }
+      ],
+      "field_wire_ranges": [
+        {
+          "field": "standard_header",
+          "wire_byte_range": [
+            0,
+            36
+          ]
+        },
+        {
+          "field": "segment_metadata",
+          "wire_byte_range": [
+            36,
+            164
+          ]
+        },
+        {
+          "field": "ambient_light_data",
+          "wire_byte_range": [
+            164,
+            164
+          ]
+        },
+        {
+          "field": "elevation_angles",
+          "wire_byte_range": [
+            164,
+            168
+          ]
+        },
+        {
+          "field": "azimuth_angles",
+          "wire_byte_range": [
+            168,
+            172
+          ]
+        },
+        {
+          "field": "relative_time_stamps",
+          "wire_byte_range": [
+            172,
+            176
+          ]
+        },
+        {
+          "field": "column_properties",
+          "wire_byte_range": [
+            176,
+            178
+          ]
+        },
+        {
+          "field": "distance",
+          "wire_byte_range": [
+            178,
+            184
+          ]
+        },
+        {
+          "field": "intensity_packed",
+          "wire_byte_range": [
+            184,
+            188
+          ]
+        }
+      ],
+      "crc32": 870527983,
+      "crc32_le_hex": "ef33e333",
+      "packet_bytes": 192,
+      "packet_sha256": "e0087909a3da3c05b5c6f3d890ccf4959be430c4669b9c8e297426145686b213",
+      "oracle": {
+        "C": 1,
+        "L": 1,
+        "E": 3,
+        "A": 0,
+        "N": 3,
+        "payload_length": 152,
+        "data_content_echo": 1,
+        "reserved_payload_hex": "a500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005a",
+        "distance_scale_word": 1048576000,
+        "number_of_interlace_steps": 4,
+        "current_interlace_index": 3,
+        "scan_configuration_identifier": 12,
+        "flat_native_order_ambient": "wire_flat_order_unqualified",
+        "rssi_declared_samples": 3,
+        "rssi_declared_sample_bits": 36,
+        "rssi_available_bits": 32,
+        "rssi_policy": "opaque_no_values_or_padding_inferred",
+        "nominal_column_sample_bit_ranges_not_parser_byte_ranges": []
+      },
+      "packet_hex": "0202020206000000feffffffffffffff08070605040302010100000098000000d4c3b2a1181716151413121128272625242322210000000001000100010003000004030c0000803e01a500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005a000000800000003f0000000001800100ffff000023c1ab56ef33e333"
+    },
+    {
+      "name": "multiscan200_type6_full_geometry",
+      "telegram_type": 6,
+      "telegram_version": 1,
+      "recipe": [
+        {
+          "field": "standard_header",
+          "hex": "0202020206000000feffffffffffffff080706050403020101000000a0fc1a00d4c3b2a1"
+        },
+        {
+          "field": "segment_metadata",
+          "hex": "181716151413121128272625242322210000000050025002c00003c00004030c0000803e05a500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005a"
+        },
+        {
+          "field": "ambient_light_data",
+          "encoding": "u16_le",
+          "count": 113664,
+          "prefix": [
+            0,
+            1,
+            65535,
+            4660
+          ],
+          "fill": 0,
+          "suffix": [
+            43981
+          ]
+        },
+        {
+          "field": "elevation_angles",
+          "encoding": "ieee_u32_le",
+          "count": 192,
+          "prefix": [
+            2147483648,
+            1065353216,
+            2143294004
+          ],
+          "fill": 0,
+          "suffix": [
+            4286578688
+          ]
+        },
+        {
+          "field": "azimuth_angles",
+          "encoding": "ieee_u32_le",
+          "count": 592,
+          "prefix": [
+            1056964608,
+            3204448256,
+            2139095040
+          ],
+          "fill": 0,
+          "suffix": [
+            2147483648
+          ]
+        },
+        {
+          "field": "relative_time_stamps",
+          "encoding": "u32_le",
+          "count": 592,
+          "prefix": [
+            0,
+            1,
+            4294967295
+          ],
+          "fill": 0,
+          "suffix": [
+            2147483647
+          ]
+        },
+        {
+          "field": "column_properties",
+          "encoding": "u16_le",
+          "count": 592,
+          "prefix": [
+            32769,
+            2,
+            65535
+          ],
+          "fill": 0,
+          "suffix": [
+            33022
+          ]
+        },
+        {
+          "field": "distance",
+          "encoding": "u16_le",
+          "count": 340992,
+          "prefix": [
+            1,
+            65535,
+            0,
+            4660,
+            42,
+            43981
+          ],
+          "fill": 0,
+          "suffix": [
+            65535,
+            1,
+            22136
+          ]
+        },
+        {
+          "field": "intensity_packed",
+          "encoding": "u8",
+          "count": 511488,
+          "prefix": [
+            35,
+            193,
+            171,
+            86,
+            244,
+            222,
+            137,
+            39,
+            1
+          ],
+          "fill": 0,
+          "suffix": [
+            255,
+            255,
+            255
+          ]
+        },
+        {
+          "field": "echo_properties",
+          "encoding": "u8",
+          "count": 340992,
+          "prefix": [
+            129,
+            2,
+            255,
+            0,
+            128,
+            7
+          ],
+          "fill": 0,
+          "suffix": [
+            255,
+            1,
+            130
+          ]
+        }
+      ],
+      "field_wire_ranges": [
+        {
+          "field": "standard_header",
+          "wire_byte_range": [
+            0,
+            36
+          ]
+        },
+        {
+          "field": "segment_metadata",
+          "wire_byte_range": [
+            36,
+            164
+          ]
+        },
+        {
+          "field": "ambient_light_data",
+          "wire_byte_range": [
+            164,
+            227492
+          ]
+        },
+        {
+          "field": "elevation_angles",
+          "wire_byte_range": [
+            227492,
+            228260
+          ]
+        },
+        {
+          "field": "azimuth_angles",
+          "wire_byte_range": [
+            228260,
+            230628
+          ]
+        },
+        {
+          "field": "relative_time_stamps",
+          "wire_byte_range": [
+            230628,
+            232996
+          ]
+        },
+        {
+          "field": "column_properties",
+          "wire_byte_range": [
+            232996,
+            234180
+          ]
+        },
+        {
+          "field": "distance",
+          "wire_byte_range": [
+            234180,
+            916164
+          ]
+        },
+        {
+          "field": "intensity_packed",
+          "wire_byte_range": [
+            916164,
+            1427652
+          ]
+        },
+        {
+          "field": "echo_properties",
+          "wire_byte_range": [
+            1427652,
+            1768644
+          ]
+        }
+      ],
+      "crc32": 1036792606,
+      "crc32_le_hex": "1e33cc3d",
+      "packet_bytes": 1768648,
+      "packet_sha256": "8c60faea847fdd34ae4ab3d087e790cec3fc5bf9655d6c8889606b1db29ba992",
+      "oracle": {
+        "C": 592,
+        "L": 192,
+        "E": 3,
+        "A": 192,
+        "N": 340992,
+        "payload_length": 1768608,
+        "data_content_echo": 5,
+        "reserved_payload_hex": "a500000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000005a",
+        "distance_scale_word": 1048576000,
+        "number_of_interlace_steps": 4,
+        "current_interlace_index": 3,
+        "scan_configuration_identifier": 12,
+        "flat_native_order_ambient": "wire_flat_order_unqualified",
+        "rssi_declared_samples": 340992,
+        "rssi_declared_sample_bits": 4091904,
+        "rssi_available_bits": 4091904,
+        "rssi_policy": "opaque_no_values_or_padding_inferred",
+        "nominal_column_sample_bit_ranges_not_parser_byte_ranges": []
+      }
+    },
+    {
+      "name": "multiscan200_type7_timestamp_first",
+      "telegram_type": 7,
+      "telegram_version": 1,
+      "recipe": [
+        {
+          "field": "standard_header",
+          "hex": "0202020207000000feffffffffffffff08070605040302010100000030000000d4c3b2a1"
+        },
+        {
+          "field": "imu_body",
+          "hex": "18171615141312110000803f000000c000000080010000000000807f3412c07f0000803f00000000000000800000807f"
+        }
+      ],
+      "field_wire_ranges": [
+        {
+          "field": "standard_header",
+          "wire_byte_range": [
+            0,
+            36
+          ]
+        },
+        {
+          "field": "imu_body",
+          "wire_byte_range": [
+            36,
+            84
+          ]
+        }
+      ],
+      "crc32": 204284792,
+      "crc32_le_hex": "78232d0c",
+      "packet_bytes": 88,
+      "packet_sha256": "55c510b1cd512b227ea30db3b0742da0dcd615dd7e04b2aaa6ade66db94cc824",
+      "oracle": {
+        "payload_length": 48,
+        "timestamp_raw": 1230066625199609624,
+        "acceleration_words": [
+          1065353216,
+          3221225472,
+          2147483648
+        ],
+        "angular_velocity_words": [
+          1,
+          2139095040,
+          2143294004
+        ],
+        "orientation_words_wxyz": [
+          1065353216,
+          0,
+          2147483648,
+          2139095040
+        ]
+      },
+      "packet_hex": "0202020207000000feffffffffffffff08070605040302010100000030000000d4c3b2a118171615141312110000803f000000c000000080010000000000807f3412c07f0000803f00000000000000800000807f78232d0c"
+    },
+    {
+      "name": "multiscan200_type3_small",
+      "telegram_type": 3,
+      "telegram_version": 1,
+      "recipe": [
+        {
+          "field": "standard_header",
+          "hex": "0202020203000000feffffffffffffff0807060504030201010000003a000000d4c3b2a1"
+        },
+        {
+          "field": "ambient_metadata",
+          "hex": "181716151413121108070605040302011032547698badcfe02000300000000800000803f000080bf3412c07f0000"
+        },
+        {
+          "field": "ambient_light_data",
+          "encoding": "u16_le",
+          "count": 6,
+          "prefix": [
+            0,
+            1,
+            65535,
+            4660,
+            43981,
+            42
+          ],
+          "fill": 0,
+          "suffix": []
+        }
+      ],
+      "field_wire_ranges": [
+        {
+          "field": "standard_header",
+          "wire_byte_range": [
+            0,
+            36
+          ]
+        },
+        {
+          "field": "ambient_metadata",
+          "wire_byte_range": [
+            36,
+            82
+          ]
+        },
+        {
+          "field": "ambient_light_data",
+          "wire_byte_range": [
+            82,
+            94
+          ]
+        }
+      ],
+      "crc32": 765962074,
+      "crc32_le_hex": "5aa7a72d",
+      "packet_bytes": 98,
+      "packet_sha256": "dd55848fe9574f048c3a02f523b3e5ab221b73ed6eb24fb2585ecc532efa0051",
+      "oracle": {
+        "payload_length": 58,
+        "layers": 2,
+        "columns": 3,
+        "encoding": 0,
+        "flat_order": "wire_flat_order_unqualified",
+        "frame_number": 1230066625199609624,
+        "timestamp_start_raw": 72623859790382856,
+        "timestamp_stop_raw": 18364758544493064720,
+        "angle_words": [
+          2147483648,
+          1065353216,
+          3212836864,
+          2143294004
+        ]
+      },
+      "packet_hex": "0202020203000000feffffffffffffff0807060504030201010000003a000000d4c3b2a1181716151413121108070605040302011032547698badcfe02000300000000800000803f000080bf3412c07f000000000100ffff3412cdab2a005aa7a72d"
+    },
+    {
+      "name": "multiscan200_type3_full_geometry",
+      "telegram_type": 3,
+      "telegram_version": 1,
+      "recipe": [
+        {
+          "field": "standard_header",
+          "hex": "0202020203000000feffffffffffffff0807060504030201010000002e780300d4c3b2a1"
+        },
+        {
+          "field": "ambient_metadata",
+          "hex": "181716151413121108070605040302011032547698badcfec0005002000000800000803f000080bf3412c07f0000"
+        },
+        {
+          "field": "ambient_light_data",
+          "encoding": "u16_le",
+          "count": 113664,
+          "prefix": [
+            0,
+            1,
+            65535,
+            4660,
+            43981,
+            42
+          ],
+          "fill": 0,
+          "suffix": [
+            22136
+          ]
+        }
+      ],
+      "field_wire_ranges": [
+        {
+          "field": "standard_header",
+          "wire_byte_range": [
+            0,
+            36
+          ]
+        },
+        {
+          "field": "ambient_metadata",
+          "wire_byte_range": [
+            36,
+            82
+          ]
+        },
+        {
+          "field": "ambient_light_data",
+          "wire_byte_range": [
+            82,
+            227410
+          ]
+        }
+      ],
+      "crc32": 744887836,
+      "crc32_le_hex": "1c16662c",
+      "packet_bytes": 227414,
+      "packet_sha256": "4af532d692a298036f2b9ef4c6e9c514f7097983d7cd526ed69f04891fe25014",
+      "oracle": {
+        "payload_length": 227374,
+        "layers": 192,
+        "columns": 592,
+        "encoding": 0,
+        "flat_order": "wire_flat_order_unqualified",
+        "frame_number": 1230066625199609624,
+        "timestamp_start_raw": 72623859790382856,
+        "timestamp_stop_raw": 18364758544493064720,
+        "angle_words": [
+          2147483648,
+          1065353216,
+          3212836864,
+          2143294004
+        ]
+      }
+    }
+  ],
+  "negative_recipe_plan": [
+    "Type3encoding1",
+    "Type3version2",
+    "Type3payloadLengthMinus1/Plus1",
+    "Type6payloadLengthMinus1/Plus1",
+    "Type7payload47/49",
+    "version2",
+    "CRCmutations",
+    "Type1badModuleLinks/EOFstages"
+  ]
+}

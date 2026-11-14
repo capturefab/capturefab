@@ -1,0 +1,365 @@
+{
+  "format_version": 1,
+  "source": {
+    "archive_url": "https://www.usb.org/sites/default/files/USBTMC_1_006a.zip",
+    "archive_bytes": 690172,
+    "archive_sha256": "e147d643a8c2fd54f6f77d522180a9694ce4ec2759bb08c462c6d913e862d8dd",
+    "usbtmc_pdf_bytes": 412058,
+    "usbtmc_pdf_sha256": "c43f71baa0f337df84f75b9f730c2fca94efe68d521f35ddc6f2c38af35aa870",
+    "usb488_pdf_bytes": 321908,
+    "usb488_pdf_sha256": "2bb73ed0300c975fc105be7ca14ca22158e9b9208726212d9de7fad39950b92d",
+    "public_contract_sha256": "b238deb1185081cafdc0057b29479c36dd2ff9dc6c7c8a38c986fcc7c7f67949",
+    "ipc_contract_sha256": "12e985387b76df47e0dc4ff37f9b77a2cea774b3b2d62344563e06c267c864e2",
+    "scope": "Independently hand-declared Rev1.0 wire/scalar controls, prior to native/codec authorship. No device, OS driver or physical instrument qualification."
+  },
+  "selector": {
+    "vendor_id": 6833,
+    "product_id": 1230,
+    "serial_number": "SN A<|>01",
+    "interface_number": 3
+  },
+  "descriptor": {
+    "vendor_id": 6833,
+    "product_id": 1230,
+    "serial_number": "SN A<|>01",
+    "interface_number": 3,
+    "configuration": 1,
+    "alternate_setting": 0,
+    "class": 254,
+    "subclass": 3,
+    "protocol": 1,
+    "bulk_in": {
+      "address": 131,
+      "max_packet_size": 64
+    },
+    "bulk_out": {
+      "address": 2,
+      "max_packet_size": 64
+    },
+    "interrupt_in": {
+      "address": 132,
+      "max_packet_size": 2
+    },
+    "capabilities_base64": "AQAAAQABAAAAAAAAAAEHDwAAAAAAAAAA"
+  },
+  "serial_rules": {
+    "min_characters": 1,
+    "max_characters": 63,
+    "ascii_min": 32,
+    "ascii_max": 126,
+    "forbidden_hex": [
+      "22",
+      "2a",
+      "2f",
+      "3a",
+      "3f",
+      "5c"
+    ],
+    "forbidden_characters": [
+      "\"",
+      "*",
+      "/",
+      ":",
+      "?",
+      "\\"
+    ],
+    "case_sensitive": true,
+    "edge_space_forbidden": true,
+    "internal_space_allowed": true,
+    "langid": 1033
+  },
+  "valid_selectors": [
+    {
+      "vendor_id": 6833,
+      "product_id": 1230,
+      "serial_number": "SN A<|>01",
+      "interface_number": 3
+    },
+    {
+      "vendor_id": 1,
+      "product_id": 0,
+      "serial_number": "A",
+      "interface_number": 0
+    },
+    {
+      "vendor_id": 65535,
+      "product_id": 65535,
+      "serial_number": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "interface_number": 255
+    }
+  ],
+  "invalid_serials": [
+    "",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    " A",
+    "A ",
+    "\u001f",
+    "\u007f",
+    "\u00e9",
+    "A\"B",
+    "A*B",
+    "A/B",
+    "A:B",
+    "A?B",
+    "A\\B"
+  ],
+  "invalid_selector_json": [
+    "{\"vendor_id\":0,\"product_id\":0,\"serial_number\":\"A\",\"interface_number\":0}",
+    "{\"vendor_id\":1.5,\"product_id\":0,\"serial_number\":\"A\",\"interface_number\":0}",
+    "{\"vendor_id\":1e-1,\"product_id\":0,\"serial_number\":\"A\",\"interface_number\":0}",
+    "{\"vendor_id\":65536,\"product_id\":0,\"serial_number\":\"A\",\"interface_number\":0}",
+    "{\"vendor_id\":1,\"product_id\":-1,\"serial_number\":\"A\",\"interface_number\":0}",
+    "{\"vendor_id\":1,\"product_id\":0,\"serial_number\":\"A\",\"interface_number\":256}",
+    "{\"vendor_id\":1,\"product_id\":0,\"serial_number\":null,\"interface_number\":0}",
+    "{\"vendor_id\":1,\"vendor_id\":2,\"product_id\":0,\"serial_number\":\"A\",\"interface_number\":0}",
+    "{\"vendor_id\":1,\"product_id\":0,\"serial_number\":\"A\",\"interface_number\":0,\"path\":null}"
+  ],
+  "descriptor_faults": [
+    "ambiguous_exact_identity",
+    "serial_differs_after_open",
+    "serial_differs_after_claim",
+    "configuration_zero",
+    "active_alt_nonzero",
+    "class_not_fe",
+    "subclass_not_03",
+    "protocol_unknown",
+    "duplicate_bulk_in",
+    "missing_bulk_out",
+    "bulk_out_address_has_in_bit",
+    "endpoint_zero",
+    "endpoint_reserved_address_bits",
+    "bulk_in_mps_zero",
+    "bulk_out_mps_two",
+    "bulk_out_mps_six",
+    "sr1_without_interrupt"
+  ],
+  "capabilities": [
+    {
+      "name": "plain_0100",
+      "protocol": 0,
+      "hex": "010000010000000000000000000000000000000000000000",
+      "valid": true,
+      "usbtmc_version": 256
+    },
+    {
+      "name": "usb488_all_defined",
+      "protocol": 1,
+      "hex": "0100000100010000000000000001070f0000000000000000",
+      "valid": true,
+      "usbtmc_version": 256,
+      "usb488_version": 256,
+      "requires_interrupt": true
+    },
+    {
+      "name": "future_valid_known_subset",
+      "protocol": 1,
+      "hex": "010000020000000000000000000200000000000000000000",
+      "valid": true,
+      "usbtmc_version": 512,
+      "usb488_version": 512,
+      "qualification": "known_Rev1_subset_only"
+    },
+    {
+      "name": "failure_ignores_trailing",
+      "protocol": 1,
+      "hex": "80ffffffffffffffffffffffffffffffffffffffffffffff",
+      "valid": false,
+      "error": "class_status",
+      "status": 128,
+      "ignore_trailing": true
+    },
+    {
+      "name": "failure_still_requires_full_length",
+      "protocol": 1,
+      "hex": "80ffffffffffffffffffffffffffffffffffffffffffff",
+      "valid": false,
+      "error": "incomplete_response"
+    },
+    {
+      "name": "talk_only",
+      "protocol": 0,
+      "hex": "010000010200000000000000000000000000000000000000",
+      "valid": false,
+      "error": "unsupported_query_direction"
+    },
+    {
+      "name": "listen_only",
+      "protocol": 0,
+      "hex": "010000010100000000000000000000000000000000000000",
+      "valid": false,
+      "error": "unsupported_query_direction"
+    },
+    {
+      "name": "unknown_interface_extension_bit",
+      "protocol": 0,
+      "hex": "010000018000000000000000000000000000000000000000",
+      "valid": false,
+      "error": "unsupported_extension"
+    },
+    {
+      "name": "scpi_without_4882_sr1",
+      "protocol": 1,
+      "hex": "010000010000000000000000000100080000000000000000",
+      "valid": false,
+      "error": "inconsistent_capabilities"
+    },
+    {
+      "name": "invalid_bcd",
+      "protocol": 0,
+      "hex": "0100a0010000000000000000000000000000000000000000",
+      "valid": false,
+      "error": "invalid_version"
+    },
+    {
+      "name": "too_old_bcd",
+      "protocol": 0,
+      "hex": "010099000000000000000000000000000000000000000000",
+      "valid": false,
+      "error": "unsupported_version"
+    }
+  ],
+  "controls": [
+    {
+      "name": "get_capabilities",
+      "setup_hex": "a107000003001800",
+      "request_type": 161,
+      "request": 7,
+      "value": 0,
+      "index": 3,
+      "length": 24
+    },
+    {
+      "name": "abort_out",
+      "setup_hex": "a2015b0002000200",
+      "request_type": 162,
+      "request": 1,
+      "value": 91,
+      "index": 2,
+      "length": 2
+    },
+    {
+      "name": "check_abort_out",
+      "setup_hex": "a202000002000800",
+      "request_type": 162,
+      "request": 2,
+      "value": 0,
+      "index": 2,
+      "length": 8
+    },
+    {
+      "name": "abort_in",
+      "setup_hex": "a2035c0083000200",
+      "request_type": 162,
+      "request": 3,
+      "value": 92,
+      "index": 131,
+      "length": 2
+    },
+    {
+      "name": "check_abort_in",
+      "setup_hex": "a204000083000800",
+      "request_type": 162,
+      "request": 4,
+      "value": 0,
+      "index": 131,
+      "length": 8
+    },
+    {
+      "name": "clear_out_halt",
+      "setup_hex": "0201000002000000",
+      "request_type": 2,
+      "request": 1,
+      "value": 0,
+      "index": 2,
+      "length": 0
+    }
+  ],
+  "abort_responses": [
+    {
+      "name": "initiate_success",
+      "hex": "015c",
+      "status": 1,
+      "poll_allowed": true
+    },
+    {
+      "name": "initiate_not_in_progress",
+      "hex": "815b",
+      "status": 129,
+      "poll_allowed": false,
+      "ignore_trailing": true
+    },
+    {
+      "name": "initiate_failed",
+      "hex": "80ff",
+      "status": 128,
+      "poll_allowed": false,
+      "ignore_trailing": true
+    },
+    {
+      "name": "initiate_warning_invalid",
+      "hex": "025c",
+      "status": 2,
+      "poll_allowed": false
+    },
+    {
+      "name": "check_in_pending_fifo",
+      "hex": "02010000efbeadde",
+      "status": 2,
+      "drain_until_short": true,
+      "ignore_count": true
+    },
+    {
+      "name": "check_in_success",
+      "hex": "0100000005000000",
+      "status": 1,
+      "bytes_transmitted": 5,
+      "further_poll": false
+    },
+    {
+      "name": "check_failed_ignore_trailing",
+      "hex": "80ffffffffffffff",
+      "status": 128,
+      "ignore_trailing": true
+    },
+    {
+      "name": "check_out_success",
+      "hex": "0100000006000000",
+      "status": 1,
+      "bytes_received": 6,
+      "clear_out_halt_required": true
+    }
+  ],
+  "forbidden_automatic_operations": [
+    "detach",
+    "set_configuration",
+    "set_interface",
+    "reset",
+    "initiate_clear",
+    "check_clear_status",
+    "trigger",
+    "ren_control",
+    "go_to_local",
+    "local_lockout",
+    "status_poll",
+    "query_retry"
+  ],
+  "recovery_order": {
+    "out": [
+      "retire_owned_out",
+      "initiate_abort_out",
+      "check_until_settled",
+      "clear_out_halt"
+    ],
+    "in": [
+      "retire_pending_request_out_if_any",
+      "initiate_abort_in_before_cancel_in",
+      "drain_short",
+      "check_until_settled"
+    ]
+  },
+  "unfinished_message_state": "unconfirmed_even_after_transfer_abort_and_host_exit",
+  "valid_selector_json": [
+    "{\"vendor_id\":1.0,\"product_id\":0,\"serial_number\":\"A\",\"interface_number\":0}",
+    "{\"vendor_id\":1e0,\"product_id\":0,\"serial_number\":\"A\",\"interface_number\":0}"
+  ]
+}

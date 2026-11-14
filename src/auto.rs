@@ -26,6 +26,10 @@ pub struct AutoChange {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct AutoStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metering_part: Option<crate::transport::multipart::PartSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<Value>,
     pub strategy: String,
     pub state: String,
     pub target_fps: Option<f64>,
@@ -97,9 +101,15 @@ fn peak_bin(peak: u16, max: u32) -> u8 {
 pub(crate) fn meter_in(view: crate::frame::FrameRef<'_>) -> Option<Meter> {
     use crate::frame::{Pixels, native_sample};
     let frame = view.frame;
+    if crate::frame::selection_required(frame)
+        || crate::frame::is_measurement_frame(frame)
+        || crate::frame::is_unclassified_mono16(frame)
+    {
+        return None;
+    }
     crate::frame::validate_source(frame).ok()?;
     let pixels = Pixels::new(view);
-    let packed = crate::frame::packing(frame.pixel_format);
+    let packed = crate::frame::frame_packing(frame);
     let color_bits = crate::frame::native_color(frame, 0, 0).map(|(_, bits)| bits);
     let format = packed.map_or(frame.pixel_format, |(format, ..)| format);
     let (w, h) = (view.width, view.height);
@@ -186,6 +196,42 @@ pub(crate) fn meter_in(view: crate::frame::FrameRef<'_>) -> Option<Meter> {
     Some(Meter {
         mean: (sum / f64::from(count)).max(1.0 / 1024.0),
         p99: f64::from(u8::try_from(p99).expect("a 256-bin histogram index fits u8")) / 255.0,
+    })
+}
+
+/// Meter only borrowed native ordinary bytes. The archive remains owned by
+/// `frame`; this allocates no image/table and uses a constant 256-bin histogram.
+#[deny(clippy::cast_precision_loss)]
+fn meter_part(
+    view: &crate::transport::multipart::OrdinaryPart<'_>,
+    region: Option<[f64; 4]>,
+) -> Result<Meter> {
+    let [x0, y0, width, height] = region.map_or([0, 0, view.width, view.height], |region| {
+        crate::inspect::region_pixels(region, view.width, view.height)
+    });
+    let (mut sum, mut count, mut histogram) = (0.0, 0u32, [0u32; 256]);
+    let width = usize::try_from(width)?;
+    let height = usize::try_from(height)?;
+    let sites = width
+        .checked_mul(height)
+        .context("multipart metering pixel count overflow")?;
+    for i in crate::frame::sample_indices(sites, 16_384) {
+        let [r, g, b] = view.at(x0 as usize + i % width, y0 as usize + i / width);
+        sum += f64::from(u32::from(r) + 2 * u32::from(g) + u32::from(b)) / (4.0 * 255.0);
+        histogram[usize::from(r.max(g).max(b))] += 1;
+        count += 1;
+    }
+    let mut seen = 0;
+    let p99 = histogram
+        .iter()
+        .position(|n| {
+            seen += n;
+            f64::from(seen) >= 0.99 * f64::from(count)
+        })
+        .unwrap_or(255);
+    Ok(Meter {
+        mean: (sum / f64::from(count)).max(1.0 / 1024.0),
+        p99: f64::from(u8::try_from(p99).context("a 256-bin histogram index fits u8")?) / 255.0,
     })
 }
 
@@ -429,6 +475,7 @@ struct WhiteBalance {
 #[derive(Clone, Default)]
 pub(crate) struct AutoController {
     status: AutoStatus,
+    part_verified: bool,
     /// Image quality (0) against frame rate (1): `BALANCE`.
     balance: f64,
     published: AutoStatus,
@@ -473,13 +520,59 @@ pub(crate) struct AutoController {
     max_exposure: Option<f64>,
 }
 
+/// Guard both camera firmware auto and Capturefab's controller by selector.
+pub(crate) fn require_intensity(camera_id: &str) -> Result<()> {
+    ensure!(
+        !crate::transport::gentl_selector::Selector::parse(camera_id)
+            .is_ok_and(|selector| selector.measurement_selected()),
+        crate::types::Categorized::error(
+            crate::types::ErrorKind::Unsupported,
+            "automatic image tuning requires an intensity image",
+        )
+    );
+    Ok(())
+}
+
 impl AutoController {
     pub(crate) fn enter(camera: &mut Camera) -> Result<Self> {
         Self::enter_with(camera, BALANCE)
     }
+    pub(crate) fn enter_selected(
+        camera: &mut Camera,
+        selection: crate::transport::multipart::PartSelection,
+    ) -> Result<Self> {
+        selection.validate()?;
+        selection
+            .format
+            .validate_binding(selection.index, &camera.info.id)?;
+        crate::transport::multipart::GvspPartFormat::validate_transport(camera.info.transport)?;
+        camera.enable_multipart_projection()?;
+        // No feature probe or plan (including implicit firmware/trigger writes)
+        // until a real frame proves the requested descriptor and exact geometry.
+        Ok(Self {
+            status: AutoStatus {
+                state: "waiting".into(),
+                strategy: "software".into(),
+                metering_part: Some(selection),
+                ..Default::default()
+            },
+            balance: BALANCE,
+            reprobe: true,
+            stale: true,
+            ..Default::default()
+        })
+    }
+
+    pub(crate) const fn part_selection(
+        &self,
+    ) -> Option<crate::transport::multipart::PartSelection> {
+        self.status.metering_part
+    }
+
     /// `enter`, weighing image quality (0) against frame rate (1) as
     /// `balance` says.
     fn enter_with(camera: &mut Camera, balance: f64) -> Result<Self> {
+        require_intensity(&camera.info.id)?;
         if !camera.info.profile.kind.supports_auto() {
             return Err(crate::types::Categorized::error(
                 crate::types::ErrorKind::Unsupported,
@@ -536,7 +629,11 @@ impl AutoController {
             (self.region, self.max_exposure) = (region, max_exposure);
             self.samples.clear();
             self.in_band = 0;
-            self.plan(camera);
+            if self.status.error.is_none()
+                && (self.status.metering_part.is_none() || self.part_verified)
+            {
+                self.plan(camera);
+            }
         }
         Ok(())
     }
@@ -552,6 +649,30 @@ impl AutoController {
         Ok(())
     }
     pub(crate) fn observe(&mut self, frame: &Frame, now: Instant) {
+        if self.status.error.is_some() {
+            return;
+        }
+        if self.status.metering_part.is_none() && crate::frame::selection_required(frame) {
+            self.fail_metering(&crate::types::Categorized::error(
+                crate::types::ErrorKind::Unsupported,
+                "automatic image tuning requires an explicit ordinary multipart selection",
+            ));
+            return;
+        }
+        let selected_view = if let Some(selection) = self.status.metering_part {
+            match selection.format.ordinary_view(frame, selection.index) {
+                Ok(view) => {
+                    self.part_verified = true;
+                    Some(view)
+                }
+                Err(error) => {
+                    self.fail_metering(&error);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         if let Some(last) = self.last_frame {
             let dt = now.saturating_duration_since(last).as_secs_f64();
             self.period = Some(self.period.map_or(dt, |p| 0.9 * p + 0.1 * dt));
@@ -569,14 +690,27 @@ impl AutoController {
         }
         self.last_meter = Some(now);
         // A region is metered where it lies, as `inspect` measures it.
-        let view = self.region.map_or_else(
-            || crate::frame::FrameRef::whole(frame),
-            |region| {
-                let px = crate::inspect::region_pixels(region, frame.width, frame.height);
-                crate::frame::FrameRef::region(frame, crate::inspect::crop_rect(frame, px))
-            },
-        );
-        let Some(m) = meter_in(view) else {
+        let selected_meter = if let Some(view) = selected_view {
+            match meter_part(&view, self.region) {
+                Ok(meter) => Some(meter),
+                Err(error) => {
+                    self.fail_metering(&error);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let Some(m) = selected_meter.or_else(|| {
+            let view = self.region.map_or_else(
+                || crate::frame::FrameRef::whole(frame),
+                |region| {
+                    let px = crate::inspect::region_pixels(region, frame.width, frame.height);
+                    crate::frame::FrameRef::region(frame, crate::inspect::crop_rect(frame, px))
+                },
+            );
+            meter_in(view)
+        }) else {
             self.unmetered = true;
             return;
         };
@@ -598,7 +732,21 @@ impl AutoController {
         self.p99 = m.p99;
         self.status.brightness = finite(m.mean);
     }
+    fn fail_metering(&mut self, error: &anyhow::Error) {
+        self.status.error = Some(crate::session::protocol::wire_error(error));
+        self.status.state = "failed".into();
+        self.status.brightness = None;
+        self.samples.clear();
+        self.in_band = 0;
+        self.unmetered = false;
+    }
+
     pub(crate) fn tick(&mut self, camera: &mut Camera, now: Instant) -> bool {
+        if self.status.error.is_some()
+            || (self.status.metering_part.is_some() && !self.part_verified)
+        {
+            return self.publish_due(now);
+        }
         let stall = Duration::from_secs_f64(3.0 * self.period.unwrap_or(0.0))
             .max(Duration::from_millis(250));
         // A stopped camera is ticked rarely and has no measurements to spoil.
@@ -623,6 +771,10 @@ impl AutoController {
                     self.clear_note("camera");
                 }
                 Err(e) => {
+                    if self.status.metering_part.is_some() {
+                        self.fail_metering(&e);
+                        return self.publish_due(now);
+                    }
                     self.backoff = (self.backoff * 2).clamp(SECOND, 30 * SECOND);
                     self.retry_at = Some(now + self.backoff);
                     self.note(
@@ -636,6 +788,9 @@ impl AutoController {
             self.taint(now);
         }
         self.account(now);
+        self.publish_due(now)
+    }
+    fn publish_due(&mut self, now: Instant) -> bool {
         let due = self.status.state != self.published.state
             || self
                 .published_at
@@ -647,15 +802,29 @@ impl AutoController {
         }
         false
     }
-    pub(crate) const fn invalidate(&mut self) {
+    pub(crate) fn invalidate(&mut self) {
         self.stale = true;
         self.reprobe = true;
+        if self.status.metering_part.is_some() {
+            self.part_verified = false;
+            self.status.state = if self.status.error.is_some() {
+                "failed"
+            } else {
+                "waiting"
+            }
+            .into();
+            self.status.brightness = None;
+            self.samples.clear();
+            self.in_band = 0;
+            self.unmetered = false;
+        }
     }
     pub(crate) fn manages(&self, feature: &str) -> bool {
         self.status.managed.iter().any(|f| f == feature)
     }
     pub(crate) fn converged(&self) -> bool {
-        self.unmetered || matches!(self.status.state.as_str(), "stable" | "limited")
+        self.status.error.is_none()
+            && (self.unmetered || matches!(self.status.state.as_str(), "stable" | "limited"))
     }
     pub(crate) const fn status(&self) -> &AutoStatus {
         &self.status
@@ -704,6 +873,11 @@ impl AutoController {
         }
     }
     pub(crate) fn release(mut self, camera: &mut Camera, revert: bool) -> Result<()> {
+        // An unproved selected source has never owned any camera setting.
+        // Its failure/cleanup must not turn unrelated firmware functions off.
+        if self.status.metering_part.is_some() && self.originals.is_empty() && self.writes == 0 {
+            return Ok(());
+        }
         if !revert {
             return hold(camera);
         }
@@ -989,9 +1163,46 @@ impl AutoController {
             );
         }
         self.caps.triggered = frame_triggered(camera);
-        self.caps.color = camera
-            .get("PixelFormat")
-            .is_ok_and(|v| v.as_str().is_some_and(|s| !s.starts_with("Mono")));
+        self.caps.color = self.status.metering_part.map_or_else(
+            || {
+                camera
+                    .get("PixelFormat")
+                    .is_ok_and(|v| v.as_str().is_some_and(|s| !s.starts_with("Mono")))
+            },
+            |selection| selection.format != crate::transport::multipart::GvspPartFormat::Mono8,
+        );
+        if self.status.metering_part.is_some() {
+            // No firmware metering region/component relationship is assumed.
+            // Verify every available auto is held before planning software writes.
+            for feature in AUTOS {
+                if !camera.has(feature) {
+                    continue;
+                }
+                if camera.get(feature)? != "Off" {
+                    self.write(
+                        camera,
+                        feature,
+                        &json!("Off"),
+                        Some("explicit multipart software metering"),
+                    )?;
+                }
+                ensure!(
+                    camera.get(feature)? == "Off",
+                    "{feature} did not remain Off for multipart metering"
+                );
+            }
+            self.caps.exposure_auto = None;
+            self.caps.gain_auto = None;
+            self.caps.white_auto = None;
+            self.caps.profile = None;
+            ensure!(
+                self.caps.exposure.is_some() || self.caps.gain.is_some(),
+                crate::types::Categorized::error(
+                    crate::types::ErrorKind::Unsupported,
+                    "selected multipart image has no adjustable exposure or gain"
+                )
+            );
+        }
         self.caps.video_mode = media && camera.has("VideoMode");
         let c = &self.caps;
         let strategy =
@@ -2164,6 +2375,11 @@ mod tests {
 
     fn frame(pixel_format: u32, width: u32, height: u32, data: Vec<u8>) -> Frame {
         Frame {
+            pixel_encoding: None,
+            device_timestamp: None,
+            received_monotonic_ns: None,
+            chunks: None,
+            multipart: None,
             id: 1,
             width,
             height,
@@ -2176,6 +2392,176 @@ mod tests {
     }
     fn near(a: f64, b: f64) -> bool {
         (a - b).abs() <= 1e-6 * b.abs().max(1.0)
+    }
+
+    #[test]
+    fn selected_meter_borrows_exact_parts_and_never_uses_the_representative() {
+        use crate::transport::multipart::{GvspPartFormat, job_selection_tests::ambiguous};
+        for native in [false, true] {
+            let frame = ambiguous(native);
+            let archive = frame.multipart.as_ref().unwrap();
+            let owners = Arc::strong_count(archive);
+            for (format, index, mean) in [
+                (GvspPartFormat::Mono8, 0, 15.0 / 255.0),
+                (GvspPartFormat::Mono8, 1, 45.0 / 255.0),
+                (GvspPartFormat::Rgb8, 2, 80.0 / 255.0),
+            ] {
+                let view = format.ordinary_view(&frame, Some(index)).unwrap();
+                let measured = meter_part(&view, None).unwrap();
+                assert!(near(measured.mean, mean));
+                let projected = format.project_index(&frame, Some(index)).unwrap();
+                assert_eq!(Some(measured), meter(&projected));
+            }
+            let view = GvspPartFormat::Mono8
+                .ordinary_view(&frame, Some(1))
+                .unwrap();
+            assert!(near(
+                meter_part(&view, Some([0.0, 0.5, 1.0, 0.5])).unwrap().mean,
+                55.0 / 255.0
+            ));
+            assert_eq!(Arc::strong_count(archive), owners);
+            assert!(archive.layout.selection_required);
+            assert_eq!(
+                &*archive.payload,
+                [
+                    10, 20, 30, 40, 50, 60, 70, 80, 90, 0xde, 0xad, 0x12, 0x34, 200
+                ]
+            );
+        }
+    }
+
+    fn ycbcr_meter_frame(width: u32) -> Frame {
+        let bytes = crate::frame::frame_len(0x020c_005a, width, 1).unwrap();
+        let data: Vec<_> = [10, 20, 128, 30, 40, 128].into_iter().take(bytes).collect();
+        let mut frame = frame(0x020c_005a, width, 1, data.clone());
+        let layout = serde_json::from_value(json!({
+            "selected":0,"selection_required":true,"byte_order":"little",
+            "original_buffer_bytes":bytes,"original_filled_bytes":bytes,"payload_bytes":bytes,
+            "parts":[{"index":0,"stored_offset":0,"original_offset":0,"length":bytes,"data_type":1,
+                "format":0x020c_005a,"namespace":4,"width":width,"height":1,"delivered_height":1,"x_padding_pixels":0}]
+        })).unwrap();
+        frame.multipart = Some(Arc::new(crate::transport::multipart::MultipartData {
+            layout,
+            payload: data.into(),
+        }));
+        frame
+    }
+
+    #[test]
+    fn selected_ycbcr_meter_requires_whole_groups_and_matches_existing_rgb_policy() {
+        use crate::transport::multipart::GvspPartFormat;
+        for width in [1, 2, 3] {
+            let frame = ycbcr_meter_frame(width);
+            let Err(error) = GvspPartFormat::Ycbcr4118.ordinary_view(&frame, Some(0)) else {
+                panic!("partial YCbCr411 row")
+            };
+            assert!(error.to_string().contains("complete four-pixel rows"));
+            let Err(error) = GvspPartFormat::Ycbcr4118.project_index(&frame, Some(0)) else {
+                panic!("partial YCbCr411 projection")
+            };
+            assert!(error.to_string().contains("complete four-pixel rows"));
+        }
+        let frame = ycbcr_meter_frame(4);
+        let view = GvspPartFormat::Ycbcr4118
+            .ordinary_view(&frame, Some(0))
+            .unwrap();
+        assert!(near(meter_part(&view, None).unwrap().mean, 25.0 / 255.0));
+        let projected = GvspPartFormat::Ycbcr4118
+            .project_index(&frame, Some(0))
+            .unwrap();
+        assert_eq!(Some(meter_part(&view, None).unwrap()), meter(&projected));
+    }
+
+    #[test]
+    fn selected_auto_waits_for_a_real_part_forces_software_and_latches_bad_frames() {
+        use crate::transport::multipart::{
+            GvspPartFormat, PartSelection, job_selection_tests::ambiguous,
+        };
+        let fake = Fake::new(true);
+        for address in [EXPOSURE_AUTO, GAIN_AUTO, WHITE_AUTO] {
+            fake.set_u32(address, 2);
+        }
+        let mut camera = fake.camera();
+        fake.writes.lock().unwrap().clear();
+        let selection = PartSelection {
+            format: GvspPartFormat::Mono8,
+            index: Some(1),
+        };
+        let mut auto = AutoController::enter_selected(&mut camera, selection).unwrap();
+        let now = Instant::now();
+        auto.set_limits(&mut camera, Some([0.0, 0.0, 1.0, 1.0]), Some(5_000.0))
+            .unwrap();
+        auto.tick(&mut camera, now);
+        assert!(fake.writes.lock().unwrap().is_empty());
+        assert!(!auto.converged());
+        let mut bad = ambiguous(false);
+        Arc::make_mut(bad.multipart.as_mut().unwrap()).layout.parts[1].namespace = Some(1000);
+        let mut rejected = auto.clone();
+        rejected.observe(&bad, now);
+        assert_eq!(rejected.status.state, "failed");
+        rejected.release(&mut camera, false).unwrap();
+        assert!(fake.writes.lock().unwrap().is_empty());
+        for address in [EXPOSURE_AUTO, GAIN_AUTO, WHITE_AUTO] {
+            assert_eq!(fake.u32(address), 2);
+        }
+        auto.observe(&ambiguous(false), now);
+        assert!(near(auto.status.brightness.unwrap(), 45.0 / 255.0));
+        auto.tick(&mut camera, now);
+        assert_eq!(auto.status.strategy, "software");
+        assert!(
+            !auto.caps.color,
+            "the selected Mono8 overrides global Bayer PixelFormat"
+        );
+        assert_eq!(
+            (
+                auto.caps.exposure_auto,
+                auto.caps.gain_auto,
+                auto.caps.white_auto
+            ),
+            (None, None, None)
+        );
+        for address in [EXPOSURE_AUTO, GAIN_AUTO, WHITE_AUTO] {
+            assert_eq!(fake.u32(address), 0);
+        }
+        assert!(auto.part_verified);
+        fake.writes.lock().unwrap().clear();
+        auto.invalidate();
+        auto.tick(&mut camera, now + SECOND);
+        assert!(!auto.part_verified);
+        assert_eq!(auto.status.brightness, None);
+        assert!(fake.writes.lock().unwrap().is_empty());
+        // Wrong index is detected even inside the metering cadence window.
+        let mut wrong = ambiguous(false);
+        Arc::make_mut(wrong.multipart.as_mut().unwrap())
+            .layout
+            .parts[1]
+            .namespace = Some(1000);
+        auto.observe(&wrong, now + Duration::from_millis(1));
+        assert_eq!(auto.status.state, "failed");
+        let error = crate::session::protocol::from_wire(auto.status.error.as_ref().unwrap());
+        assert_eq!(
+            crate::types::classify(&error).kind,
+            crate::types::ErrorKind::Unsupported
+        );
+        auto.set_limits(&mut camera, None, None).unwrap();
+        auto.tick(&mut camera, now + 2 * SECOND);
+        assert!(fake.writes.lock().unwrap().is_empty());
+        assert!(!auto.converged());
+        // Fresh controller state never inherits an old source's meter or failure.
+        let fresh = AutoController::enter_selected(
+            &mut camera,
+            PartSelection {
+                index: Some(0),
+                ..selection
+            },
+        )
+        .unwrap();
+        assert_eq!(fresh.status.brightness, None);
+        assert_eq!(fresh.status.error, None);
+        assert!(fresh.samples.is_empty());
+        assert_eq!(fresh.in_band, 0);
+        assert_eq!(fresh.last_meter, None);
+        assert_eq!(fresh.settle, None);
     }
 
     #[test]
@@ -2661,6 +3047,10 @@ mod tests {
         }
     }
     impl Backend for Fake {
+        fn enable_multipart_projection(&mut self) -> Result<()> {
+            Ok(())
+        }
+
         fn xml(&mut self) -> Result<String> {
             Ok(self.xml.clone())
         }

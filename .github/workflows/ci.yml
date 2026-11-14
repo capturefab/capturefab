@@ -159,10 +159,12 @@ jobs:
       - run: cargo clippy --locked --no-default-features -- -D warnings
       - name: Lint every optional feature independently
         run: |
-          for feature in usb jpeg videotoolbox nvjpeg vaapi keychain shell copy-audit testing; do
+          for feature in usb gentl ni-daqmx jpeg videotoolbox nvjpeg vaapi keychain shell mqtt-tls copy-audit testing; do
             cargo clippy --locked --no-default-features --features "$feature" -- -D warnings
             cargo clippy --locked --no-default-features --features "$feature" --all-targets -- -D warnings
           done
+      - name: Exercise isolated NI input with the independent fake driver
+        run: cargo test --locked --no-default-features --features ni-daqmx --lib --test data_ni_daqmx
 
   site:
     name: Site and release scripts

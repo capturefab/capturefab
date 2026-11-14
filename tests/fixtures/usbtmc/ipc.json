@@ -1,0 +1,328 @@
+{
+  "format_version": 1,
+  "source": {
+    "archive_url": "https://www.usb.org/sites/default/files/USBTMC_1_006a.zip",
+    "archive_bytes": 690172,
+    "archive_sha256": "e147d643a8c2fd54f6f77d522180a9694ce4ec2759bb08c462c6d913e862d8dd",
+    "usbtmc_pdf_bytes": 412058,
+    "usbtmc_pdf_sha256": "c43f71baa0f337df84f75b9f730c2fca94efe68d521f35ddc6f2c38af35aa870",
+    "usb488_pdf_bytes": 321908,
+    "usb488_pdf_sha256": "2bb73ed0300c975fc105be7ca14ca22158e9b9208726212d9de7fad39950b92d",
+    "public_contract_sha256": "b238deb1185081cafdc0057b29479c36dd2ff9dc6c7c8a38c986fcc7c7f67949",
+    "ipc_contract_sha256": "12e985387b76df47e0dc4ff37f9b77a2cea774b3b2d62344563e06c267c864e2",
+    "scope": "Independently hand-declared Rev1.0 wire/scalar controls, prior to native/codec authorship. No device, OS driver or physical instrument qualification."
+  },
+  "frame_max_bytes": 131072,
+  "work_clock": {
+    "earliest_ns": 1000000000,
+    "deadline_ns": 2000000000,
+    "acquisition_end_ns": 1800000000,
+    "valid_observed_ns": 1500000000,
+    "late_equal_cutoff_ns": 1800000000,
+    "late_equal_deadline_ns": 2000000000,
+    "source_time": "absent"
+  },
+  "frames": [
+    {
+      "name": "open",
+      "direction": "request",
+      "body_utf8": "{\"version\":1,\"request_id\":1,\"command\":{\"open\":{\"selector\":{\"vendor_id\":6833,\"product_id\":1230,\"serial_number\":\"SN A<|>01\",\"interface_number\":3},\"deadline_ns\":2000000000,\"acquisition_end_ns\":1800000000}}}",
+      "length_prefix_hex": "cb000000",
+      "body_bytes": 203,
+      "frame_sha256": "bd8ba734121d5cb1902b02bb786656cb43897c18d35ed9d8e7003ea3c720aceb",
+      "valid": true
+    },
+    {
+      "name": "ready",
+      "direction": "reply",
+      "body_utf8": "{\"version\":1,\"request_id\":1,\"result\":{\"ready\":{\"descriptor\":{\"vendor_id\":6833,\"product_id\":1230,\"serial_number\":\"SN A<|>01\",\"interface_number\":3,\"configuration\":1,\"alternate_setting\":0,\"class\":254,\"subclass\":3,\"protocol\":1,\"bulk_in\":{\"address\":131,\"max_packet_size\":64},\"bulk_out\":{\"address\":2,\"max_packet_size\":64},\"interrupt_in\":{\"address\":132,\"max_packet_size\":2},\"capabilities_base64\":\"AQAAAQABAAAAAAAAAAEHDwAAAAAAAAAA\"}}}}",
+      "length_prefix_hex": "ab010000",
+      "body_bytes": 427,
+      "frame_sha256": "f1def83b57ce0be05464947606e625f54509bc279eb0f4438151d30031f832b3",
+      "valid": true
+    },
+    {
+      "name": "send_query",
+      "direction": "request",
+      "body_utf8": "{\"version\":1,\"request_id\":2,\"command\":{\"send_query\":{\"bytes_base64\":\"UkVBRD8K\",\"deadline_ns\":2000000000}}}",
+      "length_prefix_hex": "6a000000",
+      "body_bytes": 106,
+      "frame_sha256": "24e5bc489fe8b0b3e0c5a53ecba1b37398626471c29e2bf01f6523ad0ddbc9c9",
+      "valid": true
+    },
+    {
+      "name": "query_sent",
+      "direction": "reply",
+      "body_utf8": "{\"version\":1,\"request_id\":2,\"result\":{\"query_sent\":{}}}",
+      "length_prefix_hex": "37000000",
+      "body_bytes": 55,
+      "frame_sha256": "43c544583b91c02326a742f41142527c614747b2b17f06bb01721f758c345b92",
+      "valid": true
+    },
+    {
+      "name": "receive",
+      "direction": "request",
+      "body_utf8": "{\"version\":1,\"request_id\":3,\"command\":{\"receive\":{\"max_bytes\":32,\"deadline_ns\":2000000000}}}",
+      "length_prefix_hex": "5c000000",
+      "body_bytes": 92,
+      "frame_sha256": "d487d2a915a90d95165accfc4458e84b72f7ed682ac6e337413cd2b56636417b",
+      "valid": true
+    },
+    {
+      "name": "data_eom",
+      "direction": "reply",
+      "body_utf8": "{\"version\":1,\"request_id\":3,\"result\":{\"data\":{\"payload_base64\":\"MS4yNQo=\",\"eom\":true,\"observed_ns\":1500000000}}}",
+      "length_prefix_hex": "70000000",
+      "body_bytes": 112,
+      "frame_sha256": "e24174b5e58e870b67d8c2a28c273386ce1ea6ac6e7a8cde5315187707430b62",
+      "valid": true
+    },
+    {
+      "name": "complete_request",
+      "direction": "request",
+      "body_utf8": "{\"version\":1,\"request_id\":4,\"command\":{\"complete\":{\"deadline_ns\":2000000000}}}",
+      "length_prefix_hex": "4e000000",
+      "body_bytes": 78,
+      "frame_sha256": "84bc2a5dd4f6d9118543232a3a9f94bcac20f8f0d88b65f87b52dcb73f309729",
+      "valid": true
+    },
+    {
+      "name": "complete_reply",
+      "direction": "reply",
+      "body_utf8": "{\"version\":1,\"request_id\":4,\"result\":{\"complete\":{}}}",
+      "length_prefix_hex": "35000000",
+      "body_bytes": 53,
+      "frame_sha256": "927b738957ae839acdf8b76212e185330f122ac9de588f4854f230137e8b0136",
+      "valid": true
+    },
+    {
+      "name": "finish_request",
+      "direction": "request",
+      "body_utf8": "{\"version\":1,\"request_id\":5,\"command\":{\"finish\":{\"deadline_ns\":2500000000}}}",
+      "length_prefix_hex": "4c000000",
+      "body_bytes": 76,
+      "frame_sha256": "1af7ff7ab9aa1d714a1cef8efe78357ba797f64d2f4a4a3b43dab4f8551d3e81",
+      "valid": true
+    },
+    {
+      "name": "finished",
+      "direction": "reply",
+      "body_utf8": "{\"version\":1,\"request_id\":5,\"result\":{\"finished\":{\"cleanup\":{\"host_resources_released\":true,\"native_transfers_settled\":true,\"class_abort\":\"not_needed\",\"message_state\":\"completed_eom\"}}}}",
+      "length_prefix_hex": "ba000000",
+      "body_bytes": 186,
+      "frame_sha256": "13b43d941712cc47ba0c7ffd8ae38526dabd3e12e5212e1c84554d0e2d97227a",
+      "valid": true
+    },
+    {
+      "name": "failed_qualified_prefix",
+      "direction": "reply",
+      "body_utf8": "{\"version\":1,\"request_id\":3,\"result\":{\"failed\":{\"error\":{\"message\":\"fixture premature short\",\"tag\":{\"code\":\"incomplete\",\"details\":{\"declared\":5,\"actual\":4}}},\"evidence\":{\"payload_prefix_base64\":\"MS4yNQ==\",\"payload_prefix_total\":4,\"payload_prefix_truncated\":false,\"observed_ns\":1500000000}}}}",
+      "length_prefix_hex": "23010000",
+      "body_bytes": 291,
+      "frame_sha256": "616c5505895380b6e8f00b7cde4bcddb88c16596949b8823ac08a7b795b2f835",
+      "valid": true
+    },
+    {
+      "name": "failed_without_prefix",
+      "direction": "reply",
+      "body_utf8": "{\"version\":1,\"request_id\":3,\"result\":{\"failed\":{\"error\":{\"message\":\"fixture premature short\",\"tag\":{\"code\":\"incomplete\",\"details\":{\"declared\":5,\"actual\":4}}}}}}",
+      "length_prefix_hex": "a0000000",
+      "body_bytes": 160,
+      "frame_sha256": "78b080f8baba18a707a1f5b6f7e4ca690f284bb150465b9f46ea33c81e520bda",
+      "valid": true
+    },
+    {
+      "name": "duplicate_version",
+      "direction": "request",
+      "body_utf8": "{\"version\":1,\"version\":1,\"request_id\":1,\"command\":{\"finish\":{\"deadline_ns\":2}}}",
+      "length_prefix_hex": "4f000000",
+      "body_bytes": 79,
+      "frame_sha256": "514293205ed3678f080d80e816f6d945033ac5664584023c74db02611e2bdc4e",
+      "valid": false,
+      "reason": "duplicate_field"
+    },
+    {
+      "name": "unknown_envelope_field",
+      "direction": "request",
+      "body_utf8": "{\"version\":1,\"request_id\":1,\"command\":{\"finish\":{\"deadline_ns\":2}},\"extra\":0}",
+      "length_prefix_hex": "4d000000",
+      "body_bytes": 77,
+      "frame_sha256": "1d7b71feeae33d0bf0241db23c27961863d73e9ead9af3c93905b50f12142771",
+      "valid": false,
+      "reason": "unknown_field"
+    },
+    {
+      "name": "null_optional",
+      "direction": "request",
+      "body_utf8": "{\"version\":1,\"request_id\":1,\"command\":{\"open\":{\"selector\":{\"vendor_id\":1,\"product_id\":0,\"serial_number\":\"A\",\"interface_number\":0},\"deadline_ns\":2,\"acquisition_end_ns\":null}}}",
+      "length_prefix_hex": "ae000000",
+      "body_bytes": 174,
+      "frame_sha256": "d9e0f5a39f82e39751035b9396fa3917985830a21822dd96f272be1a2edca7ad",
+      "valid": false,
+      "reason": "null"
+    },
+    {
+      "name": "fractional_id",
+      "direction": "request",
+      "body_utf8": "{\"version\":1,\"request_id\":1.5,\"command\":{\"finish\":{\"deadline_ns\":2}}}",
+      "length_prefix_hex": "45000000",
+      "body_bytes": 69,
+      "frame_sha256": "32ea9d4fdca6b72d961da1a123bc28e51a0d6d2b6151a923243b48eb72d1bb25",
+      "valid": false,
+      "reason": "inexact_integer"
+    },
+    {
+      "name": "negative_id",
+      "direction": "request",
+      "body_utf8": "{\"version\":1,\"request_id\":-1,\"command\":{\"finish\":{\"deadline_ns\":2}}}",
+      "length_prefix_hex": "44000000",
+      "body_bytes": 68,
+      "frame_sha256": "884b97cc8a0e3351d99949a9f9dcfb25c1c6a20fce471e69f600c5344c4ba1ef",
+      "valid": false,
+      "reason": "integer_range"
+    },
+    {
+      "name": "unknown_error_code",
+      "direction": "reply",
+      "body_utf8": "{\"version\":1,\"request_id\":3,\"result\":{\"failed\":{\"error\":{\"message\":\"fixture\",\"tag\":{\"code\":\"invented\"}}}}}",
+      "length_prefix_hex": "6a000000",
+      "body_bytes": 106,
+      "frame_sha256": "486267d520056bd61c36eb6f6450612517ed5cb6cf3966043def689bf80e0fb7",
+      "valid": false,
+      "reason": "unknown_code"
+    },
+    {
+      "name": "data_empty",
+      "direction": "reply",
+      "body_utf8": "{\"version\":1,\"request_id\":3,\"result\":{\"data\":{\"payload_base64\":\"\",\"eom\":true,\"observed_ns\":1500000000}}}",
+      "length_prefix_hex": "68000000",
+      "body_bytes": 104,
+      "frame_sha256": "2330e4809f6ca50ed76df354fcb0b64aaeab76a9710598ed330def1d76c4f974",
+      "valid": false,
+      "reason": "empty_data"
+    },
+    {
+      "name": "data_null_clock",
+      "direction": "reply",
+      "body_utf8": "{\"version\":1,\"request_id\":3,\"result\":{\"data\":{\"payload_base64\":\"QQ==\",\"eom\":true,\"observed_ns\":null}}}",
+      "length_prefix_hex": "66000000",
+      "body_bytes": 102,
+      "frame_sha256": "e9073e822d0e74a9629cbfcd1c602f6885ddbf690d11d49bce14ca7c93d0a784",
+      "valid": false,
+      "reason": "null"
+    },
+    {
+      "name": "evidence_bad_relation",
+      "direction": "reply",
+      "body_utf8": "{\"version\":1,\"request_id\":3,\"result\":{\"failed\":{\"error\":{\"message\":\"fixture premature short\",\"tag\":{\"code\":\"incomplete\",\"details\":{\"declared\":5,\"actual\":4}}},\"evidence\":{\"payload_prefix_base64\":\"MS4yNQ==\",\"payload_prefix_total\":4,\"payload_prefix_truncated\":true,\"observed_ns\":1500000000}}}}",
+      "length_prefix_hex": "22010000",
+      "body_bytes": 290,
+      "frame_sha256": "ab8f095f7f2fe03e18b59656381aad7d463a829ab33161d88012e4f60ac929ca",
+      "valid": false,
+      "reason": "truncation_relation"
+    }
+  ],
+  "frame_faults": [
+    {
+      "name": "zero_length",
+      "prefix_hex": "00000000",
+      "valid": false
+    },
+    {
+      "name": "over_maximum",
+      "prefix_hex": "01000200",
+      "announced_bytes": 131073,
+      "valid": false
+    },
+    {
+      "name": "maximum_length_boundary",
+      "prefix_hex": "00000200",
+      "announced_bytes": 131072,
+      "allocation_admitted": true,
+      "valid_json_still_required": true
+    },
+    {
+      "name": "invalid_utf8",
+      "prefix_hex": "01000000",
+      "body_hex": "ff",
+      "valid": false
+    }
+  ],
+  "scalar_bounds": {
+    "request_id_min": 1,
+    "u64_max": 18446744073709551615,
+    "receive_min": 1,
+    "receive_max": 65536,
+    "query_min": 1,
+    "query_max": 4098,
+    "error_message_utf8_max": 4096,
+    "error_hint_utf8_max": 1024,
+    "details_serialized_max": 16384,
+    "evidence_prefix_max": 4096,
+    "evidence_total_max": 65536
+  },
+  "evidence_controls": [
+    {
+      "total": 0,
+      "prefix_bytes": 0,
+      "truncated": false,
+      "presence_optional": true
+    },
+    {
+      "total": 4,
+      "prefix_bytes": 4,
+      "truncated": false
+    },
+    {
+      "total": 4096,
+      "prefix_bytes": 4096,
+      "truncated": false
+    },
+    {
+      "total": 4097,
+      "prefix_bytes": 4096,
+      "truncated": true
+    },
+    {
+      "total": 65536,
+      "prefix_bytes": 4096,
+      "truncated": true
+    }
+  ],
+  "state_controls": [
+    "open_first_only",
+    "request_ids_start_1_increase_no_wrap",
+    "sole_pending_identity",
+    "wrong_id_retires",
+    "no_query_before_ready",
+    "query_then_receive_until_eom",
+    "complete_has_no_native_read",
+    "finish_after_responsive_failure",
+    "discard_late_timed_out_reply_before_finish",
+    "ipc_error_forces_owned_termination",
+    "no_query_after_retirement",
+    "parent_first_error_survives_finish_error"
+  ],
+  "cleanup_controls": [
+    {
+      "host_resources_released": true,
+      "native_transfers_settled": true,
+      "class_abort": "not_needed",
+      "message_state": "completed_eom"
+    },
+    {
+      "host_resources_released": true,
+      "native_transfers_settled": true,
+      "class_abort": "succeeded",
+      "message_state": "unconfirmed",
+      "requires_error": true
+    },
+    {
+      "host_resources_released": false,
+      "native_transfers_settled": false,
+      "class_abort": "unconfirmed",
+      "message_state": "unconfirmed",
+      "requires_error": true
+    }
+  ]
+}

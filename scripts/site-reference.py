@@ -28,6 +28,8 @@ GROUPS = [
      ['list', 'info', 'features', 'get', 'set', 'exec']),
     ('cli-capture', 'Capture, record and measure', 'Save images and video. Measure brightness and focus or set auto exposure.',
      ['capture', 'record', 'inspect', 'watch', 'auto']),
+    ('cli-data', 'Industrial data', 'Record industrial signals on one host timeline and export CSV or JSONL.',
+     ['data']),
     ('cli-presets', 'Presets', 'Save a camera\'s settings on this computer and restore them as one change.',
      ['preset']),
     ('cli-sessions', 'Sessions and jobs', 'Keep cameras open between commands and run captures and recordings in the background.',

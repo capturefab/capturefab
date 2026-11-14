@@ -2,9 +2,10 @@
 //! feature). Frames libjpeg-turbo reads (RGB8, BGR8, Mono8) are encoded in
 //! place, and the JPEG stays in the buffer libjpeg-turbo wrote it to.
 #![deny(clippy::missing_const_for_fn)]
+use crate::types::MONO8;
 use crate::{
     frame::{Body, Samples},
-    types::{Frame, MONO8},
+    types::Frame,
 };
 use anyhow::Result;
 #[cfg(not(feature = "jpeg"))]
@@ -48,7 +49,10 @@ impl<'a> Raster<'a> {
     /// Returns an error for invalid or oversized image dimensions, an unsupported
     /// pixel format, truncated source bytes, or a missing monochrome conversion.
     pub fn new(frame: &'a Frame) -> Result<Self> {
-        let (channels, data) = if monochrome(frame.pixel_format) {
+        let (channels, data) = if monochrome(frame.pixel_format)
+            || crate::frame::frame_encoding(frame)
+                .is_some_and(crate::types::IdsPixelFormat::is_monochrome)
+        {
             // One pass straight to 8-bit gray; no RGB triplication.
             let gray = crate::frame::gray8_samples(frame)?
                 .ok_or_else(|| anyhow::anyhow!("monochrome frame has no gray conversion"))?;
@@ -113,7 +117,13 @@ pub(crate) fn encode(frame: &Frame, quality: i32) -> Result<Body<'static>> {
         crate::types::RGB8 => (PixelFormat::RGB, 3),
         0x0218_0015 => (PixelFormat::BGR, 3),
         MONO8 => (PixelFormat::GRAY, 1),
-        other if monochrome(other) => return software_quality(&Raster::new(frame)?, quality),
+        other
+            if monochrome(other)
+                || crate::frame::frame_encoding(frame)
+                    .is_some_and(crate::types::IdsPixelFormat::is_monochrome) =>
+        {
+            return software_quality(&Raster::new(frame)?, quality);
+        }
         JFIF_420 => return compress_jfif(frame, quality),
         _ => return encode_planes(frame, quality),
     };
@@ -538,6 +548,11 @@ mod tests {
     use crate::types::RGB8;
     fn frame(pixel_format: u32, width: u32, height: u32, bytes: usize) -> Frame {
         Frame {
+            pixel_encoding: None,
+            device_timestamp: None,
+            received_monotonic_ns: None,
+            chunks: None,
+            multipart: None,
             id: 1,
             width,
             height,
@@ -715,6 +730,7 @@ mod tests {
             data.extend((0..cw * ch).map(|i| u8::try_from(100 + i % cw).unwrap()));
             data.extend((0..cw * ch).map(|i| u8::try_from(150 - i / cw).unwrap()));
             let frame = Frame {
+                pixel_encoding: None,
                 width,
                 height,
                 pixel_format: JFIF_420,

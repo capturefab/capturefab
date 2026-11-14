@@ -631,6 +631,7 @@ fn encode(
         "a frame or JPEG larger than its segment"
     );
     let frame = Frame {
+        pixel_encoding: None,
         width: job.width,
         height: job.height,
         pixel_format: job.pixel_format,
@@ -982,7 +983,9 @@ impl Backend for Client {
     /// Every format the CPU encodes, at any quality; a helper that cannot
     /// take one declines it.
     fn accepts(view: FrameRef<'_>, quality: i32) -> bool {
-        (1..=100).contains(&quality) && crate::frame::convertible(view.pixel_format())
+        view.frame.pixel_encoding.is_none()
+            && (1..=100).contains(&quality)
+            && crate::frame::convertible(view.pixel_format())
     }
 
     fn encode(&mut self, view: FrameRef<'_>, quality: i32) -> Result<Body<'static>> {

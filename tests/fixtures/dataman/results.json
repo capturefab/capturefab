@@ -1,0 +1,133 @@
+{
+  "format_version": 1,
+  "proof": "Manufacturer class0x79 instance1 attr0x10 four little-endian UINTs then BYTE storage; all frames independently reconstructed, not hardware/SDK output. DMCC command framing is not inferred.",
+  "request_cip_hex": "0e03207924013010",
+  "cases": {
+    "binary_tail": {
+      "provenance": "spec_derived_not_vendor_capture",
+      "cip_hex": "8e00000034120780c3a5080041000d0a7cff8042dead",
+      "native_hex": "34120780c3a5080041000d0a7cff8042dead",
+      "active_hex": "41000d0a7cff8042",
+      "tail_hex": "dead",
+      "expected": {
+        "kind": "dataman_result",
+        "profile": "cip_result",
+        "result_id_raw": 4660,
+        "result_code_raw": 32775,
+        "result_extended_raw": 42435,
+        "result_length_raw": 8,
+        "returned_storage_bytes": 10,
+        "raw": {
+          "encoding": "base64",
+          "scope": "decode_results_attribute",
+          "data": "NBIHgMOlCABBAA0KfP+AQt6t"
+        },
+        "active": {
+          "encoding": "base64",
+          "scope": "result_data",
+          "data": "QQANCnz/gEI="
+        },
+        "tail": {
+          "encoding": "base64",
+          "scope": "returned_storage_tail",
+          "data": "3q0="
+        }
+      }
+    },
+    "empty": {
+      "provenance": "spec_derived_not_vendor_capture",
+      "cip_hex": "8e000000ffff000000000000",
+      "native_hex": "ffff000000000000",
+      "active_hex": "",
+      "tail_hex": "",
+      "expected": {
+        "kind": "dataman_result",
+        "profile": "cip_result",
+        "result_id_raw": 65535,
+        "result_code_raw": 0,
+        "result_extended_raw": 0,
+        "result_length_raw": 0,
+        "returned_storage_bytes": 0,
+        "raw": {
+          "encoding": "base64",
+          "scope": "decode_results_attribute",
+          "data": "//8AAAAAAAA="
+        },
+        "active": {
+          "encoding": "base64",
+          "scope": "result_data",
+          "data": ""
+        },
+        "tail": {
+          "encoding": "base64",
+          "scope": "returned_storage_tail",
+          "data": ""
+        }
+      }
+    },
+    "wrapped": {
+      "provenance": "spec_derived_not_vendor_capture",
+      "cip_hex": "8e0000000000000000000000",
+      "native_hex": "0000000000000000",
+      "active_hex": "",
+      "tail_hex": "",
+      "expected": {
+        "kind": "dataman_result",
+        "profile": "cip_result",
+        "result_id_raw": 0,
+        "result_code_raw": 0,
+        "result_extended_raw": 0,
+        "result_length_raw": 0,
+        "returned_storage_bytes": 0,
+        "raw": {
+          "encoding": "base64",
+          "scope": "decode_results_attribute",
+          "data": "AAAAAAAAAAA="
+        },
+        "active": {
+          "encoding": "base64",
+          "scope": "result_data",
+          "data": ""
+        },
+        "tail": {
+          "encoding": "base64",
+          "scope": "returned_storage_tail",
+          "data": ""
+        }
+      }
+    },
+    "utf8": {
+      "provenance": "spec_derived_not_vendor_capture",
+      "cip_hex": "8e00000001004180ffff07004100c2a9e282ac",
+      "native_hex": "01004180ffff07004100c2a9e282ac",
+      "active_hex": "4100c2a9e282ac",
+      "tail_hex": "",
+      "expected": {
+        "kind": "dataman_result",
+        "profile": "cip_result",
+        "result_id_raw": 1,
+        "result_code_raw": 32833,
+        "result_extended_raw": 65535,
+        "result_length_raw": 7,
+        "returned_storage_bytes": 7,
+        "raw": {
+          "encoding": "base64",
+          "scope": "decode_results_attribute",
+          "data": "AQBBgP//BwBBAMKp4oKs"
+        },
+        "active": {
+          "encoding": "base64",
+          "scope": "result_data",
+          "data": "QQDCqeKCrA=="
+        },
+        "tail": {
+          "encoding": "base64",
+          "scope": "returned_storage_tail",
+          "data": ""
+        },
+        "encoding": "utf8",
+        "text": "A\u0000©€"
+      }
+    }
+  }
+}

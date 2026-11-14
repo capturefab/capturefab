@@ -372,6 +372,9 @@ pub(super) fn process(
         scheduled_stream,
     } = state;
     command.validate()?;
+    if camera.as_ref().is_some_and(Camera::is_read_only_monitor) {
+        crate::session::monitor::validate_worker(&command)?;
+    }
     match command.session() {
         // Reading and comparing switch selectors only to read, and restore them.
         Some(SessionCommand::ReadSetup) => {
@@ -613,6 +616,7 @@ mod tests {
         let h = connected();
         h.request(SessionCommand::Auto {
             continuous: false,
+            part_selection: None,
             job: None,
             max_exposure_us: None,
             region: None,

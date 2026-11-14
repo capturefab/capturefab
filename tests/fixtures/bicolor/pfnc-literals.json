@@ -1,0 +1,223 @@
+{
+  "scope": "Independent hand-derived PFNC BiColor component/location literals. Authored after reading primary table and stated software policy, before reading candidate bicolor.rs or fixture implementations. No physical/SDK/runtime claim.",
+  "primary": {
+    "url": "https://www.emva.org/wp-content/uploads/GenICam_PFNC_2_3.pdf",
+    "edition": "2.3 January18,2019",
+    "section": "3.1.8 Figure3-17",
+    "printed_page": 20,
+    "pdf_index": 19,
+    "proof": "Both row1 and row2 are LM,NO,LM,NO. RGBG means measured RG/BG pairs; BGRG means measured BG/RG pairs. Each image position has two components; horizontal position changes phase, vertical position alone does not.",
+    "method": "Official PDF indexed text table read directly. Web screenshot returned cache-miss; no independent visual-render/hash claim."
+  },
+  "software_policy": "Preserve measured G and R/B. Fill missing R/B by mean of adjacent in-view opposite-color positions (one-sided at edges); width1 uses measured G. This is an explicit display policy, not PFNC-provided samples/calibration/accuracy. All chosen means are integral, so these vectors do not settle rounding of odd sums.",
+  "width": 3,
+  "height": 2,
+  "tight_stride": 6,
+  "raw_u8": [
+    10,
+    21,
+    70,
+    32,
+    90,
+    43,
+    130,
+    54,
+    173,
+    65,
+    218,
+    76
+  ],
+  "raw_hex": "0a1546205a2b8236ad41da4c",
+  "padded_stride": 8,
+  "padded_raw_hex": "0a1546205a2beedd8236ad41da4cccbb",
+  "rgbg": {
+    "measured_pairs": [
+      [
+        "R10 G21",
+        "B70 G32",
+        "R90 G43"
+      ],
+      [
+        "R130 G54",
+        "B173 G65",
+        "R218 G76"
+      ]
+    ],
+    "display_rgb_rows": [
+      [
+        [
+          10,
+          21,
+          70
+        ],
+        [
+          50,
+          32,
+          70
+        ],
+        [
+          90,
+          43,
+          70
+        ]
+      ],
+      [
+        [
+          130,
+          54,
+          173
+        ],
+        [
+          174,
+          65,
+          173
+        ],
+        [
+          218,
+          76,
+          173
+        ]
+      ]
+    ]
+  },
+  "bgrg": {
+    "measured_pairs": [
+      [
+        "B10 G21",
+        "R70 G32",
+        "B90 G43"
+      ],
+      [
+        "B130 G54",
+        "R173 G65",
+        "B218 G76"
+      ]
+    ],
+    "display_rgb_rows": [
+      [
+        [
+          70,
+          21,
+          10
+        ],
+        [
+          70,
+          32,
+          50
+        ],
+        [
+          70,
+          43,
+          90
+        ]
+      ],
+      [
+        [
+          173,
+          54,
+          130
+        ],
+        [
+          173,
+          65,
+          174
+        ],
+        [
+          173,
+          76,
+          218
+        ]
+      ]
+    ]
+  },
+  "odd_x_view": {
+    "x": 1,
+    "y": 0,
+    "width": 2,
+    "height": 2,
+    "raw_tight_hex": "46205a2bad41da4c",
+    "rgbg_source_view_name": "BiColorBGRG8",
+    "rgbg_source_view_display_rgb_rows": [
+      [
+        [
+          90,
+          32,
+          70
+        ],
+        [
+          90,
+          43,
+          70
+        ]
+      ],
+      [
+        [
+          218,
+          65,
+          173
+        ],
+        [
+          218,
+          76,
+          173
+        ]
+      ]
+    ],
+    "bgrg_source_view_name": "BiColorRGBG8",
+    "bgrg_source_view_display_rgb_rows": [
+      [
+        [
+          70,
+          32,
+          90
+        ],
+        [
+          70,
+          43,
+          90
+        ]
+      ],
+      [
+        [
+          173,
+          65,
+          218
+        ],
+        [
+          173,
+          76,
+          218
+        ]
+      ]
+    ],
+    "qualification": "Only in-view neighbors are used. Cropping after full-image interpolation need not equal interpolating a raw view; measured components must agree."
+  },
+  "odd_y_view": {
+    "x": 0,
+    "y": 1,
+    "width": 3,
+    "height": 1,
+    "raw_tight_hex": "8236ad41da4c",
+    "rgbg_source_view_name": "BiColorRGBG8",
+    "bgrg_source_view_name": "BiColorBGRG8",
+    "proof": "Odd row width does not carry alternating phase into the next row."
+  },
+  "width_one_odd_x_view": {
+    "x": 1,
+    "y": 0,
+    "width": 1,
+    "height": 1,
+    "raw_hex": "4620",
+    "rgbg_source_view_display_rgb": [
+      32,
+      32,
+      70
+    ],
+    "bgrg_source_view_display_rgb": [
+      70,
+      32,
+      32
+    ]
+  },
+  "source_descriptor_policy": "The original received descriptor and exact row/padding bytes remain source evidence. A derived crop may exchange RGBG/BGRG only on oddx; this does not rewrite original RAW metadata."
+}

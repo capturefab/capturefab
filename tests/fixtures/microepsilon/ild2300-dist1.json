@@ -1,0 +1,36 @@
+{
+  "qualification": "Hand-declared from the pinned manual bit diagram; not sensor captures or stock SDK output; no candidate decoder was used.",
+  "layout": {"order": ["L", "M", "H"], "tag_mask_hex": "c0", "required_tag_hex": ["00", "40", "80"], "payload_mask_hex": "3f", "payload_bits": ["D5..D0", "D11..D6", "D17..D12"], "marker": "H bit6 clear for the single output value"},
+  "cases": [
+    {"name": "zero", "raw_code": 0, "wire_hex": "004080"},
+    {"name": "one", "raw_code": 1, "wire_hex": "014080"},
+    {"name": "low_six_max", "raw_code": 63, "wire_hex": "3f4080"},
+    {"name": "middle_first", "raw_code": 64, "wire_hex": "004180"},
+    {"name": "low_twelve_max", "raw_code": 4095, "wire_hex": "3f7f80"},
+    {"name": "high_first", "raw_code": 4096, "wire_hex": "004081"},
+    {"name": "manual_midrange_code", "raw_code": 32760, "wire_hex": "387f87"},
+    {"name": "sixteen_bit_edge_minus_16", "raw_code": 65519, "wire_hex": "2f7f8f"},
+    {"name": "sixteen_bit_max", "raw_code": 65535, "wire_hex": "3f7f8f"},
+    {"name": "d16_set", "raw_code": 65536, "wire_hex": "004090"},
+    {"name": "d17_set", "raw_code": 131072, "wire_hex": "0040a0"},
+    {"name": "before_known_errors", "raw_code": 262072, "wire_hex": "387ebf"},
+    {"name": "scaling_underflow", "raw_code": 262073, "wire_hex": "397ebf"},
+    {"name": "scaling_overflow", "raw_code": 262074, "wire_hex": "3a7ebf"},
+    {"name": "output_bandwidth_exceeded", "raw_code": 262075, "wire_hex": "3b7ebf"},
+    {"name": "no_peak", "raw_code": 262076, "wire_hex": "3c7ebf"},
+    {"name": "peak_before_range", "raw_code": 262077, "wire_hex": "3d7ebf"},
+    {"name": "peak_after_range", "raw_code": 262078, "wire_hex": "3e7ebf"},
+    {"name": "calculation_unavailable", "raw_code": 262079, "wire_hex": "3f7ebf"},
+    {"name": "evaluation_unavailable", "raw_code": 262080, "wire_hex": "007fbf"},
+    {"name": "peak_too_wide", "raw_code": 262081, "wire_hex": "017fbf"},
+    {"name": "laser_off", "raw_code": 262082, "wire_hex": "027fbf"},
+    {"name": "eighteen_bit_max_uninterpreted", "raw_code": 262143, "wire_hex": "3f7fbf"}
+  ],
+  "negative_cases": [
+    {"name": "marker_set_multi_value", "wire_hex": "0040c0"},
+    {"name": "wrong_middle_tag", "wire_hex": "000080"},
+    {"name": "wrong_high_tag", "wire_hex": "004040"},
+    {"name": "wrong_low_tag", "wire_hex": "404080"},
+    {"name": "extra_low_before_high", "wire_hex": "00400080"}
+  ]
+}

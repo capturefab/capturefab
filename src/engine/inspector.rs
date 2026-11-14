@@ -589,8 +589,11 @@ fn measure(job: &Job) -> Result<Value> {
         "id": frame.id,
         "width": frame.width,
         "height": frame.height,
-        "pixel_format": crate::inspect::pixel_format_label(frame.pixel_format),
+        "pixel_format": crate::inspect::frame_pixel_format_label(frame),
+        "pixel_encoding": frame.pixel_encoding,
+        "bits": crate::frame::frame_sample_bits(frame),
         "device_ts_ns": frame.device_ts_ns,
+        "device_timestamp": frame.device_timestamp,
         "wall_ms": frame.wall_ms,
         "age_ms": u64::try_from(job.received.elapsed().as_millis()).unwrap_or(u64::MAX),
         "source": job.source,
@@ -611,6 +614,7 @@ pub(super) fn measurements(
     format: PreviewFormat,
     preview: Option<(&Path, Option<u64>)>,
 ) -> Result<Value> {
+    crate::frame::validate_encoding(frame)?;
     let mut inspection = crate::inspect::inspect(frame, kind, region, max_dimension, format)?;
     let image = inspection.image.take();
     let mut reply = serde_json::to_value(&inspection)?;

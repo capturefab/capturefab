@@ -4,19 +4,26 @@
 //! events. Ended jobs are kept a while, and the book is saved so the jobs of
 //! a session that died still read, as lost.
 #![deny(clippy::missing_const_for_fn)]
-use super::protocol::{JobStatus, Output};
+use super::{
+    SavedCapture, Worker,
+    protocol::{JobStatus, Output},
+};
 use crate::scheduling::rfc3339;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     path::PathBuf,
-    sync::{Condvar, Mutex, PoisonError},
+    sync::{Arc, Condvar, Mutex, PoisonError, Weak},
     time::{Duration, Instant},
 };
 
 /// Ended jobs kept, and for how long.
 const KEPT: usize = 256;
+/// Maximum serialized multipart references in one job summary.
+const MAX_MULTIPART_REFS: usize = 64 * 1024;
+/// Job list rows share one RPC response; keep each row substantially smaller.
+const MAX_DOCUMENT_MULTIPART_REFS: usize = 4 * 1024;
 const KEPT_MS: u64 = 3_600_000;
 /// How long a job whose client waits for it runs on once nobody waits.
 pub(crate) const LEASE: Duration = Duration::from_secs(10);
@@ -84,6 +91,12 @@ pub(crate) struct Job {
     /// The first files saved, in order; `saved` counts them all.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
+    /// Small archive references keyed by their retained primary image path.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub multipart: BTreeMap<String, Value>,
+    /// Multipart files whose references exceeded the file or summary bound.
+    #[serde(default, skip_serializing_if = "crate::types::is_default")]
+    pub multipart_truncated: u64,
     /// Files that are the JPEG the source sent, as it was.
     #[serde(default, skip_serializing_if = "crate::types::is_default")]
     pub passed_through: u64,
@@ -105,6 +118,11 @@ pub(crate) struct Job {
     seq: u64,
     #[serde(skip)]
     lease: Option<Lease>,
+    #[serde(skip)]
+    capture: Option<Weak<SavedCapture>>,
+    /// Only pinned jobs retain an exact cleanup epoch; never serialized.
+    #[serde(skip)]
+    pub(super) owner: Option<Weak<Worker>>,
 }
 
 /// A job a client waits for: it runs while that client keeps waiting.
@@ -166,7 +184,36 @@ impl Job {
                 "message": crate::scrub::redact_urls(error["message"].as_str().unwrap_or("the job failed")),
             });
         }
+        self.multipart_fields(&mut value, MAX_DOCUMENT_MULTIPART_REFS);
         value
+    }
+    fn multipart_fields(&self, value: &mut Value, limit: usize) {
+        let mut references = BTreeMap::new();
+        let mut truncated = self.multipart_truncated;
+        let mut bytes = 2usize; // JSON object braces.
+        for (path, reference) in &self.multipart {
+            // A two-element JSON array differs from this object entry by
+            // its outer brackets; the entry may need one comma separator.
+            let next = serde_json::to_vec(&(path, reference))
+                .ok()
+                .and_then(|entry| {
+                    bytes.checked_add(
+                        entry.len().saturating_sub(2) + usize::from(!references.is_empty()),
+                    )
+                });
+            if let Some(next) = next.filter(|next| *next <= limit) {
+                references.insert(path, reference);
+                bytes = next;
+            } else {
+                truncated += 1;
+            }
+        }
+        if !references.is_empty() {
+            value["multipart"] = json!(references);
+        }
+        if truncated > 0 {
+            value["multipart_truncated"] = json!(truncated);
+        }
     }
     /// Its size and file: those saved, or while a recording runs the file
     /// it writes and how large that is so far.
@@ -188,6 +235,7 @@ impl Job {
             detail = json!({});
         }
         detail["files"] = json!(self.files);
+        self.multipart_fields(&mut detail, MAX_MULTIPART_REFS);
         if self.saved > self.files.len() as u64 {
             detail["truncated"] = json!(self.saved - self.files.len() as u64);
         }
@@ -467,6 +515,8 @@ impl JobBook {
             bytes: None,
             last_file: None,
             files: Vec::new(),
+            multipart: BTreeMap::new(),
+            multipart_truncated: 0,
             passed_through: 0,
             started_ms: crate::scheduling::now_ms(),
             ended_ms: None,
@@ -478,11 +528,24 @@ impl JobBook {
                 until: Instant::now() + LEASE,
                 waiters: 0,
             }),
+            capture: None,
+            owner: None,
         });
         book.prune();
         book.dirty = true;
         book.save(true);
         Some(number)
+    }
+    pub(super) fn pin_owner(&self, number: u64, worker: &Arc<Worker>) {
+        if let Some(job) = self.lock().find(number) {
+            job.owner = Some(Arc::downgrade(worker));
+        }
+    }
+    /// Register a still's receipt before sending the schedule to its worker.
+    pub(super) fn observe_capture(&self, number: u64, capture: Weak<SavedCapture>) {
+        if let Some(job) = self.lock().find(number) {
+            job.capture = Some(capture);
+        }
     }
     /// The worker took job `number`: what its reply says of it.
     pub(super) fn accepted(&self, number: u64, detail: Value) {
@@ -511,6 +574,25 @@ impl JobBook {
         book.dirty = true;
         book.save(true);
     }
+    /// An exact-owner admission lost its reply/epoch after dispatch might have
+    /// run. Keep its receipt alive for already-owned late Saved events. The
+    /// caller also cancels/stops that job on the captured worker only.
+    pub(super) fn admission_failed(&self, number: u64, error: &anyhow::Error) {
+        let mut book = self.lock();
+        if let Some(job) = book.find(number)
+            && !job.state.ended()
+        {
+            job.state = JobState::Failed;
+            job.error = Some(super::protocol::wire_error(error));
+            job.ended_ms = Some(crate::scheduling::now_ms());
+            job.lease = None;
+            job.touch();
+            book.dirty = true;
+            book.save(true);
+        }
+        drop(book);
+        self.changed.notify_all();
+    }
     /// Follow a worker's line about one of its jobs.
     pub(super) fn event(&self, output: &Output) {
         let mut book = self.lock();
@@ -523,6 +605,11 @@ impl JobBook {
                     return;
                 };
                 job.saved += 1;
+                if matches!(file.item, crate::engine::saved::SavedItem::Capture { .. })
+                    && let Some(capture) = job.capture.as_ref().and_then(Weak::upgrade)
+                {
+                    capture.record(file);
+                }
                 if matches!(
                     file.item,
                     crate::engine::saved::SavedItem::Capture {
@@ -532,8 +619,24 @@ impl JobBook {
                 ) {
                     job.passed_through += 1;
                 }
-                if job.files.len() < crate::scheduling::MAX_JOB_FILES {
+                let retained = job.files.len() < crate::scheduling::MAX_JOB_FILES;
+                if retained {
                     job.files.push(file.path.clone());
+                }
+                if let Some(reference) = &file.multipart {
+                    if retained {
+                        job.multipart
+                            .insert(file.path.clone(), reference.as_ref().clone());
+                        // The reference has a bound independent of the retained file list.
+                        if !serde_json::to_vec(&job.multipart)
+                            .is_ok_and(|bytes| bytes.len() <= MAX_MULTIPART_REFS)
+                        {
+                            job.multipart.remove(&file.path);
+                            job.multipart_truncated += 1;
+                        }
+                    } else {
+                        job.multipart_truncated += 1;
+                    }
                 }
                 job.last_file = Some(file.path.clone());
                 if job.kind == JobKind::Record {
@@ -570,6 +673,7 @@ impl JobBook {
                 job.error.clone_from(error);
                 job.ended_ms = Some(crate::scheduling::now_ms());
                 job.lease = None;
+                job.capture = None;
                 job.touch();
                 true
             }
@@ -612,6 +716,7 @@ impl JobBook {
             job.error = (state == JobState::Failed).then(|| wire.clone());
             job.ended_ms = Some(now);
             job.lease = None;
+            job.capture = None;
             job.touch();
             changed = true;
         }
@@ -808,14 +913,60 @@ mod tests {
         Output::Saved {
             job: Some(job),
             file: SavedFile {
+                received_monotonic_ns: None,
+                device_timestamp: None,
                 wall_ms: 1,
                 path: path.into(),
                 bytes: 10,
                 sha256: None,
-                context: std::collections::BTreeMap::new(),
+                chunks: None,
+                multipart: None,
+                context: BTreeMap::new(),
                 item: SavedItem::Recording,
             },
         }
+    }
+
+    #[test]
+    fn failed_pinned_admission_keeps_late_saved_receipt_and_terminal_job() {
+        let book = JobBook::new("pinned");
+        let number = book
+            .start(JobKind::Capture, "sim:0", Some(1), true)
+            .unwrap();
+        let receipt = Arc::new(SavedCapture::default());
+        book.observe_capture(number, Arc::downgrade(&receipt));
+        let error = crate::types::Categorized::error(
+            crate::types::ErrorKind::Timeout,
+            "source admission lost its reply after dispatch",
+        );
+        book.admission_failed(number, &error);
+        assert!(receipt.try_take().is_none());
+        let mut output = saved(number, "/retained.png");
+        if let Output::Saved { file, .. } = &mut output {
+            file.item = SavedItem::Capture {
+                frame_id: 7,
+                device_ts_ns: None,
+                width: 2,
+                height: 1,
+                pixel_format: 0x0108_0001,
+                pixel_encoding: None,
+                passthrough: false,
+            };
+        }
+        book.event(&output);
+        let file = receipt.try_take().unwrap().unwrap();
+        assert_eq!(file.path, "/retained.png");
+        assert!(receipt.try_take().is_none());
+        book.event(&Output::JobEnd {
+            job: number,
+            status: JobStatus::Done,
+            error: None,
+            summary: json!({"captured":1}),
+        });
+        let job = book.get(number).unwrap();
+        assert_eq!(job.state, JobState::Failed);
+        assert_eq!(job.saved, 1);
+        assert_eq!(job.error.unwrap()["code"], "timeout");
     }
 
     #[test]
@@ -876,7 +1027,7 @@ mod tests {
 
     #[test]
     fn waits_return_on_a_change_or_the_end_and_keep_the_lease() {
-        let book = std::sync::Arc::new(JobBook::new("bench"));
+        let book = Arc::new(JobBook::new("bench"));
         let number = book.start(JobKind::Record, "sim:0", None, true).unwrap();
         let here = || false;
         let (seq, job) = book
@@ -905,11 +1056,11 @@ mod tests {
 
     #[test]
     fn a_wait_whose_client_left_ends_and_starts_the_lease() {
-        let book = std::sync::Arc::new(JobBook::new("bench"));
+        let book = Arc::new(JobBook::new("bench"));
         let number = book
             .start(JobKind::Capture, "sim:0", Some(1), true)
             .unwrap();
-        let left = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let left = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let waiter = {
             let (book, left) = (book.clone(), left.clone());
             std::thread::spawn(move || {
@@ -1011,6 +1162,47 @@ mod tests {
         (job.number, job.state, job.started_ms, job.ended_ms) =
             (number, JobState::Done, ended, Some(ended));
         job
+    }
+
+    #[test]
+    fn multipart_references_follow_saved_files_and_have_a_separate_bound() {
+        let book = JobBook::new("multipart");
+        let number = book
+            .start(JobKind::Capture, "sim:0", Some(3), false)
+            .unwrap();
+        let mut event = saved(number, "one.raw");
+        let reference = json!({"path":"one.raw.multipart.raw","metadata_path":"one.raw.multipart.raw.json","bytes":20,"selected":1,"count":3});
+        if let Output::Saved { file, .. } = &mut event {
+            file.multipart = Some(Box::new(reference.clone()));
+        }
+        book.event(&event);
+        let job = book.all().remove(0);
+        assert_eq!(job.detail()["multipart"]["one.raw"], reference);
+        assert_eq!(job.doc("multipart")["multipart"]["one.raw"], reference);
+        let restored: Job = serde_json::from_value(serde_json::to_value(&job).unwrap()).unwrap();
+        assert_eq!(restored.detail()["multipart"], job.detail()["multipart"]);
+        assert!(job.detail().get("multipart_truncated").is_none());
+        let mut event = saved(number, "large.raw");
+        if let Output::Saved { file, .. } = &mut event {
+            file.multipart = Some(Box::new(json!({"path":"x".repeat(MAX_MULTIPART_REFS)})));
+        }
+        book.event(&event);
+        let job = book.all().remove(0);
+        assert_eq!(job.files, ["one.raw", "large.raw"]);
+        assert_eq!(job.multipart.len(), 1);
+        assert_eq!(job.detail()["multipart_truncated"], 1);
+        let mut job = job;
+        job.multipart.insert(
+            "bounded.raw".into(),
+            json!({"path":"x".repeat(MAX_DOCUMENT_MULTIPART_REFS)}),
+        );
+        assert!(job.detail()["multipart"]["bounded.raw"].is_object());
+        assert!(
+            job.doc("multipart")["multipart"]
+                .get("bounded.raw")
+                .is_none()
+        );
+        assert_eq!(job.doc("multipart")["multipart_truncated"], 2);
     }
 
     #[test]

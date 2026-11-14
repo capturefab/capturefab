@@ -75,6 +75,116 @@ fn time_names_are_the_frames_time() {
 }
 
 #[test]
+fn native_part_format_requires_local_lossless_output_and_native_gige() {
+    let home = Home::new("part-format-validation");
+    let stdout = home.run(&[
+        "--json",
+        "capture",
+        "-c",
+        "sim:0",
+        "-o",
+        "-",
+        "--part-format",
+        "Coord3D_C16",
+    ]);
+    assert_eq!(stdout.code, Some(2));
+    assert_eq!(stdout.raw, [] as [u8; 0]);
+    let response: Value = serde_json::from_str(stdout.stderr.trim()).unwrap();
+    let jpeg = home.fails(
+        2,
+        &[
+            "capture",
+            "-c",
+            "sim:0",
+            "-o",
+            "image.jpg",
+            "--part-format",
+            "Coord3D_C16",
+        ],
+    );
+    for error in [&response["error"], &jpeg] {
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains("local RAW or PNG"),
+            "{error}"
+        );
+    }
+    let error = home.fails(
+        5,
+        &[
+            "--no-session",
+            "capture",
+            "-c",
+            "sim:0",
+            "-o",
+            "image.raw",
+            "--part-format",
+            "Confidence8",
+        ],
+    );
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("native GigE Vision"),
+        "{error}"
+    );
+    assert!(std::fs::read_dir(&home.work).unwrap().next().is_none());
+}
+
+#[test]
+fn native_part_format_point_clouds_require_a_local_raw_still() {
+    for format in ["Coord3D_ABC16", "Coord3D_ABC32f"] {
+        let home = Home::new("part-format-abc32f");
+        for output in ["cloud.png", "cloud.jpg"] {
+            let error = home.fails(
+                2,
+                &[
+                    "capture",
+                    "-c",
+                    "sim:0",
+                    "-o",
+                    output,
+                    "--part-format",
+                    format,
+                ],
+            );
+            assert!(
+                error["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("requires a local RAW still"),
+                "{error}"
+            );
+        }
+        let stdout = home.run(&[
+            "--json",
+            "capture",
+            "-c",
+            "sim:0",
+            "-o",
+            "-",
+            "-f",
+            "raw",
+            "--part-format",
+            format,
+        ]);
+        assert_eq!(stdout.code, Some(2));
+        assert_eq!(stdout.raw, Vec::<u8>::new());
+        let response: Value = serde_json::from_str(stdout.stderr.trim()).unwrap();
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("requires a local RAW still")
+        );
+        assert!(std::fs::read_dir(&home.work).unwrap().next().is_none());
+    }
+}
+
+#[test]
 fn direct_and_session_results_are_the_same_apart_from_timing() {
     let home = Home::new("same-results");
     // A camera keeps its settings between commands, so each direct and
@@ -176,9 +286,9 @@ fn bursts_time_lapses_and_names_that_never_overwrite() {
         "-o",
         "{serial}-{seq:6}.{ext}",
         "-f",
-        "jpg",
+        "png",
     ]);
-    assert_eq!(named["files"][0], json!(home.real("SIM0-000001.jpg")));
+    assert_eq!(named["files"][0], json!(home.real("SIM0-000001.png")));
     // {time} names differ by the millisecond, and a name taken in one is
     // numbered, never a failure.
     let timed = home.ok(&["capture", "-c", "sim:0", "-n", "2", "-o", "t/{time}.png"]);
@@ -194,13 +304,13 @@ fn bursts_time_lapses_and_names_that_never_overwrite() {
         "-n",
         "3",
         "-o",
-        "lapse/{seq}.jpg",
+        "lapse/{seq}.png",
     ]);
     assert_eq!(lapse["count"], 3);
     // Ticks are 300 ms apart from the start; the first frame can come late
     // while the camera starts, so at least the last interval separates them.
     assert!(lapse["duration_s"].as_f64().unwrap() >= 0.25, "{lapse}");
-    assert!(lapse["files"][2].as_str().unwrap().ends_with("0003.jpg"));
+    assert!(lapse["files"][2].as_str().unwrap().ends_with("0003.png"));
     // --for counts the frames: every 100ms for 300ms is three.
     let timed = home.ok(&[
         "capture", "-c", "sim:0", "--every", "100ms", "--for", "300ms", "-o", "timed/",
@@ -854,7 +964,7 @@ fn a_manifest_lists_each_saved_file_with_its_hash() {
         "-c",
         "sim:1",
         "-o",
-        "{camera}-{seq}.jpg",
+        "{camera}-{seq}.png",
         "--manifest",
         "runs/manifest.jsonl",
         "--sync",
@@ -1309,8 +1419,31 @@ fn wide_samples_keep_their_bits_or_say_they_did_not() {
         (bayer["bit_depth"].clone(), bayer["source_bits"].clone()),
         (json!(8), json!(12))
     );
-    let jpeg = shot("Mono16", "mono.jpg");
-    assert_eq!(jpeg["source_bits"], 16, "{jpeg}");
+    if cfg!(feature = "jpeg") {
+        let jpeg = shot("Mono16", "mono.jpg");
+        assert_eq!(jpeg["source_bits"], 16, "{jpeg}");
+    } else {
+        let error = home
+            .run(&[
+                "--json",
+                "capture",
+                "-c",
+                "sim:0",
+                "--set",
+                "PixelFormat=Mono16",
+                "-o",
+                "mono.jpg",
+            ])
+            .failure(1);
+        assert_eq!(error["code"], "failed");
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains("JPEG is unsupported")
+        );
+        assert!(!home.path("mono.jpg").exists());
+    }
     // Raw keeps the exact bytes, with what reading them back needs beside.
     let raw = shot("Mono12p", "frame.raw");
     assert_eq!(raw["bit_depth"], 12, "{raw}");

@@ -270,10 +270,28 @@ fn a_command_brings_its_own_free_space_floor_to_a_session() {
     let started = sessions(&home);
     // A command's own higher floor holds for the files the session writes
     // for it, a still's and a preview's, and is its own to lower.
-    for args in [
+    let mut commands = vec![
         &["--json", "capture", "-c", "sim:0", "-o", "big.png"][..],
-        &["--json", "inspect", "-c", "sim:0", "--preview", "big.jpg"],
-    ] {
+        &[
+            "--json",
+            "inspect",
+            "-c",
+            "sim:0",
+            "--preview",
+            "big-preview.png",
+        ],
+    ];
+    if cfg!(feature = "jpeg") {
+        commands.push(&["--json", "inspect", "-c", "sim:0", "--preview", "big.jpg"]);
+    } else {
+        let unsupported = run(
+            Some("100T"),
+            &["--json", "inspect", "-c", "sim:0", "--preview", "big.jpg"],
+        )
+        .failure(5);
+        assert_eq!(unsupported["code"], "unsupported");
+    }
+    for args in commands {
         let error = run(Some("100T"), args).failure(6);
         assert_eq!(error["code"], "storage_full", "{error}");
         let hint = error["hint"].as_str().unwrap();
@@ -282,7 +300,11 @@ fn a_command_brings_its_own_free_space_floor_to_a_session() {
             "{error}"
         );
     }
-    assert!(!home.path("big.png").exists() && !home.path("big.jpg").exists());
+    assert!(
+        !home.path("big.png").exists()
+            && !home.path("big-preview.png").exists()
+            && !home.path("big.jpg").exists()
+    );
     run(
         Some("0"),
         &["--json", "capture", "-c", "sim:0", "-o", "small.png"],

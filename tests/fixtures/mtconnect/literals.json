@@ -1,0 +1,31 @@
+{
+  "format_version": 1,
+  "plan_sha256": "572ed33b746a415233a924fe2d74771c931a871ccca07ad75d8090900b2c693f",
+  "qualification": "Four immutable XML bodies frozen before reviewing any product decoder. Original raw LF and final newline retained. Manufacturer Haas example is separate producer evidence, not these synthetic XML bytes.",
+  "literals": {
+    "probe12": {
+      "origin": "spec_derived_not_Haas_capture",
+      "bytes": 610,
+      "sha256": "d2ca03a59253954620a6826d37f70184ed98b3fa29f5fe4e1f642c4a2b58ad33",
+      "xml": "<MTConnectDevices xmlns=\"urn:mtconnect.org:MTConnectDevices:1.2\">\n<Header creationTime=\"2026-11-11T12:00:00Z\" sender=\"fixture\" instanceId=\"7\" version=\"1.2.0\" bufferSize=\"1024\" assetBufferSize=\"0\" assetCount=\"0\"/>\n<Devices><Device id=\"d1\" name=\"MILL\" uuid=\"synthetic-1\"><Components><Controller id=\"c1\"><DataItems>\n<DataItem id=\"p1\" category=\"SAMPLE\" type=\"POSITION\" units=\"MILLIMETER\" nativeUnits=\"INCH\" nativeScale=\"25.4\"/>\n<DataItem id=\"e1\" category=\"EVENT\" type=\"PROGRAM\"/>\n<DataItem id=\"cnd\" category=\"CONDITION\" type=\"SYSTEM\"/>\n</DataItems></Controller></Components></Device></Devices>\n</MTConnectDevices>\n"
+    },
+    "current12": {
+      "origin": "spec_derived_not_Haas_capture",
+      "bytes": 902,
+      "sha256": "e53bf1a46d4e0b93052062bef73686373cba8738474d8a9afc0f4e6c2f9f979d",
+      "xml": "<MTConnectStreams xmlns=\"urn:mtconnect.org:MTConnectStreams:1.2\">\n<Header creationTime=\"2026-11-11T12:00:01Z\" sender=\"fixture\" instanceId=\"7\" version=\"1.2.0\" bufferSize=\"1024\" firstSequence=\"100\" lastSequence=\"104\" nextSequence=\"105\"/>\n<Streams><DeviceStream name=\"MILL\" uuid=\"synthetic-1\"><ComponentStream component=\"Controller\" componentId=\"c1\">\n<Events><Program dataItemId=\"e1\" sequence=\"103\" timestamp=\"2026-11-11T11:59:58Z\">  O1234 &amp; SETUP  </Program></Events>\n<Samples><Position dataItemId=\"p1\" sequence=\"102\" timestamp=\"2026-11-11T11:59:59Z\">1.2500</Position></Samples>\n<Condition><Fault dataItemId=\"cnd\" type=\"SYSTEM\" nativeCode=\"E01\" sequence=\"100\" timestamp=\"2026-11-11T11:59:56Z\">first</Fault><Fault dataItemId=\"cnd\" type=\"SYSTEM\" nativeCode=\"E01\" sequence=\"101\" timestamp=\"2026-11-11T11:59:57Z\">second</Fault></Condition>\n</ComponentStream></DeviceStream></Streams>\n</MTConnectStreams>\n"
+    },
+    "sample25": {
+      "origin": "spec_derived_not_Haas_capture",
+      "bytes": 1007,
+      "sha256": "ae07fd53216dd608d0847cc89271c66357243ce1fd7ee26f73ad9476ed5e460d",
+      "xml": "<MTConnectStreams xmlns=\"urn:mtconnect.org:MTConnectStreams:2.5\">\n<Header creationTime=\"2026-11-11T12:00:02Z\" sender=\"fixture\" instanceId=\"8\" version=\"2.5.0\" bufferSize=\"1024\" firstSequence=\"100\" lastSequence=\"108\" nextSequence=\"109\" deviceModelChangeTime=\"2026-11-11T11:00:00Z\"/>\n<Streams><DeviceStream name=\"MILL\" uuid=\"synthetic-1\"><ComponentStream component=\"Controller\" componentId=\"c1\">\n<Samples><Position dataItemId=\"p1\" sequence=\"108\" timestamp=\"2026-11-11T12:00:01Z\">UNAVAILABLE</Position></Samples>\n<Condition><Fault dataItemId=\"cnd\" type=\"SYSTEM\" conditionId=\"activation-a\" nativeCode=\"E01\" sequence=\"105\" timestamp=\"2026-11-11T12:00:00Z\">A</Fault><Fault dataItemId=\"cnd\" type=\"SYSTEM\" conditionId=\"activation-b\" nativeCode=\"E01\" sequence=\"106\" timestamp=\"2026-11-11T12:00:00Z\">B</Fault><Normal dataItemId=\"cnd\" type=\"SYSTEM\" conditionId=\"activation-a\" nativeCode=\"E01\" sequence=\"107\" timestamp=\"2026-11-11T12:00:01Z\"/></Condition>\n</ComponentStream></DeviceStream></Streams>\n</MTConnectStreams>\n"
+    },
+    "filtered_empty12": {
+      "origin": "spec_derived_not_Haas_capture",
+      "bytes": 267,
+      "sha256": "ba070219657a6ec6854a33d838307fd75d2172da43d513da388ac2394270736e",
+      "xml": "<MTConnectStreams xmlns=\"urn:mtconnect.org:MTConnectStreams:1.2\">\n<Header creationTime=\"2026-11-11T12:00:03Z\" sender=\"fixture\" instanceId=\"7\" version=\"1.2.0\" bufferSize=\"1024\" firstSequence=\"100\" lastSequence=\"113\" nextSequence=\"114\"/>\n<Streams/>\n</MTConnectStreams>\n"
+    }
+  }
+}

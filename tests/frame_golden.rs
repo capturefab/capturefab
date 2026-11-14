@@ -206,6 +206,11 @@ fn frame_case(
 ) -> Value {
     let data = generate(generator, format, width, height);
     let frame = Frame {
+        pixel_encoding: None,
+        device_timestamp: None,
+        received_monotonic_ns: None,
+        chunks: None,
+        multipart: None,
         id: 7,
         width,
         height,
@@ -423,8 +428,8 @@ fn frames() -> Vec<Value> {
     // generator avoids assuming RGB component counts or whole-byte samples
     // in the consumers.
     for format in [
-        0x0101, 0x0102, 0x0104, 0x0108, 0x010a, 0x010c, 0x010e, 0x0110, 0x020c, 0x0210, 0x0218,
-        0x021e, 0x0220, 0x0224, 0x0228, 0x0230, 0x0240,
+        0x0101, 0x0102, 0x0104, 0x0108, 0x010a, 0x010c, 0x010e, 0x0110, 0x020c, 0x0210, 0x0214,
+        0x0218, 0x021e, 0x0220, 0x0224, 0x0228, 0x0230, 0x0240,
     ]
     .into_iter()
     .flat_map(|prefix| (0..=0x12e).map(move |id| (prefix << 16) | id))
@@ -509,6 +514,11 @@ fn pngs() -> Vec<Value> {
     ] {
         let (width, height) = (33, 17);
         let frame = Frame {
+            pixel_encoding: None,
+            device_timestamp: None,
+            received_monotonic_ns: None,
+            chunks: None,
+            multipart: None,
             id: 1,
             width,
             height,
@@ -536,6 +546,11 @@ fn pngs() -> Vec<Value> {
     }
     let too_big = json!({ "note": "x".repeat(frame::MAX_META) });
     let frame = Frame {
+        pixel_encoding: None,
+        device_timestamp: None,
+        received_monotonic_ns: None,
+        chunks: None,
+        multipart: None,
         id: 1,
         width: 2,
         height: 1,

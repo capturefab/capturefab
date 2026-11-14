@@ -1,5 +1,5 @@
 {
- "about": "Find cameras, change their settings, and save images and video.",
+ "about": "Capture images, video and industrial time series.",
  "commands": {
   "auto": {
    "args": [
@@ -101,7 +101,7 @@
     "exposure_us": "float — the exposure held",
     "gain_db": "float — the gain held",
     "iterations": "int — exposure and gain changes made; by the camera, how often it was asked whether it was done",
-    "job": "{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with --continuous by capturefab: the session job it runs as, which jobs stop ends",
+    "job": "{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,multipart?:{image_path:{format_version,storage,path,metadata_path,bytes,sha256?,selected,count}},multipart_truncated?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with --continuous by capturefab: the session job it runs as, which jobs stop ends",
     "limited_by": "exposure_max|exposure_min|gain_max|camera|timeout — what stopped it short of the target",
     "mean": "float — mean brightness 0..1 at the end",
     "mode": "off|continuous — with --off or --continuous",
@@ -194,6 +194,37 @@
      "value_name": "FORMAT"
     },
     {
+     "choices": [
+      "Mono8",
+      "RGB8",
+      "YCbCr411_8",
+      "Coord3D_C16",
+      "Coord3D_C10p",
+      "Coord3D_C12p",
+      "Confidence8",
+      "Confidence16",
+      "Mono16",
+      "Coord3D_ABC16",
+      "Coord3D_ABC32f"
+     ],
+     "help": "Save a native GVSP or `GenTL` part as a local still with every component in the companion (XYZ requires RAW)",
+     "long": "--part-format",
+     "name": "part_format",
+     "repeatable": false,
+     "required": false,
+     "type": "choice",
+     "value_name": "PART_FORMAT"
+    },
+    {
+     "help": "Exact zero-based table ordinal; requires --part-format and never implies a component name",
+     "long": "--part-index",
+     "name": "part_index",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "PART_INDEX"
+    },
+    {
      "help": "JPEG quality, 1..100 (default 90; without it, a Motion JPEG source's own JPEG is stored as it is)",
      "long": "--quality",
      "name": "quality",
@@ -260,8 +291,7 @@
      "value_name": "N"
     },
     {
-     "default": "2s",
-     "help": "How long a camera that sets its own exposure (a webcam, or ExposureAuto=Continuous; a network stream is already running) may take to settle after it starts; 0 takes frames at once",
+     "help": "Exposure settling limit (default 2s; none for read-only monitors); 0 takes frames at once",
      "long": "--warmup",
      "name": "warmup",
      "repeatable": false,
@@ -389,10 +419,11 @@
     "bit_depth": "int — bits per sample in the files: 16 for PNG of Mono10..Mono16 (samples at the top bits, sBIT says how many count), every bit for raw, else 8",
     "bytes": "int — with -o -: the image's size",
     "camera": "string — camera ID",
-    "cameras": "[{camera,files,count,truncated?,width,height,pixel_format,bit_depth,source_bits?,settings,time,device_ts_ns?,frames,dropped,incomplete?,resent?,duration_s?,fps?,first_id?,last_id?,gaps?,consecutive?,after_change?,warmup_ms?,settled?,bandwidth_mbps?,warnings?,inspect?,dry_run?,output?,format?,every_s?,first_at?,ends_at?,auto?}] — with -c repeated: one result per camera; in error details, a failed camera's {camera,error,files?,truncated?,job?}",
+    "cameras": "[{camera,files,count,truncated?,multipart?,multipart_truncated?,width,height,pixel_format,pixel_encoding?,bit_depth,source_bits?,settings,time,device_ts_ns?,device_timestamp?,frames,dropped,incomplete?,resent?,duration_s?,fps?,first_id?,last_id?,gaps?,consecutive?,after_change?,warmup_ms?,settled?,bandwidth_mbps?,warnings?,inspect?,dry_run?,output?,format?,part_format?,part_index?,every_s?,first_at?,ends_at?,auto?}] — with -c repeated: one result per camera; in error details, a failed camera's {camera,error,files?,truncated?,multipart?,multipart_truncated?,job?}",
     "consecutive": "bool — a burst's frames follow one another with no frame missing",
     "count": "int — frames saved",
-    "device_ts_ns": "int — the camera's clock when the first frame was taken (GigE, U3V, sim); never a date",
+    "device_timestamp": "{ticks,frequency_hz?} — original producer clock ticks for the first frame, with its reported frequency when known; exact unsigned integers, no inferred unit or date",
+    "device_ts_ns": "int — the camera's clock in nanoseconds when the first frame was taken, where supplied by the transport; never a date",
     "dropped": "int — frames lost while it ran: the encoders' queue was full, or the transport lost them",
     "dry_run": "true — with --dry-run; nothing was captured",
     "duration_s": "float — first to last frame, for several",
@@ -408,12 +439,17 @@
     "height": "int",
     "incomplete": "int — frames that arrived incomplete, where the transport counts them",
     "inspect": "{exposure,verdict,suggest?,focus?,preview?} — with --inspect: the last frame measured as inspect measures it",
-    "job": "{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with --background, as jobs lists it, once armed or its first frame is saved",
-    "jobs": "[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — with --background and -c repeated",
+    "job": "{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,multipart?:{image_path:{format_version,storage,path,metadata_path,bytes,sha256?,selected,count}},multipart_truncated?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with --background, as jobs lists it, once armed or its first frame is saved",
+    "jobs": "[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,multipart?:{image_path:{format_version,storage,path,metadata_path,bytes,sha256?,selected,count}},multipart_truncated?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — with --background and -c repeated",
     "last_id": "int — a burst's last frame's block ID",
+    "multipart": "{image_path:{format_version,storage,path,metadata_path,bytes,sha256?,selected,count,part_format?}} — retained component archive references for local multipart or GenDC stills, bounded to the listed files and 64 KiB. Complete part metadata is in each companion JSON",
+    "multipart_truncated": "int — multipart archive references omitted from this bounded summary; each saved image still has its local archive and metadata",
     "output": "\"-\" — with -o -: the image went to stdout",
+    "part_format": "requested exact native GVSP or GenTL part PFNC name; also present in --dry-run",
+    "part_index": "int0..31 — requested exact multipart table ordinal; requires part_format and never implies a component name",
     "passthrough": "true — the JPEG files are the ones the source sent (an MJPEG webcam, stream or file), as they were, with the provenance comment: not decoded and encoded again",
-    "pixel_format": "string — the camera's PFNC format",
+    "pixel_encoding": "{namespace:ids,name:Mono10g40IDS|Mono12g24IDS|BayerRG10g40IDS|BayerRG12g24IDS|BayerGR10g40IDS|BayerGR12g24IDS|BayerGB10g40IDS|BayerGB12g24IDS|BayerBG10g40IDS|BayerBG12g24IDS,code,gentl_namespace?} — explicit qualified IDS byte layout and original source code; absent for ordinary PFNC formats",
+    "pixel_format": "string — the camera's format name",
     "resent": "int — packets the camera sent again, where the transport counts them",
     "settings": "{exposure_us?,auto_exposure?,gain_db?,gain?,auto_gain?,auto_wb?,fps?,trigger?,black_level?,gamma?,binning?,offset_x?,offset_y?,reverse_x?,reverse_y?} — the camera's settings when the first frame was taken, as the camera has them; trigger: off, or its source (software, line0)",
     "settled": "false — its exposure was still changing when --warmup ran out (with a warning)",
@@ -473,6 +509,187 @@
    },
    "summary": "Print shell completions: bash, zsh, fish, powershell, elvish"
   },
+  "data export": {
+   "args": [
+    {
+     "help": "Recording written by data record",
+     "name": "input",
+     "repeatable": false,
+     "required": true,
+     "type": "string",
+     "value_name": "INPUT"
+    },
+    {
+     "help": "New export file; existing files are never overwritten",
+     "long": "--output",
+     "name": "output",
+     "repeatable": false,
+     "required": true,
+     "short": "-o",
+     "type": "string",
+     "value_name": "PATH"
+    },
+    {
+     "choices": [
+      "csv",
+      "jsonl"
+     ],
+     "default": "csv",
+     "help": "CSV quotes all text cells; JSONL emits one sample object per line",
+     "long": "--format",
+     "name": "format",
+     "repeatable": false,
+     "required": false,
+     "type": "choice",
+     "value_name": "FORMAT"
+    },
+    {
+     "default": "false",
+     "help": "Export complete rows from a failed/interrupted recording or one missing its end row",
+     "long": "--allow-incomplete",
+     "name": "allow_incomplete",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "ALLOW_INCOMPLETE"
+    },
+    {
+     "help": "Include only this source id",
+     "long": "--source",
+     "name": "source",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "SOURCE"
+    },
+    {
+     "help": "Include only this signal name",
+     "long": "--signal",
+     "name": "signal",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "SIGNAL"
+    }
+   ],
+   "command": "data export",
+   "contract_version": 1,
+   "effect": "file_write",
+   "errors": [
+    "usage",
+    "failed",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "permission_denied",
+    "disconnected",
+    "auth_required",
+    "auth_rejected",
+    "session_not_found",
+    "ffmpeg_missing",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [],
+   "notes": [],
+   "result": {
+    "bytes": "int — export bytes",
+    "complete": "bool — source recording ended successfully",
+    "format": "csv|jsonl",
+    "path": "string — export file",
+    "samples": "int — exported samples"
+   },
+   "summary": "Export samples as CSV or JSONL"
+  },
+  "data protocols": {
+   "args": [],
+   "command": "data protocols",
+   "contract_version": 1,
+   "effect": "read",
+   "errors": [
+    "usage",
+    "failed",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "permission_denied",
+    "disconnected",
+    "auth_required",
+    "auth_rejected",
+    "session_not_found",
+    "ffmpeg_missing",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [],
+   "notes": [],
+   "result": {
+    "example": "{version,sources} — runnable simulator configuration",
+    "protocols": "[{protocol,implementation,requirements}] — native, native_passive or external_helper",
+    "version": "1 — configuration and recording version"
+   },
+   "summary": "Show adapters and an example config"
+  },
+  "data record": {
+   "args": [
+    {
+     "help": "Version 1 JSON source configuration (see data protocols)",
+     "long": "--config",
+     "name": "config",
+     "repeatable": false,
+     "required": true,
+     "type": "string",
+     "value_name": "JSON"
+    },
+    {
+     "help": "New JSON Lines recording file; existing files are never overwritten",
+     "long": "--output",
+     "name": "output",
+     "repeatable": false,
+     "required": true,
+     "short": "-o",
+     "type": "string",
+     "value_name": "PATH"
+    },
+    {
+     "help": "Recording duration, such as 30s or 1h",
+     "long": "--for",
+     "name": "duration",
+     "repeatable": false,
+     "required": true,
+     "type": "duration",
+     "value_name": "DUR"
+    }
+   ],
+   "command": "data record",
+   "contract_version": 1,
+   "effect": "disruptive",
+   "errors": [
+    "usage",
+    "failed",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "permission_denied",
+    "disconnected",
+    "auth_required",
+    "auth_rejected",
+    "session_not_found",
+    "ffmpeg_missing",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [],
+   "notes": [],
+   "result": {
+    "bytes": "int — file bytes",
+    "clock": "host_monotonic_receive — comparable host timestamps, no hardware clock synchronization implied",
+    "path": "string — JSONL recording file",
+    "samples": "int — complete samples written",
+    "status": "complete; failed/interrupted work is in error.details"
+   },
+   "summary": "Record signals on one host timeline"
+  },
   "debug read": {
    "args": [
     {
@@ -490,18 +707,35 @@
      "help": "Address: decimal or 0x hexadecimal",
      "name": "address",
      "repeatable": false,
-     "required": true,
+     "required": false,
      "type": "string",
      "value_name": "ADDRESS"
     },
     {
-     "default": "4",
-     "help": "Bytes to read, 1..65536",
+     "help": "Bytes to read, 1..65536 (default 4 for numeric addresses)",
      "name": "length",
      "repeatable": false,
      "required": false,
      "type": "string",
      "value_name": "LENGTH"
+    },
+    {
+     "help": "XML-declared opaque Register, optionally at a declared selector bank",
+     "long": "--feature",
+     "name": "feature",
+     "repeatable": false,
+     "required": false,
+     "type": "name",
+     "value_name": "NAME"
+    },
+    {
+     "help": "One budget for selection, metadata and byte transfer (named form only)",
+     "long": "--timeout",
+     "name": "timeout",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
     }
    ],
    "command": "debug read",
@@ -524,12 +758,16 @@
    ],
    "examples": [
     "capturefab debug read -c sim:0 0x100 4",
-    "capturefab --json debug read -c gige:00c0df123456 0x0938"
+    "capturefab --json debug read -c gige:00c0df123456 0x0938",
+    "capturefab debug read -c CAMERA --feature 'LUTValueAll[LUTSelector=LUT1]' --timeout 5s"
    ],
    "notes": [],
    "result": {
     "address": "int",
-    "hex": "string — the bytes read"
+    "bank": "[{selector,value}] — named form only",
+    "bytes": "int — declared length, named form only",
+    "feature": "string — named form only",
+    "hex": "string — exact raw bytes"
    },
    "summary": "Read raw camera memory"
   },
@@ -589,7 +827,7 @@
      "help": "Address: decimal or 0x hexadecimal",
      "name": "address",
      "repeatable": false,
-     "required": true,
+     "required": false,
      "type": "string",
      "value_name": "ADDRESS"
     },
@@ -597,9 +835,36 @@
      "help": "Hex bytes, such as 00000001",
      "name": "data",
      "repeatable": false,
-     "required": true,
+     "required": false,
      "type": "string",
      "value_name": "DATA"
+    },
+    {
+     "help": "XML-declared opaque Register, optionally at a declared selector bank",
+     "long": "--feature",
+     "name": "feature",
+     "repeatable": false,
+     "required": false,
+     "type": "name",
+     "value_name": "NAME"
+    },
+    {
+     "help": "Exact raw bytes for the named register; no implicit commit or rollback. For large payloads, use debug rpc with JSON on stdin to avoid command-line limits",
+     "long": "--hex",
+     "name": "hex",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "HEX"
+    },
+    {
+     "help": "One budget for selection, metadata and byte transfer (named form only)",
+     "long": "--timeout",
+     "name": "timeout",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
     }
    ],
    "command": "debug write",
@@ -622,11 +887,14 @@
    ],
    "examples": [
     "capturefab debug write -c sim:0 0x100 80020000",
-    "capturefab --json debug write -c gige:00c0df123456 0x0a00 00000002"
+    "capturefab --json debug write -c gige:00c0df123456 0x0a00 00000002",
+    "capturefab debug write -c CAMERA --feature FileAccessBuffer --hex 0080ff"
    ],
    "notes": [],
    "result": {
     "address": "int",
+    "bank": "[{selector,value}] — named form only",
+    "feature": "string — named form only",
     "written": "int — bytes"
    },
    "summary": "Write raw camera memory"
@@ -709,7 +977,7 @@
    "result": {
     "arch": "string",
     "checks": "[{name,status:ok|warn|fail,message,fix?}] — fix is a command or step that resolves a warning",
-    "features": "{usb,jpeg,videotoolbox,nvjpeg,vaapi,keychain,shell} — what this build includes",
+    "features": "{usb,gentl,ni_daqmx,jpeg,videotoolbox,nvjpeg,vaapi,keychain,shell,mqtt_tls} — what this build includes",
     "ffmpeg": "{source:CAPTUREFAB_FFMPEG|bundled|next_to_executable|path,path,version,bundled_error?} or {error} — FFmpeg is looked for in that order; bundled_error says why a bundled copy could not be extracted",
     "folders": "{runtime,state,cache: {path,from,writable,fs_type,passed:[{path,from,why}],error}} — the folders in use (runtime: sessions; state: presets, sign-ins; cache: FFmpeg), path absent when there is none; which candidate each uses (from: a variable, XDG_*, login, home, run, temp, runtime) and the fallbacks passed over",
     "host": "{cpus,threads,cpu_quota,memory:{total_bytes,available_bytes,cgroup_limit_bytes,cgroup_used_bytes,budget_bytes}} — what cgroups leave this process",
@@ -761,6 +1029,7 @@
    "errors": [
     "usage",
     "failed",
+    "unsupported",
     "feature_not_found",
     "not_writable",
     "feature_locked",
@@ -857,7 +1126,7 @@
    "notes": [],
    "result": {
     "camera": "string — camera ID",
-    "features": "[{name,type:int|float|bool|enum|string|command,access:rw|ro|wo,value,unit,min,max,inc,choices,selectors,locked_by,category}] — Beginner features and common controls; every level with --all, a PATTERN or --category; locked_by when another setting locks it now",
+    "features": "[{name,type:int|float|bool|enum|string|command|register,access:rw|ro|wo,writable?:false,value,unit,min,max,inc,choices,selectors,locked_by,category}] — access is the XML declaration; writable:false disables writes in monitor mode. Beginner features and common controls; every level with --all, a PATTERN or --category; locked_by when another setting locks it now",
     "truncated": "int — rows left out beyond the first 200; narrow with PATTERN or --category"
    },
    "summary": "List a camera's features with values, ranges, choices and locks"
@@ -973,9 +1242,11 @@
    ],
    "notes": [],
    "result": {
+    "acquisition_control": "external — acquisition belongs to the controlling application",
     "address": "string — IP address or device path",
     "bits": "int — bits per sample",
     "camera": "string — camera ID",
+    "camera_access": "read_only_monitor — explicit GigE monitor connection",
     "controls": "{name:{feature,unit,min,max,value}} — canonical controls this camera has",
     "exposure_us": "float — ExposureTime in microseconds",
     "firmware": "string — DeviceFirmwareVersion or DeviceVersion",
@@ -1058,8 +1329,7 @@
      "value_name": "DUR"
     },
     {
-     "default": "2s",
-     "help": "How long a camera that sets its own exposure (a webcam, or ExposureAuto=Continuous; a network stream is already running) may take to settle after it starts; 0 measures at once",
+     "help": "Exposure settling limit (default 2s; none for read-only monitors); 0 measures at once",
      "long": "--warmup",
      "name": "warmup",
      "repeatable": false,
@@ -1164,7 +1434,7 @@
     "dropped": "int — frames the transport lost meanwhile, where it counts them",
     "exposure": "{mean,p1,p50,p99,clipped_low,clipped_high,clipped_low_px?,clipped_high_px?,max?} — brightness 0..1; shares and counts of pixels at black and at full scale, counted over every pixel of the region at the camera's bit depth; max: the brightest sample as a share of full scale",
     "focus": "{sharpness} — variance of the Laplacian over the region; compare between frames of one camera and scene (-v adds tenengrad, brenner, variance)",
-    "frame": "{width,height,pixel_format,bits?,id?,device_ts_ns?,time,age_ms} — the frame measured, taken after the command began: its block ID and the camera's clock (ns, never a date) where the transport has them, and when it arrived",
+    "frame": "{width,height,pixel_format,pixel_encoding?:{namespace:ids,name,code,gentl_namespace?},bits?,id?,device_ts_ns?,device_timestamp?:{ticks,frequency_hz?},time,age_ms} — the frame measured, taken after the command began: its block ID, camera nanoseconds where supplied, original producer ticks with an optional reported frequency, and host arrival time; device clocks are never dates",
     "frames": "int — frames received for this inspection, the one measured included",
     "histogram": "[16 ints] — with -v: luminance histogram",
     "incomplete": "int — frames that arrived incomplete meanwhile, where the transport counts them",
@@ -1201,7 +1471,7 @@
    ],
    "notes": [],
    "result": {
-    "jobs": "[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — every session's, a session that ended included, as it saved them (those that had not ended as lost); finished ones for an hour after they end; with IDs, those jobs in that order; with --running, only those that have not ended"
+    "jobs": "[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,multipart?:{image_path:{format_version,storage,path,metadata_path,bytes,sha256?,selected,count}},multipart_truncated?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — every session's, a session that ended included, as it saved them (those that had not ended as lost); finished ones for an hour after they end; with IDs, those jobs in that order; with --running, only those that have not ended"
    },
    "summary": "Captures, recordings and auto exposure run in sessions, ended ones included: list, stop, wait"
   },
@@ -1244,7 +1514,7 @@
    ],
    "notes": [],
    "result": {
-    "jobs": "[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — every session's, a session that ended included, as it saved them (those that had not ended as lost); finished ones for an hour after they end; with IDs, those jobs in that order; with --running, only those that have not ended"
+    "jobs": "[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,multipart?:{image_path:{format_version,storage,path,metadata_path,bytes,sha256?,selected,count}},multipart_truncated?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — every session's, a session that ended included, as it saved them (those that had not ended as lost); finished ones for an hour after they end; with IDs, those jobs in that order; with --running, only those that have not ended"
    },
    "summary": "Every session's jobs, finished ones and those of ended sessions included; or the jobs named, as they are now"
   },
@@ -1275,7 +1545,7 @@
    ],
    "notes": [],
    "result": {
-    "stopped": "[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — the jobs as they are after stopping"
+    "stopped": "[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,multipart?:{image_path:{format_version,storage,path,metadata_path,bytes,sha256?,selected,count}},multipart_truncated?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — the jobs as they are after stopping"
    },
    "summary": "Stop a job, or all of them; files saved so far stay"
   },
@@ -1333,8 +1603,8 @@
    ],
    "notes": [],
    "result": {
-    "job": "{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with one ID: done; a failed job exits with its own error code and details.job",
-    "jobs": "[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — with several IDs, in the order given, once all have ended: all done; else the first that is not exits with its own error code, and details.jobs holds them all"
+    "job": "{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,multipart?:{image_path:{format_version,storage,path,metadata_path,bytes,sha256?,selected,count}},multipart_truncated?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with one ID: done; a failed job exits with its own error code and details.job",
+    "jobs": "[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,multipart?:{image_path:{format_version,storage,path,metadata_path,bytes,sha256?,selected,count}},multipart_truncated?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — with several IDs, in the order given, once all have ended: all done; else the first that is not exits with its own error code, and details.jobs holds them all"
    },
    "summary": "Wait for jobs: exit 0 when all are done, a failed one's own code, 4 if one is still running"
   },
@@ -1378,6 +1648,7 @@
      "choices": [
       "gige",
       "u3v",
+      "gentl",
       "webcam",
       "onvif",
       "screen",
@@ -1419,7 +1690,7 @@
    ],
    "notes": [],
    "result": {
-    "cameras": "[{id,kind:gige|u3v|webcam|screen|onvif|stream|file|sim,vendor,model,serial,address,held_by?:{session,idle_releases_in_s?}}] — pass id to -c; held_by: a session keeps it open, the auto session for idle_releases_in_s more seconds unless used",
+    "cameras": "[{id,kind:gige|u3v|gentl|webcam|screen|onvif|stream|file|sim,vendor,model,serial,address,held_by?:{session,idle_releases_in_s?}}] — pass id to -c; held_by: a session keeps it open, the auto session for idle_releases_in_s more seconds unless used",
     "warnings": "[string] — transports that could not be searched"
    },
    "summary": "List cameras: GigE Vision, USB3 Vision, webcams, ONVIF"
@@ -1609,7 +1880,8 @@
    ],
    "examples": [
     "capturefab network",
-    "capturefab network --tune -c gige:00c0df123456 -c gige:00c0df654321"
+    "capturefab network --tune -c gige:00c0df123456 -c gige:00c0df654321",
+    "capturefab network force-ip --mac 003053061a58 --interface 192.168.50.1 --address 192.168.50.20 --netmask 255.255.255.0 --gateway 0.0.0.0"
    ],
    "notes": [],
    "result": {
@@ -1618,7 +1890,233 @@
     "time": "string — RFC 3339 UTC time of the scan",
     "warnings": "[string]"
    },
-   "summary": "Check GigE network paths; --tune applies bandwidth sharing to cameras"
+   "summary": "Check GigE paths; --tune shares bandwidth; force-ip assigns a temporary camera address"
+  },
+  "network action": {
+   "args": [
+    {
+     "choices": [
+      "acknowledged",
+      "sent-only"
+     ],
+     "help": "Require strict replies from each expected peer, or report only the local send",
+     "long": "--mode",
+     "name": "mode",
+     "repeatable": false,
+     "required": true,
+     "type": "choice",
+     "value_name": "MODE"
+    },
+    {
+     "help": "Current local IPv4 address selecting exactly one outgoing interface",
+     "long": "--interface",
+     "name": "interface",
+     "repeatable": false,
+     "required": true,
+     "type": "string",
+     "value_name": "IP"
+    },
+    {
+     "help": "Explicit action device key, unsigned 32-bit decimal",
+     "long": "--device-key",
+     "name": "device_key",
+     "repeatable": false,
+     "required": true,
+     "type": "string",
+     "value_name": "U32"
+    },
+    {
+     "help": "Explicit action group key, unsigned 32-bit decimal",
+     "long": "--group-key",
+     "name": "group_key",
+     "repeatable": false,
+     "required": true,
+     "type": "string",
+     "value_name": "U32"
+    },
+    {
+     "help": "Nonzero unsigned 32-bit decimal action group mask",
+     "long": "--group-mask",
+     "name": "group_mask",
+     "repeatable": false,
+     "required": true,
+     "type": "string",
+     "value_name": "NONZERO"
+    },
+    {
+     "help": "Optional absolute device timestamp in camera ticks; zero/past may execute immediately",
+     "long": "--action-time-ticks",
+     "name": "action_time_ticks",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "U64_TICKS"
+    },
+    {
+     "help": "Expected camera IPv4 address, repeatable in acknowledged mode",
+     "long": "--expect",
+     "name": "expected",
+     "repeatable": true,
+     "required": false,
+     "type": "string",
+     "value_name": "IP"
+    },
+    {
+     "default": "1s",
+     "help": "One total operation deadline, greater than zero and at most 30s",
+     "long": "--timeout",
+     "name": "timeout",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    }
+   ],
+   "command": "network action",
+   "contract_version": 1,
+   "effect": "disruptive",
+   "errors": [
+    "usage",
+    "failed",
+    "usage",
+    "invalid_duration",
+    "permission_denied",
+    "unsupported",
+    "incomplete",
+    "camera_ambiguous",
+    "failed",
+    "unavailable",
+    "timeout",
+    "interrupted"
+   ],
+   "examples": [],
+   "notes": [
+    "Runs locally alongside already-held acquisition sessions. Explicit --session is rejected; ambient CAPTUREFAB_SESSION is ignored. Configure and arm cameras separately. Acknowledged mode requires 1..32 explicit --expect peers; sent-only rejects --expect. Optional --action-time-ticks sends an absolute device timestamp without reading or qualifying camera clocks. Zero or a target already in the past may execute immediately. One datagram is attempted, with no retry, discovery, controller acquisition or cleanup mutation. An ACK or successful send does not prove execution, frame arrival or synchronization; a post-send failure may leave a future action queued."
+   ],
+   "result": {
+    "action": "immediate|scheduled — explicit packet timing request",
+    "action_may_have_been_issued": "bool — conservative once send is attempted, including errors",
+    "action_time_ticks?": "u64 — requested absolute device timestamp for scheduled packets, including zero; clock and future-time validity are not verified",
+    "bytes": "int — 20 immediate or 28 scheduled on successful send",
+    "duplicate_datagrams": "int — identical admitted peer replies",
+    "execution": "not_verified",
+    "expected": "[IPv4] — explicit acknowledged peers; empty for sent-only",
+    "frame_arrival": "not_verified",
+    "ignored_datagrams": "int — unrelated or filtered traffic",
+    "interface": "{name,index,address,netmask} — selected local interface",
+    "missing": "[IPv4] — expected peers without an admitted reply",
+    "mode": "acknowledged|sent-only",
+    "mutation_datagrams": "int — exactly one on success; no retry",
+    "mutation_send_attempted": "bool",
+    "outcome": "acknowledged|sent_without_ack_confirmation — failures retain an unconfirmed partial summary in error.details.action",
+    "received_datagrams": "int — all received traffic, at most 1024",
+    "request_id": "int — nonzero GVCP request ID",
+    "responses": "[{source,status_raw,status}] — exact correlated eight-byte ACKs; full u16 status",
+    "synchronization": "not_verified",
+    "verification": "strict_action_acknowledgements|not_requested"
+   },
+   "summary": "Send one immediate or scheduled `GigE` Vision action"
+  },
+  "network force-ip": {
+   "args": [
+    {
+     "help": "Target unicast MAC, twelve hex digits or colon-separated hex pairs",
+     "long": "--mac",
+     "name": "mac",
+     "repeatable": false,
+     "required": true,
+     "type": "string",
+     "value_name": "MAC"
+    },
+    {
+     "help": "Current local IPv4 address selecting exactly one outgoing interface",
+     "long": "--interface",
+     "name": "interface",
+     "repeatable": false,
+     "required": true,
+     "type": "string",
+     "value_name": "IP"
+    },
+    {
+     "help": "Temporary camera IPv4 address",
+     "long": "--address",
+     "name": "address",
+     "repeatable": false,
+     "required": true,
+     "type": "string",
+     "value_name": "IP"
+    },
+    {
+     "help": "Temporary contiguous IPv4 subnet mask",
+     "long": "--netmask",
+     "name": "netmask",
+     "repeatable": false,
+     "required": true,
+     "type": "string",
+     "value_name": "MASK"
+    },
+    {
+     "help": "Temporary gateway; pass 0.0.0.0 for none",
+     "long": "--gateway",
+     "name": "gateway",
+     "repeatable": false,
+     "required": true,
+     "type": "string",
+     "value_name": "IP"
+    },
+    {
+     "default": "3s",
+     "help": "Total discovery, assignment and verification deadline",
+     "long": "--timeout",
+     "name": "timeout",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    }
+   ],
+   "command": "network force-ip",
+   "contract_version": 1,
+   "effect": "disruptive",
+   "errors": [
+    "usage",
+    "failed",
+    "usage",
+    "invalid_duration",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "permission_denied",
+    "unsupported",
+    "incomplete",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [],
+   "notes": [
+    "Runs locally without opening a session or camera. Explicit --session is rejected; ambient CAPTUREFAB_SESSION is ignored. The target must have no open camera object. The mandatory MAC lock is advisory: opaque GenTL aliases, other applications/runtimes and owners opened without locks are outside its coverage. One assignment datagram is sent, with no retry or rollback; power cycling restores the camera's startup configuration."
+   ],
+   "result": {
+    "ack": "received|not_observed — ACK alone does not prove assignment",
+    "ack_source?": "string — correlated ACK sender",
+    "assignment_may_have_applied": "bool — also retained in error.details.force_ip after send",
+    "before": "{configuration:{address,netmask,gateway},reply_source} — preflight discovery",
+    "camera": "string — canonical gige:MAC identity",
+    "ignored_datagrams": "int — filtered/unrelated bootstrap traffic",
+    "interface": "{name,index,address,netmask} — selected local interface",
+    "limitations": "[string] — advisory ownership and unauthenticated discovery limits",
+    "mac": "string — twelve lowercase hex digits",
+    "mutation_datagrams": "int — exactly one on success",
+    "mutation_send_attempted": "bool",
+    "observed": "{configuration:{address,netmask,gateway},reply_source} — fresh matching discovery",
+    "reachability": "not_probed — no controller acquisition",
+    "received_datagrams": "int — includes the packet that trips the 1024-packet bound",
+    "requested": "{address,netmask,gateway} — explicit temporary configuration",
+    "reservation": "{scope:advisory_selected_runtime_native_mac,no_other_open_camera_required:true}",
+    "temporary": "true",
+    "verification": "fresh_mac_and_configuration_discovery"
+   },
+   "summary": "Temporarily assign one native `GigE` camera's IPv4 configuration, without opening it"
   },
   "onvif resolve": {
    "args": [
@@ -2188,8 +2686,7 @@
      "value_name": "DUR"
     },
     {
-     "default": "2s",
-     "help": "How long a camera that sets its own exposure (a webcam, or ExposureAuto=Continuous; a network stream is already running) may take to settle before recording; 0 records at once",
+     "help": "Exposure settling limit (default 2s; none for read-only monitors); 0 records at once",
      "long": "--warmup",
      "name": "warmup",
      "repeatable": false,
@@ -2274,7 +2771,7 @@
     "frames": "int — frames encoded, or copied; for a stream, the camera's frames handed to the encoder, which repeats them to keep --fps; absent when the file was cut at --max-size",
     "height": "int",
     "incomplete": "int — frames that arrived incomplete, where the transport counts them",
-    "job": "{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with --background: the job, as jobs lists it, once its first frame is encoded",
+    "job": "{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,multipart?:{image_path:{format_version,storage,path,metadata_path,bytes,sha256?,selected,count}},multipart_truncated?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with --background: the job, as jobs lists it, once its first frame is encoded",
     "output": "string — the file written (template expanded), or the stream URL with credentials redacted",
     "resent": "int — packets the camera sent again, where the transport counts them",
     "settled": "false — its exposure was still changing when --warmup ran out (with a warning)",
@@ -2587,6 +3084,25 @@
      "value_name": "DRY_RUN"
     },
     {
+     "default": "false",
+     "help": "Assign only `ActionDeviceKey` without readback or rollback in an existing session",
+     "long": "--write-only",
+     "name": "write_only",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "WRITE_ONLY"
+    },
+    {
+     "help": "Bound the WO key operation, including ordering and worker queue waits",
+     "long": "--write-timeout",
+     "name": "write_timeout",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    },
+    {
      "env": "CAPTUREFAB_KEEP",
      "help": "Keep the camera open in a session after use (default 60s). Use 0 to reuse an open session or run without one",
      "long": "--keep",
@@ -2628,9 +3144,15 @@
    "result": {
     "camera": "string — camera ID",
     "changed": "[{name,from,to}] — every value written, in order, `to` read back (may be rounded); autos turned off to unlock a value are listed too",
+    "completion": "native_transport_ack|producer_reported — with --write-only",
     "dry_run": "true — with --dry-run",
+    "feature": "ActionDeviceKey — with --write-only",
     "plan": "[{name,from,to}] — with --dry-run: the writes in order, none made",
-    "warnings": "[string] — with --dry-run: checks only the writes themselves can decide (a value another write of the change may unlock or bring into range)"
+    "readback": "unavailable_write_only — with --write-only",
+    "rollback": "not_available — with --write-only",
+    "scope": "current_control_epoch — not persisted or reapplied after reconnect — with --write-only",
+    "warnings": "[string] — with --dry-run: checks only the writes themselves can decide (a value another write of the change may unlock or bring into range)",
+    "write_completed": "true — reported completion, without readable verification — with --write-only"
    },
    "summary": "Change features or controls as one atomic change; a failure restores every value"
   },
@@ -2892,6 +3414,15 @@
   }
  ],
  "groups": {
+  "data": {
+   "examples": [
+    "capturefab data protocols --json",
+    "capturefab data record --config sources.json --for 30s -o run.jsonl",
+    "capturefab data export run.jsonl -o run.csv"
+   ],
+   "notes": [],
+   "summary": "Record industrial signals on a shared timeline and export CSV or JSONL"
+  },
   "debug": {
    "examples": [
     "capturefab debug xml -c sim:0 > camera.xml",
@@ -2954,6 +3485,18 @@
    "completions": [
     "read",
     "Print shell completions: bash, zsh, fish, powershell, elvish"
+   ],
+   "data export": [
+    "file_write",
+    "Export samples as CSV or JSONL"
+   ],
+   "data protocols": [
+    "read",
+    "Show adapters and an example config"
+   ],
+   "data record": [
+    "disruptive",
+    "Record signals on one host timeline"
    ],
    "debug read": [
     "read",
@@ -3033,7 +3576,15 @@
    ],
    "network": [
     "read",
-    "Check GigE network paths; --tune applies bandwidth sharing to cameras"
+    "Check GigE paths; --tune shares bandwidth; force-ip assigns a temporary camera address"
+   ],
+   "network action": [
+    "disruptive",
+    "Send one immediate or scheduled `GigE` Vision action"
+   ],
+   "network force-ip": [
+    "disruptive",
+    "Temporarily assign one native `GigE` camera's IPv4 configuration, without opening it"
    ],
    "onvif resolve": [
     "read",
@@ -3110,15 +3661,15 @@
   },
   "contract_version": 1,
   "conventions": {
-   "camera": "Use `-c CAM` or `CAPTUREFAB_CAMERA`. By default, use the session's only camera or the only camera discovered. Discovery for this default excludes simulators and screens",
-   "credentials": "Capturefab redacts credentials in camera URLs",
-   "describe": "Run `capturefab schema COMMAND` for arguments, result fields and errors",
-   "globals": "Put global options before or after the command",
-   "jobs": "`capture` and `record` normally wait for the job. `--background` returns a job to follow with `jobs wait ID`",
-   "json": "`--json` or `CAPTUREFAB_JSON=1` usually writes one result line to stdout. A failure returns `error` with `code`, `message` and optional `hint` and `details`",
-   "results": "Keys use `snake_case`, with units in names such as `exposure_us`. Timestamps use RFC 3339 UTC. Missing fields are omitted",
-   "routing": "Use `--session NAME` to choose a session. Otherwise, commands reuse a matching session. Most camera commands keep the camera open in `auto` for 60s after use. `--keep 0` can reuse a session. Use `--no-session` to bypass sessions",
-   "streams": "`watch --json` and `shell --json` emit NDJSON. With `capture --json -o -`, image bytes go to stdout and JSON goes to stderr. `--progress` sends JSON progress to stderr"
+   "camera": "`-c CAM` or `CAPTUREFAB_CAMERA`; else the session's only camera, then the only discovered camera (excluding simulators/screens)",
+   "credentials": "Camera URL credentials are redacted",
+   "describe": "`capturefab schema COMMAND` shows arguments, results and errors",
+   "globals": "Global options work before or after the command",
+   "jobs": "`capture` and `record` wait by default. `--background` returns a job for `jobs wait ID`",
+   "json": "`--json` or `CAPTUREFAB_JSON=1`: usually one stdout result; failures return `error.{code,message,hint?,details?}`",
+   "results": "Keys: `snake_case`, units as in `exposure_us`. Timestamps: RFC 3339 UTC. Missing fields are omitted",
+   "routing": "`--session NAME`, else matching session; warm `auto` lasts 60s. `--keep 0` reuses; `--no-session` bypasses. `network force-ip` and `network action` run locally, ignore ambient sessions, reject explicit sessions.",
+   "streams": "`watch --json` and `shell --json` emit NDJSON. `capture --json -o -` writes image bytes to stdout, JSON to stderr. `--progress` emits JSON progress to stderr"
   },
   "effect_with": {
    "capture": {
@@ -3261,10 +3812,10 @@
    "6": "storage full"
   },
   "grammars": {
-   "duration": "Add a unit, as in `250ms`, `1.5s` or `1h30m`. Use `0` where allowed. Some waits accept `none` for an unlimited wait",
+   "duration": "Units: `250ms`, `1.5s`, `1h30m`. Use `0` where allowed; some waits accept `none` (unlimited).",
    "name": "Use `Feature`, `Feature[Selector=Value,…]` or `Feature[Value]` for one selector. Controls include `exposure`, `gain`, `fps`, `roi`, `format`, `trigger`, `auto_exposure` and `auto_wb`",
-   "selector": "Camera ID from `list`, serial, IPv4, stream URL such as `rtsp://HOST/PATH`, `onvif://HOST`, file path, `sim:N[?drop=0..0.5&line0=every:DUR]` or `sim:replay:PATH`",
-   "template": "Capture names accept `{camera}`, `{serial}`, `{seq}`, `{seq:N}`, `{frame}`, `{time}`, `{date}`, `{datetime}`, `{tag:KEY}` and `{ext}`"
+   "selector": "ID/serial/IPv4/URL/file; sim:N[?drop=0..0.5&line0=every:DUR]; sim:replay:PATH; gige-monitor://IP?interface=IP&mac=12HEX",
+   "template": "Names accept `{camera}`, `{serial}`, `{seq}`, `{seq:N}`, `{frame}`, `{time}`, `{date}`, `{datetime}`, `{tag:KEY}` and `{ext}`"
   }
  }
 }

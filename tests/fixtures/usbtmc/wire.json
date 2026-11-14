@@ -1,0 +1,453 @@
+{
+  "format_version": 1,
+  "source": {
+    "archive_url": "https://www.usb.org/sites/default/files/USBTMC_1_006a.zip",
+    "archive_bytes": 690172,
+    "archive_sha256": "e147d643a8c2fd54f6f77d522180a9694ce4ec2759bb08c462c6d913e862d8dd",
+    "usbtmc_pdf_bytes": 412058,
+    "usbtmc_pdf_sha256": "c43f71baa0f337df84f75b9f730c2fca94efe68d521f35ddc6f2c38af35aa870",
+    "usb488_pdf_bytes": 321908,
+    "usb488_pdf_sha256": "2bb73ed0300c975fc105be7ca14ca22158e9b9208726212d9de7fad39950b92d",
+    "public_contract_sha256": "b238deb1185081cafdc0057b29479c36dd2ff9dc6c7c8a38c986fcc7c7f67949",
+    "ipc_contract_sha256": "12e985387b76df47e0dc4ff37f9b77a2cea774b3b2d62344563e06c267c864e2",
+    "scope": "Independently hand-declared Rev1.0 wire/scalar controls, prior to native/codec authorship. No device, OS driver or physical instrument qualification."
+  },
+  "normative": [
+    "USBTMC Tables1/3/4/8/9/11, sections3.2/3.3",
+    "USB488 sections3.2.2/3.3"
+  ],
+  "tag_rule": {
+    "minimum": 1,
+    "maximum": 255,
+    "host_policy_sequence": [
+      254,
+      255,
+      1,
+      2
+    ],
+    "zero_skipped": true
+  },
+  "cases": [
+    {
+      "name": "command_read",
+      "header_hex": "015ba4000600000001000000",
+      "payload_hex": "524541443f0a",
+      "padding_hex": "0000",
+      "wire_hex": "015ba4000600000001000000524541443f0a0000",
+      "direction": "out_command",
+      "tag": 91,
+      "transfer_size": 6,
+      "eom": true,
+      "valid": true,
+      "wire_bytes": 20
+    },
+    {
+      "name": "command_nonzero_pad_legal_wire",
+      "header_hex": "015ba4000600000001000000",
+      "payload_hex": "524541443f0a",
+      "padding_hex": "aa55",
+      "wire_hex": "015ba4000600000001000000524541443f0aaa55",
+      "direction": "out_command",
+      "tag": 91,
+      "transfer_size": 6,
+      "eom": true,
+      "valid": true,
+      "emitter_policy": false,
+      "wire_bytes": 20
+    },
+    {
+      "name": "command_tag_255",
+      "header_hex": "01ff00000100000001000000",
+      "payload_hex": "3f",
+      "padding_hex": "000000",
+      "wire_hex": "01ff000001000000010000003f000000",
+      "direction": "out_command",
+      "tag": 255,
+      "transfer_size": 1,
+      "eom": true,
+      "valid": true,
+      "wire_bytes": 16
+    },
+    {
+      "name": "request_32",
+      "header_hex": "025ca3002000000000000000",
+      "payload_hex": "",
+      "padding_hex": "",
+      "wire_hex": "025ca3002000000000000000",
+      "direction": "in_request",
+      "tag": 92,
+      "transfer_size": 32,
+      "termchar_enabled": false,
+      "valid": true,
+      "wire_bytes": 12
+    },
+    {
+      "name": "request_wrap_to_1",
+      "header_hex": "0201fe000100000000000000",
+      "payload_hex": "",
+      "padding_hex": "",
+      "wire_hex": "0201fe000100000000000000",
+      "direction": "in_request",
+      "tag": 1,
+      "transfer_size": 1,
+      "termchar_enabled": false,
+      "valid": true,
+      "wire_bytes": 12
+    },
+    {
+      "name": "request_65536",
+      "header_hex": "0202fd000000010000000000",
+      "payload_hex": "",
+      "padding_hex": "",
+      "wire_hex": "0202fd000000010000000000",
+      "direction": "in_request",
+      "tag": 2,
+      "transfer_size": 65536,
+      "termchar_enabled": false,
+      "valid": true,
+      "wire_bytes": 12
+    },
+    {
+      "name": "response_no_padding",
+      "header_hex": "025ca3000500000001000000",
+      "payload_hex": "312e32350a",
+      "padding_hex": "",
+      "wire_hex": "025ca3000500000001000000312e32350a",
+      "direction": "in_response",
+      "tag": 92,
+      "request_max": 32,
+      "transfer_size": 5,
+      "eom": true,
+      "valid": true,
+      "max_packet_size": 64,
+      "packet_lengths": [
+        17
+      ],
+      "posted_capacity": 128,
+      "short_observed": true,
+      "trusted_payload_hex": "312e32350a"
+    },
+    {
+      "name": "response_nonzero_non_four_aligned_padding",
+      "header_hex": "025ca3000500000001000000",
+      "payload_hex": "312e32350a",
+      "padding_hex": "ff23",
+      "wire_hex": "025ca3000500000001000000312e32350aff23",
+      "direction": "in_response",
+      "tag": 92,
+      "request_max": 32,
+      "transfer_size": 5,
+      "eom": true,
+      "valid": true,
+      "max_packet_size": 64,
+      "packet_lengths": [
+        19
+      ],
+      "posted_capacity": 128,
+      "short_observed": true,
+      "trusted_payload_hex": "312e32350a"
+    },
+    {
+      "name": "response_continuation",
+      "header_hex": "025ca3000200000000000000",
+      "payload_hex": "312e",
+      "padding_hex": "",
+      "wire_hex": "025ca3000200000000000000312e",
+      "direction": "in_response",
+      "tag": 92,
+      "request_max": 32,
+      "transfer_size": 2,
+      "eom": false,
+      "valid": true,
+      "max_packet_size": 64,
+      "packet_lengths": [
+        14
+      ],
+      "posted_capacity": 128,
+      "short_observed": true,
+      "trusted_payload_hex": "312e"
+    },
+    {
+      "name": "response_final_continuation",
+      "header_hex": "025da2000300000001000000",
+      "payload_hex": "32350a",
+      "padding_hex": "",
+      "wire_hex": "025da200030000000100000032350a",
+      "direction": "in_response",
+      "tag": 93,
+      "request_max": 32,
+      "transfer_size": 3,
+      "eom": true,
+      "valid": true,
+      "max_packet_size": 64,
+      "packet_lengths": [
+        15
+      ],
+      "posted_capacity": 128,
+      "short_observed": true,
+      "trusted_payload_hex": "32350a"
+    },
+    {
+      "name": "response_premature_short",
+      "header_hex": "025ca3000500000001000000",
+      "payload_hex": "312e3235",
+      "padding_hex": "",
+      "wire_hex": "025ca3000500000001000000312e3235",
+      "direction": "in_response",
+      "tag": 92,
+      "request_max": 32,
+      "transfer_size": 5,
+      "valid": false,
+      "max_packet_size": 64,
+      "packet_lengths": [
+        16
+      ],
+      "posted_capacity": 128,
+      "short_observed": true,
+      "error": "incomplete_payload",
+      "eom_ignored": true,
+      "trusted_payload_hex": "312e3235"
+    },
+    {
+      "name": "response_zero_declared",
+      "header_hex": "025ca3000000000001000000",
+      "payload_hex": "",
+      "padding_hex": "",
+      "wire_hex": "025ca3000000000001000000",
+      "direction": "in_response",
+      "tag": 92,
+      "request_max": 32,
+      "valid": false,
+      "error": "invalid_header",
+      "evidence_allowed": false
+    },
+    {
+      "name": "response_wrong_tag",
+      "header_hex": "025da2000500000001000000",
+      "payload_hex": "312e32350a",
+      "padding_hex": "",
+      "wire_hex": "025da2000500000001000000312e32350a",
+      "direction": "in_response",
+      "tag": 92,
+      "request_max": 32,
+      "valid": false,
+      "error": "invalid_header",
+      "evidence_allowed": false
+    },
+    {
+      "name": "response_wrong_inverse",
+      "header_hex": "025ca2000500000001000000",
+      "payload_hex": "312e32350a",
+      "padding_hex": "",
+      "wire_hex": "025ca2000500000001000000312e32350a",
+      "direction": "in_response",
+      "tag": 92,
+      "request_max": 32,
+      "valid": false,
+      "error": "invalid_header",
+      "evidence_allowed": false
+    },
+    {
+      "name": "response_reserved_byte",
+      "header_hex": "025ca3010500000001000000",
+      "payload_hex": "312e32350a",
+      "padding_hex": "",
+      "wire_hex": "025ca3010500000001000000312e32350a",
+      "direction": "in_response",
+      "tag": 92,
+      "request_max": 32,
+      "valid": false,
+      "error": "invalid_header",
+      "evidence_allowed": false
+    },
+    {
+      "name": "response_reserved_attribute",
+      "header_hex": "025ca3000500000081000000",
+      "payload_hex": "312e32350a",
+      "padding_hex": "",
+      "wire_hex": "025ca3000500000081000000312e32350a",
+      "direction": "in_response",
+      "tag": 92,
+      "request_max": 32,
+      "valid": false,
+      "error": "invalid_header",
+      "evidence_allowed": false
+    },
+    {
+      "name": "response_false_termchar_match",
+      "header_hex": "025ca3000500000003000000",
+      "payload_hex": "312e32350a",
+      "padding_hex": "",
+      "wire_hex": "025ca3000500000003000000312e32350a",
+      "direction": "in_response",
+      "tag": 92,
+      "request_max": 32,
+      "valid": false,
+      "termchar_enabled": false,
+      "error": "invalid_header",
+      "evidence_allowed": false
+    },
+    {
+      "name": "response_over_request",
+      "header_hex": "025ca3002100000001000000",
+      "payload_hex": "",
+      "padding_hex": "",
+      "wire_hex": "025ca3002100000001000000",
+      "direction": "in_response",
+      "tag": 92,
+      "request_max": 32,
+      "valid": false,
+      "error": "invalid_header",
+      "evidence_allowed": false
+    },
+    {
+      "name": "response_unknown_id",
+      "header_hex": "7f5ca3000500000001000000",
+      "payload_hex": "312e32350a",
+      "padding_hex": "",
+      "wire_hex": "7f5ca3000500000001000000312e32350a",
+      "direction": "in_response",
+      "tag": 92,
+      "request_max": 32,
+      "valid": false,
+      "error": "invalid_header",
+      "evidence_allowed": false
+    },
+    {
+      "name": "short_header",
+      "wire_hex": "025ca30005000000",
+      "direction": "in_response",
+      "tag": 92,
+      "request_max": 32,
+      "valid": false,
+      "error": "invalid_header",
+      "evidence_allowed": false
+    },
+    {
+      "name": "exact_mps_zlp",
+      "header_hex": "025ca3003400000001000000",
+      "payload_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30313233",
+      "padding_hex": "",
+      "wire_hex": "025ca3003400000001000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30313233",
+      "direction": "in_response",
+      "tag": 92,
+      "request_max": 52,
+      "transfer_size": 52,
+      "eom": true,
+      "valid": true,
+      "max_packet_size": 64,
+      "packet_lengths": [
+        64,
+        0
+      ],
+      "posted_capacity": 128,
+      "short_observed": true,
+      "trusted_payload_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30313233"
+    },
+    {
+      "name": "exact_mps_pad1",
+      "header_hex": "025ca3003400000001000000",
+      "payload_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30313233",
+      "padding_hex": "a5",
+      "wire_hex": "025ca3003400000001000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30313233a5",
+      "direction": "in_response",
+      "tag": 92,
+      "request_max": 52,
+      "transfer_size": 52,
+      "eom": true,
+      "valid": true,
+      "max_packet_size": 64,
+      "packet_lengths": [
+        64,
+        1
+      ],
+      "posted_capacity": 128,
+      "short_observed": true,
+      "trusted_payload_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30313233"
+    },
+    {
+      "name": "exact_mps_pad63",
+      "header_hex": "025ca3003400000001000000",
+      "payload_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30313233",
+      "padding_hex": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+      "wire_hex": "025ca3003400000001000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30313233a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+      "direction": "in_response",
+      "tag": 92,
+      "request_max": 52,
+      "transfer_size": 52,
+      "eom": true,
+      "valid": true,
+      "max_packet_size": 64,
+      "packet_lengths": [
+        64,
+        63
+      ],
+      "posted_capacity": 128,
+      "short_observed": true,
+      "trusted_payload_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30313233"
+    },
+    {
+      "name": "exact_mps_no_short",
+      "header_hex": "025ca3003400000001000000",
+      "payload_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30313233",
+      "padding_hex": "",
+      "wire_hex": "025ca3003400000001000000000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30313233",
+      "direction": "in_response",
+      "tag": 92,
+      "request_max": 52,
+      "transfer_size": 52,
+      "eom": true,
+      "valid": false,
+      "error": "missing_short_termination",
+      "max_packet_size": 64,
+      "packet_lengths": [
+        64
+      ],
+      "posted_capacity": 128,
+      "short_observed": false,
+      "trusted_payload_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30313233"
+    },
+    {
+      "name": "overlong_padding",
+      "header_hex": "025ca3000500000001000000",
+      "payload_hex": "312e32350a",
+      "padding_hex": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+      "wire_hex": "025ca3000500000001000000312e32350aa5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+      "direction": "in_response",
+      "tag": 92,
+      "request_max": 32,
+      "transfer_size": 5,
+      "valid": false,
+      "error": "overlong_transfer",
+      "max_packet_size": 64,
+      "packet_lengths": [
+        64,
+        17
+      ],
+      "posted_capacity": 128,
+      "short_observed": true,
+      "trusted_payload_hex": "312e32350a"
+    }
+  ],
+  "application_controls": {
+    "query_hex": "524541443f0a",
+    "line_reply_hex": "312e32350a",
+    "continuation_payloads_hex": [
+      "312e",
+      "32350a"
+    ],
+    "definite_block_reply_hex": "3a5741564520233137000aff230d417f0d0a",
+    "definite_block_prefix_hex": "3a5741564520",
+    "definite_block_header_ascii": "#17",
+    "definite_block_payload_hex": "000aff230d417f",
+    "definite_block_terminator_hex": "0d0a",
+    "payload_offset": 9,
+    "payload_bytes": 7,
+    "raw_artifact_bytes": 18,
+    "artifact_excludes": [
+      "USB_headers",
+      "USB_padding"
+    ],
+    "failed_poll": "No new Reading or final raw/sidecar artifact; prior successful polls remain."
+  }
+}

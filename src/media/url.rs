@@ -2,9 +2,32 @@
 //! must pass, and the credentials kept out of what is shown and of
 //! `FFmpeg`'s arguments.
 #![forbid(unsafe_code)]
-use super::*;
+use super::{local_file_path, native_source};
+use crate::types::{CameraInfo, Categorized, ErrorKind, Transport};
+use anyhow::{Context as _, Result, ensure};
 use std::borrow::Cow;
 use std::fmt::Write as _;
+use std::fs;
+
+/// Source recognition and validation share this allowlist. In particular,
+/// never let `FFmpeg`'s other protocols (such as concat or crypto) become
+/// camera sources merely because `FFmpeg` knows how to open them.
+const SOURCE_PROTOCOLS: &[&str] = &[
+    "rtsp",
+    "rtsps",
+    "srt",
+    "rtmp",
+    "rtmps",
+    "http",
+    "https",
+    "udp",
+    "tcp",
+    "rtp",
+    "file",
+    "avfoundation",
+    "v4l2",
+    "dshow",
+];
 
 /// Credential-bearing query names use several case and separator conventions.
 /// Decode the name once, as URL query parsers do, while preserving the original
@@ -368,23 +391,7 @@ pub(crate) fn validate_source_shape(url: &str) -> Result<()> {
     );
     if let Some(protocol) = scheme(url) {
         ensure!(
-            matches!(
-                protocol.as_ref(),
-                "rtsp"
-                    | "rtsps"
-                    | "srt"
-                    | "rtmp"
-                    | "rtmps"
-                    | "http"
-                    | "https"
-                    | "udp"
-                    | "tcp"
-                    | "rtp"
-                    | "file"
-                    | "avfoundation"
-                    | "v4l2"
-                    | "dshow"
-            ),
+            SOURCE_PROTOCOLS.contains(&protocol.as_ref()),
             "unsupported media protocol {protocol}"
         );
         if !matches!(
@@ -454,25 +461,7 @@ pub(crate) fn absolute_source(path: &std::path::Path, what: &str) -> Result<()> 
 /// Whether `url` names a source by its scheme alone, without asking the
 /// disk whether it is a file.
 pub(crate) fn is_url_source(url: &str) -> bool {
-    scheme(url).is_some_and(|s| {
-        matches!(
-            s.as_ref(),
-            "rtsp"
-                | "rtsps"
-                | "srt"
-                | "rtmp"
-                | "rtmps"
-                | "http"
-                | "https"
-                | "udp"
-                | "tcp"
-                | "rtp"
-                | "file"
-                | "avfoundation"
-                | "v4l2"
-                | "dshow"
-        )
-    })
+    scheme(url).is_some_and(|s| SOURCE_PROTOCOLS.contains(&s.as_ref()))
 }
 pub(crate) fn info(url: &str) -> Result<CameraInfo> {
     validate_source(url)?;
@@ -492,4 +481,264 @@ pub(crate) fn info(url: &str) -> Result<CameraInfo> {
         address: Some(safe_url),
         profile: crate::camera_profile::CameraProfile::default(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::media::output_args;
+    use std::path::PathBuf;
+
+    #[test]
+    fn concat_scripts_quote_what_they_name() {
+        assert_eq!(
+            concat_script(
+                "rtsp://a:it's@cam/live",
+                ["-probesize", "500000", "-rtsp_transport", "tcp+udp"].into_iter()
+            ),
+            "ffconcat version 1.0\nfile 'rtsp://a:it'\\''s@cam/live'\noption probesize '500000'\noption rtsp_transport 'tcp+udp'\n"
+        );
+        assert_eq!(
+            concat_script(
+                "",
+                ["--headers", "é'雪", "-empty", "", "-dangling"].into_iter()
+            ),
+            "ffconcat version 1.0\nfile ''\noption headers 'é'\\''雪'\noption empty ''\n"
+        );
+        assert!(credentialed("rtsp://a:b@cam/live"));
+        assert!(credentialed("http://cam/video.cgi?user=a&pass=b"));
+        assert!(!credentialed("rtsp://cam/live"));
+    }
+    #[test]
+    fn sources_redact_credentials_and_forbid_command_protocols() {
+        assert_eq!(
+            redact_url("rtsp://user:pass@camera:554/live?token=abc&fps=30"),
+            "rtsp://<redacted>@camera:554/live?token=<redacted>&fps=30"
+        );
+        assert_eq!(
+            redact_url("srt://host:8890?passphrase=secret&mode=caller"),
+            "srt://host:8890?passphrase=<redacted>&mode=caller"
+        );
+        assert_eq!(
+            redact_url("RTMPS://user:pass@host/app/instance/KEY?token=SECRET&fps=30"),
+            "RTMPS://<redacted>@host/app/<redacted>?token=<redacted>&fps=30"
+        );
+        assert_eq!(redact_url("rtmp://host/app/"), "rtmp://host/app/");
+        assert_eq!(redact_url("rtmp://host/app"), "rtmp://host/app");
+        assert_eq!(
+            redact_url("rtmp://host/app/<redacted>"),
+            "rtmp://host/app/<redacted>"
+        );
+        info("rtsp://camera/live").unwrap();
+        for source in [
+            "concat:secret|other",
+            "CONCAT:secret|other",
+            "crypto:https://camera/live",
+            "data:video/mp4;base64,AAAA",
+            "pipe:0",
+            "subfile:,,start,0,end,100,,:/tmp/video",
+        ] {
+            assert!(!is_url_source(source), "{source}");
+            info(source).unwrap_err();
+        }
+        info("rtsp://camera/live\n-x").unwrap_err();
+        // Vendor and signed-URL credentials (Foscam pwd, Blue Iris pw,
+        // authSig, API keys) never reach logs either.
+        assert_eq!(
+            redact_url(
+                "http://cam/cgi?usr=a&PWD=b&pw=c&api_key=d&ApiKey=e&authSig=f&sig=g&signature=h&stream=main&fps=5"
+            ),
+            "http://cam/cgi?usr=a&PWD=<redacted>&pw=<redacted>&api_key=<redacted>&ApiKey=<redacted>&authSig=<redacted>&sig=<redacted>&signature=<redacted>&stream=main&fps=5"
+        );
+    }
+    #[test]
+    fn query_credentials_are_redacted_across_case_separators_and_percent_encoding() {
+        for key in [
+            "api_key",
+            "API-Key",
+            "client_secret",
+            "ClIeNt-SeCrEt",
+            "X-Amz-Credential",
+            "x-AmZ-SiGnAtUrE",
+            "X-Amz-Security-Token",
+            "X-Goog-Credential",
+            "x-GoOg-SiGnAtUrE",
+            "X-Goog-Security-Token",
+            "sig",
+            "SiG",
+            "%61pI%5fkEy",
+            "%41PI%2dKeY",
+            "cLiEnT%5FsEcReT",
+            "%58-AmZ-%43reDential",
+            "X%2daMz%2dSiGnAtUrE",
+            "x-AmZ-sEcUrItY%2dtOkEn",
+            "%78-gOoG-CrEdEnTiAl",
+            "X%2DgOoG%2DsIgNaTuRe",
+            "x-GoOg-SeCuRiTy%2DtOkEn",
+            "%73%49%67",
+            "aCcEsS%5FtOkEn",
+            "%50aSsWoRd",
+            "%50wD",
+            "%70W",
+            "AuTh%53Ig",
+            "%73IgNaTuRe",
+            // IP cameras' own names for a password.
+            "pass",
+            "PASS",
+            "passcode",
+            "loginpas",
+            "loginPass",
+            "user_pwd",
+            "psw",
+            "refresh_token",
+            "auth_key",
+        ] {
+            let url = format!("https://camera/stream?{key}=PRIVATE%2fvalue&fps=30");
+            assert!(credential_query_key(key), "{key}");
+            assert_eq!(
+                redact_url(&url),
+                format!("https://camera/stream?{key}=<redacted>&fps=30"),
+                "{key}"
+            );
+        }
+    }
+    #[test]
+    fn query_redaction_preserves_noncredential_parameters() {
+        let url = "https://camera/stream?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20261018T120000Z&X-Amz-Expires=60&X-Goog-SignedHeaders=host&sv=2026-02-06&se=2026-10-19&sp=r&fps=30&format=h264&request_id=value%2fkept";
+        assert_eq!(redact_url(url), url);
+        for (input, expected) in [
+            ("https://cam/live?", "https://cam/live?"),
+            (
+                "rtsp://u:p@cam/live?a=&password=&b=two=three&&#fragment",
+                "rtsp://<redacted>@cam/live?a&password=<redacted>&b=two=three&&#fragment",
+            ),
+            (
+                "https://cam/live?label=雪&x=&token=秘密&flag&&tail=",
+                "https://cam/live?label=雪&x&token=<redacted>&flag&&tail",
+            ),
+            (
+                "https://cam/live?token&bare",
+                "https://cam/live?token=<redacted>&bare",
+            ),
+        ] {
+            assert_eq!(redact_url(input), expected);
+        }
+        for key in [
+            "X-Amz-Date",
+            "X-Goog-Algorithm",
+            "expires",
+            "client_id",
+            "keyframe_interval",
+            "apikey_hint",
+            "api%252dkey",
+            "api%key",
+            "api%2",
+            "api%zzkey",
+        ] {
+            assert!(!credential_query_key(key), "{key}");
+        }
+    }
+    #[test]
+    fn redaction_preserves_unicode_and_is_idempotent() {
+        for (url, expected) in [
+            (
+                "rtmp://利用者:密碼@cam/アプリ/秘密?fps=30&token=別",
+                "rtmp://<redacted>@cam/アプリ/<redacted>?fps=30&token=<redacted>",
+            ),
+            (
+                "rtmps://[::1]/app/密碼#fragment",
+                "rtmps://[::1]/app/<redacted>#fragment",
+            ),
+            ("rtmp://cam/app/", "rtmp://cam/app/"),
+            (
+                "RTMPS://<redacted>@cam/アプリ/<redacted>?token=<redacted>&fps=30",
+                "RTMPS://<redacted>@cam/アプリ/<redacted>?token=<redacted>&fps=30",
+            ),
+            (
+                "https://cam/画面?label=雪&fps=30",
+                "https://cam/画面?label=雪&fps=30",
+            ),
+        ] {
+            assert_eq!(redact_url(url), expected, "{url}");
+            assert_eq!(redact_url(expected), expected);
+            assert_eq!(credentialed(url), url != expected);
+        }
+    }
+    #[test]
+    fn backend_urls_lowercase_only_the_scheme_and_keep_credentials_redacted() {
+        let source = "RTSP://User:P%40ss@Camera.Example:554/Live/%aB?token=Secret%2f&Mode=TCP";
+        let canonical = "rtsp://User:P%40ss@Camera.Example:554/Live/%aB?token=Secret%2f&Mode=TCP";
+        assert_eq!(canonical_scheme(source), canonical);
+        assert_eq!(
+            canonical_scheme("HtTp://Camera/映像?label=É"),
+            "http://Camera/映像?label=É"
+        );
+        assert_eq!(canonical_scheme("rtsπ://Camera/映像"), "rtsπ://Camera/映像");
+        assert_eq!(output_args(source).unwrap().last().unwrap(), canonical);
+        assert_eq!(
+            canonical_scheme(" C:\\My Captures\\record.mkv "),
+            " C:\\My Captures\\record.mkv "
+        );
+        assert_eq!(
+            canonical_scheme("C:\\My Captures\\record.mkv"),
+            "C:\\My Captures\\record.mkv"
+        );
+        let log = redact_log(&format!("cannot open {source} or {canonical}"), source);
+        assert!(!log.contains("P%40ss"));
+        assert!(!log.contains("Secret%2f"));
+        assert!(log.contains("Camera.Example:554/Live/%aB"));
+        assert!(log.contains("Mode=TCP"));
+    }
+    #[test]
+    fn network_sources_validate_hosts_ports_and_escaping_without_disclosing_credentials() {
+        for source in [
+            "rtsp://user:secret@camera:554/live",
+            "RTSP://camera/live",
+            "https://camera/stream?token=a%2Fb",
+            "srt://[::1]:8890",
+            "udp://@239.1.2.3:5000",
+            "tcp://:5000?listen=1",
+            "UDP://@:5000",
+            "TcP://:5000?listen=1",
+            "SRT://:8890",
+        ] {
+            assert!(is_url_source(source), "{source}");
+            assert!(validate_source(source).is_ok(), "{source}");
+        }
+        for source in [
+            "rtsp:",
+            "rtsp:///live",
+            "https://",
+            "rtsp://camera:0/live",
+            "rtsp://camera:65536/live",
+            "rtsp://camera:/live",
+            "rtsp://[oops]:554/live",
+            "rtsp://::1:554/live",
+            "https://camera/a%2",
+            "https://camera/a b",
+            "avfoundation:?fps=30",
+            "v4l2:/dev/video0?fps=30&fps=60",
+            "dshow:video=Camera?size=640x480&size=1280x720",
+        ] {
+            assert!(validate_source(source).is_err(), "{source}");
+        }
+        let error = validate_source("rtsp://user:secret@camera:99999/live").unwrap_err();
+        assert!(error.to_string().contains("1..65535"));
+        assert!(!format!("{error:#}").contains("secret"));
+        assert!(local_file_path("file://remote/a.mkv").is_err() || cfg!(windows));
+        assert_eq!(
+            local_file_path("file://localhost/tmp/a.mkv").unwrap(),
+            PathBuf::from("/tmp/a.mkv")
+        );
+        assert_eq!(
+            local_file_path("file:///tmp/clip%20%C3%A9%23.mkv").unwrap(),
+            PathBuf::from("/tmp/clip é#.mkv")
+        );
+        assert_eq!(
+            local_file_path("file:literal%20name.mkv").unwrap(),
+            PathBuf::from("literal%20name.mkv")
+        );
+        local_file_path("file:///tmp/clip%00.mkv").unwrap_err();
+        local_file_path("file:///tmp/clip%QQ.mkv").unwrap_err();
+    }
 }

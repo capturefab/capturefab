@@ -1,0 +1,34 @@
+{
+  "scope": "Independent hand-authored spec-derived combined-register frames, without importing a product decoder or test builder. Not vendor examples, captures, executed stock transcripts or proof of PLC model memory capacity. No individual next address or bit order is inferred.",
+  "primary": "Actual official Appendix1.pdf SHA256 f0fc92cb3015c44373b2df9ed735eda8c36bcfdf7f99e8d69083d6f1e0a37018, visually viewed pages3/4/5. Table lists W/DW forms. Multiple8 start footnote expressly names X/Y/M/S; T/C table forms retained without extending that footnote. Native counts unchanged.",
+  "cases": [
+    {
+      "address": "WX0008", "native_bits": 16, "elements": 1, "unit": 1,
+      "request_ascii_body": "014601WX0008", "request_hex": "02303134363031575830303038413503",
+      "request_sum_before_mask": 677, "request_checksum_ascii": "A5",
+      "reply_hex": "02303134363041424344303703", "reply_sum_before_mask": 519,
+      "reply_checksum_ascii": "07", "expected": 43981
+    },
+    {
+      "address": "WX0008", "native_bits": 16, "elements": 2, "unit": 1,
+      "request_ascii_body": "014602WX0008", "request_hex": "02303134363032575830303038413603",
+      "request_sum_before_mask": 678, "request_checksum_ascii": "A6",
+      "reply_hex": "0230313436303830303046464646444403", "reply_sum_before_mask": 733,
+      "reply_checksum_ascii": "DD", "expected": [32768, 65535]
+    },
+    {
+      "address": "DWM0016", "native_bits": 32, "elements": 1, "unit": 254,
+      "request_ascii_body": "FE4601DWM0016", "request_hex": "0246453436303144574D30303136303703",
+      "request_sum_before_mask": 775, "request_checksum_ascii": "07",
+      "reply_hex": "0246453436304646464646464646353703", "reply_sum_before_mask": 855,
+      "reply_checksum_ascii": "57", "expected": 4294967295
+    },
+    {
+      "address": "DWY0008", "native_bits": 32, "elements": 2, "unit": 1,
+      "request_ascii_body": "014602DWY0008", "request_hex": "0230313436303244575930303038454203",
+      "request_sum_before_mask": 747, "request_checksum_ascii": "EB",
+      "reply_hex": "02303134363031323334353637383830303030303031324103", "reply_sum_before_mask": 1066,
+      "reply_checksum_ascii": "2A", "expected": [305419896, 2147483649]
+    }
+  ]
+}

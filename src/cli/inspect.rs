@@ -37,9 +37,9 @@ pub(crate) struct InspectArgs {
     /// How long to wait for the frame, up to 10m (default: 5s, or 3 exposures and frame periods when longer); none waits for a trigger until stopped
     #[arg(long, value_name = "DUR", value_parser = super::args::wait)]
     pub timeout: Option<Wait>,
-    /// How long a camera that sets its own exposure (a webcam, or ExposureAuto=Continuous; a network stream is already running) may take to settle after it starts; 0 measures at once
-    #[arg(long, default_value = "2s", value_name = "DUR", value_parser = super::args::duration)]
-    pub warmup: Duration,
+    /// Exposure settling limit (default 2s; none for read-only monitors); 0 measures at once
+    #[arg(long, value_name = "DUR", value_parser = super::args::duration)]
+    pub warmup: Option<Duration>,
     /// Change settings first, as one atomic change (as set does), then measure; repeatable
     #[arg(long = "set", value_name = "NAME=VALUE")]
     pub settings: Vec<String>,
@@ -117,7 +117,10 @@ pub(super) fn run(global: &Global, args: &InspectArgs) -> Result<Report> {
         )
         .into());
     }
-    if millis(args.warmup) > crate::session::MAX_WARMUP_MS {
+    if args
+        .warmup
+        .is_some_and(|warmup| millis(warmup) > crate::session::MAX_WARMUP_MS)
+    {
         return Err(Usage("--warmup is at most 60s".into()).into());
     }
     if let Some(duration) = args.sample_for {
@@ -311,7 +314,7 @@ fn inspect(
                 region: args.region,
                 min_free: preview.as_ref().and(min_free),
                 preview,
-                warmup_ms: Some(millis(args.warmup)),
+                warmup_ms: args.warmup.map(millis),
             })
             .map_err(trigger_hint)
     };
@@ -519,9 +522,11 @@ pub(super) fn document(info: &Value, reply: &Value, threshold: f64, verbose: boo
             "width": frame["width"],
             "height": frame["height"],
             "pixel_format": frame["pixel_format"],
-            "bits": info["bits"],
+            "pixel_encoding": frame["pixel_encoding"],
+            "bits": frame["bits"].as_u64().or_else(|| info["bits"].as_u64()),
             "id": frame["id"].as_u64().filter(|id| *id > 0),
             "device_ts_ns": frame["device_ts_ns"],
+            "device_timestamp": frame["device_timestamp"],
             "time": frame["wall_ms"].as_u64().filter(|ms| *ms > 0).map(crate::scheduling::rfc3339),
             "age_ms": frame["age_ms"],
         },
@@ -724,7 +729,7 @@ pub(super) const FIELDS: &[(&str, &str)] = &[
     ("camera", "string — camera ID"),
     (
         "frame",
-        "{width,height,pixel_format,bits?,id?,device_ts_ns?,time,age_ms} — the frame measured, taken after the command began: its block ID and the camera's clock (ns, never a date) where the transport has them, and when it arrived",
+        "{width,height,pixel_format,pixel_encoding?:{namespace:ids,name,code,gentl_namespace?},bits?,id?,device_ts_ns?,device_timestamp?:{ticks,frequency_hz?},time,age_ms} — the frame measured, taken after the command began: its block ID, camera nanoseconds where supplied, original producer ticks with an optional reported frequency, and host arrival time; device clocks are never dates",
     ),
     (
         "exposure",

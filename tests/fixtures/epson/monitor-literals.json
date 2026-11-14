@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "provenance": "independent primary/spec-derived ASCII literals frozen before Capturefab decoder; not a controller capture",
+  "plan_sha256": "aaf2eb7e968f0be4b8c34476b8112db340dda8d883b2451fd31e23fec2f41aee",
+  "literals": {
+    "status_request": {
+      "hex": "244765745374617475730d0a",
+      "bytes": 12,
+      "sha256": "0392301908c94ce46540498c7c8abfc3c85872bb465d8af946d7294860a58eed"
+    },
+    "status_11_response": {
+      "hex": "234765745374617475732c30303130303030303030312c303030300d0a",
+      "bytes": 29,
+      "sha256": "251f70638196c0cdfe3ca15dae8946fa91317229d0b329fd860a0fbbc9ea1369"
+    },
+    "word_request": {
+      "hex": "24476574494f576f72642c310d0a",
+      "bytes": 14,
+      "sha256": "251ae73371aff28358e1be3da04e8dedebab3706e4b1589143b12be8b867f741"
+    },
+    "word_response": {
+      "hex": "23476574494f576f72642c303130460d0a",
+      "bytes": 17,
+      "sha256": "6cdd4ca5d8d4cd4612d93a8fceec1883bf55a76f62b7306c85700ae94678cbc0"
+    },
+    "alarms_response": {
+      "hex": "23476574416c6d2c322c312c390d0a",
+      "bytes": 15,
+      "sha256": "4732469fb39c0452060d56590299c86bef90c82ac0cfbd91da83147659562867"
+    },
+    "variable_array_request": {
+      "hex": "244765745661726961626c652c6762793228332c30292c427974652c330d0a",
+      "bytes": 31,
+      "sha256": "3cdc161dd2b3787c836782860379fa8e2d5a6a2d688f38d3f1e6dc9f6ff1f041"
+    },
+    "variable_error14": {
+      "hex": "214765745661726961626c652c31340d0a",
+      "bytes": 17,
+      "sha256": "b947d78d2c39ef3b6dd15608446ff44e93778c35da6ad6f3a4770fb2fc5e5ade"
+    }
+  }
+}

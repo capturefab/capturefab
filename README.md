@@ -3,9 +3,32 @@
 Capturefab is a camera capture command-line tool for people, scripts and AI agents. One
 `capturefab` executable finds, configures, captures from and records GigE Vision, USB3 Vision
 and GenICam cameras (implemented natively in Rust, with no vendor SDK), plus webcams, RTSP/SRT
-streams, ONVIF cameras, video files and simulated cameras. With `--json`, every command prints
+streams, ONVIF cameras, video files and simulated cameras. Installed vendor GenTL/CTI drivers
+add another camera path, including compatible frame grabbers; see the
+[camera guide](docs/camera-compatibility.md) for setup and payload limits. Native GigE Vision
+synchronized multipart and GenTL multipart local stills retain all components in indexed raw
+companions. GenTL supports explicit selection of a 2D image, a supported 16-bit measurement map
+or a raw point cloud. A GenTL 1.6 producer can deliver supported GenDC containers for local
+still capture. Native GigE Vision also saves ordinary `Coord3D_ABC32f` profiles as RAW. Standard unpacked BiColor RGBG/BGRG 8/10/12 images also convert for capture, inspection and recording.
+With `--json`, every command prints
 exactly one JSON document and exits with a typed code, so an agent can drive a camera in a few
 calls and always knows what happened. It runs on macOS, Windows and Linux and is MIT-licensed.
+
+Industrial signals use `capturefab data record --config sources.json --for 30s -o run.jsonl`.
+LMI GoPxL sensor measurements are polled over Ethernet ASCII with declared framing, keeping native ×1000 values and decision bits.
+Opto 22 groov EPIC/RIO input capture uses explicit OptoMMP model and channel-type checks, preserving native values and quality codes.
+Atlas Copco PF6000 tightening results use the explicit `atlas_open_protocol` profile, preserving native values and raw frames with a JSONL checkpoint before acknowledgment.
+Native adapters capture Keyence KV Host Link, LS ELECTRIC XGT/XGB FEnet, Yokogawa FA-M3 PC Link, Modbus TCP with gateway unit selection and optional TLS, Modbus RTU and ASCII, classic S7, Beckhoff ADS, Mitsubishi SLMP 3E binary or ASCII, MC 1E and serial FX Computer Link, Panasonic FP MEWTOCOL-COM, and Omron FINS TCP/UDP, serial Host Link (including explicit legacy CPM/SRM1 areas) and CompoWay/F reads, BACnet/IP meter and controller values, IEC 62056-21 and passive SML optical meter readouts, shared-bus SDI-12 environmental sensors through a USB serial bridge, Vaisala WXT530 serial weather measurements, HART process measurements through a managed Microflex modem, SICK TiM/LMS single scans over configured CoLa A/B, passive SICK multiScan100/picoScan100 Compact scan/IMU datagrams and explicit picoScan150 encoder/mixed UDP streams, LRS4000 Compact TCP scans and multiScan200 Compact TCP scans, ambient light and IMU, passive NMEA GNSS GGA/RMC positions, passive Micro-Epsilon ILD2300 single-DIST1 RS422 raw codes, passive Velodyne VLP-16/HDL-32E raw UDP groups, passive Gocator GDP profile and surface archives, TCP/serial JSONL sensors (Unix terminals or Windows COM ports), and SCPI instruments over raw TCP, native serial, VXI-11, HiSLIP or USBTMC (`usb` feature), METTLER TOLEDO MT-SICS weights over TCP or serial, A&D standard-format Q measurements over configured serial or transparent TCP bridges, Sartorius SBI16/22 manual-print measurements over configured no-flow interfaces,
+MQTT/TCP or TLS, Logix atomic tags, explicit DWORD/packed BOOL reads and STRING members, Micro800 numeric and counted STRING values and Omron NJ/NX variables over EtherNet/IP, CIP Assembly data, SLC/MicroLogix PCCC files including whole timer/counter and ST string elements over EtherNet/IP or serial DF1, SLC 5/05 files including whole timer/counter and ST string elements over legacy CSPv4, PLC-5/E PCCC files over EtherNet/IP, OPC-UA reads or explicit queued subscriptions, ifm
+IO-Link process data and the standard IO-Link JSON GET interface, camera stills and indexed video. Keyence IV inspection results, Cognex In-Sight cells, Cognex DataMan result bytes, output-only Universal Robots RTDE v2 telemetry, read-only ABB RWS controller/RAPID state, Epson Remote Ethernet monitoring, Yaskawa HSES controller/variable data and native MTConnect agent observations can share the same recording. Passive Livox UDP capture supports explicit SDK2 Mid360/S/L and HAP TX/T1 or legacy Horizon/Avia profiles, with native point/IMU values and immutable raw archives. Mitsubishi SLMP also captures whole iQ-R long-timer records. A camera can save JPEGs while recording video in the same run.
+Camera and video sources can configure a supported write-only Action key once on
+their shared worker before acquisition, with no automatic key replay after owner loss.
+Linux can passively capture EtherCAT, Profinet RT, CAN and CAN FD process data. Camera chunks stay beside local images and video as original payloads with layout and frame indexes,
+plus values and units interpreted from the camera XML when available. Recordings share a host
+monotonic timeline and
+export to CSV or JSONL. See the [industrial data guide](docs/industrial-data.md) for configuration,
+clock semantics and current limits. An explicit `helper` source also accepts JSONL readings
+from user-supplied vendor SDKs and custom protocol bridges on Unix or Windows. Windows helpers require an absolute `.exe` path and Windows 10/Server 2016 or later.
 
 ## Install
 
@@ -97,6 +120,12 @@ gives the call patterns. The contract in short:
   a file path, `sim:N` or `sim:replay:PATH`. Without `-c` the only camera found is used; several
   give exit 2 `camera_ambiguous` with the candidates (at a terminal without `--json`, a numbered
   list asks which).
+
+- **Opaque registers**: `debug read --feature NAME` reads a complete buffer and
+  `debug write --feature NAME --hex HEX` writes it, up to 64 KiB. Ordinary `get` reports
+  only the declared length. For large writes, send a `write_register` JSON request on
+  stdin with `debug rpc` to avoid command-line size limits. See the [camera guide](docs/camera-compatibility.md#opaque-genicam-registers).
+
 - **Names**: GenICam features (`ExposureTime`), banks (`TriggerMode[FrameStart]`) and portable
   controls (`exposure`, `gain`, `fps`, `roi`, `format`, `trigger`, `auto_exposure`, `auto_wb`).
   Quote banks in the shell (`'TriggerMode[FrameStart]'`; zsh expands brackets), and quote camera
@@ -143,6 +172,7 @@ commands, so repeated calls skip connecting and starting the stream:
 | Source | `-c` selector |
 | --- | --- |
 | GigE Vision and USB3 Vision (GenICam) | `list` ID, serial number or IP address |
+| Receive an externally controlled GigE multicast stream | `gige-monitor://CAMERA_IP?interface=HOST_IP&mac=12_HEX_DIGITS` (quote the selector; see the camera guide) |
 | Webcams and capture cards (AVFoundation, V4L2, DirectShow) | `list` ID |
 | RTSP, SRT and HTTP streams; ONVIF cameras | `rtsp://…`, `srt://…`, `http://…`, `onvif://host` |
 | Video and image files | a path |
@@ -188,7 +218,14 @@ encoded. The source is still decoded meanwhile, for captures and inspection.
 Support depends on the device, its firmware, the connection and the operating system; this is an
 early implementation with less coverage than vendor SDKs. Sign-ins for password-protected streams
 are saved in the OS credential store with `capturefab login add`. `capturefab network` checks GigE
-network paths. More: [CLI workflows](docs/cli-workflows.md),
+network paths. `capturefab network force-ip` assigns a closed camera an explicit temporary
+IPv4 configuration by MAC on a selected interface; see the compatibility guide for its
+configuration and ownership limits. `capturefab network action` sends one action
+on an explicit interface, with acknowledged and sent-only modes. It is immediate by default;
+`--action-time-ticks` requests an exact absolute device timestamp without clock qualification.
+A held camera's write-only
+action key uses the separate `set --write-only` operation; configure and arm capture before
+issuing an action. More: [CLI workflows](docs/cli-workflows.md),
 [camera compatibility notes](docs/camera-compatibility.md) (with the
 [pixel format table](docs/camera-compatibility.md#pixel-formats)),
 [simulated cameras](docs/simulation.md) and [embedded and read-only hosts](docs/embedded.md).
@@ -249,12 +286,50 @@ cargo clippy --all-targets -- -D warnings
 python3 scripts/test-site.py && python3 -m unittest discover -s scripts
 ```
 
-The default features are `usb` (USB3 Vision), `jpeg` (libjpeg-turbo), `videotoolbox` (Apple's
+The default features are `usb` (USB3 Vision), `gentl` (installed CTI camera drivers), `ni-daqmx` (installed NI input drivers on supported Linux/Windows hosts), `jpeg` (libjpeg-turbo), `videotoolbox` (Apple's
 JPEG engine on macOS; nothing elsewhere), `nvjpeg` and `vaapi` (the GPU JPEG encoders on Linux,
 whose libraries are loaded at run time, so the build needs no SDK; nothing elsewhere), `keychain`
-(the OS credential store for `login`) and `shell` (line editing, history and completion in
-`capturefab shell`); `--no-default-features` builds without them. Releases are built
+(the OS credential store for `login`), `shell` (line editing, history and completion in
+`capturefab shell`) and `mqtt-tls` (verified TLS for industrial data sources); `--no-default-features` builds without them. Releases are built
 and packaged as described in [docs/release.md](docs/release.md).
+
+The `ni-daqmx` feature, included by default, adds continuous internal-clock or
+explicit software on-demand voltage, thermocouple, current, RTD, strain,
+bridge-ratio, acceleration, resistance, thermistor, physical bridge or mixed AI
+input through an installed NI-DAQmx
+runtime on supported Linux/Windows hosts. An isolated worker preserves exact
+F64 words, native statuses and explicit per-channel units, CJC, shunt, R0,
+wiring, sensor and excitation requests. Mixed mode binds each column's actual
+channel, quantity, units and settings without changing legacy rows or removing
+repeated values; a shared scan does not prove simultaneous or fresh conversions.
+
+Strain and bridge ratio retain native scaling; acceleration supports g, m/s²
+and in/s² without local unit or sensitivity conversion. Optional AC/DC/ground
+coupling and explicit internal/external/none excitation remain requests, not
+readbacks or calibration. Internal excitation can energize the sensor, and
+Stop/Clear or none does not guarantee physical power-off.
+
+The six additional AI profiles `resistance`, `thermistor_current`,
+`thermistor_voltage`, `force_bridge`, `pressure_bridge` and `torque_bridge` also
+work in MixedAI, with the same per-channel request contract. Resistance keeps
+native ohms; thermistors require explicit manufacturer coefficients and the
+voltage-excited mode adds reference R1 ohms. Force/pressure/torque requests keep
+returned units, electrical calibration units and physical calibration units
+separate. The native driver performs the scaling; Capturefab does no local
+thermal equation or interpolation. All settings and declared calibration points
+remain requests, with no physical sensor, calibration or device qualification.
+
+Additional `velocity_iepe`, `force_iepe`, `charge_acceleration`, `lvdt` and `rvdt` measurements support both AI timing modes and MixedAI, now with eighteen channel kinds. Output units and sensitivity units are separate explicit requests: velocity m/s can use mV/(mm/s), charge acceleration uses pC sensitivity, LVDT includes mV/V per milli-inch, and RVDT uses angular sensitivity. The first three require terminal configuration; LVDT/RVDT instead require explicit AC excitation frequency and four/five/six-wire mode. All five preserve driver F64 words and finite velocity/force/acceleration/position/angle without local conversion. Sensitivity accepts finite signed and zero requests with native rejection preserved; older acceleration keeps its positive-only rule. Excitation and optional coupling remain requests, with no inferred calibration, delivered power or physical device qualification.
+
+Software-only `digital_port`, `counter_count`, `counter_frequency`,
+`counter_period`, `counter_pulse_width`, `counter_angular_position` and
+`counter_linear_position` modes retain native U32 states/count snapshots or
+F64 frequency/time/position values. Each counter task has one explicit typed
+channel. Encoder PPR, distance, initial position and all Z-index fields remain
+requests; enabled Z can reset the measurement, with phase ignored in two-pulse
+mode. No masks, count unwrapping or host-derived rate/position is inferred.
+On-demand requires an explicit poll interval and one scan per read, without
+hardware-rate, freshness or device-qualification claims. See [NI input configuration](docs/industrial-data.md#ni-daqmx-analog-voltage-acquisition).
 
 ## License
 

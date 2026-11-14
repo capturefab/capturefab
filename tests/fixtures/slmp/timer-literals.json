@@ -1,0 +1,43 @@
+{
+  "schema": 1,
+  "provenance": "independent spec-derived hand transcripts from primary-qualified frozen SLMP timer plan; not a PLC capture",
+  "plan_sha256": "f6c95512304f23a6cbdc35600009db957764d290d9af4bcfc5a7f8e7b5a27cd4",
+  "binary_request_hex": "500000ffff03000e000400010402000000000052000800",
+  "binary_reply_hex": "d00000ffff03001200000078563412a3a5efbeffff0080525a2301",
+  "ascii_request": "500000FF03FF00001C000404010002LTN*000000000008",
+  "ascii_reply": "D00000FF03FF000024000056781234A5A3BEEFFFFF80005A520123",
+  "expected": [
+    {
+      "kind": "slmp_long_timer",
+      "device": "LTN",
+      "raw_words": [
+        22136,
+        4660,
+        42403,
+        48879
+      ],
+      "current_word_pair_raw": [
+        22136,
+        4660
+      ],
+      "coil": true,
+      "contact": true
+    },
+    {
+      "kind": "slmp_long_timer",
+      "device": "LTN",
+      "raw_words": [
+        65535,
+        32768,
+        23122,
+        291
+      ],
+      "current_word_pair_raw": [
+        65535,
+        32768
+      ],
+      "coil": false,
+      "contact": true
+    }
+  ]
+}

@@ -1,0 +1,2229 @@
+{
+ "version": 1,
+ "status": "predecoder_spec_derived_independent",
+ "not_device_capture": true,
+ "profile_scope": [
+  "multiscan100",
+  "picoscan100"
+ ],
+ "streams": [
+  "points",
+  "imu"
+ ],
+ "wire_basis": "official_pinned_ksy_with_current_vendor_udp_contract",
+ "no_control_writes": true,
+ "oracle_semantics": "accept/reject and exact native fields are independent of a future JSON schema; rejection labels do not freeze public ErrorKind names",
+ "variants": [
+  {
+   "name": "plan_type1_v3",
+   "origin": "exact_plan_ab0_packet",
+   "packet_hex": "020202020100000001000000000000000807060504030201030000005a000000000000000000000005000000000000002a0000000100000002000000020000006400000000000000c800000000000000000000800000803f0000004000000000000303000100ff00ffff01000040810200030004000500325402741f00c6",
+   "packet_bytes": 126,
+   "packet_sha256": "3e20f8a59b255ded15c71882fba0e828d8cd03f11729184561f66a450208d21f",
+   "stored_crc32_hex": "c6001f74",
+   "calculated_crc32_hex": "c6001f74",
+   "crc_valid": true,
+   "outcome": "accept",
+   "oracle": {
+    "telegram_type": 1,
+    "telegram_counter": 1,
+    "transmit_timestamp_raw": 72623859790382856,
+    "transmit_timestamp_basis": "unix_microseconds_declared",
+    "version": 3,
+    "size_module_0": 90,
+    "modules": [
+     {
+      "segment_counter": 0,
+      "frame_number": 5,
+      "sender_id": 42,
+      "line_count": 1,
+      "beams_per_line": 2,
+      "echoes_per_beam": 2,
+      "timestamp_start_raw": [
+       100
+      ],
+      "timestamp_stop_raw": [
+       200
+      ],
+      "line_timestamp_basis": "device_timebase_microseconds_declared",
+      "phi_words": [
+       2147483648
+      ],
+      "theta_start_words": [
+       1065353216
+      ],
+      "theta_stop_words": [
+       1073741824
+      ],
+      "next_module_size": 0,
+      "reserved_raw": [
+       0,
+       0
+      ],
+      "echo_mask_raw": 3,
+      "beam_mask_raw": 3,
+      "present_echo_fields": [
+       "distance_raw",
+       "rssi_raw"
+      ],
+      "present_beam_fields": [
+       "properties_raw",
+       "azimuth_raw"
+      ],
+      "distance_relation": {
+       "unit": "mm",
+       "basis": "raw_for_v3_or_raw_times_module_scale_for_v4"
+      },
+      "echo_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 0,
+        "distance_raw": 1,
+        "rssi_raw": 255
+       },
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 1,
+        "distance_raw": 65535,
+        "rssi_raw": 1
+       },
+       {
+        "beam": 1,
+        "line": 0,
+        "echo": 0,
+        "distance_raw": 2,
+        "rssi_raw": 3
+       },
+       {
+        "beam": 1,
+        "line": 0,
+        "echo": 1,
+        "distance_raw": 4,
+        "rssi_raw": 5
+       }
+      ],
+      "beam_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "azimuth_raw": 16384,
+        "properties_raw": 129,
+        "reflector": true,
+        "property_reserved_bits_masked": 128
+       },
+       {
+        "beam": 1,
+        "line": 0,
+        "azimuth_raw": 21554,
+        "properties_raw": 2,
+        "reflector": false,
+        "property_reserved_bits_masked": 2
+       }
+      ],
+      "module_bytes": 90
+     }
+    ],
+    "source_time": "omitted",
+    "clock_sync": "not_verified"
+   }
+  },
+  {
+   "name": "plan_type1_v4",
+   "origin": "exact_plan_ab0_packet",
+   "packet_hex": "020202020100000001000000000000000807060504030201040000005e000000000000000000000005000000000000002a0000000100000002000000020000006400000000000000c800000000000000000000800000803f000000400000803e00000000000303000100ff00ffff010081004002000300040005000232548557fed0",
+   "packet_bytes": 130,
+   "packet_sha256": "665f70a850a7c0bb565cb2b739ff4c6f14e3bcaf0be424c3f26b723e2603767b",
+   "stored_crc32_hex": "d0fe5785",
+   "calculated_crc32_hex": "d0fe5785",
+   "crc_valid": true,
+   "outcome": "accept",
+   "oracle": {
+    "telegram_type": 1,
+    "telegram_counter": 1,
+    "transmit_timestamp_raw": 72623859790382856,
+    "transmit_timestamp_basis": "unix_microseconds_declared",
+    "version": 4,
+    "size_module_0": 94,
+    "modules": [
+     {
+      "segment_counter": 0,
+      "frame_number": 5,
+      "sender_id": 42,
+      "line_count": 1,
+      "beams_per_line": 2,
+      "echoes_per_beam": 2,
+      "timestamp_start_raw": [
+       100
+      ],
+      "timestamp_stop_raw": [
+       200
+      ],
+      "line_timestamp_basis": "device_timebase_microseconds_declared",
+      "phi_words": [
+       2147483648
+      ],
+      "theta_start_words": [
+       1065353216
+      ],
+      "theta_stop_words": [
+       1073741824
+      ],
+      "next_module_size": 0,
+      "reserved_raw": [
+       0,
+       0
+      ],
+      "echo_mask_raw": 3,
+      "beam_mask_raw": 3,
+      "present_echo_fields": [
+       "distance_raw",
+       "rssi_raw"
+      ],
+      "present_beam_fields": [
+       "properties_raw",
+       "azimuth_raw"
+      ],
+      "distance_relation": {
+       "unit": "mm",
+       "basis": "raw_for_v3_or_raw_times_module_scale_for_v4"
+      },
+      "echo_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 0,
+        "distance_raw": 1,
+        "rssi_raw": 255
+       },
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 1,
+        "distance_raw": 65535,
+        "rssi_raw": 1
+       },
+       {
+        "beam": 1,
+        "line": 0,
+        "echo": 0,
+        "distance_raw": 2,
+        "rssi_raw": 3
+       },
+       {
+        "beam": 1,
+        "line": 0,
+        "echo": 1,
+        "distance_raw": 4,
+        "rssi_raw": 5
+       }
+      ],
+      "beam_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "azimuth_raw": 16384,
+        "properties_raw": 129,
+        "reflector": true,
+        "property_reserved_bits_masked": 128
+       },
+       {
+        "beam": 1,
+        "line": 0,
+        "azimuth_raw": 21554,
+        "properties_raw": 2,
+        "reflector": false,
+        "property_reserved_bits_masked": 2
+       }
+      ],
+      "distance_scale_word": 1048576000,
+      "module_bytes": 94
+     }
+    ],
+    "source_time": "omitted",
+    "clock_sync": "not_verified"
+   }
+  },
+  {
+   "name": "plan_type2_imu_v1",
+   "origin": "exact_plan_ab0_packet",
+   "packet_hex": "0202020202000000010000000000803f000000c000000000000000800000807f3412c07f0000803f000000000000000000000000640000000000000019538588",
+   "packet_bytes": 64,
+   "packet_sha256": "e269e68b1003356b50fc48cb83b17120b735291c10fae7dc41c8cbe327955b10",
+   "stored_crc32_hex": "88855319",
+   "calculated_crc32_hex": "88855319",
+   "crc_valid": true,
+   "outcome": "accept",
+   "oracle": {
+    "telegram_type": 2,
+    "version": 1,
+    "acceleration_words": [
+     1065353216,
+     3221225472,
+     0
+    ],
+    "acceleration_unit": "m/s^2",
+    "angular_velocity_words": [
+     2147483648,
+     2139095040,
+     2143294004
+    ],
+    "angular_velocity_unit": "rad/s",
+    "orientation_words_wxyz": [
+     1065353216,
+     0,
+     0,
+     0
+    ],
+    "timestamp_raw": 100,
+    "timestamp_basis": "unix_microseconds_declared",
+    "word_controls": {
+     "80000000": "negative_zero",
+     "7f800000": "positive_infinity",
+     "7fc01234": "nan_payload_001234"
+    },
+    "source_time": "omitted",
+    "clock_sync": "not_verified"
+   }
+  },
+  {
+   "name": "empty_modules_v3",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "02020202010000000100000000000000080706050403020103000000000000006b934408",
+   "packet_bytes": 36,
+   "packet_sha256": "a41c43ccab6e93052ea27947a4f7f9ead3d78a495434651ed2c6d21f5a51c94a",
+   "stored_crc32_hex": "0844936b",
+   "calculated_crc32_hex": "0844936b",
+   "crc_valid": true,
+   "outcome": "accept",
+   "oracle": {
+    "telegram_type": 1,
+    "telegram_counter": 1,
+    "transmit_timestamp_raw": 72623859790382856,
+    "transmit_timestamp_basis": "unix_microseconds_declared",
+    "version": 3,
+    "size_module_0": 0,
+    "modules": [],
+    "source_time": "omitted",
+    "clock_sync": "not_verified"
+   }
+  },
+  {
+   "name": "empty_modules_v4",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "0202020201000000ffffffffffffffff00000000000000000400000000000000085f25ab",
+   "packet_bytes": 36,
+   "packet_sha256": "12a85ad9e22156184ff495e69063b10c440918b776d96020246bfa2dc00a8b6b",
+   "stored_crc32_hex": "ab255f08",
+   "calculated_crc32_hex": "ab255f08",
+   "crc_valid": true,
+   "outcome": "accept",
+   "oracle": {
+    "telegram_type": 1,
+    "telegram_counter": 18446744073709551615,
+    "transmit_timestamp_raw": 0,
+    "transmit_timestamp_basis": "unix_microseconds_declared",
+    "version": 4,
+    "size_module_0": 0,
+    "modules": [],
+    "source_time": "omitted",
+    "clock_sync": "not_verified"
+   }
+  },
+  {
+   "name": "v3_mask_none",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "0202020201000000010000000000000008070605040302010300000044000000000000000000000005000000000000002a0000000100000001000000020000006400000000000000c800000000000000000000800000803f0000004000000000000000000d8953f5",
+   "packet_bytes": 104,
+   "packet_sha256": "06b4b328f0bf6773fc221a4042cc6993fe32f8a98a9323533c3e648f43eb47ee",
+   "stored_crc32_hex": "f553890d",
+   "calculated_crc32_hex": "f553890d",
+   "crc_valid": true,
+   "outcome": "accept",
+   "oracle": {
+    "telegram_type": 1,
+    "telegram_counter": 1,
+    "transmit_timestamp_raw": 72623859790382856,
+    "transmit_timestamp_basis": "unix_microseconds_declared",
+    "version": 3,
+    "size_module_0": 68,
+    "modules": [
+     {
+      "segment_counter": 0,
+      "frame_number": 5,
+      "sender_id": 42,
+      "line_count": 1,
+      "beams_per_line": 1,
+      "echoes_per_beam": 2,
+      "timestamp_start_raw": [
+       100
+      ],
+      "timestamp_stop_raw": [
+       200
+      ],
+      "line_timestamp_basis": "device_timebase_microseconds_declared",
+      "phi_words": [
+       2147483648
+      ],
+      "theta_start_words": [
+       1065353216
+      ],
+      "theta_stop_words": [
+       1073741824
+      ],
+      "next_module_size": 0,
+      "reserved_raw": [
+       0,
+       0
+      ],
+      "echo_mask_raw": 0,
+      "beam_mask_raw": 0,
+      "present_echo_fields": [],
+      "present_beam_fields": [],
+      "distance_relation": {
+       "unit": "mm",
+       "basis": "raw_for_v3_or_raw_times_module_scale_for_v4"
+      },
+      "echo_values": [],
+      "beam_values": [],
+      "module_bytes": 68
+     }
+    ],
+    "source_time": "omitted",
+    "clock_sync": "not_verified"
+   }
+  },
+  {
+   "name": "v3_mask_distance",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "0202020201000000010000000000000008070605040302010300000048000000000000000000000005000000000000002a0000000100000001000000020000006400000000000000c800000000000000000000800000803f0000004000000000000100000100ffffa903cc3c",
+   "packet_bytes": 108,
+   "packet_sha256": "a8e4874ecc03790ba9e71de369ad1ba274a5f6143e33b2f2fd555fedc48d7db6",
+   "stored_crc32_hex": "3ccc03a9",
+   "calculated_crc32_hex": "3ccc03a9",
+   "crc_valid": true,
+   "outcome": "accept",
+   "oracle": {
+    "telegram_type": 1,
+    "telegram_counter": 1,
+    "transmit_timestamp_raw": 72623859790382856,
+    "transmit_timestamp_basis": "unix_microseconds_declared",
+    "version": 3,
+    "size_module_0": 72,
+    "modules": [
+     {
+      "segment_counter": 0,
+      "frame_number": 5,
+      "sender_id": 42,
+      "line_count": 1,
+      "beams_per_line": 1,
+      "echoes_per_beam": 2,
+      "timestamp_start_raw": [
+       100
+      ],
+      "timestamp_stop_raw": [
+       200
+      ],
+      "line_timestamp_basis": "device_timebase_microseconds_declared",
+      "phi_words": [
+       2147483648
+      ],
+      "theta_start_words": [
+       1065353216
+      ],
+      "theta_stop_words": [
+       1073741824
+      ],
+      "next_module_size": 0,
+      "reserved_raw": [
+       0,
+       0
+      ],
+      "echo_mask_raw": 1,
+      "beam_mask_raw": 0,
+      "present_echo_fields": [
+       "distance_raw"
+      ],
+      "present_beam_fields": [],
+      "distance_relation": {
+       "unit": "mm",
+       "basis": "raw_for_v3_or_raw_times_module_scale_for_v4"
+      },
+      "echo_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 0,
+        "distance_raw": 1
+       },
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 1,
+        "distance_raw": 65535
+       }
+      ],
+      "beam_values": [],
+      "module_bytes": 72
+     }
+    ],
+    "source_time": "omitted",
+    "clock_sync": "not_verified"
+   }
+  },
+  {
+   "name": "v3_mask_rssi",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "0202020201000000010000000000000008070605040302010300000048000000000000000000000005000000000000002a0000000100000001000000020000006400000000000000c800000000000000000000800000803f000000400000000000020000ff0001001e5ba0cc",
+   "packet_bytes": 108,
+   "packet_sha256": "3cf76a9cbd2058e8322f5b162795661ba609834ab86fe2078808359295fef488",
+   "stored_crc32_hex": "cca05b1e",
+   "calculated_crc32_hex": "cca05b1e",
+   "crc_valid": true,
+   "outcome": "accept",
+   "oracle": {
+    "telegram_type": 1,
+    "telegram_counter": 1,
+    "transmit_timestamp_raw": 72623859790382856,
+    "transmit_timestamp_basis": "unix_microseconds_declared",
+    "version": 3,
+    "size_module_0": 72,
+    "modules": [
+     {
+      "segment_counter": 0,
+      "frame_number": 5,
+      "sender_id": 42,
+      "line_count": 1,
+      "beams_per_line": 1,
+      "echoes_per_beam": 2,
+      "timestamp_start_raw": [
+       100
+      ],
+      "timestamp_stop_raw": [
+       200
+      ],
+      "line_timestamp_basis": "device_timebase_microseconds_declared",
+      "phi_words": [
+       2147483648
+      ],
+      "theta_start_words": [
+       1065353216
+      ],
+      "theta_stop_words": [
+       1073741824
+      ],
+      "next_module_size": 0,
+      "reserved_raw": [
+       0,
+       0
+      ],
+      "echo_mask_raw": 2,
+      "beam_mask_raw": 0,
+      "present_echo_fields": [
+       "rssi_raw"
+      ],
+      "present_beam_fields": [],
+      "distance_relation": {
+       "unit": "mm",
+       "basis": "raw_for_v3_or_raw_times_module_scale_for_v4"
+      },
+      "echo_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 0,
+        "rssi_raw": 255
+       },
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 1,
+        "rssi_raw": 1
+       }
+      ],
+      "beam_values": [],
+      "module_bytes": 72
+     }
+    ],
+    "source_time": "omitted",
+    "clock_sync": "not_verified"
+   }
+  },
+  {
+   "name": "v3_mask_property",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "0202020201000000010000000000000008070605040302010300000045000000000000000000000005000000000000002a0000000100000001000000020000006400000000000000c800000000000000000000800000803f000000400000000000000100813645f7c0",
+   "packet_bytes": 105,
+   "packet_sha256": "6bc36cc2318bf0e028d6f8b34cc24a256bb8c3db16ef0737864b0679053b1c60",
+   "stored_crc32_hex": "c0f74536",
+   "calculated_crc32_hex": "c0f74536",
+   "crc_valid": true,
+   "outcome": "accept",
+   "oracle": {
+    "telegram_type": 1,
+    "telegram_counter": 1,
+    "transmit_timestamp_raw": 72623859790382856,
+    "transmit_timestamp_basis": "unix_microseconds_declared",
+    "version": 3,
+    "size_module_0": 69,
+    "modules": [
+     {
+      "segment_counter": 0,
+      "frame_number": 5,
+      "sender_id": 42,
+      "line_count": 1,
+      "beams_per_line": 1,
+      "echoes_per_beam": 2,
+      "timestamp_start_raw": [
+       100
+      ],
+      "timestamp_stop_raw": [
+       200
+      ],
+      "line_timestamp_basis": "device_timebase_microseconds_declared",
+      "phi_words": [
+       2147483648
+      ],
+      "theta_start_words": [
+       1065353216
+      ],
+      "theta_stop_words": [
+       1073741824
+      ],
+      "next_module_size": 0,
+      "reserved_raw": [
+       0,
+       0
+      ],
+      "echo_mask_raw": 0,
+      "beam_mask_raw": 1,
+      "present_echo_fields": [],
+      "present_beam_fields": [
+       "properties_raw"
+      ],
+      "distance_relation": {
+       "unit": "mm",
+       "basis": "raw_for_v3_or_raw_times_module_scale_for_v4"
+      },
+      "echo_values": [],
+      "beam_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "properties_raw": 129,
+        "reflector": true,
+        "property_reserved_bits_masked": 128
+       }
+      ],
+      "module_bytes": 69
+     }
+    ],
+    "source_time": "omitted",
+    "clock_sync": "not_verified"
+   }
+  },
+  {
+   "name": "v3_mask_azimuth",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "0202020201000000010000000000000008070605040302010300000046000000000000000000000005000000000000002a0000000100000001000000020000006400000000000000c800000000000000000000800000803f000000400000000000000200004089ef28a9",
+   "packet_bytes": 106,
+   "packet_sha256": "b8f5d1ab5dd80adc3fe08369d126bbbf031e76c1bf6c2dec8279b40e58abf988",
+   "stored_crc32_hex": "a928ef89",
+   "calculated_crc32_hex": "a928ef89",
+   "crc_valid": true,
+   "outcome": "accept",
+   "oracle": {
+    "telegram_type": 1,
+    "telegram_counter": 1,
+    "transmit_timestamp_raw": 72623859790382856,
+    "transmit_timestamp_basis": "unix_microseconds_declared",
+    "version": 3,
+    "size_module_0": 70,
+    "modules": [
+     {
+      "segment_counter": 0,
+      "frame_number": 5,
+      "sender_id": 42,
+      "line_count": 1,
+      "beams_per_line": 1,
+      "echoes_per_beam": 2,
+      "timestamp_start_raw": [
+       100
+      ],
+      "timestamp_stop_raw": [
+       200
+      ],
+      "line_timestamp_basis": "device_timebase_microseconds_declared",
+      "phi_words": [
+       2147483648
+      ],
+      "theta_start_words": [
+       1065353216
+      ],
+      "theta_stop_words": [
+       1073741824
+      ],
+      "next_module_size": 0,
+      "reserved_raw": [
+       0,
+       0
+      ],
+      "echo_mask_raw": 0,
+      "beam_mask_raw": 2,
+      "present_echo_fields": [],
+      "present_beam_fields": [
+       "azimuth_raw"
+      ],
+      "distance_relation": {
+       "unit": "mm",
+       "basis": "raw_for_v3_or_raw_times_module_scale_for_v4"
+      },
+      "echo_values": [],
+      "beam_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "azimuth_raw": 16384
+       }
+      ],
+      "module_bytes": 70
+     }
+    ],
+    "source_time": "omitted",
+    "clock_sync": "not_verified"
+   }
+  },
+  {
+   "name": "v3_mask_distance_azimuth",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "020202020100000001000000000000000807060504030201030000004a000000000000000000000005000000000000002a0000000100000001000000020000006400000000000000c800000000000000000000800000803f0000004000000000000102000100ffff0040cf14dbb3",
+   "packet_bytes": 110,
+   "packet_sha256": "b9fcd68e7e0cb68c0a0b2476eea44b7e45811f136d41880d8b60fc3491d04114",
+   "stored_crc32_hex": "b3db14cf",
+   "calculated_crc32_hex": "b3db14cf",
+   "crc_valid": true,
+   "outcome": "accept",
+   "oracle": {
+    "telegram_type": 1,
+    "telegram_counter": 1,
+    "transmit_timestamp_raw": 72623859790382856,
+    "transmit_timestamp_basis": "unix_microseconds_declared",
+    "version": 3,
+    "size_module_0": 74,
+    "modules": [
+     {
+      "segment_counter": 0,
+      "frame_number": 5,
+      "sender_id": 42,
+      "line_count": 1,
+      "beams_per_line": 1,
+      "echoes_per_beam": 2,
+      "timestamp_start_raw": [
+       100
+      ],
+      "timestamp_stop_raw": [
+       200
+      ],
+      "line_timestamp_basis": "device_timebase_microseconds_declared",
+      "phi_words": [
+       2147483648
+      ],
+      "theta_start_words": [
+       1065353216
+      ],
+      "theta_stop_words": [
+       1073741824
+      ],
+      "next_module_size": 0,
+      "reserved_raw": [
+       0,
+       0
+      ],
+      "echo_mask_raw": 1,
+      "beam_mask_raw": 2,
+      "present_echo_fields": [
+       "distance_raw"
+      ],
+      "present_beam_fields": [
+       "azimuth_raw"
+      ],
+      "distance_relation": {
+       "unit": "mm",
+       "basis": "raw_for_v3_or_raw_times_module_scale_for_v4"
+      },
+      "echo_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 0,
+        "distance_raw": 1
+       },
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 1,
+        "distance_raw": 65535
+       }
+      ],
+      "beam_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "azimuth_raw": 16384
+       }
+      ],
+      "module_bytes": 74
+     }
+    ],
+    "source_time": "omitted",
+    "clock_sync": "not_verified"
+   }
+  },
+  {
+   "name": "v3_mask_rssi_property",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "0202020201000000010000000000000008070605040302010300000049000000000000000000000005000000000000002a0000000100000001000000020000006400000000000000c800000000000000000000800000803f000000400000000000020100ff00010081ad95e6d5",
+   "packet_bytes": 109,
+   "packet_sha256": "9f1344edab27f8bccdad4c4f5fecbed85c4d11d56e54873663eb69f1a1badeac",
+   "stored_crc32_hex": "d5e695ad",
+   "calculated_crc32_hex": "d5e695ad",
+   "crc_valid": true,
+   "outcome": "accept",
+   "oracle": {
+    "telegram_type": 1,
+    "telegram_counter": 1,
+    "transmit_timestamp_raw": 72623859790382856,
+    "transmit_timestamp_basis": "unix_microseconds_declared",
+    "version": 3,
+    "size_module_0": 73,
+    "modules": [
+     {
+      "segment_counter": 0,
+      "frame_number": 5,
+      "sender_id": 42,
+      "line_count": 1,
+      "beams_per_line": 1,
+      "echoes_per_beam": 2,
+      "timestamp_start_raw": [
+       100
+      ],
+      "timestamp_stop_raw": [
+       200
+      ],
+      "line_timestamp_basis": "device_timebase_microseconds_declared",
+      "phi_words": [
+       2147483648
+      ],
+      "theta_start_words": [
+       1065353216
+      ],
+      "theta_stop_words": [
+       1073741824
+      ],
+      "next_module_size": 0,
+      "reserved_raw": [
+       0,
+       0
+      ],
+      "echo_mask_raw": 2,
+      "beam_mask_raw": 1,
+      "present_echo_fields": [
+       "rssi_raw"
+      ],
+      "present_beam_fields": [
+       "properties_raw"
+      ],
+      "distance_relation": {
+       "unit": "mm",
+       "basis": "raw_for_v3_or_raw_times_module_scale_for_v4"
+      },
+      "echo_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 0,
+        "rssi_raw": 255
+       },
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 1,
+        "rssi_raw": 1
+       }
+      ],
+      "beam_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "properties_raw": 129,
+        "reflector": true,
+        "property_reserved_bits_masked": 128
+       }
+      ],
+      "module_bytes": 73
+     }
+    ],
+    "source_time": "omitted",
+    "clock_sync": "not_verified"
+   }
+  },
+  {
+   "name": "v4_mask_none",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "0202020201000000010000000000000008070605040302010400000048000000000000000000000005000000000000002a0000000100000001000000020000006400000000000000c800000000000000000000800000803f000000400000803e0000000000000000ada721c8",
+   "packet_bytes": 108,
+   "packet_sha256": "37e4fd844530a074eaa5c82ddabaab67f2e01edea2ae8ac6e20821205bd7119e",
+   "stored_crc32_hex": "c821a7ad",
+   "calculated_crc32_hex": "c821a7ad",
+   "crc_valid": true,
+   "outcome": "accept",
+   "oracle": {
+    "telegram_type": 1,
+    "telegram_counter": 1,
+    "transmit_timestamp_raw": 72623859790382856,
+    "transmit_timestamp_basis": "unix_microseconds_declared",
+    "version": 4,
+    "size_module_0": 72,
+    "modules": [
+     {
+      "segment_counter": 0,
+      "frame_number": 5,
+      "sender_id": 42,
+      "line_count": 1,
+      "beams_per_line": 1,
+      "echoes_per_beam": 2,
+      "timestamp_start_raw": [
+       100
+      ],
+      "timestamp_stop_raw": [
+       200
+      ],
+      "line_timestamp_basis": "device_timebase_microseconds_declared",
+      "phi_words": [
+       2147483648
+      ],
+      "theta_start_words": [
+       1065353216
+      ],
+      "theta_stop_words": [
+       1073741824
+      ],
+      "next_module_size": 0,
+      "reserved_raw": [
+       0,
+       0
+      ],
+      "echo_mask_raw": 0,
+      "beam_mask_raw": 0,
+      "present_echo_fields": [],
+      "present_beam_fields": [],
+      "distance_relation": {
+       "unit": "mm",
+       "basis": "raw_for_v3_or_raw_times_module_scale_for_v4"
+      },
+      "echo_values": [],
+      "beam_values": [],
+      "distance_scale_word": 1048576000,
+      "module_bytes": 72
+     }
+    ],
+    "source_time": "omitted",
+    "clock_sync": "not_verified"
+   }
+  },
+  {
+   "name": "v4_mask_distance",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "020202020100000001000000000000000807060504030201040000004c000000000000000000000005000000000000002a0000000100000001000000020000006400000000000000c800000000000000000000800000803f000000400000803e00000000000100000100ffff3a14218b",
+   "packet_bytes": 112,
+   "packet_sha256": "59b9482bb19ea0a3585a314508dd0f8318383c6e0ff254f6af8c095d1ac83802",
+   "stored_crc32_hex": "8b21143a",
+   "calculated_crc32_hex": "8b21143a",
+   "crc_valid": true,
+   "outcome": "accept",
+   "oracle": {
+    "telegram_type": 1,
+    "telegram_counter": 1,
+    "transmit_timestamp_raw": 72623859790382856,
+    "transmit_timestamp_basis": "unix_microseconds_declared",
+    "version": 4,
+    "size_module_0": 76,
+    "modules": [
+     {
+      "segment_counter": 0,
+      "frame_number": 5,
+      "sender_id": 42,
+      "line_count": 1,
+      "beams_per_line": 1,
+      "echoes_per_beam": 2,
+      "timestamp_start_raw": [
+       100
+      ],
+      "timestamp_stop_raw": [
+       200
+      ],
+      "line_timestamp_basis": "device_timebase_microseconds_declared",
+      "phi_words": [
+       2147483648
+      ],
+      "theta_start_words": [
+       1065353216
+      ],
+      "theta_stop_words": [
+       1073741824
+      ],
+      "next_module_size": 0,
+      "reserved_raw": [
+       0,
+       0
+      ],
+      "echo_mask_raw": 1,
+      "beam_mask_raw": 0,
+      "present_echo_fields": [
+       "distance_raw"
+      ],
+      "present_beam_fields": [],
+      "distance_relation": {
+       "unit": "mm",
+       "basis": "raw_for_v3_or_raw_times_module_scale_for_v4"
+      },
+      "echo_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 0,
+        "distance_raw": 1
+       },
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 1,
+        "distance_raw": 65535
+       }
+      ],
+      "beam_values": [],
+      "distance_scale_word": 1048576000,
+      "module_bytes": 76
+     }
+    ],
+    "source_time": "omitted",
+    "clock_sync": "not_verified"
+   }
+  },
+  {
+   "name": "v4_mask_rssi",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "020202020100000001000000000000000807060504030201040000004c000000000000000000000005000000000000002a0000000100000001000000020000006400000000000000c800000000000000000000800000803f000000400000803e0000000000020000ff0001008d4c4d7b",
+   "packet_bytes": 112,
+   "packet_sha256": "3fba9c1f4521cda85f4614c2358d5615c3206c2601222a545ba9a60636eb4d7a",
+   "stored_crc32_hex": "7b4d4c8d",
+   "calculated_crc32_hex": "7b4d4c8d",
+   "crc_valid": true,
+   "outcome": "accept",
+   "oracle": {
+    "telegram_type": 1,
+    "telegram_counter": 1,
+    "transmit_timestamp_raw": 72623859790382856,
+    "transmit_timestamp_basis": "unix_microseconds_declared",
+    "version": 4,
+    "size_module_0": 76,
+    "modules": [
+     {
+      "segment_counter": 0,
+      "frame_number": 5,
+      "sender_id": 42,
+      "line_count": 1,
+      "beams_per_line": 1,
+      "echoes_per_beam": 2,
+      "timestamp_start_raw": [
+       100
+      ],
+      "timestamp_stop_raw": [
+       200
+      ],
+      "line_timestamp_basis": "device_timebase_microseconds_declared",
+      "phi_words": [
+       2147483648
+      ],
+      "theta_start_words": [
+       1065353216
+      ],
+      "theta_stop_words": [
+       1073741824
+      ],
+      "next_module_size": 0,
+      "reserved_raw": [
+       0,
+       0
+      ],
+      "echo_mask_raw": 2,
+      "beam_mask_raw": 0,
+      "present_echo_fields": [
+       "rssi_raw"
+      ],
+      "present_beam_fields": [],
+      "distance_relation": {
+       "unit": "mm",
+       "basis": "raw_for_v3_or_raw_times_module_scale_for_v4"
+      },
+      "echo_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 0,
+        "rssi_raw": 255
+       },
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 1,
+        "rssi_raw": 1
+       }
+      ],
+      "beam_values": [],
+      "distance_scale_word": 1048576000,
+      "module_bytes": 76
+     }
+    ],
+    "source_time": "omitted",
+    "clock_sync": "not_verified"
+   }
+  },
+  {
+   "name": "v4_mask_property",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "0202020201000000010000000000000008070605040302010400000049000000000000000000000005000000000000002a0000000100000001000000020000006400000000000000c800000000000000000000800000803f000000400000803e000000000000010081e4973f20",
+   "packet_bytes": 109,
+   "packet_sha256": "3d9ab8e0356d40b89d51eb084336d35df5ad0c3f0c100bc6140a130df96120f7",
+   "stored_crc32_hex": "203f97e4",
+   "calculated_crc32_hex": "203f97e4",
+   "crc_valid": true,
+   "outcome": "accept",
+   "oracle": {
+    "telegram_type": 1,
+    "telegram_counter": 1,
+    "transmit_timestamp_raw": 72623859790382856,
+    "transmit_timestamp_basis": "unix_microseconds_declared",
+    "version": 4,
+    "size_module_0": 73,
+    "modules": [
+     {
+      "segment_counter": 0,
+      "frame_number": 5,
+      "sender_id": 42,
+      "line_count": 1,
+      "beams_per_line": 1,
+      "echoes_per_beam": 2,
+      "timestamp_start_raw": [
+       100
+      ],
+      "timestamp_stop_raw": [
+       200
+      ],
+      "line_timestamp_basis": "device_timebase_microseconds_declared",
+      "phi_words": [
+       2147483648
+      ],
+      "theta_start_words": [
+       1065353216
+      ],
+      "theta_stop_words": [
+       1073741824
+      ],
+      "next_module_size": 0,
+      "reserved_raw": [
+       0,
+       0
+      ],
+      "echo_mask_raw": 0,
+      "beam_mask_raw": 1,
+      "present_echo_fields": [],
+      "present_beam_fields": [
+       "properties_raw"
+      ],
+      "distance_relation": {
+       "unit": "mm",
+       "basis": "raw_for_v3_or_raw_times_module_scale_for_v4"
+      },
+      "echo_values": [],
+      "beam_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "properties_raw": 129,
+        "reflector": true,
+        "property_reserved_bits_masked": 128
+       }
+      ],
+      "distance_scale_word": 1048576000,
+      "module_bytes": 73
+     }
+    ],
+    "source_time": "omitted",
+    "clock_sync": "not_verified"
+   }
+  },
+  {
+   "name": "v4_mask_azimuth",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "020202020100000001000000000000000807060504030201040000004a000000000000000000000005000000000000002a0000000100000001000000020000006400000000000000c800000000000000000000800000803f000000400000803e00000000000002000040218d20ee",
+   "packet_bytes": 110,
+   "packet_sha256": "4b3dea2d0b7e9d44e9389cf624a3902bf67fa5baded27d5c156482b6407723c5",
+   "stored_crc32_hex": "ee208d21",
+   "calculated_crc32_hex": "ee208d21",
+   "crc_valid": true,
+   "outcome": "accept",
+   "oracle": {
+    "telegram_type": 1,
+    "telegram_counter": 1,
+    "transmit_timestamp_raw": 72623859790382856,
+    "transmit_timestamp_basis": "unix_microseconds_declared",
+    "version": 4,
+    "size_module_0": 74,
+    "modules": [
+     {
+      "segment_counter": 0,
+      "frame_number": 5,
+      "sender_id": 42,
+      "line_count": 1,
+      "beams_per_line": 1,
+      "echoes_per_beam": 2,
+      "timestamp_start_raw": [
+       100
+      ],
+      "timestamp_stop_raw": [
+       200
+      ],
+      "line_timestamp_basis": "device_timebase_microseconds_declared",
+      "phi_words": [
+       2147483648
+      ],
+      "theta_start_words": [
+       1065353216
+      ],
+      "theta_stop_words": [
+       1073741824
+      ],
+      "next_module_size": 0,
+      "reserved_raw": [
+       0,
+       0
+      ],
+      "echo_mask_raw": 0,
+      "beam_mask_raw": 2,
+      "present_echo_fields": [],
+      "present_beam_fields": [
+       "azimuth_raw"
+      ],
+      "distance_relation": {
+       "unit": "mm",
+       "basis": "raw_for_v3_or_raw_times_module_scale_for_v4"
+      },
+      "echo_values": [],
+      "beam_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "azimuth_raw": 16384
+       }
+      ],
+      "distance_scale_word": 1048576000,
+      "module_bytes": 74
+     }
+    ],
+    "source_time": "omitted",
+    "clock_sync": "not_verified"
+   }
+  },
+  {
+   "name": "v4_mask_distance_azimuth",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "020202020100000001000000000000000807060504030201040000004e000000000000000000000005000000000000002a0000000100000001000000020000006400000000000000c800000000000000000000800000803f000000400000803e00000000000102000100ffff0040fc11e103",
+   "packet_bytes": 114,
+   "packet_sha256": "f31df76c86f00324b955b44558ea9b666774d31af5ef09efe21a4ea9ad900b6a",
+   "stored_crc32_hex": "03e111fc",
+   "calculated_crc32_hex": "03e111fc",
+   "crc_valid": true,
+   "outcome": "accept",
+   "oracle": {
+    "telegram_type": 1,
+    "telegram_counter": 1,
+    "transmit_timestamp_raw": 72623859790382856,
+    "transmit_timestamp_basis": "unix_microseconds_declared",
+    "version": 4,
+    "size_module_0": 78,
+    "modules": [
+     {
+      "segment_counter": 0,
+      "frame_number": 5,
+      "sender_id": 42,
+      "line_count": 1,
+      "beams_per_line": 1,
+      "echoes_per_beam": 2,
+      "timestamp_start_raw": [
+       100
+      ],
+      "timestamp_stop_raw": [
+       200
+      ],
+      "line_timestamp_basis": "device_timebase_microseconds_declared",
+      "phi_words": [
+       2147483648
+      ],
+      "theta_start_words": [
+       1065353216
+      ],
+      "theta_stop_words": [
+       1073741824
+      ],
+      "next_module_size": 0,
+      "reserved_raw": [
+       0,
+       0
+      ],
+      "echo_mask_raw": 1,
+      "beam_mask_raw": 2,
+      "present_echo_fields": [
+       "distance_raw"
+      ],
+      "present_beam_fields": [
+       "azimuth_raw"
+      ],
+      "distance_relation": {
+       "unit": "mm",
+       "basis": "raw_for_v3_or_raw_times_module_scale_for_v4"
+      },
+      "echo_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 0,
+        "distance_raw": 1
+       },
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 1,
+        "distance_raw": 65535
+       }
+      ],
+      "beam_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "azimuth_raw": 16384
+       }
+      ],
+      "distance_scale_word": 1048576000,
+      "module_bytes": 78
+     }
+    ],
+    "source_time": "omitted",
+    "clock_sync": "not_verified"
+   }
+  },
+  {
+   "name": "v4_mask_rssi_property",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "020202020100000001000000000000000807060504030201040000004d000000000000000000000005000000000000002a0000000100000001000000020000006400000000000000c800000000000000000000800000803f000000400000803e0000000000020100ff000100812d267910",
+   "packet_bytes": 113,
+   "packet_sha256": "cd4c41a74bc4d6ec75722521757d57f69f94d3be59212fa50d8d1e9d73c76733",
+   "stored_crc32_hex": "1079262d",
+   "calculated_crc32_hex": "1079262d",
+   "crc_valid": true,
+   "outcome": "accept",
+   "oracle": {
+    "telegram_type": 1,
+    "telegram_counter": 1,
+    "transmit_timestamp_raw": 72623859790382856,
+    "transmit_timestamp_basis": "unix_microseconds_declared",
+    "version": 4,
+    "size_module_0": 77,
+    "modules": [
+     {
+      "segment_counter": 0,
+      "frame_number": 5,
+      "sender_id": 42,
+      "line_count": 1,
+      "beams_per_line": 1,
+      "echoes_per_beam": 2,
+      "timestamp_start_raw": [
+       100
+      ],
+      "timestamp_stop_raw": [
+       200
+      ],
+      "line_timestamp_basis": "device_timebase_microseconds_declared",
+      "phi_words": [
+       2147483648
+      ],
+      "theta_start_words": [
+       1065353216
+      ],
+      "theta_stop_words": [
+       1073741824
+      ],
+      "next_module_size": 0,
+      "reserved_raw": [
+       0,
+       0
+      ],
+      "echo_mask_raw": 2,
+      "beam_mask_raw": 1,
+      "present_echo_fields": [
+       "rssi_raw"
+      ],
+      "present_beam_fields": [
+       "properties_raw"
+      ],
+      "distance_relation": {
+       "unit": "mm",
+       "basis": "raw_for_v3_or_raw_times_module_scale_for_v4"
+      },
+      "echo_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 0,
+        "rssi_raw": 255
+       },
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 1,
+        "rssi_raw": 1
+       }
+      ],
+      "beam_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "properties_raw": 129,
+        "reflector": true,
+        "property_reserved_bits_masked": 128
+       }
+      ],
+      "distance_scale_word": 1048576000,
+      "module_bytes": 77
+     }
+    ],
+    "source_time": "omitted",
+    "clock_sync": "not_verified"
+   }
+  },
+  {
+   "name": "v3_two_unequal_modules",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "0202020201000000010000000000000008070605040302010300000046000000000000000000000005000000000000002a0000000100000001000000010000006400000000000000c800000000000000000000800000803f000000407c000000000100000700010000000000000005000000000000002a0000000200000002000000010000002c0100000000000090010000000000005e01000000000000c20100000000000000000000000000800000803f000080bf00000040000000c000000000000303000a0014000040010b0015000140020c0016000240030d00170003400427930617",
+   "packet_bytes": 230,
+   "packet_sha256": "14d65b697e77e07fcaf32e70ae852a7d34d3a66ce7cf203b7df52debece3c271",
+   "stored_crc32_hex": "17069327",
+   "calculated_crc32_hex": "17069327",
+   "crc_valid": true,
+   "outcome": "accept",
+   "oracle": {
+    "telegram_type": 1,
+    "telegram_counter": 1,
+    "transmit_timestamp_raw": 72623859790382856,
+    "transmit_timestamp_basis": "unix_microseconds_declared",
+    "version": 3,
+    "size_module_0": 70,
+    "modules": [
+     {
+      "segment_counter": 0,
+      "frame_number": 5,
+      "sender_id": 42,
+      "line_count": 1,
+      "beams_per_line": 1,
+      "echoes_per_beam": 1,
+      "timestamp_start_raw": [
+       100
+      ],
+      "timestamp_stop_raw": [
+       200
+      ],
+      "line_timestamp_basis": "device_timebase_microseconds_declared",
+      "phi_words": [
+       2147483648
+      ],
+      "theta_start_words": [
+       1065353216
+      ],
+      "theta_stop_words": [
+       1073741824
+      ],
+      "next_module_size": 124,
+      "reserved_raw": [
+       0,
+       0
+      ],
+      "echo_mask_raw": 1,
+      "beam_mask_raw": 0,
+      "present_echo_fields": [
+       "distance_raw"
+      ],
+      "present_beam_fields": [],
+      "distance_relation": {
+       "unit": "mm",
+       "basis": "raw_for_v3_or_raw_times_module_scale_for_v4"
+      },
+      "echo_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 0,
+        "distance_raw": 7
+       }
+      ],
+      "beam_values": [],
+      "module_bytes": 70
+     },
+     {
+      "segment_counter": 1,
+      "frame_number": 5,
+      "sender_id": 42,
+      "line_count": 2,
+      "beams_per_line": 2,
+      "echoes_per_beam": 1,
+      "timestamp_start_raw": [
+       300,
+       400
+      ],
+      "timestamp_stop_raw": [
+       350,
+       450
+      ],
+      "line_timestamp_basis": "device_timebase_microseconds_declared",
+      "phi_words": [
+       0,
+       2147483648
+      ],
+      "theta_start_words": [
+       1065353216,
+       3212836864
+      ],
+      "theta_stop_words": [
+       1073741824,
+       3221225472
+      ],
+      "next_module_size": 0,
+      "reserved_raw": [
+       0,
+       0
+      ],
+      "echo_mask_raw": 3,
+      "beam_mask_raw": 3,
+      "present_echo_fields": [
+       "distance_raw",
+       "rssi_raw"
+      ],
+      "present_beam_fields": [
+       "properties_raw",
+       "azimuth_raw"
+      ],
+      "distance_relation": {
+       "unit": "mm",
+       "basis": "raw_for_v3_or_raw_times_module_scale_for_v4"
+      },
+      "echo_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 0,
+        "distance_raw": 10,
+        "rssi_raw": 20
+       },
+       {
+        "beam": 0,
+        "line": 1,
+        "echo": 0,
+        "distance_raw": 11,
+        "rssi_raw": 21
+       },
+       {
+        "beam": 1,
+        "line": 0,
+        "echo": 0,
+        "distance_raw": 12,
+        "rssi_raw": 22
+       },
+       {
+        "beam": 1,
+        "line": 1,
+        "echo": 0,
+        "distance_raw": 13,
+        "rssi_raw": 23
+       }
+      ],
+      "beam_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "azimuth_raw": 16384,
+        "properties_raw": 1,
+        "reflector": true,
+        "property_reserved_bits_masked": 0
+       },
+       {
+        "beam": 0,
+        "line": 1,
+        "azimuth_raw": 16385,
+        "properties_raw": 2,
+        "reflector": false,
+        "property_reserved_bits_masked": 2
+       },
+       {
+        "beam": 1,
+        "line": 0,
+        "azimuth_raw": 16386,
+        "properties_raw": 3,
+        "reflector": true,
+        "property_reserved_bits_masked": 2
+       },
+       {
+        "beam": 1,
+        "line": 1,
+        "azimuth_raw": 16387,
+        "properties_raw": 4,
+        "reflector": false,
+        "property_reserved_bits_masked": 4
+       }
+      ],
+      "module_bytes": 124
+     }
+    ],
+    "source_time": "omitted",
+    "clock_sync": "not_verified"
+   }
+  },
+  {
+   "name": "v4_two_unequal_modules",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "0202020201000000010000000000000008070605040302010400000049000000000000000000000005000000000000002a0000000100000001000000020000006400000000000000c800000000000000000000800000803f000000400000803e7a0000000000010081010000000000000005000000000000002a0000000200000001000000020000002c0100000000000090010000000000005e01000000000000c20100000000000000000000000000800000803f000080bf00000040000000c00000803f00000000000303000a0014000b0015000100400c0016000d00170002014071549528",
+   "packet_bytes": 231,
+   "packet_sha256": "26d3ace80e4611742bd2c84c1ab10104d6561b53d502b0a9ce6eebe5399e09b7",
+   "stored_crc32_hex": "28955471",
+   "calculated_crc32_hex": "28955471",
+   "crc_valid": true,
+   "outcome": "accept",
+   "oracle": {
+    "telegram_type": 1,
+    "telegram_counter": 1,
+    "transmit_timestamp_raw": 72623859790382856,
+    "transmit_timestamp_basis": "unix_microseconds_declared",
+    "version": 4,
+    "size_module_0": 73,
+    "modules": [
+     {
+      "segment_counter": 0,
+      "frame_number": 5,
+      "sender_id": 42,
+      "line_count": 1,
+      "beams_per_line": 1,
+      "echoes_per_beam": 2,
+      "timestamp_start_raw": [
+       100
+      ],
+      "timestamp_stop_raw": [
+       200
+      ],
+      "line_timestamp_basis": "device_timebase_microseconds_declared",
+      "phi_words": [
+       2147483648
+      ],
+      "theta_start_words": [
+       1065353216
+      ],
+      "theta_stop_words": [
+       1073741824
+      ],
+      "next_module_size": 122,
+      "reserved_raw": [
+       0,
+       0
+      ],
+      "echo_mask_raw": 0,
+      "beam_mask_raw": 1,
+      "present_echo_fields": [],
+      "present_beam_fields": [
+       "properties_raw"
+      ],
+      "distance_relation": {
+       "unit": "mm",
+       "basis": "raw_for_v3_or_raw_times_module_scale_for_v4"
+      },
+      "echo_values": [],
+      "beam_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "properties_raw": 129,
+        "reflector": true,
+        "property_reserved_bits_masked": 128
+       }
+      ],
+      "distance_scale_word": 1048576000,
+      "module_bytes": 73
+     },
+     {
+      "segment_counter": 1,
+      "frame_number": 5,
+      "sender_id": 42,
+      "line_count": 2,
+      "beams_per_line": 1,
+      "echoes_per_beam": 2,
+      "timestamp_start_raw": [
+       300,
+       400
+      ],
+      "timestamp_stop_raw": [
+       350,
+       450
+      ],
+      "line_timestamp_basis": "device_timebase_microseconds_declared",
+      "phi_words": [
+       0,
+       2147483648
+      ],
+      "theta_start_words": [
+       1065353216,
+       3212836864
+      ],
+      "theta_stop_words": [
+       1073741824,
+       3221225472
+      ],
+      "next_module_size": 0,
+      "reserved_raw": [
+       0,
+       0
+      ],
+      "echo_mask_raw": 3,
+      "beam_mask_raw": 3,
+      "present_echo_fields": [
+       "distance_raw",
+       "rssi_raw"
+      ],
+      "present_beam_fields": [
+       "properties_raw",
+       "azimuth_raw"
+      ],
+      "distance_relation": {
+       "unit": "mm",
+       "basis": "raw_for_v3_or_raw_times_module_scale_for_v4"
+      },
+      "echo_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 0,
+        "distance_raw": 10,
+        "rssi_raw": 20
+       },
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 1,
+        "distance_raw": 11,
+        "rssi_raw": 21
+       },
+       {
+        "beam": 0,
+        "line": 1,
+        "echo": 0,
+        "distance_raw": 12,
+        "rssi_raw": 22
+       },
+       {
+        "beam": 0,
+        "line": 1,
+        "echo": 1,
+        "distance_raw": 13,
+        "rssi_raw": 23
+       }
+      ],
+      "beam_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "azimuth_raw": 16384,
+        "properties_raw": 1,
+        "reflector": true,
+        "property_reserved_bits_masked": 0
+       },
+       {
+        "beam": 0,
+        "line": 1,
+        "azimuth_raw": 16385,
+        "properties_raw": 2,
+        "reflector": false,
+        "property_reserved_bits_masked": 2
+       }
+      ],
+      "distance_scale_word": 1065353216,
+      "module_bytes": 122
+     }
+    ],
+    "source_time": "omitted",
+    "clock_sync": "not_verified"
+   }
+  },
+  {
+   "name": "v3_reserved_bits_retained",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "020202020100000001000000000000000807060504030201030000005a000000000000000000000005000000000000002a0000000100000002000000020000006400000000000000c800000000000000000000800000803f0000004000000000a583435a0100ff00ffff010000408102000300040005003254023e93f8b4",
+   "packet_bytes": 126,
+   "packet_sha256": "917d7dc6098d747a6753d69e9e16c25dca546fb6f6aca26ceded560b1b78b569",
+   "stored_crc32_hex": "b4f8933e",
+   "calculated_crc32_hex": "b4f8933e",
+   "crc_valid": true,
+   "outcome": "accept",
+   "oracle": {
+    "telegram_type": 1,
+    "telegram_counter": 1,
+    "transmit_timestamp_raw": 72623859790382856,
+    "transmit_timestamp_basis": "unix_microseconds_declared",
+    "version": 3,
+    "size_module_0": 90,
+    "modules": [
+     {
+      "segment_counter": 0,
+      "frame_number": 5,
+      "sender_id": 42,
+      "line_count": 1,
+      "beams_per_line": 2,
+      "echoes_per_beam": 2,
+      "timestamp_start_raw": [
+       100
+      ],
+      "timestamp_stop_raw": [
+       200
+      ],
+      "line_timestamp_basis": "device_timebase_microseconds_declared",
+      "phi_words": [
+       2147483648
+      ],
+      "theta_start_words": [
+       1065353216
+      ],
+      "theta_stop_words": [
+       1073741824
+      ],
+      "next_module_size": 0,
+      "reserved_raw": [
+       165,
+       90
+      ],
+      "echo_mask_raw": 131,
+      "beam_mask_raw": 67,
+      "present_echo_fields": [
+       "distance_raw",
+       "rssi_raw"
+      ],
+      "present_beam_fields": [
+       "properties_raw",
+       "azimuth_raw"
+      ],
+      "distance_relation": {
+       "unit": "mm",
+       "basis": "raw_for_v3_or_raw_times_module_scale_for_v4"
+      },
+      "echo_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 0,
+        "distance_raw": 1,
+        "rssi_raw": 255
+       },
+       {
+        "beam": 0,
+        "line": 0,
+        "echo": 1,
+        "distance_raw": 65535,
+        "rssi_raw": 1
+       },
+       {
+        "beam": 1,
+        "line": 0,
+        "echo": 0,
+        "distance_raw": 2,
+        "rssi_raw": 3
+       },
+       {
+        "beam": 1,
+        "line": 0,
+        "echo": 1,
+        "distance_raw": 4,
+        "rssi_raw": 5
+       }
+      ],
+      "beam_values": [
+       {
+        "beam": 0,
+        "line": 0,
+        "azimuth_raw": 16384,
+        "properties_raw": 129,
+        "reflector": true,
+        "property_reserved_bits_masked": 128
+       },
+       {
+        "beam": 1,
+        "line": 0,
+        "azimuth_raw": 21554,
+        "properties_raw": 2,
+        "reflector": false,
+        "property_reserved_bits_masked": 2
+       }
+      ],
+      "module_bytes": 90
+     }
+    ],
+    "source_time": "omitted",
+    "clock_sync": "not_verified"
+   }
+  },
+  {
+   "name": "v3_zero_masks_max_counts",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "0202020201000000010000000000000008070605040302010300000044000000000000000000000005000000000000002a00000001000000ffffffffffffffff6400000000000000c800000000000000000000800000803f0000004000000000000000000dc84b30",
+   "packet_bytes": 104,
+   "packet_sha256": "afe4f679d49decbc6f218dbdf6bad12bb612c21b0cc18e01bd4d77618e86b874",
+   "stored_crc32_hex": "304bc80d",
+   "calculated_crc32_hex": "304bc80d",
+   "crc_valid": true,
+   "outcome": "reject_work_capacity_before_iteration",
+   "oracle": {
+    "wire_layout_and_crc": "valid_zero_byte_measurement_content",
+    "line_count": 1,
+    "beams_per_line": 4294967295,
+    "echoes_per_beam": 4294967295,
+    "logical_echo_cells_decimal": "18446744065119617025",
+    "measurement_bytes": 0,
+    "must_not_allocate_or_iterate_logical_cells": true,
+    "threshold_origin": "future_fixed_capture_policy_not_device_maximum"
+   }
+  },
+  {
+   "name": "v3_nonzero_mask_count_product_overflow",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "0202020201000000010000000000000008070605040302010300000044000000000000000000000005000000000000002a00000001000000ffffffffffffffff6400000000000000c800000000000000000000800000803f0000004000000000000100003aa28931",
+   "packet_bytes": 104,
+   "packet_sha256": "6ad98e466c06e6fb5615c26584aca183eb0697fdb92537728c8039329776c7a0",
+   "stored_crc32_hex": "3189a23a",
+   "calculated_crc32_hex": "3189a23a",
+   "crc_valid": true,
+   "outcome": "reject_checked_extent_or_work_capacity",
+   "oracle": {
+    "minimum_measurement_bytes_decimal": "36893488130239234050",
+    "exceeds_u64": true,
+    "must_reject_before_allocation": true
+   }
+  },
+  {
+   "name": "wrong_magic_crc_valid",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "030202020100000001000000000000000807060504030201030000005a000000000000000000000005000000000000002a0000000100000002000000020000006400000000000000c800000000000000000000800000803f0000004000000000000303000100ff00ffff010000408102000300040005003254020aa75353",
+   "packet_bytes": 126,
+   "packet_sha256": "96773940699a359e6313e66a8ddc17108d5d87b1ca574c753dad5f011e1b869d",
+   "stored_crc32_hex": "5353a70a",
+   "calculated_crc32_hex": "5353a70a",
+   "crc_valid": true,
+   "outcome": "reject_magic",
+   "oracle": {
+    "selected_integrity": "crc_valid",
+    "no_native_publication": true
+   },
+   "isolates": "magic"
+  },
+  {
+   "name": "unsupported_type_crc_valid",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "020202020300000001000000000000000807060504030201030000005a000000000000000000000005000000000000002a0000000100000002000000020000006400000000000000c800000000000000000000800000803f0000004000000000000303000100ff00ffff010000408102000300040005003254025667eda2",
+   "packet_bytes": 126,
+   "packet_sha256": "17b26c426b95084c9a429e7ff24cc78864ce0847554f29e3fe9eab90c2996f85",
+   "stored_crc32_hex": "a2ed6756",
+   "calculated_crc32_hex": "a2ed6756",
+   "crc_valid": true,
+   "outcome": "reject_telegram_type",
+   "oracle": {
+    "selected_integrity": "crc_valid",
+    "no_native_publication": true
+   },
+   "isolates": "telegram_type"
+  },
+  {
+   "name": "scan_version2_crc_valid",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "020202020100000001000000000000000807060504030201020000005a000000000000000000000005000000000000002a0000000100000002000000020000006400000000000000c800000000000000000000800000803f0000004000000000000303000100ff00ffff01000040810200030004000500325402238ac5ac",
+   "packet_bytes": 126,
+   "packet_sha256": "7f86e8bfacb961ffb69ab9e752884a33630b3970e02eb43f766227ec10a79be2",
+   "stored_crc32_hex": "acc58a23",
+   "calculated_crc32_hex": "acc58a23",
+   "crc_valid": true,
+   "outcome": "reject_version",
+   "oracle": {
+    "selected_integrity": "crc_valid",
+    "no_native_publication": true
+   },
+   "isolates": "version"
+  },
+  {
+   "name": "scan_version5_crc_valid",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "020202020100000001000000000000000807060504030201050000005a000000000000000000000005000000000000002a0000000100000002000000020000006400000000000000c800000000000000000000800000803f0000004000000000000303000100ff00ffff01000040810200030004000500325402c766ec63",
+   "packet_bytes": 126,
+   "packet_sha256": "d2b326b8dad61518f9ecc5be7877adc61c13b830a589804034cfa189b3af691e",
+   "stored_crc32_hex": "63ec66c7",
+   "calculated_crc32_hex": "63ec66c7",
+   "crc_valid": true,
+   "outcome": "reject_version",
+   "oracle": {
+    "selected_integrity": "crc_valid",
+    "no_native_publication": true
+   },
+   "isolates": "version"
+  },
+  {
+   "name": "scan_v3_relabelled_v4",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "020202020100000001000000000000000807060504030201040000005a000000000000000000000005000000000000002a0000000100000002000000020000006400000000000000c800000000000000000000800000803f0000004000000000000303000100ff00ffff0100004081020003000400050032540290f32909",
+   "packet_bytes": 126,
+   "packet_sha256": "8e632a9c8795a76a8ed6fbe6aae0b69cd8d3cc30fa5af28ae885ba398468189d",
+   "stored_crc32_hex": "0929f390",
+   "calculated_crc32_hex": "0929f390",
+   "crc_valid": true,
+   "outcome": "reject_version_layout",
+   "oracle": {
+    "selected_integrity": "crc_valid",
+    "no_native_publication": true
+   },
+   "isolates": "version_layout"
+  },
+  {
+   "name": "first_module_too_small",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "0202020201000000010000000000000008070605040302010300000059000000000000000000000005000000000000002a0000000100000002000000020000006400000000000000c800000000000000000000800000803f0000004000000000000303000100ff00ffff010000408102000300040005003254021ab44e6a",
+   "packet_bytes": 126,
+   "packet_sha256": "399d97594de5dfd5d887449109075bf1ab77000064f4102a53d28049456034b2",
+   "stored_crc32_hex": "6a4eb41a",
+   "calculated_crc32_hex": "6a4eb41a",
+   "crc_valid": true,
+   "outcome": "reject_module_extent",
+   "oracle": {
+    "selected_integrity": "crc_valid",
+    "no_native_publication": true
+   },
+   "isolates": "module_extent"
+  },
+  {
+   "name": "first_module_too_large",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "020202020100000001000000000000000807060504030201030000005b000000000000000000000005000000000000002a0000000100000002000000020000006400000000000000c800000000000000000000800000803f0000004000000000000303000100ff00ffff01000040810200030004000500325402ae793aa2",
+   "packet_bytes": 126,
+   "packet_sha256": "1f0f8c0aed1d9e817f0e3a3e1ff02c77843d47648b2423849dcac9601909423d",
+   "stored_crc32_hex": "a23a79ae",
+   "calculated_crc32_hex": "a23a79ae",
+   "crc_valid": true,
+   "outcome": "reject_module_extent",
+   "oracle": {
+    "selected_integrity": "crc_valid",
+    "no_native_publication": true
+   },
+   "isolates": "module_extent"
+  },
+  {
+   "name": "nonzero_final_link_without_next_module",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "020202020100000001000000000000000807060504030201030000005a000000000000000000000005000000000000002a0000000100000002000000020000006400000000000000c800000000000000000000800000803f0000004001000000000303000100ff00ffff010000408102000300040005003254027cfc60fa",
+   "packet_bytes": 126,
+   "packet_sha256": "308bb9f30515944491328dd9e30760be3b1c755ed5e4f63d1fb0dfc1af364861",
+   "stored_crc32_hex": "fa60fc7c",
+   "calculated_crc32_hex": "fa60fc7c",
+   "crc_valid": true,
+   "outcome": "reject_module_chain_extent",
+   "oracle": {
+    "selected_integrity": "crc_valid",
+    "no_native_publication": true
+   },
+   "isolates": "module_chain_extent"
+  },
+  {
+   "name": "beam_count_exceeds_supplied_data",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "020202020100000001000000000000000807060504030201030000005a000000000000000000000005000000000000002a0000000100000003000000020000006400000000000000c800000000000000000000800000803f0000004000000000000303000100ff00ffff010000408102000300040005003254026bb2e98f",
+   "packet_bytes": 126,
+   "packet_sha256": "b5381b160b5fe1c5573f5d76a8e6fa57bcd9e16b78b8be977dfc9684fa12ce4b",
+   "stored_crc32_hex": "8fe9b26b",
+   "calculated_crc32_hex": "8fe9b26b",
+   "crc_valid": true,
+   "outcome": "reject_count_extent",
+   "oracle": {
+    "selected_integrity": "crc_valid",
+    "no_native_publication": true
+   },
+   "isolates": "count_extent"
+  },
+  {
+   "name": "imu_version2_crc_valid",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "0202020202000000020000000000803f000000c000000000000000800000807f3412c07f0000803f00000000000000000000000064000000000000000e57d032",
+   "packet_bytes": 64,
+   "packet_sha256": "a9594261d09139b3b6374b3f747d4617d319ce4ccaf626e4e6209bbd486a4f42",
+   "stored_crc32_hex": "32d0570e",
+   "calculated_crc32_hex": "32d0570e",
+   "crc_valid": true,
+   "outcome": "reject_version",
+   "oracle": {
+    "selected_integrity": "crc_valid",
+    "no_native_publication": true
+   },
+   "isolates": "version"
+  },
+  {
+   "name": "scan_extra_byte_before_crc",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "020202020100000001000000000000000807060504030201030000005a000000000000000000000005000000000000002a0000000100000002000000020000006400000000000000c800000000000000000000800000803f0000004000000000000303000100ff00ffff0100004081020003000400050032540200b75aac85",
+   "packet_bytes": 127,
+   "packet_sha256": "8a87303e9fbeba46f1ae8efca5a575fbb4e14cf23dad836878830fdebcc24a0f",
+   "stored_crc32_hex": "85ac5ab7",
+   "calculated_crc32_hex": "85ac5ab7",
+   "crc_valid": true,
+   "outcome": "reject_trailing_bytes",
+   "oracle": {
+    "selected_integrity": "crc_valid",
+    "trailing_bytes": 1,
+    "no_native_publication": true
+   },
+   "isolates": "exact_frame_extent"
+  },
+  {
+   "name": "scan_short_one_measurement_byte",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "020202020100000001000000000000000807060504030201030000005a000000000000000000000005000000000000002a0000000100000002000000020000006400000000000000c800000000000000000000800000803f0000004000000000000303000100ff00ffff0100004081020003000400050032541eb6ac03",
+   "packet_bytes": 125,
+   "packet_sha256": "43e29e64a5c0f13a5b2d457db63090b171c0e6a986540723d4a4e0317f8e7a5c",
+   "stored_crc32_hex": "03acb61e",
+   "calculated_crc32_hex": "03acb61e",
+   "crc_valid": true,
+   "outcome": "reject_module_extent",
+   "oracle": {
+    "selected_integrity": "crc_valid",
+    "no_native_publication": true
+   },
+   "isolates": "declared_module_extent"
+  },
+  {
+   "name": "imu_extra_byte_before_crc",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "0202020202000000010000000000803f000000c000000000000000800000807f3412c07f0000803f0000000000000000000000006400000000000000001ec2e1b6",
+   "packet_bytes": 65,
+   "packet_sha256": "971cb78861607d9838091e1363e9cf73ce1e01b49eb4665177f7c53ff3765998",
+   "stored_crc32_hex": "b6e1c21e",
+   "calculated_crc32_hex": "b6e1c21e",
+   "crc_valid": true,
+   "outcome": "reject_exact_type2_extent",
+   "oracle": {
+    "expected_packet_bytes": 64,
+    "no_native_publication": true
+   },
+   "isolates": "type2_65_bytes"
+  },
+  {
+   "name": "imu_short_one_timestamp_byte",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "0202020202000000010000000000803f000000c000000000000000800000807f3412c07f0000803f00000000000000000000000064000000000000fe8f6382",
+   "packet_bytes": 63,
+   "packet_sha256": "3c7e8103090a473b9f46ea96014781f85aff8ea21ec365f19dfc8b7b4226601c",
+   "stored_crc32_hex": "82638ffe",
+   "calculated_crc32_hex": "82638ffe",
+   "crc_valid": true,
+   "outcome": "reject_exact_type2_extent",
+   "oracle": {
+    "expected_packet_bytes": 64,
+    "no_native_publication": true
+   },
+   "isolates": "type2_63_bytes"
+  },
+  {
+   "name": "crc_covers_telegram_counter",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "020202020100000000000000000000000807060504030201030000005a000000000000000000000005000000000000002a0000000100000002000000020000006400000000000000c800000000000000000000800000803f0000004000000000000303000100ff00ffff01000040810200030004000500325402741f00c6",
+   "packet_bytes": 126,
+   "packet_sha256": "907429a74ed008b8f7b8dde03a3eec20c442071ab437f4239c41172931744c8e",
+   "stored_crc32_hex": "c6001f74",
+   "calculated_crc32_hex": "b807341c",
+   "crc_valid": false,
+   "outcome": "reject_crc",
+   "oracle": {
+    "no_native_publication": true,
+    "stored_crc_not_recomputed": true
+   },
+   "isolates": "crc_coverage"
+  },
+  {
+   "name": "crc_covers_echo_data",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "020202020100000001000000000000000807060504030201030000005a000000000000000000000005000000000000002a0000000100000002000000020000006400000000000000c800000000000000000000800000803f0000004000000000000303000000ff00ffff01000040810200030004000500325402741f00c6",
+   "packet_bytes": 126,
+   "packet_sha256": "3e32491617231452784e718583dfcb3625dc9884d497166d609b685c55e3deee",
+   "stored_crc32_hex": "c6001f74",
+   "calculated_crc32_hex": "d1287bb4",
+   "crc_valid": false,
+   "outcome": "reject_crc",
+   "oracle": {
+    "no_native_publication": true,
+    "stored_crc_not_recomputed": true
+   },
+   "isolates": "crc_coverage"
+  },
+  {
+   "name": "crc_covers_imu_timestamp",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "0202020202000000010000000000803f000000c000000000000000800000807f3412c07f0000803f000000000000000000000000650000000000000019538588",
+   "packet_bytes": 64,
+   "packet_sha256": "98dee3b921236374e144067d41819f5c2f98fd0a0132ef8fba29480259a4a9ed",
+   "stored_crc32_hex": "88855319",
+   "calculated_crc32_hex": "442f5387",
+   "crc_valid": false,
+   "outcome": "reject_crc",
+   "oracle": {
+    "no_native_publication": true,
+    "stored_crc_not_recomputed": true
+   },
+   "isolates": "crc_coverage"
+  },
+  {
+   "name": "stored_zero_is_not_crc_disable",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "020202020100000001000000000000000807060504030201030000005a000000000000000000000005000000000000002a0000000100000002000000020000006400000000000000c800000000000000000000800000803f0000004000000000000303000100ff00ffff0100004081020003000400050032540200000000",
+   "packet_bytes": 126,
+   "packet_sha256": "1eeebd7d547040ed5bb185440a9bc20e0938b75d502a9f71e061e9c41e973331",
+   "stored_crc32_hex": "00000000",
+   "calculated_crc32_hex": "c6001f74",
+   "crc_valid": false,
+   "outcome": "reject_crc",
+   "oracle": {
+    "no_native_publication": true,
+    "calculated_crc32_hex": "c6001f74"
+   },
+   "isolates": "mandatory_crc_even_when_stored_zero"
+  },
+  {
+   "name": "missing_crc_trailer",
+   "origin": "hand_field_concatenation",
+   "packet_hex": "0202020202000000010000000000803f000000c000000000000000800000807f3412c07f0000803f0000000000000000000000006400000000000000",
+   "packet_bytes": 60,
+   "packet_sha256": "0a61d65a08ea34e77ec41336f16e0fee601f6ced341a342f8ef7b6b0cf1e704f",
+   "stored_crc32_hex": "00000000",
+   "calculated_crc32_hex": "e809d3e4",
+   "crc_valid": false,
+   "outcome": "reject_truncated_crc_or_extent",
+   "oracle": {
+    "no_native_publication": true
+   },
+   "isolates": "required_crc_trailer"
+  }
+ ]
+}

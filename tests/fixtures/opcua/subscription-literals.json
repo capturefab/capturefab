@@ -1,0 +1,463 @@
+{
+  "version": 1,
+  "provenance": "Hand-declared UA Binary/semantic literals from current OPC Foundation Part6 and cached async-opcua-types 0.19.0 source; authored before candidate value encoder. No SDK decode/encode/server/reference execution. Metadata hashing and JSON/hex extent checks only. Not captured device packets.",
+  "primary_urls": [
+    "https://reference.opcfoundation.org/specs/OPC-10000-6/5.2.2.17",
+    "https://reference.opcfoundation.org/specs/OPC-10000-6/5.2.2.16",
+    "https://reference.opcfoundation.org/specs/OPC-10000-4/7.26",
+    "https://reference.opcfoundation.org/specs/OPC-10000-4/5.14.5"
+  ],
+  "datavalues": [
+    {
+      "name": "absent",
+      "binary_hex": "00",
+      "bytes": 1,
+      "sha256": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+      "expected": {}
+    },
+    {
+      "name": "present_null_variant",
+      "binary_hex": "0100",
+      "bytes": 2,
+      "sha256": "47dc540c94ceb704a23875c11273e16bb0b8a87aed84de911f2133568115f254",
+      "expected": {
+        "value": {
+          "type": "Null"
+        }
+      }
+    },
+    {
+      "name": "explicit_good_status",
+      "binary_hex": "0200000000",
+      "bytes": 5,
+      "sha256": "395c2f5598a1643a205154c6f4c46ce36895b28e6c35660a95e5c6fd5ef9aeab",
+      "expected": {
+        "status_raw": 0
+      }
+    },
+    {
+      "name": "u64_above_exact_double",
+      "binary_hex": "01090100000000002000",
+      "bytes": 10,
+      "sha256": "3d26c94e02d5043689da8927ec35b1f887e49bb3fbaf85f32db3f6945e781580",
+      "expected": {
+        "value": {
+          "type": "UInt64",
+          "value": 9007199254740993
+        }
+      }
+    },
+    {
+      "name": "u64_max",
+      "binary_hex": "0109ffffffffffffffff",
+      "bytes": 10,
+      "sha256": "6cc68d7ec66df01d25500434a8f165f9e6f7cc9bf650deb4e41e88f26a6c9cc9",
+      "expected": {
+        "value": {
+          "type": "UInt64",
+          "value": 18446744073709551615
+        }
+      }
+    },
+    {
+      "name": "f32_nan_payload",
+      "binary_hex": "010a3412c07f",
+      "bytes": 6,
+      "sha256": "aa843461a6623ebca56081132f7a1b8cc1211dcb18c84989a090bd536e848eec",
+      "expected": {
+        "value": {
+          "type": "Float",
+          "bits": 2143294004,
+          "classification": "nan",
+          "sign_bit": false
+        }
+      }
+    },
+    {
+      "name": "f32_negative_zero",
+      "binary_hex": "010a00000080",
+      "bytes": 6,
+      "sha256": "06905e0c59fa2dc24341a78766c1d1e5b82cf27c3c429ce8a78305494074eb3b",
+      "expected": {
+        "value": {
+          "type": "Float",
+          "bits": 2147483648,
+          "classification": "finite",
+          "sign_bit": true,
+          "value_lexeme": "-0.0"
+        }
+      }
+    },
+    {
+      "name": "f64_nan_payload",
+      "binary_hex": "010b341200000000f87f",
+      "bytes": 10,
+      "sha256": "237f7c3520e7292c393cefc52c9c13c7b7cc9793c9914184440009824b0edecb",
+      "expected": {
+        "value": {
+          "type": "Double",
+          "bits": 9221120237041095220,
+          "classification": "nan",
+          "sign_bit": false
+        }
+      }
+    },
+    {
+      "name": "f64_negative_zero",
+      "binary_hex": "010b0000000000000080",
+      "bytes": 10,
+      "sha256": "3b19ad3d9b6ef5ebd7ae13a56be962824fbb9f4c3cf61005af827913f737d8f9",
+      "expected": {
+        "value": {
+          "type": "Double",
+          "bits": 9223372036854775808,
+          "classification": "finite",
+          "sign_bit": true,
+          "value_lexeme": "-0.0"
+        }
+      }
+    },
+    {
+      "name": "f64_positive_infinity",
+      "binary_hex": "010b000000000000f07f",
+      "bytes": 10,
+      "sha256": "b57c33b03916774e459083cd063a1b8f307b35de107dc647333b27e95634f8b1",
+      "expected": {
+        "value": {
+          "type": "Double",
+          "bits": 9218868437227405312,
+          "classification": "positive_infinity",
+          "sign_bit": false
+        }
+      }
+    },
+    {
+      "name": "f32_negative_infinity",
+      "binary_hex": "010a000080ff",
+      "bytes": 6,
+      "sha256": "38822232734046b3a13f6479e931b1b27e0f0eb8e0c4ebda3838b3ce5fbd2502",
+      "expected": {
+        "value": {
+          "type": "Float",
+          "bits": 4286578688,
+          "classification": "negative_infinity",
+          "sign_bit": true
+        }
+      }
+    },
+    {
+      "name": "string_null",
+      "binary_hex": "010cffffffff",
+      "bytes": 6,
+      "sha256": "a94a751c3f9104e02fc6001f40d6ff184a7c49716fb7cb1e0961b8ea074943c6",
+      "expected": {
+        "value": {
+          "type": "String",
+          "is_null": true
+        }
+      }
+    },
+    {
+      "name": "string_empty",
+      "binary_hex": "010c00000000",
+      "bytes": 6,
+      "sha256": "2d5612b423554db747489d6ae1907984555d927db23b6b587ac0e6a21fbd5f0a",
+      "expected": {
+        "value": {
+          "type": "String",
+          "is_null": false,
+          "value": ""
+        }
+      }
+    },
+    {
+      "name": "string_nul_unicode",
+      "binary_hex": "010c050000004100e29883",
+      "bytes": 11,
+      "sha256": "6e2f12df2a69f1e18fa3590595e508624013fd0b4527470d36a2943621ca8dc2",
+      "expected": {
+        "value": {
+          "type": "String",
+          "is_null": false,
+          "value": "A\u0000☃"
+        }
+      }
+    },
+    {
+      "name": "bytestring_null",
+      "binary_hex": "010fffffffff",
+      "bytes": 6,
+      "sha256": "63e666f108b2b3a32dd5106f1a76c8e874640f1c586c33407d0f9748bf8ffe49",
+      "expected": {
+        "value": {
+          "type": "ByteString",
+          "is_null": true
+        }
+      }
+    },
+    {
+      "name": "bytestring_empty",
+      "binary_hex": "010f00000000",
+      "bytes": 6,
+      "sha256": "077834889cb43851b117c5972fbad1f5f798a45ba96772492acce13b5389bfef",
+      "expected": {
+        "value": {
+          "type": "ByteString",
+          "is_null": false,
+          "base64": ""
+        }
+      }
+    },
+    {
+      "name": "bytestring_binary",
+      "binary_hex": "010f0300000000ff0a",
+      "bytes": 9,
+      "sha256": "570f50262d724875660076737824f91a573644185959a326333d0a30182c0bd2",
+      "expected": {
+        "value": {
+          "type": "ByteString",
+          "is_null": false,
+          "base64": "AP8K"
+        }
+      }
+    },
+    {
+      "name": "int32_array_null",
+      "binary_hex": "0186ffffffff",
+      "bytes": 6,
+      "sha256": "8d087d77ead9476c206512e1d4fc29b326734c602e123bd2a2ef4066c13272db",
+      "expected": {
+        "value": {
+          "type": "Array",
+          "element_type": "Int32",
+          "values": [],
+          "dimensions": []
+        }
+      },
+      "wire_distinction": "null",
+      "sdk_normalization": "0.19.0 maps null and empty typed arrays to identical Array with dimensions Some([]); original distinction unavailable"
+    },
+    {
+      "name": "int32_array_empty",
+      "binary_hex": "018600000000",
+      "bytes": 6,
+      "sha256": "ee6325d0b7455744d1dfb4d168c1194489c09aab1e49c8a0a4f357016b00a14d",
+      "expected": {
+        "value": {
+          "type": "Array",
+          "element_type": "Int32",
+          "values": [],
+          "dimensions": []
+        }
+      },
+      "wire_distinction": "empty",
+      "sdk_normalization": "0.19.0 maps null and empty typed arrays to identical Array with dimensions Some([]); original distinction unavailable"
+    },
+    {
+      "name": "int32_array_endpoints",
+      "binary_hex": "01860300000000000080ffffffffffffff7f",
+      "bytes": 18,
+      "sha256": "75b3da0c59b2d05087170e3d0613a65075e7bef46e1f02da5b8a5a9ebb49011f",
+      "expected": {
+        "value": {
+          "type": "Array",
+          "element_type": "Int32",
+          "values": [
+            -2147483648,
+            -1,
+            2147483647
+          ]
+        }
+      }
+    },
+    {
+      "name": "uint16_matrix_2x2",
+      "binary_hex": "01c50400000001000001ffff0000020000000200000002000000",
+      "bytes": 26,
+      "sha256": "bba08a820ce5ff173548e8612bcda6c182fb4c6028894e3be500334b753f5705",
+      "expected": {
+        "value": {
+          "type": "Array",
+          "element_type": "UInt16",
+          "values": [
+            1,
+            256,
+            65535,
+            0
+          ],
+          "dimensions": [
+            2,
+            2
+          ]
+        }
+      }
+    },
+    {
+      "name": "full_bad_quality_ticks_picos",
+      "binary_hex": "3f07785634128004058007060504030201000f271106050403020100ffff",
+      "bytes": 30,
+      "sha256": "b45186327d25263b5e9c06d072940fc6693784fcc5f526cb6a7c260116bbb902",
+      "expected": {
+        "value": {
+          "type": "UInt32",
+          "value": 305419896
+        },
+        "status_raw": 2147812480,
+        "source_ticks": 283686952306183,
+        "source_picoseconds_raw": 9999,
+        "source_picoseconds_effective": 9999,
+        "server_ticks": 283686952306193,
+        "server_picoseconds_raw": 65535,
+        "server_picoseconds_effective": 9999
+      }
+    },
+    {
+      "name": "bad_without_value",
+      "binary_hex": "0200000580",
+      "bytes": 5,
+      "sha256": "f7155f46b51bb679a7be2fef6610fdc8b2b15af0329e75e0650c97f0426e827a",
+      "expected": {
+        "status_raw": 2147811328
+      }
+    },
+    {
+      "name": "uncertain_full_status",
+      "binary_hex": "0306ffffffff80049240",
+      "bytes": 10,
+      "sha256": "c6155a1e799daf48591451c8671911a6972ee6046f3abfd827ccd981ef7140ad",
+      "expected": {
+        "value": {
+          "type": "Int32",
+          "value": -1
+        },
+        "status_raw": 1083311232
+      }
+    },
+    {
+      "name": "negative_source_tick",
+      "binary_hex": "04ffffffffffffffff",
+      "bytes": 9,
+      "sha256": "0806653bb73f9922b047d694edd1750c506c086957c9ee0608ddd1856d207de5",
+      "expected": {
+        "source_ticks": -1
+      },
+      "sdk_normalization": "DateTime ticks() exposes -1; checked_ticks()/reencoding clamps nonpositive timestamps to 0, so decoded binary is not original wire"
+    },
+    {
+      "name": "picos_without_timestamps",
+      "binary_hex": "301027ffff",
+      "bytes": 5,
+      "sha256": "3af02351aac41aa90f432e6d9670a9efe43f66b34bcb0c8e77ef75cbe7e31469",
+      "expected": {},
+      "sdk_normalization": "Both picoseconds words consumed then discarded because associated timestamps absent"
+    },
+    {
+      "name": "unknown_mask_bits",
+      "binary_hex": "c0",
+      "bytes": 1,
+      "sha256": "e4ff5e7d7a7f08e9800a3e25cb774533cb20040df30b6ba10f956f9acd0eb3f7",
+      "expected": {},
+      "sdk_normalization": "Unknown DataValue mask bits truncated by SDK; no unknown-mask recovery claim"
+    }
+  ],
+  "notification_messages": [
+    {
+      "name": "keepalive_then_real_same_sequence",
+      "notification_message_hex": "01000000070605040302010000000000",
+      "expected": {
+        "sequence": 1,
+        "publish_ticks": 283686952306183,
+        "notification_data": [],
+        "message_kind": "keepalive",
+        "next_expected_sequence": 1,
+        "ack": false
+      },
+      "bytes": 16,
+      "sha256": "8adcc7ef5c49dbeade229eab33062e741ac743bd8e9cfd4b049664d1261c150c"
+    },
+    {
+      "name": "two_changes_same_handle",
+      "notification_message_hex": "0100000007060504030201000100000001002b03011c000000020000002a00000001070a0000002a00000001070b00000000000000",
+      "expected": {
+        "sequence": 1,
+        "publish_ticks": 283686952306183,
+        "data_changes": [
+          {
+            "client_handle": 42,
+            "type": "UInt32",
+            "value": 10
+          },
+          {
+            "client_handle": 42,
+            "type": "UInt32",
+            "value": 11
+          }
+        ],
+        "next_expected_sequence": 2,
+        "ack_only_after_local_admission": true
+      },
+      "bytes": 53,
+      "sha256": "06845bdc5db69c381e612ca6e6d9893a0499fee2dacf1861947ebe70abef41d8"
+    }
+  ],
+  "sequence_cases": [
+    {
+      "input": [
+        {
+          "kind": "keepalive",
+          "sequence": 1
+        },
+        {
+          "kind": "data",
+          "sequence": 1
+        },
+        {
+          "kind": "data",
+          "sequence": 2
+        }
+      ],
+      "real_order": [
+        1,
+        2
+      ],
+      "ackable_after_admission": [
+        1,
+        2
+      ]
+    },
+    {
+      "initial_expected": 4294967295,
+      "input": [
+        4294967295,
+        1,
+        2
+      ],
+      "next_expected": 3
+    },
+    {
+      "expected": 2,
+      "received": 4,
+      "republish_required": [
+        2,
+        3
+      ],
+      "delivery_order": [
+        2,
+        3,
+        4
+      ]
+    },
+    {
+      "expected": 2,
+      "received": 4,
+      "republish_unavailable": 2,
+      "terminal_gap": true
+    }
+  ],
+  "ack_literal": {
+    "subscription_id": 16909060,
+    "sequence": 4294967295,
+    "binary_hex": "04030201ffffffff"
+  },
+  "limits": "Null/empty typed arrays and other noted SDK-normalized fields are not original-wire recoverable. Expected semantics are independent of candidate JSON key spellings; fixture adapts explicit mapping only."
+}

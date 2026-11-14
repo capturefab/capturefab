@@ -1,0 +1,138 @@
+{
+  "schema": "capturefab_independent_packed_bicolor_literals_v1",
+  "scope": "Hand-derived specification literals, not captured device bytes, a stock decoder, executable checks or physical qualification. No candidate/product packed decoder was read or executed.",
+  "sources": {
+    "format_values": "https://www.emva.org/wp-content/uploads/GenICamPixelFormatValues.pdf",
+    "format_values_edition": "13-May-2026, page6",
+    "pfnc": "https://www.emva.org/wp-content/uploads/GenICam_PFNC_2_3.pdf",
+    "pfnc_sections": ["3.1.8", "6.3.1", "6.7"],
+    "model_manual": "https://www.bhphotovideo.com/lit_files/1268774.pdf",
+    "model_manual_identity": "JAI SW-2005/4005-5GE User Manual v1.4, 2025-10-22; manufacturer-authored distributor copy, web text read only; no local byte/hash/render or observed-device claim",
+    "model_scope": "SW-4005BL-5GE documented packed formats and width step8. Tiny widths below are representation literals, not model-valid configured ROI claims."
+  },
+  "formats": [
+    {"name": "BiColorRGBG10p", "code": 34865320, "code_hex": "0x021400A8", "bits": 10, "first_measured_color": "red", "second_measured_color": "blue"},
+    {"name": "BiColorBGRG10p", "code": 34865322, "code_hex": "0x021400AA", "bits": 10, "first_measured_color": "blue", "second_measured_color": "red"},
+    {"name": "BiColorRGBG12p", "code": 35127468, "code_hex": "0x021800AC", "bits": 12, "first_measured_color": "red", "second_measured_color": "blue"},
+    {"name": "BiColorBGRG12p", "code": 35127470, "code_hex": "0x021800AE", "bits": 12, "first_measured_color": "blue", "second_measured_color": "red"}
+  ],
+  "interpretation": {
+    "admission_scope": "10p requires positive even source width at every height, including height1; final partial-group/tail rules for odd10p are not qualified. 12p allows any positive source width.",
+    "pairs": "Each [C,G] is a measured pair. C alternates the format's first/second measured color; phase resets at each image row. Packing is identical between RGBG and BGRG, while color interpretation swaps red and blue.",
+    "native_rgb_policy": "Hand-worked current bounded horizontal interpolation policy: keep the measured channel, average floor of same-row immediate missing-color neighbors within the view; one in-view neighbor is copied, none falls back to measured green. This interpolation policy is not a manufacturer wire claim.",
+    "bgrg_rgb_rule": "Swap red/blue positions of every listed RGBG native_rgb triplet; green stays exact.",
+    "view_scope": "Views borrow original packed rows; odd-x or odd-width view does not alter admitted source packing. Materialized normalized pairs use unpacked BiColor10/12 and phase shifted by x only."
+  },
+  "cases": [
+    {
+      "id": "even10_two_rows",
+      "formats": ["BiColorRGBG10p", "BiColorBGRG10p"],
+      "width": 4,
+      "height": 2,
+      "row_bytes": 10,
+      "pairs": [
+        [[1,1023],[341,682],[512,17],[1023,0]],
+        [[1023,512],[0,341],[17,682],[683,1]]
+      ],
+      "packed_rows_hex": ["01fc5f95aa0046f03f00", "ff0308405511a8ba6a00"],
+      "tight_hex": "01fc5f95aa0046f03f00ff0308405511a8ba6a00",
+      "rgbg_native_rgb": [
+        [[1,1023,341],[256,682,341],[512,17,682],[512,0,1023]],
+        [[1023,512,0],[520,341,0],[17,682,341],[17,1,683]]
+      ],
+      "padded_layout": {
+        "offset": 2,
+        "row_stride": 12,
+        "x_padding": 2,
+        "y_padding": 1,
+        "total_bytes": 27,
+        "prefix_hex": "f1f2",
+        "row_padding_hex": "dead",
+        "tail_padding_hex": "be",
+        "payload_hex": "f1f201fc5f95aa0046f03f00deadff0308405511a8ba6a00deadbe"
+      },
+      "odd_x_view": {
+        "roi": [1,0,3,2],
+        "pairs": [
+          [[341,682],[512,17],[1023,0]],
+          [[0,341],[17,682],[683,1]]
+        ],
+        "rgbg_native_rgb": [
+          [[512,682,341],[512,17,682],[512,0,1023]],
+          [[17,341,0],[17,682,341],[17,1,683]]
+        ],
+        "normalized_unpacked_le_rows_hex": ["5501aa0200021100ff030000", "000055011100aa02ab020100"],
+        "source_rgbg_materialized_format": "BiColorBGRG10",
+        "source_bgrg_materialized_format": "BiColorRGBG10"
+      }
+    },
+    {
+      "id": "odd12_two_rows",
+      "formats": ["BiColorRGBG12p", "BiColorBGRG12p"],
+      "width": 3,
+      "height": 2,
+      "row_bytes": 9,
+      "pairs": [
+        [[1,4095],[2748,291],[4095,2048]],
+        [[2048,1],[0,4095],[1365,2730]]
+      ],
+      "packed_rows_hex": ["01f0ffbc3a12ff0f80", "00180000f0ff55a5aa"],
+      "tight_hex": "01f0ffbc3a12ff0f8000180000f0ff55a5aa",
+      "rgbg_native_rgb": [
+        [[1,4095,2748],[2048,291,2748],[4095,2048,2748]],
+        [[2048,1,0],[1706,4095,0],[1365,2730,0]]
+      ],
+      "padded_layout": {
+        "offset": 2,
+        "row_stride": 11,
+        "x_padding": 2,
+        "y_padding": 1,
+        "total_bytes": 25,
+        "prefix_hex": "f1f2",
+        "row_padding_hex": "dead",
+        "tail_padding_hex": "be",
+        "payload_hex": "f1f201f0ffbc3a12ff0f80dead00180000f0ff55a5aadeadbe"
+      },
+      "odd_x_view": {
+        "roi": [1,0,2,2],
+        "pairs": [
+          [[2748,291],[4095,2048]],
+          [[0,4095],[1365,2730]]
+        ],
+        "rgbg_native_rgb": [
+          [[4095,291,2748],[4095,2048,2748]],
+          [[1365,4095,0],[1365,2730,0]]
+        ],
+        "normalized_unpacked_le_rows_hex": ["bc0a2301ff0f0008", "0000ff0f5505aa0a"],
+        "source_rgbg_materialized_format": "BiColorBGRG12",
+        "source_bgrg_materialized_format": "BiColorRGBG12"
+      }
+    },
+    {
+      "id": "one12_fallback",
+      "formats": ["BiColorRGBG12p", "BiColorBGRG12p"],
+      "width": 1,
+      "height": 1,
+      "row_bytes": 3,
+      "pairs": [[[2748,291]]],
+      "packed_rows_hex": ["bc3a12"],
+      "tight_hex": "bc3a12",
+      "rgbg_native_rgb": [[[2748,291,291]]],
+      "bgrg_native_rgb": [[[291,291,2748]]]
+    }
+  ],
+  "unsupported_odd10_boundary_counterexample": {
+    "width": 3,
+    "height": 2,
+    "pairs": [
+      [[1,1023],[341,682],[512,17]],
+      [[1023,512],[0,341],[17,682]]
+    ],
+    "image_continuous_bytes": 15,
+    "image_continuous_hex": "01fc5f95aa0046f03f8000541581aa",
+    "line_aligned_bytes": 16,
+    "line_aligned_hex": "01fc5f95aa004600ff0308405511a80a",
+    "image_continuous_plus_y_padding_hex": "01fc5f95aa0046f03f8000541581aa00",
+    "policy": "All variants remain Unsupported as source layouts absent an authoritative referencing-interface boundary rule. Equal buffer lengths or padding bytes cannot select one."
+  }
+}

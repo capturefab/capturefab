@@ -1,0 +1,301 @@
+{
+  "version": 1,
+  "status": "frozen_independent_pre_current_native_authoring_scratch_only",
+  "freeze_basis": "Only retained manufacturer plan7d7cedc7 and independently fetched official NI pages/pinned NI-owned bindings; no current product implementation exists or was read.",
+  "public_config_shape_frozen": false,
+  "base_abi_sha256": "1bbc016312c3aab6093483cfa3aeee442e6bc3aaeb74eaa8113641a090329b6b",
+  "profile": "owned_continuous_internal_clock_ai_current_fixed_amperes",
+  "abi": {
+    "name": "DAQmxCreateAICurrentChan",
+    "returns": "i32",
+    "convention": {
+      "linux": "C",
+      "windows": "fixed extern system / NI __CFUNC"
+    },
+    "TaskHandle": "pointer-sized opaque handle",
+    "slots": [
+      "TaskHandle",
+      "const char* physical",
+      "const char* virtual_name",
+      "i32 terminal_config",
+      "f64 min_amperes",
+      "f64 max_amperes",
+      "i32 units",
+      "i32 shunt_location",
+      "f64 external_shunt_ohms_argument",
+      "const char* custom_scale_name"
+    ],
+    "custom_scale_name": {
+      "pointer": "NULL",
+      "not_empty_string": true,
+      "reason": "The official constructor mandates NULL unless FromCustomScale is selected; this profile selects Amps."
+    },
+    "virtual_name": {
+      "value": "",
+      "reason": "retain each explicit physical channel identity"
+    },
+    "common_exports": [
+      "DAQmxCreateTask",
+      "DAQmxCfgSampClkTiming",
+      "DAQmxCfgInputBuffer",
+      "DAQmxSetReadOverWrite",
+      "DAQmxGetTaskNumChans",
+      "DAQmxGetNthTaskReadChannel",
+      "DAQmxStartTask",
+      "DAQmxGetSampClkRate",
+      "DAQmxGetReadAvailSampPerChan",
+      "DAQmxReadAnalogF64",
+      "DAQmxStopTask",
+      "DAQmxClearTask",
+      "DAQmxGetErrorString",
+      "DAQmxGetExtendedErrorInfo"
+    ],
+    "selection": "Resolve the14 common exports and only the selected current constructor before CreateTask; no TC terminal setter is needed."
+  },
+  "constants": {
+    "amperes": 10342,
+    "terminal_config": {
+      "default": -1,
+      "rse": 10083,
+      "nrse": 10078,
+      "differential": 10106,
+      "pseudodifferential": 12529
+    },
+    "shunt_location": {
+      "built_in": 10200,
+      "external": 10167
+    },
+    "deferred_not_in_profile": {
+      "driver_chooses_shunt": -1,
+      "custom_scale_units": 10065,
+      "teds_property_units_not_ordinary_constructor_proof": 12516
+    }
+  },
+  "two_channel_constructor_arguments": [
+    {
+      "role": "built_in_control",
+      "physical_suffix": "ai0",
+      "virtual_name": "",
+      "terminal_config_code": 10106,
+      "min_amperes_decimal": "0.0",
+      "min_bits_hex": "0000000000000000",
+      "max_amperes_decimal": "0.020",
+      "max_bits_hex": "3f947ae147ae147b",
+      "units_code": 10342,
+      "shunt_location_code": 10200,
+      "external_shunt_ohms_argument_decimal": "249.0",
+      "external_argument_bits_hex": "406f200000000000",
+      "external_argument_provenance": "NI wrapper convenience default in required positional slot; not a configured/queried built-in resistance",
+      "custom_scale_pointer": "NULL"
+    },
+    {
+      "role": "external_250_ohm_control",
+      "physical_suffix": "ai1",
+      "virtual_name": "",
+      "terminal_config_code": 10083,
+      "min_amperes_decimal": "-0.020",
+      "min_bits_hex": "bf947ae147ae147b",
+      "max_amperes_decimal": "0.020",
+      "max_bits_hex": "3f947ae147ae147b",
+      "units_code": 10342,
+      "shunt_location_code": 10167,
+      "external_shunt_ohms_argument_decimal": "250.0",
+      "external_argument_bits_hex": "406f400000000000",
+      "external_argument_provenance": "explicit positive finite operator request in ohms, not device readback",
+      "custom_scale_pointer": "NULL"
+    }
+  ],
+  "builtin_numeric_slot_boundary": {
+    "reference_argument_decimal": "249.0",
+    "zero_acceptance_assumed": false,
+    "official_description": "The constructor selects the built-in resistor with Internal; extShuntResistorVal is described as external-shunt ohms and required for External.",
+    "ignored_or_universally_accepted_under_internal_explicitly_promised_by_fetched_primary": false,
+    "qualification": "A reference-wrapper default does not establish a physical internal resistor value or universal driver acceptance/ignored-argument semantics; preserve any native rejection without retry/fallback."
+  },
+  "manual_patterns": [
+    {
+      "name": "one_sixty_fourth_ampere_builtin",
+      "bits_hex": "3f90000000000000",
+      "ieee754_le_hex": "000000000000903f",
+      "sign_bit": false,
+      "classification": "normal",
+      "finite_amperes_decimal": "0.015625"
+    },
+    {
+      "name": "same_one_sixty_fourth_ampere_external",
+      "bits_hex": "3f90000000000000",
+      "ieee754_le_hex": "000000000000903f",
+      "sign_bit": false,
+      "classification": "normal",
+      "finite_amperes_decimal": "0.015625"
+    },
+    {
+      "name": "four_milliamp_value_in_amperes",
+      "bits_hex": "3f70624dd2f1a9fc",
+      "ieee754_le_hex": "fca9f1d24d62703f",
+      "sign_bit": false,
+      "classification": "normal",
+      "finite_amperes_decimal": "0.004"
+    },
+    {
+      "name": "twenty_milliamp_value_in_amperes",
+      "bits_hex": "3f947ae147ae147b",
+      "ieee754_le_hex": "7b14ae47e17a943f",
+      "sign_bit": false,
+      "classification": "normal",
+      "finite_amperes_decimal": "0.020"
+    },
+    {
+      "name": "negative_zero",
+      "bits_hex": "8000000000000000",
+      "ieee754_le_hex": "0000000000000080",
+      "sign_bit": true,
+      "classification": "zero",
+      "finite_amperes_decimal": "-0.0"
+    },
+    {
+      "name": "quiet_nan_payload_a5",
+      "bits_hex": "7ff80000000000a5",
+      "ieee754_le_hex": "a50000000000f87f",
+      "sign_bit": false,
+      "classification": "nan"
+    },
+    {
+      "name": "positive_infinity",
+      "bits_hex": "7ff0000000000000",
+      "ieee754_le_hex": "000000000000f07f",
+      "sign_bit": false,
+      "classification": "infinity"
+    },
+    {
+      "name": "negative_infinity",
+      "bits_hex": "fff0000000000000",
+      "ieee754_le_hex": "000000000000f0ff",
+      "sign_bit": true,
+      "classification": "infinity"
+    },
+    {
+      "name": "minimum_positive_subnormal",
+      "bits_hex": "0000000000000001",
+      "ieee754_le_hex": "0100000000000000",
+      "sign_bit": false,
+      "classification": "subnormal",
+      "finite_amperes_decimal": "4.9406564584124654e-324"
+    },
+    {
+      "name": "maximum_finite",
+      "bits_hex": "7fefffffffffffff",
+      "ieee754_le_hex": "ffffffffffffef7f",
+      "sign_bit": false,
+      "classification": "normal",
+      "finite_amperes_decimal": "1.7976931348623157e308"
+    },
+    {
+      "name": "minimum_negative_subnormal",
+      "bits_hex": "8000000000000001",
+      "ieee754_le_hex": "0100000000000080",
+      "sign_bit": true,
+      "classification": "subnormal",
+      "finite_amperes_decimal": "-4.9406564584124654e-324"
+    },
+    {
+      "name": "negative_quiet_nan_payload_45",
+      "bits_hex": "fff8000000000045",
+      "ieee754_le_hex": "450000000000f8ff",
+      "sign_bit": true,
+      "classification": "nan"
+    }
+  ],
+  "decimal_rounding_proofs": [
+    {
+      "decimal_literal": "0.004",
+      "exact_rational": "1/250",
+      "nearest_binary64_bits": "3f70624dd2f1a9fc",
+      "distance_to_exact_rational": "3/36028797018963968000",
+      "strictly_nearer_than_both_adjacent_finite_words": true,
+      "ties_not_present": true
+    },
+    {
+      "decimal_literal": "0.020",
+      "exact_rational": "1/50",
+      "nearest_binary64_bits": "3f947ae147ae147b",
+      "distance_to_exact_rational": "3/7205759403792793600",
+      "strictly_nearer_than_both_adjacent_finite_words": true,
+      "ties_not_present": true
+    }
+  ],
+  "two_channel_six_scan_sequence": {
+    "shape": [
+      6,
+      2
+    ],
+    "layout": "scan_major",
+    "all_words_le_hex": "000000000000903f000000000000903ffca9f1d24d62703f7b14ae47e17a943f0000000000000080a50000000000f87f000000000000f07f000000000000f0ff0100000000000000ffffffffffffef7f0100000000000080450000000000f8ff",
+    "control": "First scan contains identical exact1/64A words for built-in and external250ohm channels; no multiplication/division by shunt and no milliamp conversion."
+  },
+  "partial_two_channel_one_scan": {
+    "requested_per_channel": 3,
+    "actual_per_channel": 1,
+    "capacity_f64": 6,
+    "native_status": -200284,
+    "valid_words_le_hex": "000000000000903f000000000000903f"
+  },
+  "metadata_semantics": {
+    "quantity": "current",
+    "finite_presentation": "amperes",
+    "raw": "ieee754_le_hex for every word",
+    "omit_for_nonfinite": "finite numeric amperes; never JSON null as a numeric replacement",
+    "built_in": "No resistance_ohms or ohms inferred from249 ABI argument",
+    "external": "Configured250ohm request may be retained as requested_not_read_back",
+    "no_conversion": [
+      "multiply_by1000_to_milliamps",
+      "volts_divided_by_resistance",
+      "resistance_multiplied_by_current",
+      "builtin_resistance_inference",
+      "ADC_integer_inference"
+    ],
+    "clock": "Actual host native-read completion only; no physical sample-clock interpolation or source_time."
+  },
+  "primary": {
+    "read_policy": "256KiB/request and10s deadlines; RAM only; no downloaded source/SDK/capture files retained",
+    "api_pages": [
+      {
+        "role": "constructor",
+        "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__channel__configuration__creation__create__analog__input__channels_1gadc9361c4cad612aeae3abe022076f5eb.html",
+        "bytes": 24627,
+        "sha256": "ec12374563ff36daa62616b38e765a9138c379fa179d71c66027e79184484351"
+      },
+      {
+        "role": "shunt_location",
+        "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__properties__channel__analog__input__general__properties__signal__conditioning__current__shunt__resistor_1gacffd57e3f7d198fe7c6f1637e33ae82b.html",
+        "bytes": 11209,
+        "sha256": "ed7c45a1d49146af94c5c9631a3a1dae0817523aef60751e1248cafd5cddd97f"
+      },
+      {
+        "role": "external_shunt_ohms",
+        "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__properties__channel__analog__input__general__properties__signal__conditioning__current__shunt__resistor_1ga73b6fa9c4bfd739ec930c341fba0d67e.html",
+        "bytes": 10079,
+        "sha256": "38f49f28c60942d9ae0fb8870cd87d53a406f5e393d1412f6b69460c909c55d3"
+      },
+      {
+        "role": "current_units",
+        "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__properties__channel__analog__input__current_1ga1af069863da88e2f5f148cdb8cd3b616.html",
+        "bytes": 9655,
+        "sha256": "426c5cf140f745ca1dd51698673a9f4c1b252ba960744a65b06d4fb768a8fd00"
+      }
+    ],
+    "ni_python_commit": "1d60b6c53ef11dead0ba6aa9d6e2855351835ad7",
+    "constants": {
+      "path": "generated/nidaqmx/constants.py",
+      "bytes": 50365,
+      "sha256": "9d15eb38ccb03769f9e5ad94289a00658ee36b6685709e4f3d49dafb25b4ae57"
+    },
+    "ai_collection": {
+      "path": "generated/nidaqmx/task/collections/_ai_channel_collection.py",
+      "bytes": 178880,
+      "sha256": "43afe14f318c456f07fec8fed232e6aef08ec71df07965be2c629c7d626cd350"
+    },
+    "wrapper_default_caveat": "Pinned NI Python convenience defaults external argument249.0 and custom_scale_name empty string. For Amps this oracle follows the explicit current C-reference NULL requirement instead of copying that empty-string default."
+  },
+  "qualification": "Independent synthetic ABI/bit oracle only. No current product, SDK execution, installed-driver acceptance, NI-9203/9208 chassis/OS combination, physical current, loop power, calibration, sensor health or timing qualification."
+}

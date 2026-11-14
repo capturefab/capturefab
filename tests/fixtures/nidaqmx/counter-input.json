@@ -1,0 +1,625 @@
+{
+ "version": 1,
+ "freeze": "Independent additive scientific/ABI oracle, written before any digital/counter native implementation is authored or read. Literal words and asymmetric arguments are hand-declared; no product encoder/decoder, SDK, compiler, native call or runtime.",
+ "immutable_prior_oracles_sha256": {
+  "abi.json": "1bbc016312c3aab6093483cfa3aeee442e6bc3aaeb74eaa8113641a090329b6b",
+  "current.json": "14f428f82a6cf94704ac47ff2b42d18bf71553435437ae4f0345bf4260779bff",
+  "mixed-ai.json": "d4a74d1e2310b8f16648e296ab95ebffe175559fbe326655ac98dae6d31a9d78",
+  "on-demand.json": "b87122de19d2bdb77f16c0511d1759925b84697ad59e97375197d1b54e81fe89",
+  "rtd.json": "5f83a52d2ce10c71d6e1f7498bb6bd020828365a734fbe235cb7bbcadd2cb6a5",
+  "thermocouple.json": "2a8109877c63aa7448965c0d0ac9ec060355d8dde41e98496b4ff8050ac65cb1",
+  "voltage-scale-null.json": "5764fe41ecab45d8b5795d15dc82f723c566d5ba0af565048224337ed321ba63"
+ },
+ "abi_policy": {
+  "TaskHandle": "pointer-sized opaque owned handle",
+  "return_status": "signed i32; zero success, positive warning, negative failure",
+  "bool32": "u32, including pointer target for reserved",
+  "calling_convention": "fixed NI __CFUNC: C on Linux, system on Windows; no variadic attribute calls",
+  "all_exports_before_create": true
+ },
+ "common_exports": [
+  "DAQmxCreateTask",
+  "DAQmxGetTaskNumChans",
+  "DAQmxGetNthTaskReadChannel",
+  "DAQmxStartTask",
+  "DAQmxStopTask",
+  "DAQmxClearTask",
+  "DAQmxGetErrorString",
+  "DAQmxGetExtendedErrorInfo"
+ ],
+ "excluded_analog_or_clock_exports": [
+  "DAQmxReadAnalogF64",
+  "DAQmxCreateAIVoltageChan",
+  "DAQmxCreateAIThrmcplChan",
+  "DAQmxCreateAICurrentChan",
+  "DAQmxCreateAIRTDChan",
+  "DAQmxSetAITermCfg",
+  "DAQmxCfgSampClkTiming",
+  "DAQmxCfgInputBuffer",
+  "DAQmxSetReadOverWrite",
+  "DAQmxGetReadAvailSampPerChan",
+  "DAQmxGetSampClkRate",
+  "DAQmxSetSampTimingType",
+  "DAQmxGetSampTimingType"
+ ],
+ "positive_timeout_word": {
+  "name": "positive_read_timeout_control",
+  "exact_rational_seconds": "1/8",
+  "decimal_seconds": "0.125",
+  "bits_hex": "3fc0000000000000",
+  "ieee754_le_hex": "000000000000c03f",
+  "rule": "An exactly representable independent positive timeout control. Actual Read receives positive original remaining duration, never this constant as a renewed budget."
+ },
+ "one_scan_status_geometry_controls": [
+  {
+   "status": 0,
+   "actual_per_channel": 0,
+   "result": "Incomplete; no data block"
+  },
+  {
+   "status": 12345,
+   "actual_per_channel": 0,
+   "result": "Incomplete; preserve raw warning and geometry; no data block"
+  },
+  {
+   "status": -200284,
+   "actual_per_channel": 0,
+   "result": "original negative error; no data block"
+  },
+  {
+   "status": 0,
+   "actual_per_channel": -1,
+   "result": "Incomplete; no data block; do not inspect unqualified words"
+  },
+  {
+   "status": 0,
+   "actual_per_channel": 2,
+   "result": "Incomplete; no data block; do not inspect unqualified words"
+  },
+  {
+   "status": -200284,
+   "actual_per_channel": 1,
+   "result": "one complete scan/word and raw status retained before original error/deferred diagnostics"
+  },
+  {
+   "status": 12345,
+   "actual_per_channel": 1,
+   "result": "one complete scan/word plus raw warning; no extra native read from Finish"
+  }
+ ],
+ "software_attempt_frontier_control": {
+  "unit": "host_monotonic_ns",
+  "poll_interval_ns": 10000000,
+  "ready_observed_ns": 1000000000,
+  "ready_advances_frontier": false,
+  "original_deadline_ns": 1500000000,
+  "cutoff_ns": 1600000000,
+  "trace": [
+   {
+    "attempt_start_ns": 1010000000,
+    "next_not_before_ns": 1020000000,
+    "read_observed_ns": 1011000000,
+    "native_read_count_delta": 1
+   },
+   {
+    "attempt_start_ns": null,
+    "request_observed_ns": 1015000000,
+    "next_not_before_ns": 1020000000,
+    "native_read_count_delta": 0
+   },
+   {
+    "attempt_start_ns": 1022000000,
+    "next_not_before_ns": 1032000000,
+    "read_observed_ns": 1037000000,
+    "native_read_count_delta": 1
+   },
+   {
+    "attempt_start_ns": 1038000000,
+    "next_not_before_ns": 1048000000,
+    "read_observed_ns": 1039000000,
+    "native_read_count_delta": 1
+   }
+  ],
+  "semantics": "Each actual attempt owns one pre-FFI host start+interval frontier; early idle repeats frontier without SDK. Slow completion neither adds completion+interval nor triggers catchup bursts. No exact physical C-entry gap, fresh conversion, hardware sampling rate or RT guarantee."
+ },
+ "clock_and_retention_contract": {
+  "completion": "Host monotonic sampled immediately after selected Read returns, before optional diagnostics/encoding/IPC. Preserve original clock for accepted data and exports. No device source_time.",
+  "deadline": "One original operation deadline and cutoff across setup/probes/read/publication. No native calls while early-idle; no Read in Finish; no retry/fallback/reconnect after terminal failure.",
+  "diagnostics": "Publish valid returned data/raw read status first. Deferred optional negative diagnostics precede other NI cleanup calls at Finish; diagnostic hang cannot erase received data or replace first code. Owned Stop/Clear only and cleanup uncertainty explicit."
+ },
+ "legacy_preservation": "All seven prior JSON byte hashes, all five C manual arrays (voltage, thermocouple, current, RTD, mixed eight-word), existing AI homogeneous/mixed rows and both timing modes remain unchanged.",
+ "qualification": "Synthetic ABI/host lifecycle only. No physical NI USB/C-Series/chassis/OS/driver acceptance, routing/electrical/width readback beyond stated getter, simultaneity, missed-transition or real-time guarantee.",
+ "profile": "one fresh owned counter INPUT per task; explicit on_demand only; edge-count U32 or frequency F64, never both in one task",
+ "public_boundary": {
+  "private_protocol": 7,
+  "channels": "exactly ONE typed individual Device/ctrN object; no ranges/lists/MAX alias",
+  "count": {
+   "measurement": "counter_count",
+   "event": "counter_count_block",
+   "representation": "driver_unscaled_u32_counter_count",
+   "word_keys": [
+    "count",
+    "u32_le_hex"
+   ],
+   "word_bytes": 4
+  },
+  "frequency": {
+   "measurement": "counter_frequency",
+   "event": "counter_frequency_block",
+   "representation": "driver_scaled_f64_counter_frequency",
+   "finite_word_keys": [
+    "frequency_hz",
+    "ieee754_le_hex"
+   ],
+   "word_bytes": 8
+  }
+ },
+ "fixed_abis": [
+  {
+   "name": "DAQmxCreateCICountEdgesChan",
+   "returns": "i32",
+   "slot_count": 6,
+   "arguments": [
+    "TaskHandle",
+    "const char* physical_counter",
+    "const char* virtual_name",
+    "i32 edge",
+    "u32 initial_count",
+    "i32 direction"
+   ]
+  },
+  {
+   "name": "DAQmxCreateCIFreqChan",
+   "returns": "i32",
+   "slot_count": 11,
+   "arguments": [
+    "TaskHandle",
+    "const char* physical_counter",
+    "const char* virtual_name",
+    "f64 min_hz",
+    "f64 max_hz",
+    "i32 units",
+    "i32 edge",
+    "i32 method",
+    "f64 measurement_time_seconds",
+    "u32 divisor",
+    "const char* custom_scale"
+   ]
+  },
+  {
+   "name": "DAQmxReadCounterU32",
+   "returns": "i32",
+   "slot_count": 7,
+   "arguments": [
+    "TaskHandle",
+    "i32 requested_per_channel",
+    "f64 timeout_seconds",
+    "u32* zeroed_output",
+    "u32 capacity_in_U32_elements",
+    "i32* actual_per_channel",
+    "u32* reserved"
+   ]
+  },
+  {
+   "name": "DAQmxReadCounterF64",
+   "returns": "i32",
+   "slot_count": 7,
+   "arguments": [
+    "TaskHandle",
+    "i32 requested_per_channel",
+    "f64 timeout_seconds",
+    "f64* zeroed_output",
+    "u32 capacity_in_F64_elements",
+    "i32* actual_per_channel",
+    "u32* reserved"
+   ]
+  },
+  {
+   "name": "DAQmxSetCICountEdgesTerm",
+   "returns": "i32",
+   "slot_count": 3,
+   "arguments": [
+    "TaskHandle",
+    "const char* exact_requested_physical_counter",
+    "const char* exact_requested_terminal"
+   ]
+  },
+  {
+   "name": "DAQmxSetCIFreqTerm",
+   "returns": "i32",
+   "slot_count": 3,
+   "arguments": [
+    "TaskHandle",
+    "const char* exact_requested_physical_counter",
+    "const char* exact_requested_terminal"
+   ]
+  }
+ ],
+ "critical_abi_distinction": "Both selected counter array reads have seven slots and NO fillMode. Ex and scalar exports are different/unselected. Do not shift the output pointer by inserting DI/AI fill mode.",
+ "constants": {
+  "rising": 10280,
+  "falling": 10171,
+  "up": 10128,
+  "down": 10124,
+  "Hz": 10373,
+  "low_frequency_one_counter": 10105,
+  "high_frequency_two_counter": 10157,
+  "large_range_two_counter": 10205,
+  "dynamic_averaging": 16065
+ },
+ "primary_sources": [
+  {
+   "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__channel__configuration__creation__create__counter__input__channels_1ga898d4d3101b616a681bc31199ae37d5f.html",
+   "bytes": 17363,
+   "sha256": "88136d45f8dba94d1d1c7a78325f8806204d1cacd81b7520bde8717e18d83cca",
+   "prototype": "int32 __CFUNC DAQmxCreateCICountEdgesChan(TaskHandle taskHandle, const char counter[], const char nameToAssignToChannel[], int32 edge, uInt32 initialCount, int32 countDirection)"
+  },
+  {
+   "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__channel__configuration__creation__create__counter__input__channels_1gad7f76a3c13cd1acceb5015cbb57c5743.html",
+   "bytes": 25119,
+   "sha256": "21f91e105c12056b69df08b68759e0bb92cd3812b91e939333f436e0c640e7ad",
+   "prototype": "int32 __CFUNC DAQmxCreateCIFreqChan(TaskHandle taskHandle, const char counter[], const char nameToAssignToChannel[], float64 minVal, float64 maxVal, int32 units, int32 edge, int32 measMethod, float64 measTime, uInt32 divisor, const char customScaleName[])",
+   "scale_rule": "customScaleName [in] const char[] The name of a custom scale to apply to the channel. To use this parameter, you must set units to DAQmx_Val_FromCustomScale . If you do not set units to DAQmx_Val_FromCustomScale , you must set customScaleName to NULL. Returns The error code returned by the function in the event of an error or warning. A value of 0 indicates success. A positive value indicates a warning. A negative value indicates an error. Parent topic: Cr"
+  },
+  {
+   "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__read__functions_1ga769ef90d653190fdf86c3ed24a97ce5c.html",
+   "bytes": 11848,
+   "sha256": "a9f29b5107b328cfe7327dc468efa3d1d6d5404761cda29669aa27c4b2002b06",
+   "prototype": "int32 __CFUNC DAQmxReadCounterU32(TaskHandle taskHandle, int32 numSampsPerChan, float64 timeout, uInt32 readArray[], uInt32 arraySizeInSamps, int32 *sampsPerChanRead, bool32 *reserved)"
+  },
+  {
+   "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__read__functions_1gaf2ab9ad7ec64ab0f3d1158814ea358c2.html",
+   "bytes": 11889,
+   "sha256": "5fccfb37232696827720d793516d651ab2672c0f11f294db0bdd8260fca64afd",
+   "prototype": "int32 __CFUNC DAQmxReadCounterF64(TaskHandle taskHandle, int32 numSampsPerChan, float64 timeout, float64 readArray[], uInt32 arraySizeInSamps, int32 *sampsPerChanRead, bool32 *reserved)"
+  },
+  {
+   "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__read__functions__advanced_1ga323a4f09ce420b14d37b68c9a9ded308.html",
+   "bytes": 9919,
+   "sha256": "81e809582f18d418f5c61f600d56af534b879cf4f941cab5ca65e7687096b54d",
+   "prototype": "int32 __CFUNC DAQmxGetNthTaskReadChannel(TaskHandle taskHandle, uInt32 index, char buffer[], int32 bufferSize)"
+  },
+  {
+   "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__property__manipulation__setter_1gacb253cbd06d6ad90c0b85ac765ace3ab.html",
+   "bytes": 6255,
+   "sha256": "c8c38d1c62702f90915e91d02ef8c59b34cbb73bd67809b8390f9514afc95004"
+  },
+  {
+   "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__property__manipulation__setter_1ga28314d1aae3b69ca35650bd7022c6a40.html",
+   "bytes": 6189,
+   "sha256": "46416760e155de83fc4826f7858896c599c35f49bacc476f53948677c264bc67"
+  },
+  {
+   "url": "https://raw.githubusercontent.com/ni/nidaqmx-python/1d60b6c53ef11dead0ba6aa9d6e2855351835ad7/generated/nidaqmx/constants.py",
+   "bytes": 50365,
+   "sha256": "9d15eb38ccb03769f9e5ad94289a00658ee36b6685709e4f3d49dafb25b4ae57"
+  }
+ ],
+ "manual_argument_words": [
+  {
+   "name": "frequency_min_hz",
+   "exact_rational": "1/8",
+   "bits_hex": "3fc0000000000000",
+   "ieee754_le_hex": "000000000000c03f"
+  },
+  {
+   "name": "frequency_max_hz",
+   "exact_rational": "8192",
+   "bits_hex": "40c0000000000000",
+   "ieee754_le_hex": "000000000000c040"
+  },
+  {
+   "name": "frequency_measurement_time_seconds",
+   "exact_rational": "1/16",
+   "bits_hex": "3fb0000000000000",
+   "ieee754_le_hex": "000000000000b03f"
+  }
+ ],
+ "count_constructor_controls": [
+  {
+   "physical": "CountSuccess/ctr7",
+   "virtual_name": "",
+   "edge": "falling",
+   "edge_code": 10171,
+   "initial_count": 2147483649,
+   "initial_u32_hex": "80000001",
+   "initial_u32_le_hex": "01000080",
+   "direction": "down",
+   "direction_code": 10124,
+   "input_terminal_omitted": true
+  },
+  {
+   "physical": "CountUp/ctr2",
+   "virtual_name": "",
+   "edge": "rising",
+   "edge_code": 10280,
+   "initial_count": 17,
+   "initial_u32_hex": "00000011",
+   "initial_u32_le_hex": "11000000",
+   "direction": "up",
+   "direction_code": 10128,
+   "input_terminal": "/CountUp/PFI3"
+  }
+ ],
+ "frequency_constructor_control": {
+  "physical": "FrequencySuccess/ctr3",
+  "virtual_name": "",
+  "min_word": "frequency_min_hz",
+  "max_word": "frequency_max_hz",
+  "units": "Hz",
+  "units_code": 10373,
+  "edge": "falling",
+  "edge_code": 10171,
+  "method": "large_range_two_counter",
+  "method_code": 10205,
+  "measurement_time_word": "frequency_measurement_time_seconds",
+  "divisor": 7,
+  "custom_scale": "NULL",
+  "input_terminal_omitted": true
+ },
+ "frequency_method_controls": [
+  {
+   "method": "low_frequency_one_counter",
+   "code": 10105
+  },
+  {
+   "method": "high_frequency_two_counter",
+   "code": 10157
+  },
+  {
+   "method": "large_range_two_counter",
+   "code": 10205
+  },
+  {
+   "method": "dynamic_averaging",
+   "code": 16065
+  }
+ ],
+ "frequency_method_boundary": "All four generic method codes/constructor slot values are explicit requests; no universal model acceptance, ignored-slot guarantee, local divisor scaling or coerced/read-back window is claimed. Low/two-counter/dynamic methods can reserve differing resources. Native rejection remains original; no fallback.",
+ "input_terminal_controls": {
+  "omitted": {
+   "calls": [],
+   "provenance": "driver_default_unqueried",
+   "no_inferred_terminal_value": true
+  },
+  "count_explicit": {
+   "setter": "DAQmxSetCICountEdgesTerm",
+   "channel": "CountUp/ctr2",
+   "data": "/CountUp/PFI3",
+   "before_start": true,
+   "provenance": "requested_not_read_back"
+  },
+  "frequency_explicit": {
+   "setter": "DAQmxSetCIFreqTerm",
+   "channel": "FrequencyExplicit/ctr3",
+   "data": "/FrequencyExplicit/PFI11",
+   "before_start": true,
+   "provenance": "requested_not_read_back"
+  },
+  "rules": [
+   "Resolve only matching setter before CreateTask when terminal is supplied.",
+   "Exact requested physical bytes are the setter channel argument, matching constructor empty-virtual association; normalized queried actual name is independently checked.",
+   "Explicit null is rejected; omission does not call either getter/setter.",
+   "Native setter failure is terminal with owned cleanup, no retry/default or output route.",
+   "No getter buffer sizing-probe semantics are assumed."
+  ]
+ },
+ "identity_rules": {
+  "task_channels": 1,
+  "virtual_name": "",
+  "nth_index_base": 1,
+  "actual_identity": "normalized same device/ctrN as requested individual counter, no AI parser or automatic pin derivation",
+  "setup_faults": [
+   "count0 or2",
+   "different device/counter Nth name",
+   "negative matching explicit terminal setter status"
+  ]
+ },
+ "read_controls": {
+  "count": {
+   "selected_export": "DAQmxReadCounterU32",
+   "requested_per_channel": 1,
+   "actual_channels": 1,
+   "capacity_elements": 1,
+   "allocation_bytes": 4,
+   "zero_initial_bytes_hex": "00000000",
+   "reserved": "NULL",
+   "fill_mode_argument_present": false
+  },
+  "frequency": {
+   "selected_export": "DAQmxReadCounterF64",
+   "requested_per_channel": 1,
+   "actual_channels": 1,
+   "capacity_elements": 1,
+   "allocation_bytes": 8,
+   "zero_initial_bytes_hex": "0000000000000000",
+   "reserved": "NULL",
+   "fill_mode_argument_present": false
+  }
+ },
+ "manual_count_snapshots": [
+  {
+   "sample_index": 0,
+   "count": 0,
+   "u32_hex": "00000000",
+   "u32_le_hex": "00000000"
+  },
+  {
+   "sample_index": 1,
+   "count": 2147483648,
+   "u32_hex": "80000000",
+   "u32_le_hex": "00000080"
+  },
+  {
+   "sample_index": 2,
+   "count": 4294967294,
+   "u32_hex": "fffffffe",
+   "u32_le_hex": "feffffff"
+  },
+  {
+   "sample_index": 3,
+   "count": 4294967295,
+   "u32_hex": "ffffffff",
+   "u32_le_hex": "ffffffff"
+  },
+  {
+   "sample_index": 4,
+   "count": 0,
+   "u32_hex": "00000000",
+   "u32_le_hex": "00000000"
+  },
+  {
+   "sample_index": 5,
+   "count": 1,
+   "u32_hex": "00000001",
+   "u32_le_hex": "01000000"
+  },
+  {
+   "sample_index": 6,
+   "count": 1,
+   "u32_hex": "00000001",
+   "u32_le_hex": "01000000"
+  },
+  {
+   "sample_index": 7,
+   "count": 4294967295,
+   "u32_hex": "ffffffff",
+   "u32_le_hex": "ffffffff"
+  }
+ ],
+ "count_raw_extent_control": {
+  "word_count": 8,
+  "bytes": 32,
+  "all_words_le_hex": "0000000000000080feffffffffffffff000000000100000001000000ffffffff",
+  "negative_valid_first_word_le_hex": "00000000",
+  "negative_valid_first_word_bytes": 4,
+  "rule": "A zero-valued received word is a valid sample when actual count1, including negative native status; distinct from actual0. Wrap-like decreases and repeated words remain exact snapshots, no unwrap/delta/reset/rollover inference. Synthetic sequence does not claim physical edge timing or hardware width."
+ },
+ "manual_frequency_patterns": [
+  {
+   "sample_index": 0,
+   "bits_hex": "4039000000000000",
+   "ieee754_le_hex": "0000000000003940",
+   "classification": "finite",
+   "sign_bit": 0,
+   "exact_rational": "25",
+   "finite_decimal": "25.0"
+  },
+  {
+   "sample_index": 1,
+   "bits_hex": "3f90000000000000",
+   "ieee754_le_hex": "000000000000903f",
+   "classification": "finite",
+   "sign_bit": 0,
+   "exact_rational": "1/64",
+   "finite_decimal": "0.015625"
+  },
+  {
+   "sample_index": 2,
+   "bits_hex": "0000000000000000",
+   "ieee754_le_hex": "0000000000000000",
+   "classification": "zero",
+   "sign_bit": 0,
+   "exact_rational": "0",
+   "finite_decimal": "0.0"
+  },
+  {
+   "sample_index": 3,
+   "bits_hex": "8000000000000000",
+   "ieee754_le_hex": "0000000000000080",
+   "classification": "zero",
+   "sign_bit": 1,
+   "exact_rational": "0",
+   "finite_decimal": "-0.0"
+  },
+  {
+   "sample_index": 4,
+   "bits_hex": "7ff80000000000a5",
+   "ieee754_le_hex": "a50000000000f87f",
+   "classification": "nan",
+   "sign_bit": 0,
+   "nan_fraction_hex": "80000000000a5"
+  },
+  {
+   "sample_index": 5,
+   "bits_hex": "7ff0000000000000",
+   "ieee754_le_hex": "000000000000f07f",
+   "classification": "infinity",
+   "sign_bit": 0
+  },
+  {
+   "sample_index": 6,
+   "bits_hex": "fff0000000000000",
+   "ieee754_le_hex": "000000000000f0ff",
+   "classification": "infinity",
+   "sign_bit": 1
+  },
+  {
+   "sample_index": 7,
+   "bits_hex": "c004000000000000",
+   "ieee754_le_hex": "00000000000004c0",
+   "classification": "finite",
+   "sign_bit": 1,
+   "exact_rational": "-5/2",
+   "finite_decimal": "-2.5"
+  }
+ ],
+ "frequency_raw_extent_control": {
+  "word_count": 8,
+  "bytes": 64,
+  "all_words_le_hex": "0000000000003940000000000000903f00000000000000000000000000000080a50000000000f87f000000000000f07f000000000000f0ff00000000000004c0",
+  "negative_valid_first_word_le_hex": "0000000000003940",
+  "negative_valid_first_word_bytes": 8,
+  "rule": "Preserve original F64 bits and finite numeric Hz without clipping/conversion. Nonfinite numeric key omitted; NaN payload and signed zero retained. Out-of-request-range synthetic words do not claim physical negative frequency or hardware behavior."
+ },
+ "selected_exports": {
+  "count_no_terminal": [
+   "DAQmxCreateTask",
+   "DAQmxGetTaskNumChans",
+   "DAQmxGetNthTaskReadChannel",
+   "DAQmxStartTask",
+   "DAQmxStopTask",
+   "DAQmxClearTask",
+   "DAQmxGetErrorString",
+   "DAQmxGetExtendedErrorInfo",
+   "DAQmxCreateCICountEdgesChan",
+   "DAQmxReadCounterU32"
+  ],
+  "frequency_no_terminal": [
+   "DAQmxCreateTask",
+   "DAQmxGetTaskNumChans",
+   "DAQmxGetNthTaskReadChannel",
+   "DAQmxStartTask",
+   "DAQmxStopTask",
+   "DAQmxClearTask",
+   "DAQmxGetErrorString",
+   "DAQmxGetExtendedErrorInfo",
+   "DAQmxCreateCIFreqChan",
+   "DAQmxReadCounterF64"
+  ],
+  "optional_count_only": [
+   "DAQmxSetCICountEdgesTerm"
+  ],
+  "optional_frequency_only": [
+   "DAQmxSetCIFreqTerm"
+  ]
+ },
+ "also_absent_unneeded": [
+  "DAQmxCreateDIChan",
+  "DAQmxReadDigitalU32",
+  "DAQmxReadDigitalLines",
+  "DAQmxGetDINumLines",
+  "DAQmxReadCounterU32Ex",
+  "DAQmxReadCounterF64Ex",
+  "DAQmxReadCounterScalarU32",
+  "DAQmxReadCounterScalarF64",
+  "DAQmxGetCICountEdgesTerm",
+  "DAQmxGetCIFreqTerm"
+ ],
+ "semantic_rules": [
+  "No signed cast, accumulation, count difference, unwrap, inferred wrap count, local frequency or reset after decrease.",
+  "Hz numeric value comes only from driver-scaled F64, not host elapsed/count/divisor calculations.",
+  "Only exact one-counter task; no implicit multi-counter task support or shared AI/DI/CI task.",
+  "Input may configure/reserve hardware including paired counters/routes; no CO/write/output clock/export/reset/takeover and no passive-monitor promise."
+ ]
+}

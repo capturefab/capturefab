@@ -1,0 +1,1112 @@
+{
+  "version": 1,
+  "freeze": "2026-11-12 independent pre-native/C scientific literals; no product encoder/decoder/runtime",
+  "accepted_contract_sha256": "4e0d39dddfd149e8c26dfb204c73d1f67eafbb3b6440a8a8b2760dc9fc75141e",
+  "baseline_source": {
+    "sha256": "36339595ab0433fc62f119e444f715ab01a4946aaeb696805e9f26d27a349ed4",
+    "paths": 882
+  },
+  "immutable_prior_ni_oracles": {
+    "abi.json": {
+      "bytes": 9023,
+      "sha256": "1bbc016312c3aab6093483cfa3aeee442e6bc3aaeb74eaa8113641a090329b6b"
+    },
+    "counter-input.json": {
+      "bytes": 21579,
+      "sha256": "a056640e872e599b54413e18e7824ac114a6fe99b248693838b09b7a51a44d93"
+    },
+    "counter-time-position.json": {
+      "bytes": 24938,
+      "sha256": "1a3e1be6f66ff03ea3f41c776ca057339d5cc1ce3c985e38d935b13a8c21e63d"
+    },
+    "current.json": {
+      "bytes": 11773,
+      "sha256": "14f428f82a6cf94704ac47ff2b42d18bf71553435437ae4f0345bf4260779bff"
+    },
+    "digital-port.json": {
+      "bytes": 13567,
+      "sha256": "78475d5d3a4dc0e02405b57887dfd9f3bfd3e7659b31613edde6aea674af9434"
+    },
+    "engineering-ai.json": {
+      "bytes": 30993,
+      "sha256": "889cba7a8fef9408df7dba6af195dda402df094387d39ee14a54f4eaa44797fb"
+    },
+    "mixed-ai.json": {
+      "bytes": 17722,
+      "sha256": "d4a74d1e2310b8f16648e296ab95ebffe175559fbe326655ac98dae6d31a9d78"
+    },
+    "on-demand.json": {
+      "bytes": 17474,
+      "sha256": "b87122de19d2bdb77f16c0511d1759925b84697ad59e97375197d1b54e81fe89"
+    },
+    "physical-bridge.json": {
+      "bytes": 31633,
+      "sha256": "ddea433df60cc8a0b13a1dfa252a47a059f18fb47995ec4829ab97116abd9f55"
+    },
+    "resistive-ai.json": {
+      "bytes": 31747,
+      "sha256": "1b53d4de698afc6cadeb64f1b801adf24284b4eb32bb039958b31c509bb4c240"
+    },
+    "rtd.json": {
+      "bytes": 18165,
+      "sha256": "5f83a52d2ce10c71d6e1f7498bb6bd020828365a734fbe235cb7bbcadd2cb6a5"
+    },
+    "thermocouple.json": {
+      "bytes": 11979,
+      "sha256": "2a8109877c63aa7448965c0d0ac9ec060355d8dde41e98496b4ff8050ac65cb1"
+    },
+    "voltage-scale-null.json": {
+      "bytes": 2411,
+      "sha256": "5764fe41ecab45d8b5795d15dc82f723c566d5ba0af565048224337ed321ba63"
+    }
+  },
+  "immutable_usbtmc_oracles": {
+    "ipc.json": {
+      "bytes": 12874,
+      "sha256": "5d5db67140ac12ed6a67fe4a7123486beb34ebd4472fe1e68911c6ef2e79db6b"
+    },
+    "selector-control.json": {
+      "bytes": 9547,
+      "sha256": "0a1ec921926d3e91e29e6318afc54c83cc736784bdfa2e65667c87e562eb1540"
+    },
+    "wire.json": {
+      "bytes": 14360,
+      "sha256": "cde5c5b5078f29c2669077833a81f7bd7497781905fb770cadbf97c160c4eba3"
+    }
+  },
+  "immutable_fourteen_c_word_arrays_text_sha256": {
+    "words": "d33dae464ecceaadc4899b09d31bf09af0546a822db79612680d2132caaa4d92",
+    "tc_words": "d42057e167b20a607f173cd2902ca57185b7633ea67f3894364e4d0757014496",
+    "current_words": "83d49b770ec0813b9f2a11b36e30e92303b4e8c3109f801e487465a9a8f464c2",
+    "rtd_words": "a0621fdea511efa372a8a5675070b773700cfd6f6b3325ebf1eada76ecc9a966",
+    "mixed_words": "67d1533c2be4a430a11f19b6cc9fd3cadcc4dd56db14b9d1f03cd7fdb49aed99",
+    "resistive_words": "f682c3692c83a57ee228a62683bdb0ab47d8ddaa1ca65373f129b26f4baf9dc3",
+    "physical_bridge_words": "2ac1b5c9e855003be79383de69816ec7663ab3400db300d6482f8a2a7c2b8097",
+    "resistive_mixed_words": "a604912a19b4fbca2f8f83ae26aacb3effe1212bfc38d5ec28c6d84eb6ecfa7d",
+    "engineering_words": "99c57d35c6d5dbb611e3271058b1164a505348f97bfe1268dafd899c8a621d36",
+    "engineering_mixed_words": "2993a8e268c34fc9fb21983ae37213bac9f23e573d81326185f72f60ba954602",
+    "engineering_counter_words": "41ade0ec88361c9cb8f5c75b253cba165dbdd9f10e3a3e40b94d390521e16d79",
+    "digital_words": "be6f5d896eabb2a6a053cde8f4dcc05f03d10d8d2ad81c49a8a48f6b7f5d5489",
+    "count_words": "89f06a5474da075b2dc5c0fc0ebeaf88c03aa1ecab3543e0b2f6355c84bb72f3",
+    "frequency_words": "8d8263d3c909d65d9d0ea5080d7b2d911664b3cc5b175eb39f0190ddf7df690d"
+  },
+  "private_protocol": 10,
+  "abi_policy": {
+    "calling_convention": "NI __CFUNC/system",
+    "TaskHandle": "pointer-sized opaque owned identity",
+    "integer_enums": "signed i32; preserve default -1",
+    "physical": "exact requested individual AI string",
+    "virtual_name": "non-NULL empty string",
+    "ordinary_custom_scale": "NULL, never non-NULL empty or named",
+    "no_new_terminal_setter": true
+  },
+  "common_exports": {
+    "always": [
+      "DAQmxCreateTask",
+      "DAQmxGetTaskNumChans",
+      "DAQmxGetNthTaskReadChannel",
+      "DAQmxStartTask",
+      "DAQmxStopTask",
+      "DAQmxClearTask",
+      "DAQmxGetErrorString",
+      "DAQmxGetExtendedErrorInfo"
+    ],
+    "selected_read": "DAQmxReadAnalogF64",
+    "continuous_only": [
+      "DAQmxCfgSampClkTiming",
+      "DAQmxCfgInputBuffer",
+      "DAQmxSetReadOverWrite",
+      "DAQmxGetReadAvailSampPerChan",
+      "DAQmxGetSampClkRate"
+    ],
+    "on_demand_must_not_require_or_call": [
+      "DAQmxCfgSampClkTiming",
+      "DAQmxCfgInputBuffer",
+      "DAQmxSetReadOverWrite",
+      "DAQmxGetReadAvailSampPerChan",
+      "DAQmxGetSampClkRate"
+    ]
+  },
+  "read_abi": {
+    "name": "DAQmxReadAnalogF64",
+    "slot_count": 8,
+    "arguments": [
+      "H",
+      "i32 requested_per_channel",
+      "f64 original_remaining_timeout",
+      "u32 fill_mode=1",
+      "f64* zeroed_output",
+      "u32 capacity_f64=requested*actual_channels",
+      "i32* actual_per_channel",
+      "u32* (bool32*) reserved=NULL"
+    ],
+    "continuous_request": "positive bounded available and configured cap",
+    "on_demand_request": 1,
+    "allocation_max_f64": 4096,
+    "order": "scan-major/interleaved; actual count and complete initialized extent qualified"
+  },
+  "coupling_abi": {
+    "name": "DAQmxSetAICoupling",
+    "slot_count": 3,
+    "arguments": [
+      "H",
+      "const char* requested_physical",
+      "i32 coupling"
+    ],
+    "order": "only explicit; after its own constructor and before Start; resolve before CreateTask"
+  },
+  "scientific_rules": [
+    "native driver-scaled F64 bytes are authoritative, including signed zero/subnormal/NaN payload",
+    "no host sensitivity division/integration/differentiation/unit conversion/clipping/calibration",
+    "same native words remain identical under differing output/sensitivity units",
+    "request units and sensitivity units are independent",
+    "no sensor source_time or fresh/simultaneous physical conversion inference",
+    "all finite new sensitivity values including negative and signed zero are software-admitted; native rejection remains original",
+    "old acceleration positive sensitivity rule is unchanged",
+    "I/E excitation amounts finite positive; None finite nonnegative including signed zero; mandatory unchanged amount",
+    "AC Hz finite positive for every source including None; no zero/default or ignored-slot inference",
+    "None/Stop/Clear do not prove physical power-off; ordinary excitation can energize/persist"
+  ],
+  "admission": {
+    "required": "closed typed channels, exact fields under accepted contract; no duplicate/unknown/null/missing before library/task",
+    "range": "finite min<max; no additional universal sign bound",
+    "sensitivity": "every finite IEEE value for only these five",
+    "amount": "I/E >0; None >=0 preserving -0 bits",
+    "ac_frequency": "all sources >0",
+    "reject": [
+      "nonfinite request fields",
+      "equal/reversed ranges",
+      "null coupling, or missing/null required terminal/scientific field; omitted coupling is allowed",
+      "extra excitation on charge",
+      "extra terminal on LVDT/RVDT",
+      "I/E zero or negative amount",
+      "None negative amount",
+      "AC zero/-0/negative/nonfinite Hz"
+    ]
+  },
+  "status_controls": {
+    "negative_valid_prefix": {
+      "status": -200284,
+      "actual_per_channel": 1,
+      "rule": "publish exact complete one-scan prefix and original native status before deferred lookup"
+    },
+    "warning": {
+      "status": 12345,
+      "rule": "raw positive status retained, no data conversion"
+    },
+    "invalid_geometry": [
+      "success or warning actual0 in on_demand => Incomplete with raw status/count",
+      "actual<0 or actual>requested => Incomplete; no unqualified bytes"
+    ],
+    "later_constructor": {
+      "status": -990104,
+      "rule": "first original error, qualified owned cleanup only, no Start/Read"
+    },
+    "deferred_hang": "valid prefix and original native code precede optional diagnostic; bounded separate Finish; no native Read in Finish"
+  },
+  "lifecycle": [
+    "resolve eight common + selected AnalogF64/constructor union + only explicit coupling/needed old TC setter before CreateTask",
+    "configured constructor order; optional coupling after own constructor before Start",
+    "continuous: constructors then clock/buffer/overwrite then exact count/Nth then Start/rate",
+    "on_demand: constructors then exact count/Nth then Start; no clock/buffer/overwrite/availability/rate exports",
+    "reject actual count/name/order mismatch before allocating/reading",
+    "worker host pre-FFI attempt frontier and original D/cutoff; no metadata/poll-based renewal or hard realtime SDK-entry promise",
+    "scoped owned cleanup/first cause preserved, no reset/retry/output task"
+  ],
+  "metadata": {
+    "homogeneous": "measurement + requested_not_read_back; ordered channel_measurements with channel_index, actual physical, requested units/science; no per-item measurement/quantity",
+    "terminal": "first three request+provenance; default driver_default_unqueried, others explicit_request_not_read_back; no LVDT/RVDT terminal",
+    "coupling": "omitted driver_default_unqueried with no request; explicit request + explicit_request_not_read_back",
+    "mixed": "measurement:mixed; column measurement/quantity/units once; finite key follows column; no per-word tags/global units"
+  },
+  "selection_width": {
+    "existing_flags": 29,
+    "new_flags": 5,
+    "total_flags": 34,
+    "highest_index": 33,
+    "storage": "u64, never truncate to u32",
+    "all_five_mask_hex": "00000003e0000000",
+    "bit32_hex": "0000000100000000",
+    "bit33_hex": "0000000200000000",
+    "tests": "selected missing constructors at indices32/33 fail before CreateTask; unused absent constructors/setter must not block other profiles",
+    "new_profile_bit_indices": {
+      "velocity_iepe": 29,
+      "force_iepe": 30,
+      "charge_acceleration": 31,
+      "lvdt": 32,
+      "rvdt": 33
+    }
+  },
+  "qualification": "fixed generic API and synthetic request/data contract only; no device/sensor/module/driver/OS qualification, delivered excitation/scale/readback/calibration/power-off/freshness proof",
+  "constants_primary": {
+    "url": "https://raw.githubusercontent.com/ni/nidaqmx-python/1d60b6c53ef11dead0ba6aa9d6e2855351835ad7/generated/nidaqmx/constants.py",
+    "bytes": 50365,
+    "sha256": "9d15eb38ccb03769f9e5ad94289a00658ee36b6685709e4f3d49dafb25b4ae57"
+  },
+  "constants": {
+    "terminal": {
+      "default": -1,
+      "rse": 10083,
+      "nrse": 10078,
+      "differential": 10106,
+      "pseudodifferential": 12529
+    },
+    "coupling": {
+      "ac": 10045,
+      "dc": 10050,
+      "ground": 10066
+    },
+    "source": {
+      "internal": 10200,
+      "external": 10167,
+      "none": 10230
+    },
+    "ac_wire_mode": {
+      "four_wire": 4,
+      "five_wire": 5,
+      "six_wire": 6
+    },
+    "velocity_units": {
+      "m_s": 15959,
+      "in_s": 15960
+    },
+    "velocity_sensitivity_units": {
+      "mv_per_mm_s": 15963,
+      "mv_per_in_s": 15964
+    },
+    "force_units": {
+      "newtons": 15875,
+      "pounds": 15876,
+      "kilogram_force": 15877
+    },
+    "force_sensitivity_units": {
+      "mv_per_newton": 15891,
+      "mv_per_pound": 15892
+    },
+    "acceleration_units": {
+      "g": 10186,
+      "m_s2": 12470,
+      "in_s2": 12471
+    },
+    "charge_sensitivity_units": {
+      "pc_per_g": 16099,
+      "pc_per_m_s2": 16100,
+      "pc_per_in_s2": 16101
+    },
+    "linear_units": {
+      "meters": 10219,
+      "inches": 10379
+    },
+    "lvdt_sensitivity_units": {
+      "mv_per_v_per_mm": 12506,
+      "mv_per_v_per_milli_inch": 12505
+    },
+    "angular_units": {
+      "degrees": 10146,
+      "radians": 10273
+    },
+    "rvdt_sensitivity_units": {
+      "mv_per_v_per_degree": 12507,
+      "mv_per_v_per_radian": 12508
+    }
+  },
+  "profiles": [
+    "velocity_iepe",
+    "force_iepe",
+    "charge_acceleration"
+  ],
+  "primary_sources": {
+    "velocity_iepe": {
+      "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__channel__configuration__creation__create__analog__input__channels_1ga0256a5337cbe48c93b7450f39f27386e.html",
+      "bytes": 28564,
+      "sha256": "c88b249cb44d35e888a8ce5d6abcacb5fa18cb075e25136725cc8444522c94b8"
+    },
+    "force_iepe": {
+      "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__channel__configuration__creation__create__analog__input__channels_1gaa6ff3418553a70767e450e29bc380256.html",
+      "bytes": 28489,
+      "sha256": "10123eae713dea05220d064c7ff52dfdd81b3c88fac6b3072eebab3d4b0aadb9"
+    },
+    "charge_acceleration": {
+      "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__channel__configuration__creation__create__analog__input__channels_1ga5d74e4c3c40c2aaef12c5dab3d8f8277.html",
+      "bytes": 25492,
+      "sha256": "65cb573d6b75cf8a7065f0bcc1f93fc0c2a3de9484b3491ee831cbbee133c38f"
+    }
+  },
+  "fixed_abis": [
+    {
+      "name": "DAQmxCreateAIVelocityIEPEChan",
+      "calling_convention": "NI __CFUNC/system",
+      "returns": "signed i32",
+      "slot_count": 12,
+      "arguments": [
+        {
+          "role": "H",
+          "type": "TaskHandle"
+        },
+        {
+          "role": "physical",
+          "type": "const char*"
+        },
+        {
+          "role": "virtual_name",
+          "type": "const char*"
+        },
+        {
+          "role": "terminal",
+          "type": "i32"
+        },
+        {
+          "role": "min",
+          "type": "f64"
+        },
+        {
+          "role": "max",
+          "type": "f64"
+        },
+        {
+          "role": "units",
+          "type": "i32"
+        },
+        {
+          "role": "sensitivity",
+          "type": "f64"
+        },
+        {
+          "role": "sensitivity_units",
+          "type": "i32"
+        },
+        {
+          "role": "source",
+          "type": "i32"
+        },
+        {
+          "role": "amperes",
+          "type": "f64"
+        },
+        {
+          "role": "custom_scale",
+          "type": "const char*"
+        }
+      ]
+    },
+    {
+      "name": "DAQmxCreateAIForceIEPEChan",
+      "calling_convention": "NI __CFUNC/system",
+      "returns": "signed i32",
+      "slot_count": 12,
+      "arguments": [
+        {
+          "role": "H",
+          "type": "TaskHandle"
+        },
+        {
+          "role": "physical",
+          "type": "const char*"
+        },
+        {
+          "role": "virtual_name",
+          "type": "const char*"
+        },
+        {
+          "role": "terminal",
+          "type": "i32"
+        },
+        {
+          "role": "min",
+          "type": "f64"
+        },
+        {
+          "role": "max",
+          "type": "f64"
+        },
+        {
+          "role": "units",
+          "type": "i32"
+        },
+        {
+          "role": "sensitivity",
+          "type": "f64"
+        },
+        {
+          "role": "sensitivity_units",
+          "type": "i32"
+        },
+        {
+          "role": "source",
+          "type": "i32"
+        },
+        {
+          "role": "amperes",
+          "type": "f64"
+        },
+        {
+          "role": "custom_scale",
+          "type": "const char*"
+        }
+      ]
+    },
+    {
+      "name": "DAQmxCreateAIAccelChargeChan",
+      "calling_convention": "NI __CFUNC/system",
+      "returns": "signed i32",
+      "slot_count": 10,
+      "arguments": [
+        {
+          "role": "H",
+          "type": "TaskHandle"
+        },
+        {
+          "role": "physical",
+          "type": "const char*"
+        },
+        {
+          "role": "virtual_name",
+          "type": "const char*"
+        },
+        {
+          "role": "terminal",
+          "type": "i32"
+        },
+        {
+          "role": "min",
+          "type": "f64"
+        },
+        {
+          "role": "max",
+          "type": "f64"
+        },
+        {
+          "role": "units",
+          "type": "i32"
+        },
+        {
+          "role": "sensitivity",
+          "type": "f64"
+        },
+        {
+          "role": "sensitivity_units",
+          "type": "i32"
+        },
+        {
+          "role": "custom_scale",
+          "type": "const char*"
+        }
+      ]
+    }
+  ],
+  "ordered_constructor_pairs": {
+    "velocity_iepe": [
+      {
+        "case": "velocity_a",
+        "measurement": "velocity_iepe",
+        "physical": "Velocity/ai0",
+        "virtual_name": "",
+        "units": "m_s",
+        "sensitivity_units": "mv_per_mm_s",
+        "ordered_arguments": [
+          "owned_task",
+          "Velocity/ai0",
+          "",
+          10106,
+          "vmin_a",
+          "vmax_a",
+          15959,
+          "vsens_a",
+          15963,
+          10200,
+          "vamps_a",
+          "NULL"
+        ],
+        "float_argument_words": {
+          "min": "vmin_a",
+          "max": "vmax_a",
+          "sensitivity": "vsens_a",
+          "amperes": "vamps_a"
+        },
+        "custom_scale": "NULL",
+        "coupling": "ac",
+        "terminal_config": "differential",
+        "excitation_source": "internal",
+        "coupling_code": 10045
+      },
+      {
+        "case": "velocity_b",
+        "measurement": "velocity_iepe",
+        "physical": "Velocity/ai1",
+        "virtual_name": "",
+        "units": "in_s",
+        "sensitivity_units": "mv_per_in_s",
+        "ordered_arguments": [
+          "owned_task",
+          "Velocity/ai1",
+          "",
+          10083,
+          "vmin_b",
+          "vmax_b",
+          15960,
+          "vsens_b",
+          15964,
+          10167,
+          "vamps_b",
+          "NULL"
+        ],
+        "float_argument_words": {
+          "min": "vmin_b",
+          "max": "vmax_b",
+          "sensitivity": "vsens_b",
+          "amperes": "vamps_b"
+        },
+        "custom_scale": "NULL",
+        "coupling": "omitted",
+        "terminal_config": "rse",
+        "excitation_source": "external"
+      }
+    ],
+    "force_iepe": [
+      {
+        "case": "iepe_force_a",
+        "measurement": "force_iepe",
+        "physical": "IepeForce/ai0",
+        "virtual_name": "",
+        "units": "newtons",
+        "sensitivity_units": "mv_per_newton",
+        "ordered_arguments": [
+          "owned_task",
+          "IepeForce/ai0",
+          "",
+          10078,
+          "fmin_a",
+          "fmax_a",
+          15875,
+          "fsens_a",
+          15891,
+          10200,
+          "famps_a",
+          "NULL"
+        ],
+        "float_argument_words": {
+          "min": "fmin_a",
+          "max": "fmax_a",
+          "sensitivity": "fsens_a",
+          "amperes": "famps_a"
+        },
+        "custom_scale": "NULL",
+        "coupling": "omitted",
+        "terminal_config": "nrse",
+        "excitation_source": "internal"
+      },
+      {
+        "case": "iepe_force_b",
+        "measurement": "force_iepe",
+        "physical": "IepeForce/ai1",
+        "virtual_name": "",
+        "units": "pounds",
+        "sensitivity_units": "mv_per_pound",
+        "ordered_arguments": [
+          "owned_task",
+          "IepeForce/ai1",
+          "",
+          -1,
+          "fmin_b",
+          "fmax_b",
+          15876,
+          "fsens_b",
+          15892,
+          10167,
+          "famps_b",
+          "NULL"
+        ],
+        "float_argument_words": {
+          "min": "fmin_b",
+          "max": "fmax_b",
+          "sensitivity": "fsens_b",
+          "amperes": "famps_b"
+        },
+        "custom_scale": "NULL",
+        "coupling": "dc",
+        "terminal_config": "default",
+        "excitation_source": "external",
+        "coupling_code": 10050
+      }
+    ],
+    "charge_acceleration": [
+      {
+        "case": "charge_a",
+        "measurement": "charge_acceleration",
+        "physical": "Charge/ai0",
+        "virtual_name": "",
+        "units": "g",
+        "sensitivity_units": "pc_per_g",
+        "ordered_arguments": [
+          "owned_task",
+          "Charge/ai0",
+          "",
+          10106,
+          "cmin_a",
+          "cmax_a",
+          10186,
+          "csens_a",
+          16099,
+          "NULL"
+        ],
+        "float_argument_words": {
+          "min": "cmin_a",
+          "max": "cmax_a",
+          "sensitivity": "csens_a"
+        },
+        "custom_scale": "NULL",
+        "coupling": "ground",
+        "terminal_config": "differential",
+        "coupling_code": 10066
+      },
+      {
+        "case": "charge_b",
+        "measurement": "charge_acceleration",
+        "physical": "Charge/ai1",
+        "virtual_name": "",
+        "units": "m_s2",
+        "sensitivity_units": "pc_per_in_s2",
+        "ordered_arguments": [
+          "owned_task",
+          "Charge/ai1",
+          "",
+          12529,
+          "cmin_b",
+          "cmax_b",
+          12470,
+          "csens_b",
+          16101,
+          "NULL"
+        ],
+        "float_argument_words": {
+          "min": "cmin_b",
+          "max": "cmax_b",
+          "sensitivity": "csens_b"
+        },
+        "custom_scale": "NULL",
+        "coupling": "omitted",
+        "terminal_config": "pseudodifferential"
+      }
+    ]
+  },
+  "short_request_cycles": {
+    "velocity_iepe": [
+      {
+        "case": "velocity_iepe_cycle_0",
+        "base_case": "velocity_a",
+        "overrides": {
+          "sensitivity_word": "negative_sensitivity",
+          "coupling": "ac",
+          "excitation_source": "none",
+          "excitation_amount_word": "positive_amount"
+        },
+        "expectation": "software admission only; pass original literal bits and native rejection unchanged"
+      },
+      {
+        "case": "velocity_iepe_cycle_1",
+        "base_case": "velocity_a",
+        "overrides": {
+          "sensitivity_word": "zero",
+          "coupling": "dc",
+          "excitation_source": "none",
+          "excitation_amount_word": "zero"
+        },
+        "expectation": "software admission only; pass original literal bits and native rejection unchanged"
+      },
+      {
+        "case": "velocity_iepe_cycle_2",
+        "base_case": "velocity_a",
+        "overrides": {
+          "sensitivity_word": "negative_zero",
+          "coupling": "ground",
+          "excitation_source": "none",
+          "excitation_amount_word": "negative_zero"
+        },
+        "expectation": "software admission only; pass original literal bits and native rejection unchanged"
+      }
+    ],
+    "force_iepe": [
+      {
+        "case": "force_iepe_cycle_0",
+        "base_case": "iepe_force_a",
+        "overrides": {
+          "sensitivity_word": "negative_sensitivity",
+          "coupling": "ac",
+          "excitation_source": "none",
+          "excitation_amount_word": "positive_amount",
+          "units": "kilogram_force"
+        },
+        "expectation": "software admission only; pass original literal bits and native rejection unchanged"
+      },
+      {
+        "case": "force_iepe_cycle_1",
+        "base_case": "iepe_force_a",
+        "overrides": {
+          "sensitivity_word": "zero",
+          "coupling": "dc",
+          "excitation_source": "none",
+          "excitation_amount_word": "zero",
+          "units": "pounds"
+        },
+        "expectation": "software admission only; pass original literal bits and native rejection unchanged"
+      },
+      {
+        "case": "force_iepe_cycle_2",
+        "base_case": "iepe_force_a",
+        "overrides": {
+          "sensitivity_word": "negative_zero",
+          "coupling": "ground",
+          "excitation_source": "none",
+          "excitation_amount_word": "negative_zero",
+          "units": "newtons"
+        },
+        "expectation": "software admission only; pass original literal bits and native rejection unchanged"
+      }
+    ],
+    "charge_acceleration": [
+      {
+        "case": "charge_acceleration_cycle_0",
+        "base_case": "charge_a",
+        "overrides": {
+          "sensitivity_word": "negative_sensitivity",
+          "coupling": "ac",
+          "units": "in_s2",
+          "sensitivity_units": "pc_per_m_s2"
+        },
+        "expectation": "software admission only; pass original literal bits and native rejection unchanged"
+      },
+      {
+        "case": "charge_acceleration_cycle_1",
+        "base_case": "charge_a",
+        "overrides": {
+          "sensitivity_word": "zero",
+          "coupling": "dc",
+          "units": "g",
+          "sensitivity_units": "pc_per_g"
+        },
+        "expectation": "software admission only; pass original literal bits and native rejection unchanged"
+      },
+      {
+        "case": "charge_acceleration_cycle_2",
+        "base_case": "charge_a",
+        "overrides": {
+          "sensitivity_word": "negative_zero",
+          "coupling": "ground",
+          "units": "m_s2",
+          "sensitivity_units": "pc_per_in_s2"
+        },
+        "expectation": "software admission only; pass original literal bits and native rejection unchanged"
+      }
+    ]
+  },
+  "manual_argument_words": {
+    "vmin_a": {
+      "exact_rational": "-3/8",
+      "decimal": "-0.375",
+      "ieee754_hex": "bfd8000000000000",
+      "ieee754_le_hex": "000000000000d8bf"
+    },
+    "vmax_a": {
+      "exact_rational": "13/8",
+      "decimal": "1.625",
+      "ieee754_hex": "3ffa000000000000",
+      "ieee754_le_hex": "000000000000fa3f"
+    },
+    "vsens_a": {
+      "exact_rational": "5/16",
+      "decimal": "0.3125",
+      "ieee754_hex": "3fd4000000000000",
+      "ieee754_le_hex": "000000000000d43f"
+    },
+    "vamps_a": {
+      "exact_rational": "1/512",
+      "decimal": "0.001953125",
+      "ieee754_hex": "3f60000000000000",
+      "ieee754_le_hex": "000000000000603f"
+    },
+    "vmin_b": {
+      "exact_rational": "-7/16",
+      "decimal": "-0.4375",
+      "ieee754_hex": "bfdc000000000000",
+      "ieee754_le_hex": "000000000000dcbf"
+    },
+    "vmax_b": {
+      "exact_rational": "21/16",
+      "decimal": "1.3125",
+      "ieee754_hex": "3ff5000000000000",
+      "ieee754_le_hex": "000000000000f53f"
+    },
+    "vsens_b": {
+      "exact_rational": "9/32",
+      "decimal": "0.28125",
+      "ieee754_hex": "3fd2000000000000",
+      "ieee754_le_hex": "000000000000d23f"
+    },
+    "vamps_b": {
+      "exact_rational": "3/1024",
+      "decimal": "0.0029296875",
+      "ieee754_hex": "3f68000000000000",
+      "ieee754_le_hex": "000000000000683f"
+    },
+    "fmin_a": {
+      "exact_rational": "-5/2",
+      "decimal": "-2.5",
+      "ieee754_hex": "c004000000000000",
+      "ieee754_le_hex": "00000000000004c0"
+    },
+    "fmax_a": {
+      "exact_rational": "19/2",
+      "decimal": "9.5",
+      "ieee754_hex": "4023000000000000",
+      "ieee754_le_hex": "0000000000002340"
+    },
+    "fsens_a": {
+      "exact_rational": "7/8",
+      "decimal": "0.875",
+      "ieee754_hex": "3fec000000000000",
+      "ieee754_le_hex": "000000000000ec3f"
+    },
+    "famps_a": {
+      "exact_rational": "5/2048",
+      "decimal": "0.00244140625",
+      "ieee754_hex": "3f64000000000000",
+      "ieee754_le_hex": "000000000000643f"
+    },
+    "fmin_b": {
+      "exact_rational": "-7/4",
+      "decimal": "-1.75",
+      "ieee754_hex": "bffc000000000000",
+      "ieee754_le_hex": "000000000000fcbf"
+    },
+    "fmax_b": {
+      "exact_rational": "45/4",
+      "decimal": "11.25",
+      "ieee754_hex": "4026800000000000",
+      "ieee754_le_hex": "0000000000802640"
+    },
+    "fsens_b": {
+      "exact_rational": "9/16",
+      "decimal": "0.5625",
+      "ieee754_hex": "3fe2000000000000",
+      "ieee754_le_hex": "000000000000e23f"
+    },
+    "famps_b": {
+      "exact_rational": "7/4096",
+      "decimal": "0.001708984375",
+      "ieee754_hex": "3f5c000000000000",
+      "ieee754_le_hex": "0000000000005c3f"
+    },
+    "cmin_a": {
+      "exact_rational": "-9/16",
+      "decimal": "-0.5625",
+      "ieee754_hex": "bfe2000000000000",
+      "ieee754_le_hex": "000000000000e2bf"
+    },
+    "cmax_a": {
+      "exact_rational": "65/16",
+      "decimal": "4.0625",
+      "ieee754_hex": "4010400000000000",
+      "ieee754_le_hex": "0000000000401040"
+    },
+    "csens_a": {
+      "exact_rational": "11/32",
+      "decimal": "0.34375",
+      "ieee754_hex": "3fd6000000000000",
+      "ieee754_le_hex": "000000000000d63f"
+    },
+    "cmin_b": {
+      "exact_rational": "-11/8",
+      "decimal": "-1.375",
+      "ieee754_hex": "bff6000000000000",
+      "ieee754_le_hex": "000000000000f6bf"
+    },
+    "cmax_b": {
+      "exact_rational": "73/8",
+      "decimal": "9.125",
+      "ieee754_hex": "4022400000000000",
+      "ieee754_le_hex": "0000000000402240"
+    },
+    "csens_b": {
+      "exact_rational": "13/64",
+      "decimal": "0.203125",
+      "ieee754_hex": "3fca000000000000",
+      "ieee754_le_hex": "000000000000ca3f"
+    },
+    "zero": {
+      "exact_rational": "0",
+      "decimal": "0.0",
+      "ieee754_hex": "0000000000000000",
+      "ieee754_le_hex": "0000000000000000"
+    },
+    "negative_zero": {
+      "exact_rational": "0",
+      "decimal": "-0.0",
+      "ieee754_hex": "8000000000000000",
+      "ieee754_le_hex": "0000000000000080"
+    },
+    "negative_sensitivity": {
+      "exact_rational": "-5/16",
+      "decimal": "-0.3125",
+      "ieee754_hex": "bfd4000000000000",
+      "ieee754_le_hex": "000000000000d4bf"
+    },
+    "positive_amount": {
+      "exact_rational": "1/2048",
+      "decimal": "0.00048828125",
+      "ieee754_hex": "3f40000000000000",
+      "ieee754_le_hex": "000000000000403f"
+    },
+    "positive_hz": {
+      "exact_rational": "1/8",
+      "decimal": "0.125",
+      "ieee754_hex": "3fc0000000000000",
+      "ieee754_le_hex": "000000000000c03f"
+    }
+  },
+  "manual_native_patterns": {
+    "twenty_five": {
+      "ieee754_hex": "4039000000000000",
+      "ieee754_le_hex": "0000000000003940",
+      "classification": "finite",
+      "sign": 0,
+      "exact_value": "25"
+    },
+    "negative_zero": {
+      "ieee754_hex": "8000000000000000",
+      "ieee754_le_hex": "0000000000000080",
+      "classification": "finite",
+      "sign": 1,
+      "exact_value": "0"
+    },
+    "positive_zero": {
+      "ieee754_hex": "0000000000000000",
+      "ieee754_le_hex": "0000000000000000",
+      "classification": "finite",
+      "sign": 0,
+      "exact_value": "0"
+    },
+    "one_sixty_fourth": {
+      "ieee754_hex": "3f90000000000000",
+      "ieee754_le_hex": "000000000000903f",
+      "classification": "finite",
+      "sign": 0,
+      "exact_value": "1/64"
+    },
+    "negative_three_eighths": {
+      "ieee754_hex": "bfd8000000000000",
+      "ieee754_le_hex": "000000000000d8bf",
+      "classification": "finite",
+      "sign": 1,
+      "exact_value": "-3/8"
+    },
+    "nan_payload_42": {
+      "ieee754_hex": "7ff8000000000042",
+      "ieee754_le_hex": "420000000000f87f",
+      "classification": "nan",
+      "sign": 0
+    },
+    "positive_infinity": {
+      "ieee754_hex": "7ff0000000000000",
+      "ieee754_le_hex": "000000000000f07f",
+      "classification": "infinity",
+      "sign": 0
+    },
+    "negative_infinity": {
+      "ieee754_hex": "fff0000000000000",
+      "ieee754_le_hex": "000000000000f0ff",
+      "classification": "infinity",
+      "sign": 1
+    },
+    "minimum_subnormal": {
+      "ieee754_hex": "0000000000000001",
+      "ieee754_le_hex": "0100000000000000",
+      "classification": "finite",
+      "sign": 0,
+      "exact_value": "2^-1074"
+    },
+    "negative_minimum_subnormal": {
+      "ieee754_hex": "8000000000000001",
+      "ieee754_le_hex": "0100000000000080",
+      "classification": "finite",
+      "sign": 1,
+      "exact_value": "-2^-1074"
+    },
+    "one": {
+      "ieee754_hex": "3ff0000000000000",
+      "ieee754_le_hex": "000000000000f03f",
+      "classification": "finite",
+      "sign": 0,
+      "exact_value": "1"
+    }
+  },
+  "raw_extent": {
+    "shape": [
+      6,
+      2
+    ],
+    "words": 12,
+    "bytes": 96,
+    "pattern_names_scan_major": [
+      "twenty_five",
+      "twenty_five",
+      "negative_zero",
+      "positive_zero",
+      "one_sixty_fourth",
+      "negative_three_eighths",
+      "nan_payload_42",
+      "positive_infinity",
+      "negative_infinity",
+      "minimum_subnormal",
+      "negative_minimum_subnormal",
+      "one"
+    ],
+    "literal_bits_scan_major": [
+      "4039000000000000",
+      "4039000000000000",
+      "8000000000000000",
+      "0000000000000000",
+      "3f90000000000000",
+      "bfd8000000000000",
+      "7ff8000000000042",
+      "7ff0000000000000",
+      "fff0000000000000",
+      "0000000000000001",
+      "8000000000000001",
+      "3ff0000000000000"
+    ],
+    "all_words_le_hex": "0000000000003940000000000000394000000000000000800000000000000000000000000000903f000000000000d8bf420000000000f87f000000000000f07f000000000000f0ff01000000000000000100000000000080000000000000f03f",
+    "negative_one_scan_le_hex": "00000000000039400000000000003940",
+    "negative_one_scan_bytes": 16,
+    "continuous_request_per_channel": 3,
+    "continuous_capacity_f64": 6,
+    "on_demand_request_per_channel": 1,
+    "on_demand_capacity_f64": 2,
+    "no_conversion": "same raw12 words for both channels under each pair of differing units; repeated across all homogeneous kinds in this file"
+  },
+  "public_rows": {
+    "velocity_iepe": {
+      "event": "velocity_iepe_block",
+      "representation": "driver_scaled_f64_velocity_iepe",
+      "finite_key": "velocity",
+      "mixed_quantity": "velocity"
+    },
+    "force_iepe": {
+      "event": "force_iepe_block",
+      "representation": "driver_scaled_f64_force_iepe",
+      "finite_key": "force",
+      "mixed_quantity": "force"
+    },
+    "charge_acceleration": {
+      "event": "charge_acceleration_block",
+      "representation": "driver_scaled_f64_charge_acceleration",
+      "finite_key": "acceleration",
+      "mixed_quantity": "acceleration"
+    }
+  },
+  "unit_caveats": [
+    "velocity sensitivity mv_per_mm_s is mV/(mm/s), not mV/(m/s) or mV/(mm*s); no factor1000",
+    "force kgf pass-through is generic ForceUnits property+pinned NI wrapper corroboration; constructor C table itself only N/lbf; driver acceptance remains decisive",
+    "acceleration g is acceleration not grams mass; charge units need charge-capable front end",
+    "IEPE None cannot be used when sensor requires excitation; none still declared request/native-error path"
+  ]
+}

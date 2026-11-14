@@ -13,6 +13,7 @@ mod mkv;
 mod native;
 #[cfg(target_os = "linux")]
 mod pipes;
+pub(crate) mod timeline;
 mod url;
 #[cfg(any(test, target_os = "linux"))]
 mod v4l2;
@@ -749,6 +750,27 @@ impl Log {
             .collect::<Vec<_>>();
         redact_log(&String::from_utf8_lossy(&bytes), source)
     }
+    /// Indexed recording progress reports muxed video packets, not frames
+    /// merely handed to the encoder (`FFmpeg`'s `print_report`):
+    /// <https://github.com/FFmpeg/FFmpeg/blob/master/fftools/ffmpeg.c>.
+    fn completed_video_frames(&self) -> Option<u64> {
+        let stored = self
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let bytes = stored.iter().copied().collect::<Vec<_>>();
+        let text = String::from_utf8_lossy(&bytes);
+        let mut frames = None;
+        for line in text.lines() {
+            if let Some(value) = line.strip_prefix("frame=") {
+                frames = value.trim().parse().ok();
+            }
+            if line == "progress=end" {
+                return frames;
+            }
+        }
+        None
+    }
     fn collect(self: &Arc<Self>, mut input: impl Read + Send + 'static) -> JoinHandle<()> {
         let log = self.clone();
         thread::spawn(move || {
@@ -919,12 +941,17 @@ fn read_ppm(
         .context("truncated FFmpeg RGB frame")?;
     crate::copies::record(crate::copies::Site::PipeRead, size);
     Ok(Frame {
+        pixel_encoding: None,
+        device_timestamp: None,
         id,
         width,
         height,
         pixel_format: RGB8,
         device_ts_ns: None,
         wall_ms: 0,
+        received_monotonic_ns: None,
+        chunks: None,
+        multipart: None,
         data: data.freeze(),
         jpeg: None,
     })
@@ -3611,6 +3638,9 @@ pub(crate) struct ForwardConfig {
     /// as well as the worker's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_free: Option<u64>,
+    /// Optional per-frame correspondence for a synchronized local recording.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeline: Option<timeline::Config>,
 }
 impl ForwardConfig {
     /// Validate forwarding settings before starting a process, changing camera
@@ -3629,6 +3659,13 @@ impl ForwardConfig {
         output_args(&self.output)?;
         crate::naming::validate_output(&self.output)?;
         let recording = recording_output(&self.output)?;
+        if let Some(timeline) = &self.timeline {
+            ensure!(
+                recording.is_some(),
+                "a video timeline requires a local recording"
+            );
+            timeline.validate(&self.output)?;
+        }
         ensure!(
             self.max_file_bytes != Some(0),
             "a recording's maximum size must be positive"
@@ -3679,11 +3716,17 @@ pub(crate) struct ForwardStats {
     /// The finished local recording, set once its file is complete.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recording: Option<crate::engine::saved::RecordedFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunks: Option<Value>,
 }
 struct WriterState {
     /// The newest frame, converted only once the writer takes it.
     latest: Option<Frame>,
     error: Option<String>,
+    error_tag: Option<crate::types::ErrorTag>,
+    /// The first failure came from an encoder input pipe, not conversion.
+    input_broken_pipe: bool,
+    chunks: Option<Value>,
 }
 struct WriterQueue {
     state: Mutex<WriterState>,
@@ -3697,6 +3740,8 @@ struct WriterQueue {
     busy: AtomicBool,
     /// Writing the encoded recording failed, for example on a full disk.
     output_failed: AtomicBool,
+    /// Encoded bytes already stored; final joined storage remains authoritative.
+    encoded_bytes: AtomicU64,
     /// The recording is near its maximum size, which ends it as asked:
     /// its `FFmpeg` is stopped while what it still holds fits
     /// ([`NearEnd`]), or the file reached that size.
@@ -3708,6 +3753,8 @@ struct WriterQueue {
     /// can come from before the recording was asked for, back to the key
     /// frame it starts at.
     first_copied_ms: AtomicU64,
+    /// Chunk payloads require a one-to-one mapping to encoder inputs.
+    chunks_seen: AtomicBool,
 }
 /// Without a new frame for this long a recording counts as stalled.
 const STALL: Duration = Duration::from_secs(2);
@@ -3724,6 +3771,9 @@ impl WriterQueue {
             state: Mutex::new(WriterState {
                 latest: None,
                 error: None,
+                error_tag: None,
+                input_broken_pipe: false,
+                chunks: None,
             }),
             changed: Condvar::new(),
             running: AtomicBool::new(true),
@@ -3733,10 +3783,12 @@ impl WriterQueue {
             late: AtomicU64::new(0),
             busy: AtomicBool::new(false),
             output_failed: AtomicBool::new(false),
+            encoded_bytes: AtomicU64::new(0),
             full_size: AtomicBool::new(false),
             epoch: Instant::now(),
             arrived_ms: AtomicU64::new(0),
             first_copied_ms: AtomicU64::new(0),
+            chunks_seen: AtomicBool::new(false),
         }
     }
     fn stalled(&self) -> bool {
@@ -3751,13 +3803,26 @@ impl WriterQueue {
     /// alone is enough for `WriterFrame::Repeat`. Returns `None` once the
     /// writer stops.
     fn take(&self, slot: Instant, repeat_from: Option<Instant>) -> Option<WriterFrame> {
+        self.take_mode(slot, repeat_from, false)
+    }
+    fn take_mode(
+        &self,
+        slot: Instant,
+        repeat_from: Option<Instant>,
+        drain: bool,
+    ) -> Option<WriterFrame> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             if !self.running.load(Ordering::Acquire) {
-                return None;
+                let final_frame = drain
+                    .then(|| state.latest.take())
+                    .flatten()
+                    .map(WriterFrame::New);
+                self.changed.notify_all();
+                return final_frame;
             }
             let now = Instant::now();
             let ready = state.latest.is_some() || repeat_from.is_some_and(|from| now >= from);
@@ -3785,12 +3850,61 @@ impl WriterQueue {
                 .0;
         }
     }
+    fn fail_timeline(&self, error: &anyhow::Error) {
+        self.fail_artifact("video timeline", error);
+    }
+    fn fail_artifact(&self, artifact: &str, error: &anyhow::Error) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.error.is_none() {
+            state.error = Some(format!("{artifact}: {error:#}"));
+        }
+        if state.error_tag.is_none() {
+            state.error_tag = crate::types::error_tag(error);
+        }
+    }
+    fn typed_error(&self) -> Option<anyhow::Error> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .error
+            .as_ref()
+            .map(|message| crate::types::error_from_tag(state.error_tag.clone(), message.clone()))
+    }
     fn fail(&self, error: String) {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .error
             .get_or_insert(error);
+    }
+    fn fail_input(&self, error: &std::io::Error) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.error.is_none() {
+            state.error = Some(format!("FFmpeg input failed: {error}"));
+            state.input_broken_pipe = error.kind() == std::io::ErrorKind::BrokenPipe;
+        }
+    }
+    fn input_closed(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.input_broken_pipe && state.error_tag.is_none()
+    }
+    fn fallback_failure(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.error_tag.is_none() && (state.error.is_none() || state.input_broken_pipe)
     }
 }
 /// Hands a frame's own bytes to the encoder's pipe without copying them.
@@ -3843,6 +3957,8 @@ fn write_frames(
     (raw, jetson): (RawInput, Option<JetsonInput>),
     interval: Duration,
     repeat: Repeat,
+    mut timeline: Option<timeline::Writer>,
+    mut chunks: Option<timeline::ChunkWriter>,
 ) -> u64 {
     let mut next = Instant::now();
     let mut last: Option<Frame> = None;
@@ -3850,16 +3966,41 @@ fn write_frames(
     let mut taken = 0;
     loop {
         let repeat_from = match repeat {
-            _ if last.is_none() => None,
+            _ if last.is_none() || shared.chunks_seen.load(Ordering::Acquire) => None,
             Repeat::Never => None,
             Repeat::UntilStalled => (!shared.stalled()).then(Instant::now),
             Repeat::Always => Some(Instant::now()),
             Repeat::AfterSilence => Some(shared.arrived() + KEEP_ALIVE),
         };
-        let Some(fresh) = shared.take(next, repeat_from) else {
+        let Some(fresh) = (if timeline.is_some() || shared.chunks_seen.load(Ordering::Acquire) {
+            shared.take_mode(next, repeat_from, true)
+        } else {
+            shared.take(next, repeat_from)
+        }) else {
             break;
         };
         if let WriterFrame::New(frame) = fresh {
+            if frame.chunks.is_some() {
+                shared.chunks_seen.store(true, Ordering::Release);
+                if chunks.is_none() {
+                    let error = Categorized::error(
+                        ErrorKind::Unsupported,
+                        "image chunk data requires a local recording with chunk artifacts",
+                    );
+                    shared.fail_artifact("video chunks", &error);
+                    break;
+                }
+            }
+            if let Some(timeline) = &timeline {
+                match timeline.accepts(&frame) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => {
+                        shared.fail_timeline(&error);
+                        break;
+                    }
+                }
+            }
             taken += 1;
             // A frame that needs converting is converted here, once: the
             // frames a newer one replaced in the queue never are, and a
@@ -3896,17 +4037,46 @@ fn write_frames(
         };
         shared.busy.store(false, Ordering::Relaxed);
         if let Err(e) = written {
-            shared.fail(format!("FFmpeg input failed: {e}"));
+            shared.fail_input(&e);
             break;
         }
         shared.written.fetch_add(1, Ordering::Relaxed);
-        if repeat == Repeat::Never {
+        if let Some(chunks) = &mut chunks
+            && let Err(error) = chunks.wrote(frame)
+        {
+            shared.fail_artifact("video chunks", &error);
+            break;
+        }
+        if let Some(timeline) = &mut timeline
+            && let Err(error) = timeline.wrote(frame)
+        {
+            shared.fail_timeline(&error);
+            break;
+        }
+        if repeat == Repeat::Never || shared.chunks_seen.load(Ordering::Acquire) {
             last = None;
         }
         // Slots stay on a fixed grid; a writer that fell behind skips the
         // slots it missed instead of catching up in a burst.
         let now = Instant::now();
         next = (next + interval).max(now.checked_sub(interval).unwrap_or(now));
+    }
+    if let Some(timeline) = timeline
+        && let Err(error) = timeline.finish()
+    {
+        shared.fail_timeline(&error);
+    }
+    if let Some(chunks) = chunks {
+        match chunks.finish() {
+            Ok(summary) => {
+                shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .chunks = summary;
+            }
+            Err(error) => shared.fail_artifact("video chunks", &error),
+        }
     }
     taken
 }
@@ -3947,7 +4117,7 @@ fn write_copied(shared: &WriterQueue, feed: &copy::Feed, input: &mut impl Write)
             .and_then(|()| input.write_all(&frame.data));
         shared.busy.store(false, Ordering::Relaxed);
         if let Err(e) = written {
-            shared.fail(format!("FFmpeg input failed: {e}"));
+            shared.fail_input(&e);
             break;
         }
         crate::copies::record(crate::copies::Site::StreamCopy, frame.data.len());
@@ -4022,6 +4192,7 @@ pub(crate) struct Forwarder {
     /// replacing it, so a file is recorded whole, even while the encoder
     /// starts.
     waits: bool,
+    timeline: Option<timeline::Writer>,
 }
 /// Frames handed to a Jetson encoder: formats `nvvidconv` accepts in system
 /// memory and converts on the VIC engine.
@@ -4332,6 +4503,7 @@ impl RawPreparation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[deny(clippy::struct_excessive_bools)]
 struct RawInput {
+    pixel_encoding: Option<crate::types::PixelEncoding>,
     pixel_format: u32,
     ffmpeg: &'static str,
     bytes_per_pixel: usize,
@@ -4360,6 +4532,18 @@ fn planes(pix_fmt: &str) -> bool {
 }
 #[deny(clippy::cast_precision_loss)]
 impl RawInput {
+    fn for_frame(frame: &Frame) -> Result<Self> {
+        crate::frame::validate_encoding(frame)?;
+        if let Some(ids) = crate::frame::frame_encoding(frame) {
+            let mut raw = Self::for_format(crate::frame::frame_unpacked_format(frame))?;
+            raw.pixel_format = frame.pixel_format;
+            raw.pixel_encoding = frame.pixel_encoding;
+            raw.preparation = RawPreparation::Unpack;
+            debug_assert!(matches!(ids.bits(), 10 | 12));
+            return Ok(raw);
+        }
+        Self::for_format(frame.pixel_format)
+    }
     fn for_format(pixel_format: u32) -> Result<Self> {
         let unpacked = crate::frame::packing(pixel_format).map_or(pixel_format, |(v, ..)| v);
         let mut convert = false;
@@ -4409,6 +4593,7 @@ impl RawInput {
         };
         Ok(Self {
             pixel_format,
+            pixel_encoding: None,
             ffmpeg,
             bytes_per_pixel,
             color,
@@ -4475,7 +4660,11 @@ impl RawInput {
         {
             return base;
         }
-        match crate::frame::reduced(self.pixel_format)
+        match self
+            .pixel_encoding
+            .and_then(|encoding| encoding.ids(self.pixel_format).ok())
+            .map(|ids| (ids.reduced_format(), ids.bits() - 8))
+            .or_else(|| crate::frame::reduced(self.pixel_format))
             .and_then(|(eight, shift)| Some((Self::for_format(eight).ok()?, shift)))
         {
             Some((eight, shift)) => Self {
@@ -4561,15 +4750,16 @@ impl RawInput {
     fn check(&self, frame: &Frame) -> Result<()> {
         let length = self.frame_len(frame.width, frame.height)?;
         ensure!(
-            frame.pixel_format == self.pixel_format,
+            frame.pixel_format == self.pixel_format && frame.pixel_encoding == self.pixel_encoding,
             "the camera's pixel format changed; start a new recording to continue"
         );
-        let name = crate::frame::pixel_format_name(frame.pixel_format);
-        if self.preparation.decodes() {
+        crate::frame::validate_encoding(frame)?;
+        let name = crate::frame::frame_format_name(frame);
+        if self.preparation.unpacks() || self.preparation.decodes() {
             return crate::frame::validate_source(frame);
         }
         let needed = if self.preparation.unpacks() || self.narrow.is_some() {
-            crate::frame::row_bytes(frame.width, frame.pixel_format)
+            crate::frame::frame_row_bytes(frame)
                 .checked_mul(frame.height as usize)
                 .context("forwarding frame exceeds size limit")?
         } else {
@@ -4601,8 +4791,8 @@ impl RawInput {
             let width = frame.width as usize;
             let eight =
                 |sample: &[u8; 2]| crate::frame::clamp8(u16::from_le_bytes(*sample) >> shift);
-            if let Some((_, bits, packing)) = crate::frame::packing(frame.pixel_format) {
-                let row = crate::frame::row_bytes(frame.width, frame.pixel_format);
+            if let Some((_, bits, packing)) = crate::frame::frame_packing(frame) {
+                let row = crate::frame::frame_row_bytes(frame);
                 let rows = frame.data[..row * frame.height as usize].chunks_exact(row);
                 let mut samples = vec![[0; 2]; width];
                 for (line, out) in rows.zip(scratch.chunks_exact_mut(width)) {
@@ -4633,9 +4823,9 @@ impl RawInput {
                 (value << self.widen).to_le_bytes()
             };
             if let Some((_, bits, packing)) =
-                crate::frame::packing(frame.pixel_format).filter(|_| self.preparation.unpacks())
+                crate::frame::frame_packing(frame).filter(|_| self.preparation.unpacks())
             {
-                let row = crate::frame::row_bytes(frame.width, frame.pixel_format);
+                let row = crate::frame::frame_row_bytes(frame);
                 let rows = frame.data[..row * frame.height as usize].chunks_exact(row);
                 let out_row = frame.width as usize * 2;
                 for (line, out) in rows.zip(scratch.chunks_exact_mut(out_row)) {
@@ -4659,7 +4849,7 @@ impl RawInput {
         ensure!(
             scratch.len() == length,
             "truncated {} frame",
-            crate::frame::pixel_format_name(frame.pixel_format)
+            crate::frame::frame_format_name(frame)
         );
         Ok(())
     }
@@ -4706,10 +4896,31 @@ impl RawInput {
     }
 }
 impl Forwarder {
+    /// Keep the first failure's classification and reason while retaining the
+    /// diagnostics collected when the encoder and its stderr finish.
+    pub(crate) fn completed_error(
+        primary: &anyhow::Error,
+        completed: &anyhow::Error,
+    ) -> anyhow::Error {
+        let first = format!("{primary:#}");
+        let finished = format!("{completed:#}");
+        let message = if first == finished {
+            first
+        } else {
+            format!("{first}; while finishing forwarding: {finished}")
+        };
+        crate::types::error_from_tag(crate::types::error_tag(primary), message)
+    }
     pub(crate) fn new(config: ForwardConfig) -> Result<Self> {
         config.validate()?;
         check_codec(&config)?;
+        let timeline = config
+            .timeline
+            .as_ref()
+            .map(|timeline| timeline::Writer::create(timeline, config.fps, config.min_free))
+            .transpose()?;
         Ok(Self {
+            timeline,
             config,
             process: None,
             final_stats: ForwardStats::default(),
@@ -4731,7 +4942,22 @@ impl Forwarder {
             }
             return Err(error);
         }
+        let timeline = match config
+            .timeline
+            .as_ref()
+            .map(|timeline| timeline::Writer::create(timeline, config.fps, config.min_free))
+            .transpose()
+        {
+            Ok(timeline) => timeline,
+            Err(error) => {
+                if let Some(reserved) = reserved {
+                    reserved.abort().context("remove unused recording output")?;
+                }
+                return Err(error);
+            }
+        };
         Ok(Self {
+            timeline,
             config,
             process: None,
             final_stats: ForwardStats::default(),
@@ -4750,6 +4976,10 @@ impl Forwarder {
         tap: Arc<copy::Tap>,
     ) -> Result<Self> {
         let checked = config.validate().and_then(|()| {
+            ensure!(
+                config.timeline.is_none(),
+                "indexed video cannot copy compressed source packets"
+            );
             ensure!(
                 codec_family(&config.codec)? == tap.codec(),
                 "a copied recording keeps the source's {} video",
@@ -4771,7 +5001,12 @@ impl Forwarder {
             failed: None,
             copy: Some(tap),
             waits: false,
+            timeline: None,
         })
+    }
+    /// The index this forwarder exclusively created, before writer transfer.
+    pub(crate) fn owned_timeline_path(&self) -> Option<&std::path::Path> {
+        self.timeline.as_ref().map(timeline::Writer::path)
     }
     /// The local file this forwarder records to, if it records.
     pub(crate) fn recording_path(&self) -> Option<PathBuf> {
@@ -4788,8 +5023,15 @@ impl Forwarder {
             .context("recording keyframe interval exceeds the encoder range")?
             .to_string();
         let exe = executable()?;
-        let skip = self.failed.as_slice();
-        let encoder = select_encoder(&exe, &self.config, (width, height), &raw, skip)?;
+        let mut skip = self.failed.iter().cloned().collect::<Vec<_>>();
+        if self.config.timeline.is_some() {
+            skip.extend(["nvv4l2h264enc", "nvv4l2h265enc", "nvv4l2av1enc"].map(str::to_owned));
+        }
+        let encoder = select_encoder(&exe, &self.config, (width, height), &raw, &skip)?;
+        ensure!(
+            self.config.timeline.is_none() || !jetson_encoder(&encoder),
+            "indexed video requires a direct FFmpeg encoder"
+        );
         let raw = raw.for_encoder(&encoder);
         let jetson = jetson_encoder(&encoder).then_some(if raw.color {
             JetsonInput::Rgba
@@ -4877,9 +5119,10 @@ impl Forwarder {
                 &format!("{width}x{height}"),
                 "-framerate",
                 &fps,
-                "-use_wallclock_as_timestamps",
-                "1",
             ]);
+            if self.config.timeline.is_none() {
+                cmd.args(["-use_wallclock_as_timestamps", "1"]);
+            }
             cmd.args(raw.color_options());
             cmd.args([
                 "-i",
@@ -4893,12 +5136,26 @@ impl Forwarder {
                 &gop,
             ]);
             let options = encoder_output_options(&encoder, input, pix_fmt);
-            cmd.args(if is_recording(&self.config.output) {
-                recording_clock_options(options)
-            } else {
-                options
-            });
-            if is_recording(&self.config.output) {
+            cmd.args(
+                if is_recording(&self.config.output) && self.config.timeline.is_none() {
+                    recording_clock_options(options)
+                } else {
+                    options
+                },
+            );
+            if self.config.timeline.is_some() {
+                cmd.args([
+                    "-fps_mode",
+                    "passthrough",
+                    "-enc_time_base",
+                    "0",
+                    "-avoid_negative_ts",
+                    "disabled",
+                ]);
+                if self.config.codec != "ffv1" {
+                    cmd.args(["-bf", "0"]);
+                }
+            } else if is_recording(&self.config.output) {
                 cmd.args(["-fps_mode", "vfr"]);
             } else {
                 // A stream keeps its rate: FFmpeg repeats a frame for the
@@ -4965,6 +5222,9 @@ impl Forwarder {
         input: Input,
     ) -> Result<()> {
         let recording = recording_output(&self.config.output)?;
+        if recording.is_some() && !matches!(&input, Input::Copied(..)) {
+            cmd.args(["-nostats", "-progress", "pipe:2"]);
+        }
         let local = recording.is_some();
         let matroska = recording
             .as_ref()
@@ -4972,6 +5232,11 @@ impl Forwarder {
         if let Some((_, container)) = &recording {
             if *container == "mp4" {
                 cmd.args(["-movflags", "frag_keyframe+empty_moov"]);
+            }
+            if *container == "mpegts" && self.config.timeline.is_some() {
+                // MPEG-TS otherwise adds its default mux delay to every PTS,
+                // shifting the sidecar's frame-count clock by 1.4 seconds.
+                cmd.args(["-muxdelay", "0", "-mpegts_copyts", "1"]);
             }
             // Its length and index are added once FFmpeg is done (`mkv`).
             if matroska {
@@ -5019,6 +5284,9 @@ impl Forwarder {
         let log_thread = log.collect(child.stderr.take().unwrap());
         let queue = Arc::new(WriterQueue::new());
         let alarm = storage.as_ref().map(crate::storage::Recording::alarm);
+        let chunks = storage.as_ref().map(|storage| {
+            timeline::ChunkWriter::new(storage.path().to_path_buf(), self.config.min_free)
+        });
         let limit = self.config.max_file_bytes;
         let output_thread = storage.map(|mut storage| {
             let mut output = child.stdout.take().expect("piped encoded output");
@@ -5027,12 +5295,16 @@ impl Forwarder {
                 let mut near = limit.map(NearEnd::new);
                 let mut start = matroska.then(mkv::Rewriter::new);
                 let error = copy_recording(&mut output, &mut storage, start.as_mut(), |written| {
+                    shared.encoded_bytes.store(written, Ordering::Release);
                     if near.as_mut().is_some_and(|near| near.reached(written)) {
                         shared.full_size.store(true, Ordering::Release);
                     }
                 })
                 .err()
                 .map(|error| format!("write bounded recording: {error}"));
+                shared
+                    .encoded_bytes
+                    .store(storage.bytes_written(), Ordering::Release);
                 let head = start.and_then(|start| start.head());
                 if storage.cut() == Some(crate::storage::Cut::MaxSize) {
                     shared.full_size.store(true, Ordering::Release);
@@ -5067,11 +5339,16 @@ impl Forwarder {
             #[cfg(not(target_os = "linux"))]
             let _ = raw;
         }
+        let timeline = self.timeline.take();
         let writer = thread::spawn(move || {
             let held = match input {
                 Input::Frames(raw, jetson) => {
                     // Each new frame once, at most one per slot.
-                    let repeat = Repeat::of(jetson.is_some(), local);
+                    let repeat = if timeline.is_some() {
+                        Repeat::Never
+                    } else {
+                        Repeat::of(jetson.is_some(), local)
+                    };
                     // FFmpeg reads a frame's own bytes straight from its
                     // pages, which stay as they are until it has.
                     #[cfg(target_os = "linux")]
@@ -5087,6 +5364,8 @@ impl Forwarder {
                         (raw, jetson),
                         interval,
                         repeat,
+                        timeline,
+                        chunks,
                     );
                     #[cfg(target_os = "linux")]
                     let held = splicer.map(Splicer::into_held).unwrap_or_default();
@@ -5137,17 +5416,30 @@ impl Forwarder {
     /// candidate. One that had written video ends the recording and keeps
     /// it. A stream's early exit is more likely its server's doing, and a
     /// failed write the disk's.
-    fn fall_back(&mut self, status: std::process::ExitStatus) -> Result<bool> {
-        let Some(process) = self.process.as_ref() else {
-            return Ok(false);
-        };
-        if status.success()
+    fn fallback_available(&self, process: &EncoderProcess) -> bool {
+        !(self.config.timeline.is_some()
+            || process.queue.chunks_seen.load(Ordering::Acquire)
             || self.config.encoder != "auto"
             || process.raw.is_none()
             || self.failed.is_some()
-            || process.output_thread.is_none()
+            || !is_recording(&self.config.output)
             || process.queue.output_failed.load(Ordering::Acquire)
+            || process.queue.encoded_bytes.load(Ordering::Acquire) > HEADER_BYTES
             || process.spawned.elapsed() > Duration::from_secs(10)
+            || self.file_end(process).is_some()
+            || !process.queue.fallback_failure())
+    }
+    fn fall_back(&mut self) -> Result<bool> {
+        let status = match self.process.as_mut() {
+            Some(process) => process.child.try_wait()?,
+            None => return Ok(false),
+        };
+        let Some(process) = self.process.as_ref() else {
+            return Ok(false);
+        };
+        if status.is_some_and(|status| status.success())
+            || (status.is_none() && !process.queue.input_closed())
+            || !self.fallback_available(process)
         {
             return Ok(false);
         }
@@ -5157,16 +5449,32 @@ impl Forwarder {
         let (width, height) = (process.width, process.height);
         let raw = process.raw.context("a copying recording has no encoder")?;
         let finished = finish(&mut process);
-        match finished.1 {
-            Some(output) if output.storage.bytes_written() <= HEADER_BYTES => output
+        // A broken input pipe may precede child exit. Existing bounded shutdown
+        // must confirm failure, and final storage/artifact facts must still
+        // permit replacing its header-only file.
+        if finished.0.is_none_or(|status| status.success())
+            || !self.fallback_available(&process)
+            || finished
+                .1
+                .as_ref()
+                .is_none_or(|output| output.storage.bytes_written() > HEADER_BYTES)
+        {
+            let end = self.file_end(&process);
+            let settled = self.settle(process, finished);
+            if let Some(end) = end {
+                return Err(match settled {
+                    Ok(()) => end,
+                    Err(error) => end.context(format!("while finishing forwarding: {error:#}")),
+                });
+            }
+            settled?;
+            bail!("FFmpeg forwarding stopped before an encoder replacement was possible");
+        }
+        if let Some(output) = finished.1 {
+            output
                 .storage
                 .abort()
-                .context("remove failed recording output")?,
-            Some(_) => {
-                self.settle(process, finished)?;
-                bail!("FFmpeg forwarding exited ({status})");
-            }
-            None => {}
+                .context("remove failed recording output")?;
         }
         if let Ok(exe) = executable() {
             remember(&exe, |probes| {
@@ -5195,21 +5503,47 @@ impl Forwarder {
     pub(crate) fn push(&mut self, frame: Frame) -> Result<bool> {
         // The output thread notes why the file ended before it fails the
         // queue, so a failure seen once the file has ended is that end.
-        self.queue_frame(frame)
-            .map_err(|error| self.storage_end().unwrap_or(error))
+        self.queue_frame(frame).map_err(|error| {
+            self.process
+                .as_ref()
+                .and_then(|process| self.file_end(process))
+                .unwrap_or(error)
+        })
     }
     fn queue_frame(&mut self, frame: Frame) -> Result<bool> {
+        if frame.multipart.is_some() {
+            return Err(Categorized::error(
+                ErrorKind::Unsupported,
+                "multipart component archives currently require a local still capture",
+            ));
+        }
+        if frame.chunks.is_some() && (!is_recording(&self.config.output) || self.copy.is_some()) {
+            return Err(Categorized::error(
+                ErrorKind::Unsupported,
+                "image chunk data requires a local encoded recording; network streams cannot retain chunk artifacts",
+            ));
+        }
+        if let Some(timeline) = &self.config.timeline {
+            let received = frame.received_monotonic_ns.ok_or_else(|| {
+                Categorized::error(
+                    ErrorKind::Incomplete,
+                    "indexed video frame has no host receive timestamp",
+                )
+            })?;
+            if received > timeline.acquisition_end_ns {
+                return Ok(false);
+            }
+        }
         if self.process.is_none() {
             match self.copy.clone() {
                 Some(tap) => self.spawn_copy(frame.width, frame.height, tap)?,
-                None => self.spawn(
-                    frame.width,
-                    frame.height,
-                    RawInput::for_format(frame.pixel_format)?,
-                )?,
+                None => self.spawn(frame.width, frame.height, RawInput::for_frame(&frame)?)?,
             }
         }
-        let process = self.process.as_mut().unwrap();
+        let process = self.process.as_ref().unwrap();
+        if frame.chunks.is_some() {
+            process.queue.chunks_seen.store(true, Ordering::Release);
+        }
         ensure!(
             frame.width == process.width && frame.height == process.height,
             "the camera's resolution changed from {}x{} to {}x{}; start a new recording to continue",
@@ -5226,24 +5560,27 @@ impl Forwarder {
                 .is_none_or(|raw| frame.pixel_format == raw.pixel_format),
             "the camera's pixel format changed; start a new recording to continue"
         );
+        // Bad source bytes are an input error, never a reason to replace an
+        // encoder whose pipe happened to close at the same time.
+        match (process.jetson, process.raw) {
+            (Some(_), _) => crate::frame::validate_source(&frame)?,
+            (None, Some(raw)) => raw.check(&frame)?,
+            (None, None) => {}
+        }
         // A recording at its maximum size, or on a disk below its floor,
         // ends: as asked, or with storage_full.
-        if let Some(end) = self.storage_end() {
+        if let Some(end) = self.file_end(process) {
             return Err(end);
-        }
-        let process = self.process.as_mut().unwrap();
-        #[cfg(test)]
-        if let Some(race) = PUSH_RACE.get() {
-            race(&process.queue);
         }
         // An encoder that died at start leaves a broken pipe behind; falling
         // back to the next one comes first.
-        if let Some(status) = process.child.try_wait()?
-            && self.fall_back(status)?
-        {
+        if self.fall_back()? {
             return self.queue_frame(frame);
         }
         let process = self.process.as_mut().unwrap();
+        if let Some(error) = process.queue.typed_error() {
+            return Err(error);
+        }
         let stored_error = process
             .queue
             .state
@@ -5260,21 +5597,21 @@ impl Forwarder {
                 process.log.text(&self.config.output).trim()
             );
         }
+        #[cfg(test)]
+        if let Some(race) = PUSH_RACE.get() {
+            race(&process.queue);
+        }
         // FFmpeg converts on its own threads with SIMD swscale (or the encoder
         // hardware), so the camera's buffer itself is queued for the pipe.
         // What FFmpeg cannot read, and Jetson's RGBA or I420, the writer
         // builds from it in one pass; only what that reads is checked here.
-        match (process.jetson, process.raw) {
-            (Some(_), _) => crate::frame::validate_source(&frame)?,
-            (None, Some(raw)) => raw.check(&frame)?,
+        if process.raw.is_none() {
             // A copied recording's frames only show the source is live.
-            (None, None) => {
-                let queue = &process.queue;
-                queue.accepted.fetch_add(1, Ordering::Relaxed);
-                let arrived = u64::try_from(queue.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
-                queue.arrived_ms.store(arrived, Ordering::Relaxed);
-                return Ok(true);
-            }
+            let queue = &process.queue;
+            queue.accepted.fetch_add(1, Ordering::Relaxed);
+            let arrived = u64::try_from(queue.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
+            queue.arrived_ms.store(arrived, Ordering::Relaxed);
+            return Ok(true);
         }
         let queue = &process.queue;
         let mut state = queue
@@ -5297,8 +5634,21 @@ impl Forwarder {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .0;
         }
-        if let Some(error) = &state.error {
-            bail!("{error}: {}", process.log.text(&self.config.output).trim());
+        if state.error.is_some() {
+            drop(state);
+            // The writer can close its input after the first health check or
+            // while this source waits for its queued frame to be taken.
+            if self.fall_back()? {
+                return self.queue_frame(frame);
+            }
+            if let Some(error) = self
+                .process
+                .as_ref()
+                .and_then(|process| process.queue.typed_error())
+            {
+                return Err(error);
+            }
+            bail!("FFmpeg forwarding writer stopped");
         }
         ensure!(
             queue.running.load(Ordering::Acquire),
@@ -5323,17 +5673,34 @@ impl Forwarder {
     /// free-space floor (`storage_full`).
     pub(crate) fn storage_end(&self) -> Option<anyhow::Error> {
         let process = self.process.as_ref()?;
+        self.file_end(process).or_else(|| {
+            // Only an actual early input EPIPE can await the next push's
+            // bounded confirmation. Existing startup age ends this deferral
+            // even if no more frames arrive; stop never restarts a recording.
+            if process.queue.input_closed() && self.fallback_available(process) {
+                None
+            } else {
+                process.queue.typed_error()
+            }
+        })
+    }
+    fn file_end(&self, process: &EncoderProcess) -> Option<anyhow::Error> {
         if process.queue.full_size.load(Ordering::Acquire) {
             let limit = self.config.max_file_bytes.unwrap_or_default();
             return Some(crate::storage::MaxSize(limit).into());
         }
-        process.alarm.as_ref()?.error()
+        process.alarm.as_ref().and_then(|alarm| alarm.error())
     }
     pub(crate) fn stats(&self) -> ForwardStats {
         self.process.as_ref().map_or_else(
             || self.final_stats.clone(),
             |p| {
                 let lost = p.copied.as_ref().map_or(0, |(_, feed)| feed.dropped());
+                let state = p
+                    .queue
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 ForwardStats {
                     accepted: p.queue.accepted.load(Ordering::Relaxed),
                     written: p.queue.written.load(Ordering::Relaxed),
@@ -5342,14 +5709,9 @@ impl Forwarder {
                     stalled: p.queue.stalled(),
                     encoder: p.encoder.clone(),
                     codec: self.config.codec.clone(),
-                    error: p
-                        .queue
-                        .state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .error
-                        .clone(),
+                    error: state.error.clone(),
                     recording: None,
+                    chunks: state.chunks.clone(),
                 }
             },
         )
@@ -5360,10 +5722,35 @@ impl Forwarder {
         if let Some(reserved) = self.reserved.take() {
             reserved.abort().context("remove unused recording output")?;
         }
+        if let Some(timeline) = self.timeline.take() {
+            timeline.finish()?;
+        }
         let Some(mut process) = self.process.take() else {
             return Ok(());
         };
-        let finished = finish(&mut process);
+        let mut finished = finish(&mut process);
+        if self.config.timeline.is_some() || process.queue.chunks_seen.load(Ordering::Acquire) {
+            let indexed = process.queue.written.load(Ordering::Relaxed);
+            let encoded = process.log.completed_video_frames();
+            if let Some(chunks) = process
+                .queue
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .chunks
+                .as_mut()
+            {
+                chunks["encoded_frames"] = json!(encoded);
+                chunks["video_frames_verified"] = json!(encoded == Some(indexed));
+            }
+            if encoded != Some(indexed) {
+                let error=Categorized::new(ErrorKind::Incomplete,"encoded video frame count differs from its frame index or final encoder progress is missing")
+                    .details(json!({"index_frames":indexed,"encoded_frames":encoded}));
+                let error: anyhow::Error = error.into();
+                process.queue.fail_timeline(&error);
+                finished.2.get_or_insert_with(|| format!("{error:#}"));
+            }
+        }
         self.settle(process, finished)
     }
     /// Keep or remove the recording of a finished encoder process, and say
@@ -5372,6 +5759,14 @@ impl Forwarder {
     fn settle(&mut self, process: EncoderProcess, finished: Finished) -> Result<()> {
         let (status, recording, mut error) = finished;
         self.final_stats.written = process.queue.written.load(Ordering::Relaxed);
+        self.final_stats.chunks.clone_from(
+            &process
+                .queue
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .chunks,
+        );
         let mut full_size = false;
         if let Some(mut output) = recording {
             // Video the encoder wrote stays even when it failed or had to be
@@ -5383,8 +5778,20 @@ impl Forwarder {
             // is no error, but the file is reported as cut.
             let cut = output.storage.cut();
             full_size = cut == Some(crate::storage::Cut::MaxSize);
-            if full_size {
+            if full_size
+                && self.config.timeline.is_none()
+                && !process.queue.chunks_seen.load(Ordering::Acquire)
+            {
                 (error, output.error) = (None, None);
+            } else if full_size {
+                let failure: anyhow::Error = Categorized::new(
+                    ErrorKind::Incomplete,
+                    "indexed video was truncated at its file-size limit",
+                )
+                .details(json!({"max_file_bytes":self.config.max_file_bytes}))
+                .into();
+                process.queue.fail_timeline(&failure);
+                error.get_or_insert_with(|| format!("{failure:#}"));
             }
             let kept = (output.error.is_none() || cut.is_some())
                 && output.storage.bytes_written() > HEADER_BYTES;
@@ -5427,6 +5834,13 @@ impl Forwarder {
                         codec: self.config.codec.clone(),
                         encoder: process.encoder,
                         truncated: full_size,
+                        chunks: process
+                            .queue
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .chunks
+                            .clone(),
                     };
                     self.final_stats.recording = Some(recorded);
                 })
@@ -5451,11 +5865,20 @@ impl Forwarder {
         }
         self.final_stats.error.clone_from(&error);
         if let Some(error) = error {
+            let tag = process
+                .queue
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .error_tag
+                .clone();
+            let failure = crate::types::error_from_tag(tag, error);
             let log = process.log.text(&self.config.output);
-            if log.trim().is_empty() {
-                bail!("{error}");
-            }
-            bail!("{error}: {}", log.trim());
+            return if log.trim().is_empty() {
+                Err(failure)
+            } else {
+                Err(failure.context(log.trim().to_owned()))
+            };
         }
         Ok(())
     }
@@ -5918,7 +6341,7 @@ esac"#,
         camera.start(12).unwrap();
         let frame = camera.next_frame(Duration::from_secs(2)).unwrap();
         assert_eq!(
-            crate::frame::pixel_format_name(frame.pixel_format),
+            crate::frame::frame_format_name(&frame),
             "YCbCr709_420_8_Planar"
         );
         // The probe, the launch that failed, and one in software.
@@ -6092,7 +6515,7 @@ sleep 5"#,
             let frame = camera.next_frame(Duration::from_secs(2)).unwrap();
             assert_eq!((frame.width, frame.height, frame.data.len()), (4, 2, 12));
             assert_eq!(
-                crate::frame::pixel_format_name(frame.pixel_format),
+                crate::frame::frame_format_name(&frame),
                 "YCbCr709_420_8_Planar"
             );
         }
@@ -6474,26 +6897,6 @@ exit 1"#,
         }
     }
     #[test]
-    fn concat_scripts_quote_what_they_name() {
-        assert_eq!(
-            concat_script(
-                "rtsp://a:it's@cam/live",
-                ["-probesize", "500000", "-rtsp_transport", "tcp+udp"].into_iter()
-            ),
-            "ffconcat version 1.0\nfile 'rtsp://a:it'\\''s@cam/live'\noption probesize '500000'\noption rtsp_transport 'tcp+udp'\n"
-        );
-        assert_eq!(
-            concat_script(
-                "",
-                ["--headers", "é'雪", "-empty", "", "-dangling"].into_iter()
-            ),
-            "ffconcat version 1.0\nfile ''\noption headers 'é'\\''雪'\noption empty ''\n"
-        );
-        assert!(credentialed("rtsp://a:b@cam/live"));
-        assert!(credentialed("http://cam/video.cgi?user=a&pass=b"));
-        assert!(!credentialed("rtsp://cam/live"));
-    }
-    #[test]
     fn a_stream_that_drops_again_soon_keeps_backing_off() {
         let mut camera = native("rtsp://camera/live", Vec::new());
         camera.native = false;
@@ -6776,12 +7179,17 @@ for i in 1 2; do printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; done"#,
     #[cfg(unix)]
     fn tiny(width: u32, height: u32) -> Frame {
         Frame {
+            pixel_encoding: None,
+            device_timestamp: None,
             id: 1,
             width,
             height,
             pixel_format: RGB8,
             device_ts_ns: None,
             wall_ms: 0,
+            received_monotonic_ns: None,
+            chunks: None,
+            multipart: None,
             data: vec![7; (width * height * 3) as usize].into(),
             jpeg: None,
         }
@@ -6789,6 +7197,7 @@ for i in 1 2; do printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; done"#,
     #[cfg(unix)]
     fn stream(encoder: &str, fps: f64) -> ForwardConfig {
         ForwardConfig {
+            timeline: None,
             output: "tcp://127.0.0.1:9".into(),
             codec: "h264".into(),
             encoder: encoder.into(),
@@ -7101,6 +7510,68 @@ esac"#,
         assert_eq!(crate::cli::error_code(&error), ("unsupported", 5));
     }
     #[test]
+    fn completed_forwarding_diagnostics_preserve_the_first_typed_cause() {
+        let primary: anyhow::Error =
+            Categorized::new(ErrorKind::Disconnected, "first ownership lease expired")
+                .details(json!({"controller_ownership":"retired","reason":"lease_expired"}))
+                .into();
+        let completed = anyhow!("FFmpeg input failed: Broken pipe; Connection refused");
+        let error = Forwarder::completed_error(&primary, &completed);
+        assert_eq!(
+            crate::types::error_tag(&error),
+            crate::types::error_tag(&primary)
+        );
+        assert!(crate::transport::gige::ownership_retired(&error));
+        let message = format!("{error:#}");
+        assert!(message.starts_with("first ownership lease expired"));
+        assert!(message.contains("Connection refused"));
+        assert_eq!(
+            format!("{}", Forwarder::completed_error(&primary, &primary)),
+            format!("{primary:#}")
+        );
+    }
+    #[test]
+    #[cfg(unix)]
+    fn an_early_pipe_failure_keeps_stderr_collected_during_forwarding_finish() {
+        let fake = Fake::new(
+            "late-encoder-diagnostic",
+            r#"case "$*" in
+*-encoders*) printf ' V....D libx264 x264 (codec h264)\n' ;;
+*"-f null"*) ;;
+*) exec 0<&-; : > "$dir/input-closed"
+   while [ ! -e "$dir/release-diagnostic" ]; do sleep 0.01; done
+   printf 'Connection refused while opening output\n' >&2; exit 1 ;;
+esac"#,
+        );
+        let mut forward = Forwarder::new(stream("libx264", 30.0)).unwrap();
+        forward.push(tiny(8, 4)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fake.dir.join("input-closed").exists() {
+            assert!(Instant::now() < deadline, "encoder did not close its input");
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Force the writer-before-stderr interleaving independently of pipe
+        // capacity or reader scheduling. The real encoder has closed stdin,
+        // but cannot publish its diagnostic until this test releases it.
+        forward
+            .process
+            .as_ref()
+            .unwrap()
+            .queue
+            .fail("FFmpeg input failed: Broken pipe".into());
+        let primary = forward.storage_end().unwrap();
+        assert!(format!("{primary:#}").contains("Broken pipe"));
+        assert!(!format!("{primary:#}").contains("refused"));
+        fs::write(fake.dir.join("release-diagnostic"), b"").unwrap();
+        let completed = forward.stop().unwrap_err();
+        assert!(format!("{completed:#}").contains("Connection refused"));
+        let error = Forwarder::completed_error(&primary, &completed);
+        assert_eq!(crate::cli::error_code(&error), ("failed", 1));
+        assert!(format!("{error:#}").contains("Connection refused"));
+        assert!(forward.stats().recording.is_none());
+    }
+
+    #[test]
     #[cfg(unix)]
     fn a_stream_whose_encoder_exits_does_not_fall_back() {
         let first = encoder_candidates("h264")[0];
@@ -7127,6 +7598,302 @@ esac"#
             fake.launches(&["-c:v libx264", "-use_wallclock_as_timestamps"]),
             0
         );
+    }
+    #[test]
+    #[cfg(unix)]
+    fn only_the_first_actual_input_broken_pipe_is_retryable() {
+        #[derive(Clone, Copy)]
+        struct RejectInput(std::io::ErrorKind);
+        impl Write for RejectInput {
+            fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(self.0, "rejected encoder input"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for kind in [
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            let queue = WriterQueue::new();
+            queue.state.lock().unwrap().latest = Some(tiny(8, 4));
+            let taken = write_frames(
+                &queue,
+                (&mut RejectInput(kind), None),
+                (RawInput::for_format(RGB8).unwrap(), None),
+                Duration::ZERO,
+                Repeat::Never,
+                None,
+                None,
+            );
+            assert_eq!(taken, 1);
+            assert_eq!(queue.written.load(Ordering::Relaxed), 0);
+            assert_eq!(queue.input_closed(), kind == std::io::ErrorKind::BrokenPipe);
+            assert!(
+                queue
+                    .typed_error()
+                    .unwrap()
+                    .to_string()
+                    .contains("rejected encoder input")
+            );
+        }
+        let queue = WriterQueue::new();
+        queue.fail("Broken pipe while preparing invalid source pixels".into());
+        queue.fail_input(&std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        assert!(!queue.input_closed());
+        assert!(!queue.fallback_failure());
+        assert_eq!(
+            queue.typed_error().unwrap().to_string(),
+            "Broken pipe while preparing invalid source pixels"
+        );
+        let queue = WriterQueue::new();
+        queue.fail_input(&std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        queue.fail_timeline(&Categorized::error(ErrorKind::Incomplete, "index failed"));
+        assert!(!queue.input_closed());
+        assert!(!queue.fallback_failure());
+        assert_eq!(
+            crate::types::classify(&queue.typed_error().unwrap()).kind,
+            ErrorKind::Incomplete
+        );
+    }
+    #[test]
+    #[cfg(unix)]
+    fn a_live_startup_child_with_an_input_epipe_is_confirmed_before_one_fallback() {
+        for during_push in [false, true] {
+            let first = encoder_candidates("h264")[0];
+            let fake = Fake::new(
+                "fallback-before-exit",
+                &format!(
+                    r#"echo "$*" >> "$dir/argv"
+case "$*" in
+*-encoders*) printf ' V....D {first} first (codec h264)\n V....D libx264 x264 (codec h264)\n' ;;
+*"-f null"*) ;;
+*"-c:v {first}"*) cat >/dev/null; printf 'partial'; exit 1 ;;
+*) cat ;;
+esac"#
+                ),
+            );
+            let output = fake.dir.join("recover.mkv");
+            let mut forward = Forwarder::new(recording(&output, "auto")).unwrap();
+            forward.wait_for_writer();
+            forward
+                .spawn(16, 16, RawInput::for_format(RGB8).unwrap())
+                .unwrap();
+            assert_eq!(
+                forward.process.as_mut().unwrap().child.try_wait().unwrap(),
+                None
+            );
+            if during_push {
+                // Arrive after the child/error health checks, at the same
+                // final queue-error branch used after waiting for a slot.
+                PUSH_RACE.set(Some(|queue| {
+                    PUSH_RACE.set(None);
+                    queue.fail_input(&std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+                }));
+            } else {
+                forward
+                    .process
+                    .as_ref()
+                    .unwrap()
+                    .queue
+                    .fail_input(&std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+                // Engine idle polling must leave this startup failure for
+                // bounded confirmation instead of ending before push runs.
+                assert!(forward.storage_end().is_none());
+            }
+            assert!(forward.push(tiny(16, 16)).unwrap());
+            assert_eq!(forward.stats().encoder, "libx264");
+            assert_eq!(forward.failed.as_deref(), Some(first));
+            assert!(forward.push(tiny(16, 16)).unwrap());
+            forward.stop().unwrap();
+            let written = usize::try_from(forward.stats().written).unwrap();
+            assert!(written >= 1);
+            assert_eq!(fs::read(&output).unwrap(), vec![7; written * 16 * 16 * 3]);
+            assert_eq!(
+                fake.launches(&[&format!("-c:v {first}"), "-use_wallclock_as_timestamps"]),
+                1
+            );
+            assert_eq!(
+                fake.launches(&["-c:v libx264", "-use_wallclock_as_timestamps"]),
+                1
+            );
+        }
+    }
+    #[test]
+    #[cfg(unix)]
+    fn startup_pipe_deferral_is_bounded_and_does_not_mask_input_or_artifact_errors() {
+        let first = encoder_candidates("h264")[0];
+        let fake = Fake::new(
+            "fallback-guards",
+            &format!(
+                r#"echo "$*" >> "$dir/argv"
+case "$*" in
+*-encoders*) printf ' V....D {first} first (codec h264)\n V....D libx264 x264 (codec h264)\n' ;;
+*"-f null"*) ;;
+*) cat >/dev/null; exit 1 ;;
+esac"#
+            ),
+        );
+        let output = fake.dir.join("guarded.mkv");
+        let mut forward = Forwarder::new(recording(&output, "auto")).unwrap();
+        forward
+            .spawn(16, 16, RawInput::for_format(RGB8).unwrap())
+            .unwrap();
+        let queue = forward.process.as_ref().unwrap().queue.clone();
+        queue.fail_input(&std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        assert!(forward.storage_end().is_none());
+        let resized = forward.push(tiny(8, 4)).unwrap_err();
+        assert!(resized.to_string().contains("resolution changed"));
+        let mut truncated = tiny(16, 16);
+        truncated.data = vec![7; 1].into();
+        let malformed = forward.push(truncated).unwrap_err();
+        assert!(malformed.to_string().contains("truncated"), "{malformed:#}");
+        assert!(
+            !malformed.to_string().contains("Broken pipe"),
+            "{malformed:#}"
+        );
+        assert_eq!(forward.stats().accepted, 0);
+        forward.config.encoder = "libx264".into();
+        assert!(forward.storage_end().is_some());
+        forward.config.encoder = "auto".into();
+        forward.config.output = "tcp://127.0.0.1:9".into();
+        assert!(forward.storage_end().is_some());
+        forward.config.output = output.to_string_lossy().into();
+        forward.config.timeline = Some(timeline::Config {
+            path: fake.dir.join("unused.jsonl").to_string_lossy().into(),
+            acquisition_end_ns: 1,
+        });
+        assert!(forward.storage_end().is_some());
+        forward.config.timeline = None;
+        queue.chunks_seen.store(true, Ordering::Release);
+        assert!(forward.storage_end().is_some());
+        queue.chunks_seen.store(false, Ordering::Release);
+        queue.output_failed.store(true, Ordering::Release);
+        assert!(forward.storage_end().is_some());
+        queue.output_failed.store(false, Ordering::Release);
+        queue
+            .encoded_bytes
+            .store(HEADER_BYTES + 1, Ordering::Release);
+        assert!(forward.storage_end().is_some());
+        queue.encoded_bytes.store(0, Ordering::Release);
+        let spawned = forward.process.as_ref().unwrap().spawned;
+        forward.process.as_mut().unwrap().spawned =
+            Instant::now().checked_sub(Duration::from_secs(11)).unwrap();
+        assert!(forward.storage_end().is_some());
+        forward.process.as_mut().unwrap().spawned = spawned;
+        forward.failed = Some(first.into());
+        assert!(forward.storage_end().is_some());
+        forward.failed = None;
+        let raw = forward.process.as_mut().unwrap().raw.take();
+        assert!(forward.storage_end().is_some());
+        forward.process.as_mut().unwrap().raw = raw;
+        queue.full_size.store(true, Ordering::Release);
+        assert!(
+            forward
+                .storage_end()
+                .unwrap()
+                .is::<crate::storage::MaxSize>()
+        );
+        queue.full_size.store(false, Ordering::Release);
+        queue.fail_artifact(
+            "video chunks",
+            &Categorized::error(ErrorKind::StorageFull, "artifact storage exhausted"),
+        );
+        let error = forward.storage_end().unwrap();
+        assert_eq!(crate::types::classify(&error).kind, ErrorKind::StorageFull);
+        assert!(forward.process.is_some());
+        drop(forward);
+        assert_eq!(
+            fake.launches(&["-c:v libx264", "-use_wallclock_as_timestamps"]),
+            0
+        );
+    }
+    #[test]
+    #[cfg(unix)]
+    fn fallback_confirmation_keeps_final_video_and_file_size_cutoffs() {
+        for limit in [None, Some(5_000)] {
+            let first = encoder_candidates("h264")[0];
+            let fake = Fake::new(
+                "fallback-finish-output",
+                &format!(
+                    r#"echo "$*" >> "$dir/argv"
+case "$*" in
+*-encoders*) printf ' V....D {first} first (codec h264)\n V....D libx264 x264 (codec h264)\n' ;;
+*"-f null"*) ;;
+*) cat >/dev/null; head -c 10000 /dev/zero; exit 1 ;;
+esac"#
+                ),
+            );
+            let output = fake.dir.join("retained.mkv");
+            let mut config = recording(&output, "auto");
+            config.max_file_bytes = limit;
+            let mut forward = Forwarder::new(config).unwrap();
+            forward
+                .spawn(16, 16, RawInput::for_format(RGB8).unwrap())
+                .unwrap();
+            let queue = forward.process.as_ref().unwrap().queue.clone();
+            assert_eq!(queue.encoded_bytes.load(Ordering::Acquire), 0);
+            queue.fail_input(&std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            assert!(forward.storage_end().is_none());
+            let error = forward.push(tiny(16, 16)).unwrap_err();
+            if limit.is_some() {
+                assert!(error.is::<crate::storage::MaxSize>(), "{error:#}");
+            } else {
+                assert!(error.to_string().contains("FFmpeg"), "{error:#}");
+            }
+            let kept = limit.unwrap_or(10_000);
+            assert_eq!(fs::metadata(&output).unwrap().len(), kept);
+            let recorded = forward.stats().recording.unwrap();
+            assert_eq!(recorded.bytes, kept);
+            assert_eq!(recorded.truncated, limit.is_some());
+            assert!(forward.process.is_none());
+            assert!(forward.failed.is_none());
+            forward.stop().unwrap();
+            assert_eq!(
+                fake.launches(&["-c:v libx264", "-use_wallclock_as_timestamps"]),
+                0
+            );
+        }
+    }
+    #[test]
+    #[cfg(unix)]
+    fn fallback_requires_a_failed_exit_not_a_successful_or_stuck_child() {
+        for ending in ["exit 0", r#"mkfifo "$dir/hold" && exec cat "$dir/hold""#] {
+            let first = encoder_candidates("h264")[0];
+            let fake = Fake::new(
+                "fallback-confirmation",
+                &format!(
+                    r#"echo "$*" >> "$dir/argv"
+case "$*" in
+*-encoders*) printf ' V....D {first} first (codec h264)\n V....D libx264 x264 (codec h264)\n' ;;
+*"-f null"*) ;;
+*) cat >/dev/null; {ending} ;;
+esac"#
+                ),
+            );
+            let output = fake.dir.join("unconfirmed.mkv");
+            let mut forward = Forwarder::new(recording(&output, "auto")).unwrap();
+            forward
+                .spawn(16, 16, RawInput::for_format(RGB8).unwrap())
+                .unwrap();
+            forward
+                .process
+                .as_ref()
+                .unwrap()
+                .queue
+                .fail_input(&std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+            let error = forward.push(tiny(16, 16)).unwrap_err();
+            assert!(error.to_string().contains("FFmpeg"), "{error:#}");
+            assert!(forward.process.is_none());
+            assert!(forward.failed.is_none());
+            assert!(!output.exists());
+            forward.stop().unwrap();
+            assert_eq!(
+                fake.launches(&["-c:v libx264", "-use_wallclock_as_timestamps"]),
+                0
+            );
+        }
     }
     #[test]
     #[cfg(unix)]
@@ -7209,7 +7976,12 @@ esac"#
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(30));
         }
-        forward.stop().unwrap();
+        // The writer can observe the broken encoder pipe before push settles
+        // the process. In that ordering stop must report the same failure;
+        // otherwise push has already reported it and stop is idempotent.
+        if let Err(error) = forward.stop() {
+            assert!(error.to_string().contains("FFmpeg"), "{error:#}");
+        }
         let stats = forward.stats();
         assert!(stats.error.is_some(), "{stats:?}");
         assert_eq!(stats.recording.unwrap().bytes, 10_000);
@@ -7279,227 +8051,6 @@ esac"#
         }
     }
     #[test]
-    fn sources_redact_credentials_and_forbid_command_protocols() {
-        assert_eq!(
-            redact_url("rtsp://user:pass@camera:554/live?token=abc&fps=30"),
-            "rtsp://<redacted>@camera:554/live?token=<redacted>&fps=30"
-        );
-        assert_eq!(
-            redact_url("srt://host:8890?passphrase=secret&mode=caller"),
-            "srt://host:8890?passphrase=<redacted>&mode=caller"
-        );
-        assert_eq!(
-            redact_url("RTMPS://user:pass@host/app/instance/KEY?token=SECRET&fps=30"),
-            "RTMPS://<redacted>@host/app/<redacted>?token=<redacted>&fps=30"
-        );
-        assert_eq!(redact_url("rtmp://host/app/"), "rtmp://host/app/");
-        assert_eq!(redact_url("rtmp://host/app"), "rtmp://host/app");
-        assert_eq!(
-            redact_url("rtmp://host/app/<redacted>"),
-            "rtmp://host/app/<redacted>"
-        );
-        info("rtsp://camera/live").unwrap();
-        info("concat:secret|other").unwrap_err();
-        info("rtsp://camera/live\n-x").unwrap_err();
-        // Vendor and signed-URL credentials (Foscam pwd, Blue Iris pw,
-        // authSig, API keys) never reach logs either.
-        assert_eq!(
-            redact_url(
-                "http://cam/cgi?usr=a&PWD=b&pw=c&api_key=d&ApiKey=e&authSig=f&sig=g&signature=h&stream=main&fps=5"
-            ),
-            "http://cam/cgi?usr=a&PWD=<redacted>&pw=<redacted>&api_key=<redacted>&ApiKey=<redacted>&authSig=<redacted>&sig=<redacted>&signature=<redacted>&stream=main&fps=5"
-        );
-    }
-    #[test]
-    fn query_credentials_are_redacted_across_case_separators_and_percent_encoding() {
-        for key in [
-            "api_key",
-            "API-Key",
-            "client_secret",
-            "ClIeNt-SeCrEt",
-            "X-Amz-Credential",
-            "x-AmZ-SiGnAtUrE",
-            "X-Amz-Security-Token",
-            "X-Goog-Credential",
-            "x-GoOg-SiGnAtUrE",
-            "X-Goog-Security-Token",
-            "sig",
-            "SiG",
-            "%61pI%5fkEy",
-            "%41PI%2dKeY",
-            "cLiEnT%5FsEcReT",
-            "%58-AmZ-%43reDential",
-            "X%2daMz%2dSiGnAtUrE",
-            "x-AmZ-sEcUrItY%2dtOkEn",
-            "%78-gOoG-CrEdEnTiAl",
-            "X%2DgOoG%2DsIgNaTuRe",
-            "x-GoOg-SeCuRiTy%2DtOkEn",
-            "%73%49%67",
-            "aCcEsS%5FtOkEn",
-            "%50aSsWoRd",
-            "%50wD",
-            "%70W",
-            "AuTh%53Ig",
-            "%73IgNaTuRe",
-            // IP cameras' own names for a password.
-            "pass",
-            "PASS",
-            "passcode",
-            "loginpas",
-            "loginPass",
-            "user_pwd",
-            "psw",
-            "refresh_token",
-            "auth_key",
-        ] {
-            let url = format!("https://camera/stream?{key}=PRIVATE%2fvalue&fps=30");
-            assert!(credential_query_key(key), "{key}");
-            assert_eq!(
-                redact_url(&url),
-                format!("https://camera/stream?{key}=<redacted>&fps=30"),
-                "{key}"
-            );
-        }
-    }
-    #[test]
-    fn query_redaction_preserves_noncredential_parameters() {
-        let url = "https://camera/stream?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20261018T120000Z&X-Amz-Expires=60&X-Goog-SignedHeaders=host&sv=2026-02-06&se=2026-10-19&sp=r&fps=30&format=h264&request_id=value%2fkept";
-        assert_eq!(redact_url(url), url);
-        for (input, expected) in [
-            ("https://cam/live?", "https://cam/live?"),
-            (
-                "rtsp://u:p@cam/live?a=&password=&b=two=three&&#fragment",
-                "rtsp://<redacted>@cam/live?a&password=<redacted>&b=two=three&&#fragment",
-            ),
-            (
-                "https://cam/live?label=雪&x=&token=秘密&flag&&tail=",
-                "https://cam/live?label=雪&x&token=<redacted>&flag&&tail",
-            ),
-            (
-                "https://cam/live?token&bare",
-                "https://cam/live?token=<redacted>&bare",
-            ),
-        ] {
-            assert_eq!(redact_url(input), expected);
-        }
-        for key in [
-            "X-Amz-Date",
-            "X-Goog-Algorithm",
-            "expires",
-            "client_id",
-            "keyframe_interval",
-            "apikey_hint",
-            "api%252dkey",
-            "api%key",
-            "api%2",
-            "api%zzkey",
-        ] {
-            assert!(!credential_query_key(key), "{key}");
-        }
-    }
-    #[test]
-    fn redaction_preserves_unicode_and_is_idempotent() {
-        for (url, expected) in [
-            (
-                "rtmp://利用者:密碼@cam/アプリ/秘密?fps=30&token=別",
-                "rtmp://<redacted>@cam/アプリ/<redacted>?fps=30&token=<redacted>",
-            ),
-            (
-                "rtmps://[::1]/app/密碼#fragment",
-                "rtmps://[::1]/app/<redacted>#fragment",
-            ),
-            ("rtmp://cam/app/", "rtmp://cam/app/"),
-            (
-                "RTMPS://<redacted>@cam/アプリ/<redacted>?token=<redacted>&fps=30",
-                "RTMPS://<redacted>@cam/アプリ/<redacted>?token=<redacted>&fps=30",
-            ),
-            (
-                "https://cam/画面?label=雪&fps=30",
-                "https://cam/画面?label=雪&fps=30",
-            ),
-        ] {
-            assert_eq!(redact_url(url), expected, "{url}");
-            assert_eq!(redact_url(expected), expected);
-            assert_eq!(credentialed(url), url != expected);
-        }
-    }
-    #[test]
-    fn backend_urls_lowercase_only_the_scheme_and_keep_credentials_redacted() {
-        let source = "RTSP://User:P%40ss@Camera.Example:554/Live/%aB?token=Secret%2f&Mode=TCP";
-        let canonical = "rtsp://User:P%40ss@Camera.Example:554/Live/%aB?token=Secret%2f&Mode=TCP";
-        assert_eq!(canonical_scheme(source), canonical);
-        assert_eq!(
-            canonical_scheme("HtTp://Camera/映像?label=É"),
-            "http://Camera/映像?label=É"
-        );
-        assert_eq!(canonical_scheme("rtsπ://Camera/映像"), "rtsπ://Camera/映像");
-        assert_eq!(output_args(source).unwrap().last().unwrap(), canonical);
-        assert_eq!(
-            canonical_scheme(" C:\\My Captures\\record.mkv "),
-            " C:\\My Captures\\record.mkv "
-        );
-        assert_eq!(
-            canonical_scheme("C:\\My Captures\\record.mkv"),
-            "C:\\My Captures\\record.mkv"
-        );
-        let log = redact_log(&format!("cannot open {source} or {canonical}"), source);
-        assert!(!log.contains("P%40ss"));
-        assert!(!log.contains("Secret%2f"));
-        assert!(log.contains("Camera.Example:554/Live/%aB"));
-        assert!(log.contains("Mode=TCP"));
-    }
-    #[test]
-    fn network_sources_validate_hosts_ports_and_escaping_without_disclosing_credentials() {
-        for source in [
-            "rtsp://user:secret@camera:554/live",
-            "RTSP://camera/live",
-            "https://camera/stream?token=a%2Fb",
-            "srt://[::1]:8890",
-            "udp://@239.1.2.3:5000",
-            "tcp://:5000?listen=1",
-            "UDP://@:5000",
-            "TcP://:5000?listen=1",
-            "SRT://:8890",
-        ] {
-            assert!(validate_source(source).is_ok(), "{source}");
-        }
-        for source in [
-            "rtsp:",
-            "rtsp:///live",
-            "https://",
-            "rtsp://camera:0/live",
-            "rtsp://camera:65536/live",
-            "rtsp://camera:/live",
-            "rtsp://[oops]:554/live",
-            "rtsp://::1:554/live",
-            "https://camera/a%2",
-            "https://camera/a b",
-            "avfoundation:?fps=30",
-            "v4l2:/dev/video0?fps=30&fps=60",
-            "dshow:video=Camera?size=640x480&size=1280x720",
-        ] {
-            assert!(validate_source(source).is_err(), "{source}");
-        }
-        let error = validate_source("rtsp://user:secret@camera:99999/live").unwrap_err();
-        assert!(error.to_string().contains("1..65535"));
-        assert!(!format!("{error:#}").contains("secret"));
-        assert!(local_file_path("file://remote/a.mkv").is_err() || cfg!(windows));
-        assert_eq!(
-            local_file_path("file://localhost/tmp/a.mkv").unwrap(),
-            PathBuf::from("/tmp/a.mkv")
-        );
-        assert_eq!(
-            local_file_path("file:///tmp/clip%20%C3%A9%23.mkv").unwrap(),
-            PathBuf::from("/tmp/clip é#.mkv")
-        );
-        assert_eq!(
-            local_file_path("file:literal%20name.mkv").unwrap(),
-            PathBuf::from("literal%20name.mkv")
-        );
-        local_file_path("file:///tmp/clip%00.mkv").unwrap_err();
-        local_file_path("file:///tmp/clip%QQ.mkv").unwrap_err();
-    }
-    #[test]
     fn forwarding_output_selection() {
         assert_eq!(
             output_args("rtsp://host/live").unwrap(),
@@ -7534,12 +8085,17 @@ esac"#
         );
         JetsonInput::Rgba.frame_bytes(1, tallest + 1).unwrap_err();
         let mut frame = Frame {
+            pixel_encoding: None,
+            device_timestamp: None,
             id: 1,
             width: 3,
             height: 3,
             pixel_format: crate::types::MONO8,
             device_ts_ns: None,
             wall_ms: 0,
+            received_monotonic_ns: None,
+            chunks: None,
+            multipart: None,
             data: vec![7; 8].into(),
             jpeg: None,
         };
@@ -7594,12 +8150,17 @@ esac"#
         assert_eq!(bits_per_second("800000").unwrap(), 800_000);
         assert!(bits_per_second("5G").is_err() && bits_per_second("x").is_err());
         let gray = Frame {
+            pixel_encoding: None,
+            device_timestamp: None,
             id: 1,
             width: 3,
             height: 3,
             pixel_format: crate::types::MONO8,
             device_ts_ns: None,
             wall_ms: 0,
+            received_monotonic_ns: None,
+            chunks: None,
+            multipart: None,
             data: (1..=9).collect(),
             jpeg: None,
         };
@@ -7622,6 +8183,7 @@ esac"#
         // conversion would make them.
         for format in [0x0108_00b1, 0x0108_00c6] {
             let plane = Frame {
+                pixel_encoding: None,
                 pixel_format: format,
                 ..gray.clone()
             };
@@ -7630,6 +8192,7 @@ esac"#
         }
         // Other monochrome formats are converted to 8-bit luma.
         let wide = Frame {
+            pixel_encoding: None,
             pixel_format: 0x0110_0005,
             data: (1..=9u16).flat_map(|v| (v << 4).to_le_bytes()).collect(),
             ..gray.clone()
@@ -7724,12 +8287,17 @@ esac"#
     #[test]
     fn raw_inputs_unpack_and_widen_what_ffmpeg_cannot_read() {
         let frame = |pixel_format, width, data| Frame {
+            pixel_encoding: None,
+            device_timestamp: None,
             id: 1,
             width,
             height: 1,
             pixel_format,
             device_ts_ns: None,
             wall_ms: 0,
+            received_monotonic_ns: None,
+            chunks: None,
+            multipart: None,
             data,
             jpeg: None,
         };
@@ -7804,6 +8372,7 @@ esac"#
     fn ffv1_keeps_every_bit_of_deep_rgb() {
         // RGB12: two pixels of 16-bit containers.
         let frame = Frame {
+            pixel_encoding: None,
             width: 2,
             height: 1,
             pixel_format: 0x0230_001a,
@@ -7989,6 +8558,7 @@ esac"#
     #[test]
     fn raw_inputs_keep_fourteen_bit_precision() {
         let frame = |pixel_format, data| Frame {
+            pixel_encoding: None,
             width: 2,
             height: 1,
             pixel_format,
@@ -8092,6 +8662,7 @@ esac"#
         assert!(raw.preparation.unpacks());
         let frames: Vec<Frame> = (1..=4u8)
             .map(|n| Frame {
+                pixel_encoding: None,
                 id: n.into(),
                 width: 8,
                 height: 4,
@@ -8123,8 +8694,15 @@ esac"#
                     } else {
                         Repeat::Never
                     };
-                    let taken =
-                        write_frames(&queue, (&mut pipe, None), (raw, None), interval, repeat);
+                    let taken = write_frames(
+                        &queue,
+                        (&mut pipe, None),
+                        (raw, None),
+                        interval,
+                        repeat,
+                        None,
+                        None,
+                    );
                     (pipe.bytes, taken)
                 }
             });
@@ -8176,6 +8754,7 @@ esac"#
             assert!(queue.stalled());
             let queue = Arc::new(queue);
             queue.state.lock().unwrap().latest = Some(Frame {
+                pixel_encoding: None,
                 id: 1,
                 width: 4,
                 height: 2,
@@ -8188,7 +8767,15 @@ esac"#
                 move || {
                     let mut pipe = Vec::new();
                     let interval = Duration::from_millis(1);
-                    write_frames(&queue, (&mut pipe, None), (raw, None), interval, repeat);
+                    write_frames(
+                        &queue,
+                        (&mut pipe, None),
+                        (raw, None),
+                        interval,
+                        repeat,
+                        None,
+                        None,
+                    );
                     pipe
                 }
             });
@@ -8295,6 +8882,7 @@ esac"#
             let raw = RawInput::for_format(format).unwrap();
             for (width, height) in [(1, 1), (2, 3), (3, 2), (5, 3), (8, 2), (12, 4)] {
                 let frame = Frame {
+                    pixel_encoding: None,
                     width,
                     height,
                     pixel_format: format,
@@ -8339,6 +8927,7 @@ esac"#
             let expected = data.clone();
             let buffer = data.as_ptr();
             let frame = Frame {
+                pixel_encoding: None,
                 width: 3,
                 height: 1,
                 pixel_format: format,
@@ -8358,6 +8947,7 @@ esac"#
             let raw = RawInput::for_format(format).unwrap();
             for (width, height) in [(0, 1), (1, 0), (u32::MAX, u32::MAX), (100_000, 100_000)] {
                 let frame = Frame {
+                    pixel_encoding: None,
                     width,
                     height,
                     pixel_format: format,
@@ -8378,6 +8968,7 @@ esac"#
         rgba.frame_len(8193, 8192).unwrap_err();
         let gray = RawInput::for_format(crate::types::MONO8).unwrap();
         let frame = Frame {
+            pixel_encoding: None,
             width: 1,
             height: 1,
             pixel_format: RGB8,
@@ -8451,6 +9042,7 @@ esac"#
                 "converted RGB has no YUV matrix tag"
             );
             let frame = Frame {
+                pixel_encoding: None,
                 width,
                 height,
                 pixel_format: format,
@@ -8487,6 +9079,7 @@ esac"#
             );
             let data: Vec<u8> = (0..u8::try_from(len).unwrap()).collect();
             let frame = Frame {
+                pixel_encoding: None,
                 width: 2,
                 height: 2,
                 pixel_format: format,
@@ -8503,12 +9096,17 @@ esac"#
         for format in [0x0210_0032, 0x0210_001f, 0x0210_003b, 0x0210_0043] {
             let raw = RawInput::for_format(format).unwrap();
             let frame = |width, height, data| Frame {
+                pixel_encoding: None,
+                device_timestamp: None,
                 id: 1,
                 width,
                 height,
                 pixel_format: format,
                 device_ts_ns: None,
                 wall_ms: 0,
+                received_monotonic_ns: None,
+                chunks: None,
+                multipart: None,
                 data,
                 jpeg: None,
             };
@@ -8529,12 +9127,17 @@ esac"#
         }
         let mono = RawInput::for_format(crate::types::MONO8).unwrap();
         let odd = Frame {
+            pixel_encoding: None,
+            device_timestamp: None,
             id: 1,
             width: 3,
             height: 1,
             pixel_format: crate::types::MONO8,
             device_ts_ns: None,
             wall_ms: 0,
+            received_monotonic_ns: None,
+            chunks: None,
+            multipart: None,
             data: vec![1, 2, 3].into(),
             jpeg: None,
         };
@@ -8566,12 +9169,17 @@ esac"#
                 .collect::<Vec<u8>>();
             assert_eq!(data.len(), width * height * 2);
             let frame = Frame {
+                pixel_encoding: None,
+                device_timestamp: None,
                 id: 1,
                 width: u32::try_from(width).unwrap(),
                 height: u32::try_from(height).unwrap(),
                 pixel_format: format,
                 device_ts_ns: None,
                 wall_ms: 0,
+                received_monotonic_ns: None,
+                chunks: None,
+                multipart: None,
                 data: data.into(),
                 jpeg: None,
             };
@@ -8737,12 +9345,17 @@ esac"#
         for (pixel_format, data) in formats {
             let raw = RawInput::for_format(pixel_format).unwrap();
             let frame = Frame {
+                pixel_encoding: None,
+                device_timestamp: None,
                 id: 1,
                 width: u32::try_from(width).unwrap(),
                 height: u32::try_from(height).unwrap(),
                 pixel_format,
                 device_ts_ns: None,
                 wall_ms: 0,
+                received_monotonic_ns: None,
+                chunks: None,
+                multipart: None,
                 data: data.into(),
                 jpeg: None,
             };
@@ -9243,10 +9856,7 @@ esac"#
         for (index, jpeg) in jpegs.iter().enumerate().take(10) {
             let frame = camera.next_frame(Duration::from_secs(3)).unwrap();
             assert_eq!(frame.jpeg.as_deref(), Some(&**jpeg), "frame {index}");
-            assert_eq!(
-                crate::frame::pixel_format_name(frame.pixel_format),
-                "YCbCr422_8_Planar"
-            );
+            assert_eq!(crate::frame::frame_format_name(&frame), "YCbCr422_8_Planar");
         }
         camera.stop().unwrap();
         // FFmpeg's own decoding of the same JPEGs, as planes.
@@ -9386,6 +9996,7 @@ esac"#
                 let output = dir.join(format!("{codec}-copy.{container}"));
                 let mut forward = Forwarder::copying(
                     ForwardConfig {
+                        timeline: None,
                         output: output.to_string_lossy().into(),
                         codec: codec.into(),
                         encoder: "auto".into(),
@@ -9441,6 +10052,7 @@ esac"#
             (0x0110_002f, "bayer_rggb16le"),
         ] {
             let frame = Frame {
+                pixel_encoding: None,
                 width,
                 height,
                 pixel_format: format,
@@ -9543,6 +10155,7 @@ esac"#
             .take(crate::frame::row_bytes(width, format) * height as usize)
             .collect();
             let frame = Frame {
+                pixel_encoding: None,
                 width,
                 height,
                 pixel_format: format,
@@ -9655,6 +10268,7 @@ esac"#
         }
         camera.stop().unwrap();
         let mut forward = Forwarder::new(ForwardConfig {
+            timeline: None,
             output: output.to_string_lossy().into(),
             codec: "h264".into(),
             encoder: "libx264".into(),
@@ -9787,6 +10401,7 @@ esac"#
         .take(cores() * 2)
         .collect::<Vec<_>>();
         let mut forward = Forwarder::new(ForwardConfig {
+            timeline: None,
             output: output.to_string_lossy().into(),
             codec: "h264".into(),
             encoder: "libx264".into(),
@@ -9815,12 +10430,17 @@ esac"#
         for id in 0u64.. {
             forward
                 .push(Frame {
+                    pixel_encoding: None,
+                    device_timestamp: None,
                     id,
                     width: u32::try_from(width).unwrap(),
                     height: u32::try_from(height).unwrap(),
                     pixel_format: RGB8,
                     device_ts_ns: None,
                     wall_ms: 0,
+                    received_monotonic_ns: None,
+                    chunks: None,
+                    multipart: None,
                     data: pictures
                         [usize::try_from(id % u64::try_from(pictures.len()).unwrap()).unwrap()]
                     .clone()
@@ -9894,6 +10514,7 @@ esac"#
         let dir = temp_dir("gap");
         let output = dir.join("gap.mkv");
         let mut forward = Forwarder::new(ForwardConfig {
+            timeline: None,
             output: output.to_string_lossy().into(),
             codec: "h264".into(),
             encoder: "libx264".into(),
@@ -9907,12 +10528,17 @@ esac"#
         let push = |forward: &mut Forwarder, id: u64| {
             forward
                 .push(Frame {
+                    pixel_encoding: None,
+                    device_timestamp: None,
                     id,
                     width: u32::try_from(width).unwrap(),
                     height: u32::try_from(height).unwrap(),
                     pixel_format: RGB8,
                     device_ts_ns: None,
                     wall_ms: 0,
+                    received_monotonic_ns: None,
+                    chunks: None,
+                    multipart: None,
                     data: vec![(id * 8).to_le_bytes()[0]; width * height * 3].into(),
                     jpeg: None,
                 })
@@ -9977,6 +10603,7 @@ esac"#
             let _ = stop.recv_timeout(Duration::from_secs(8));
         });
         let mut forward = Forwarder::new(ForwardConfig {
+            timeline: None,
             output,
             codec: "h264".into(),
             encoder: "libx264".into(),
@@ -9996,12 +10623,17 @@ esac"#
         .take(640 * 480 * 3)
         .collect::<Vec<_>>();
         let frame = Frame {
+            pixel_encoding: None,
+            device_timestamp: None,
             id: 1,
             width: 640,
             height: 480,
             pixel_format: RGB8,
             device_ts_ns: None,
             wall_ms: 0,
+            received_monotonic_ns: None,
+            chunks: None,
+            multipart: None,
             data: data.into(),
             jpeg: None,
         };
@@ -10027,6 +10659,7 @@ esac"#
             .as_nanos();
         let path = std::env::temp_dir().join(format!("capturefab-invalid-encoder-{nonce}.mp4"));
         let mut forward = Forwarder::new(ForwardConfig {
+            timeline: None,
             output: path.to_string_lossy().into(),
             codec: "h264".into(),
             encoder: "capturefab_nonexistent_encoder".into(),
@@ -10037,12 +10670,17 @@ esac"#
         })
         .unwrap();
         let frame = Frame {
+            pixel_encoding: None,
+            device_timestamp: None,
             id: 1,
             width: 64,
             height: 48,
             pixel_format: RGB8,
             device_ts_ns: None,
             wall_ms: 0,
+            received_monotonic_ns: None,
+            chunks: None,
+            multipart: None,
             data: vec![0; 64 * 48 * 3].into(),
             jpeg: None,
         };
@@ -10066,6 +10704,7 @@ esac"#
             .as_nanos();
         let path = std::env::temp_dir().join(format!("capturefab-bounded-recording-{nonce}.mp4"));
         let mut forward = Forwarder::new(ForwardConfig {
+            timeline: None,
             output: path.to_string_lossy().into(),
             codec: "h264".into(),
             encoder: encoder.into(),
@@ -10076,12 +10715,17 @@ esac"#
         })
         .unwrap();
         let frame = Frame {
+            pixel_encoding: None,
+            device_timestamp: None,
             id: 1,
             width: 64,
             height: 48,
             pixel_format: RGB8,
             device_ts_ns: None,
             wall_ms: 0,
+            received_monotonic_ns: None,
+            chunks: None,
+            multipart: None,
             data: vec![127; 64 * 48 * 3].into(),
             jpeg: None,
         };
@@ -10113,6 +10757,7 @@ esac"#
         let path = std::env::temp_dir().join(format!("capturefab-capped-recording-{nonce}.mkv"));
         let limit = 256 << 10;
         let mut forward = Forwarder::new(ForwardConfig {
+            timeline: None,
             output: path.to_string_lossy().into(),
             codec: "h264".into(),
             encoder: "libx264".into(),
@@ -10136,6 +10781,11 @@ esac"#
             .take(160 * 120 * 3)
             .collect();
             let frame = Frame {
+                pixel_encoding: None,
+                device_timestamp: None,
+                received_monotonic_ns: None,
+                chunks: None,
+                multipart: None,
                 id,
                 width: 160,
                 height: 120,
@@ -10236,6 +10886,7 @@ esac"#
     #[test]
     fn forwarding_configuration_fails_closed() {
         let config = ForwardConfig {
+            timeline: None,
             output: "video.mp4".into(),
             codec: "h264".into(),
             encoder: "auto".into(),
@@ -10515,6 +11166,7 @@ while :; do head -c 12 /dev/zero; sleep 0.02; done"#,
         let output = fake.dir.join("copy.mkv");
         let mut forward = Forwarder::copying(
             ForwardConfig {
+                timeline: None,
                 output: output.to_string_lossy().into(),
                 codec: "h264".into(),
                 encoder: "auto".into(),
@@ -10572,6 +11224,11 @@ while :; do head -c 12 /dev/zero; sleep 0.02; done"#,
     #[test]
     fn a_live_source_gives_its_newest_frame_and_drops_the_older_ones() {
         let frame = |id| Frame {
+            pixel_encoding: None,
+            device_timestamp: None,
+            received_monotonic_ns: None,
+            chunks: None,
+            multipart: None,
             id,
             width: 1,
             height: 1,
@@ -11204,10 +11861,7 @@ while :; do head -c 256 /dev/zero; sleep 0.02; done"#,
         for _ in 0..3 {
             let frame = camera.next_frame(Duration::from_secs(2)).unwrap();
             assert_eq!(frame.jpeg.as_deref(), Some(&*jpeg));
-            assert_eq!(
-                crate::frame::pixel_format_name(frame.pixel_format),
-                "YCbCr422_8_Planar"
-            );
+            assert_eq!(crate::frame::frame_format_name(&frame), "YCbCr422_8_Planar");
         }
         // Decoded by FFmpeg once, to learn what it is, then copied.
         assert_eq!(fake.launches(&["-f rawvideo"]), 1);
@@ -11608,5 +12262,807 @@ while :; do head -c 192 /dev/zero; sleep 0.02; done"#,
             "no frames from FaceTime HD Camera (timed out after 5 s): the camera may be suspended (for example a closed MacBook lid), in use, or blocked by permissions"
         );
         assert_eq!(kind.code().1, 4);
+    }
+    #[test]
+    fn indexed_progress_requires_the_final_muxed_frame_count() {
+        let log = Log::new();
+        log.keep(b"frame=2\nprogress=continue\n");
+        assert_eq!(log.completed_video_frames(), None);
+        log.keep(b"frame=5\nprogress=end\n");
+        assert_eq!(log.completed_video_frames(), Some(5));
+        let malformed = Log::new();
+        malformed.keep(b"frame=5\nframe=invalid\nprogress=end\n");
+        assert_eq!(malformed.completed_video_frames(), None);
+    }
+
+    fn chunked_frame() -> Frame {
+        with_test_chunks(Frame {
+            pixel_encoding: None,
+            id: 23,
+            width: 2,
+            height: 2,
+            pixel_format: crate::types::MONO8,
+            data: vec![7; 4].into(),
+            received_monotonic_ns: Some(123),
+            ..Frame::default()
+        })
+    }
+    fn with_test_chunks(mut frame: Frame) -> Frame {
+        let image_bytes = frame.data.len();
+        let mut payload = frame.data.to_vec();
+        payload.extend(123u64.to_be_bytes());
+        payload.extend(0xffff_1234u32.to_be_bytes());
+        payload.extend(8u32.to_be_bytes());
+        let mut chunks = crate::transport::chunks::ChunkData::parse(
+            &payload,
+            image_bytes,
+            image_bytes,
+            crate::transport::chunks::ByteOrder::Big,
+            67,
+        )
+        .unwrap();
+        chunks.image_layout = Some(crate::transport::chunks::ImageLayout {
+            pixel_encoding: None,
+            offset: 0,
+            pfnc_code: Some(frame.pixel_format),
+            width: frame.width,
+            height: frame.height,
+            row_bytes: crate::frame::frame_row_bytes(&frame),
+            row_stride: crate::frame::frame_row_bytes(&frame),
+            padding_y: 0,
+            byte_order: Some(crate::transport::chunks::ByteOrder::Little),
+            continuous_packing: false,
+        });
+        chunks.payload = payload.into();
+        frame.chunks = Some(chunks.into());
+        frame
+    }
+
+    #[test]
+    fn chunked_writer_drains_once_and_finalizes_payload_before_reporting_it() {
+        let directory = temp_dir("chunked-writer");
+        let video = directory.join("video.mkv");
+        let queue = WriterQueue::new();
+        queue.state.lock().unwrap().latest = Some(chunked_frame());
+        queue.chunks_seen.store(true, Ordering::Release);
+        queue.running.store(false, Ordering::Release);
+        let mut encoded = Vec::new();
+        let taken = write_frames(
+            &queue,
+            (&mut encoded, None),
+            (RawInput::for_format(crate::types::MONO8).unwrap(), None),
+            Duration::from_millis(1),
+            Repeat::Always,
+            None,
+            Some(timeline::ChunkWriter::new(video, None)),
+        );
+        assert_eq!(taken, 1);
+        assert_eq!(encoded, vec![7; 4]);
+        assert_eq!(queue.written.load(Ordering::Relaxed), 1);
+        assert!(queue.typed_error().is_none());
+        let summary = queue.state.lock().unwrap().chunks.clone().unwrap();
+        assert_eq!(summary["chunk_frames"], 1);
+        assert_eq!(summary["complete"], true);
+        assert_eq!(
+            fs::read(summary["payload_path"].as_str().unwrap()).unwrap(),
+            chunked_frame().chunks.unwrap().payload.to_vec()
+        );
+        let record: Value =
+            serde_json::from_str(&fs::read_to_string(summary["path"].as_str().unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(record["frame_index"], 0);
+        assert_eq!(record["frame_id"], 23);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn chunked_writer_rejects_destinations_that_cannot_retain_chunks() {
+        let queue = WriterQueue::new();
+        queue.state.lock().unwrap().latest = Some(chunked_frame());
+        queue.running.store(false, Ordering::Release);
+        queue.chunks_seen.store(true, Ordering::Release);
+        let mut encoded = Vec::new();
+        write_frames(
+            &queue,
+            (&mut encoded, None),
+            (RawInput::for_format(crate::types::MONO8).unwrap(), None),
+            Duration::from_millis(1),
+            Repeat::Never,
+            None,
+            None,
+        );
+        assert_eq!(encoded, [] as [u8; 0]);
+        assert_eq!(
+            crate::types::error_transport_code(&queue.typed_error().unwrap()),
+            Some("unsupported")
+        );
+        let mut forward = Forwarder {
+            config: ForwardConfig {
+                output: "udp://127.0.0.1:9".into(),
+                codec: "h264".into(),
+                encoder: "auto".into(),
+                fps: 30.0,
+                bitrate: "1M".into(),
+                max_file_bytes: None,
+                min_free: None,
+                timeline: None,
+            },
+            process: None,
+            final_stats: ForwardStats::default(),
+            reserved: None,
+            failed: None,
+            copy: None,
+            waits: false,
+            timeline: None,
+        };
+        let error = forward.push(chunked_frame()).unwrap_err();
+        assert_eq!(
+            crate::types::error_transport_code(&error),
+            Some("unsupported")
+        );
+        assert!(forward.process.is_none());
+    }
+
+    #[test]
+    fn chunked_writer_retains_companion_errors_without_replacing_existing_files() {
+        let directory = temp_dir("chunked-collision");
+        let video = directory.join("video.mkv");
+        let index = directory.join("video.mkv.chunks.jsonl");
+        fs::write(&index, b"keep").unwrap();
+        let queue = WriterQueue::new();
+        queue.state.lock().unwrap().latest = Some(chunked_frame());
+        queue.chunks_seen.store(true, Ordering::Release);
+        queue.running.store(false, Ordering::Release);
+        let mut encoded = Vec::new();
+        write_frames(
+            &queue,
+            (&mut encoded, None),
+            (RawInput::for_format(crate::types::MONO8).unwrap(), None),
+            Duration::from_millis(1),
+            Repeat::Never,
+            None,
+            Some(timeline::ChunkWriter::new(video, None)),
+        );
+        assert_eq!(encoded, vec![7; 4]);
+        assert!(
+            queue
+                .typed_error()
+                .unwrap()
+                .to_string()
+                .contains("video chunks")
+        );
+        assert_eq!(fs::read(&index).unwrap(), b"keep");
+        assert!(!directory.join("video.mkv.chunks.raw").exists());
+        assert!(queue.state.lock().unwrap().chunks.is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn indexed_writer_drains_only_the_latest_pending_frame_after_stop() {
+        let directory = temp_dir("indexed-pending");
+        let index = directory.join("frames.jsonl");
+        let config = timeline::Config {
+            path: index.display().to_string(),
+            acquisition_end_ns: 1000,
+        };
+        let writer = timeline::Writer::create(&config, 10.0, None).unwrap();
+        let frame = |id: u64, pixel: u8| Frame {
+            pixel_encoding: None,
+            id,
+            width: 2,
+            height: 2,
+            pixel_format: crate::types::MONO8,
+            data: vec![pixel; 4].into(),
+            received_monotonic_ns: Some(id * 100),
+            ..Frame::default()
+        };
+        let queue = WriterQueue::new();
+        queue.state.lock().unwrap().latest = Some(frame(1, 11));
+        queue.state.lock().unwrap().latest.replace(frame(2, 22));
+        queue.running.store(false, Ordering::Release);
+        let mut encoded = Vec::new();
+        let taken = write_frames(
+            &queue,
+            (&mut encoded, None),
+            (RawInput::for_format(crate::types::MONO8).unwrap(), None),
+            Duration::from_secs(1),
+            Repeat::Never,
+            Some(writer),
+            None,
+        );
+        assert_eq!(taken, 1);
+        assert_eq!(queue.written.load(Ordering::Relaxed), 1);
+        assert_eq!(encoded, [22; 4]);
+        let records = fs::read_to_string(&index)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<timeline::FrameRecord>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].frame_index, 0);
+        assert_eq!(records[0].frame_id, 2);
+        assert_eq!(records[0].received_monotonic_ns, 200);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn indexed_writer_never_records_a_failed_encoder_input_write() {
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "fixture encoder closed",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let directory = temp_dir("indexed-broken");
+        let index = directory.join("frames.jsonl");
+        let writer = timeline::Writer::create(
+            &timeline::Config {
+                path: index.display().to_string(),
+                acquisition_end_ns: 1000,
+            },
+            30.0,
+            None,
+        )
+        .unwrap();
+        let queue = WriterQueue::new();
+        queue.state.lock().unwrap().latest = Some(Frame {
+            pixel_encoding: None,
+            id: 1,
+            width: 2,
+            height: 2,
+            pixel_format: crate::types::MONO8,
+            data: vec![7; 4].into(),
+            received_monotonic_ns: Some(100),
+            chunks: chunked_frame().chunks,
+            ..Frame::default()
+        });
+        queue.running.store(false, Ordering::Release);
+        write_frames(
+            &queue,
+            (&mut Broken, None),
+            (RawInput::for_format(crate::types::MONO8).unwrap(), None),
+            Duration::from_millis(1),
+            Repeat::Never,
+            Some(writer),
+            Some(timeline::ChunkWriter::new(
+                directory.join("video.mkv"),
+                None,
+            )),
+        );
+        assert_eq!(queue.written.load(Ordering::Relaxed), 0);
+        assert_eq!(fs::read(&index).unwrap(), [] as [u8; 0]);
+        assert!(!directory.join("video.mkv.chunks.raw").exists());
+        assert!(!directory.join("video.mkv.chunks.jsonl").exists());
+        assert!(
+            queue
+                .typed_error()
+                .unwrap()
+                .to_string()
+                .contains("fixture encoder closed")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn indexed_recording_fails_when_the_encoder_reports_missing_output_frames() {
+        let fake = Fake::new(
+            "indexed-drop",
+            r#"case "$*" in
+*-encoders*) printf ' V....D libx264 x264 (codec h264)\n' ;;
+*"-f null"*) ;;
+*) head -c 8192 /dev/zero; cat >/dev/null; printf 'frame=0\nprogress=end\n' >&2 ;;
+esac"#,
+        );
+        let video = fake.dir.join("video.ts");
+        let index = fake.dir.join("video.frames.jsonl");
+        let mut config = recording(&video, "libx264");
+        config.timeline = Some(timeline::Config {
+            path: index.display().to_string(),
+            acquisition_end_ns: u64::MAX,
+        });
+        let mut forward = Forwarder::new(config).unwrap();
+        let mut frame = tiny(16, 16);
+        frame.received_monotonic_ns = Some(100);
+        forward.push(frame).unwrap();
+        let error = forward.stop().unwrap_err();
+        assert_eq!(
+            crate::types::classify(&error).kind,
+            ErrorKind::Incomplete,
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains("frame count differs"));
+        assert_eq!(forward.stats().written, 1);
+        assert_eq!(fs::read_to_string(&index).unwrap().lines().count(), 1);
+        assert!(
+            video.exists(),
+            "a failed indexed recording preserves its partial video"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn indexed_size_limits_never_erase_finalization_errors() {
+        let fake = Fake::new(
+            "indexed-size",
+            r#"case "$*" in
+*-encoders*) printf ' V....D libx264 x264 (codec h264)\n' ;;
+*"-f null"*) ;;
+*) head -c 8192 /dev/zero; cat >/dev/null; printf 'frame=0\nprogress=end\n' >&2 ;;
+esac"#,
+        );
+        let mut config = recording(&fake.dir.join("video.ts"), "libx264");
+        config.max_file_bytes = Some(5000);
+        config.timeline = Some(timeline::Config {
+            path: fake.dir.join("index.jsonl").display().to_string(),
+            acquisition_end_ns: u64::MAX,
+        });
+        let mut forward = Forwarder::new(config).unwrap();
+        let mut frame = tiny(16, 16);
+        frame.received_monotonic_ns = Some(100);
+        drop(forward.push(frame));
+        let error = forward.stop().unwrap_err();
+        assert_eq!(
+            crate::types::classify(&error).kind,
+            ErrorKind::Incomplete,
+            "{error:#}"
+        );
+        assert!(forward.stats().recording.as_ref().unwrap().truncated);
+    }
+
+    #[test]
+    #[ignore = "requires FFmpeg and ffprobe"]
+    fn chunked_recording_retains_measurements_alongside_decodable_video() {
+        let directory = temp_dir("chunked-real");
+        let video = directory.join("video.mkv");
+        let config = ForwardConfig {
+            output: video.display().to_string(),
+            codec: "ffv1".into(),
+            encoder: "ffv1".into(),
+            fps: 10.0,
+            bitrate: "1M".into(),
+            max_file_bytes: None,
+            min_free: None,
+            timeline: None,
+        };
+        let mut forward = Forwarder::new(config).unwrap();
+        forward.wait_for_writer();
+        for id in 1..=3u8 {
+            forward
+                .push(with_test_chunks(Frame {
+                    pixel_encoding: None,
+                    id: u64::from(id),
+                    width: 16,
+                    height: 16,
+                    pixel_format: crate::types::MONO8,
+                    data: vec![id; 16 * 16].into(),
+                    received_monotonic_ns: Some(u64::from(id) * 100),
+                    ..Frame::default()
+                }))
+                .unwrap();
+        }
+        forward.stop().unwrap();
+        let summary = forward.stats().recording.unwrap().chunks.unwrap();
+        assert_eq!(summary["chunk_frames"], 3);
+        assert_eq!(summary["video_frames_verified"], true);
+        let records = fs::read_to_string(summary["path"].as_str().unwrap())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 3);
+        let payload = fs::read(summary["payload_path"].as_str().unwrap()).unwrap();
+        for (index, record) in records.iter().enumerate() {
+            assert_eq!(record["frame_index"], index);
+            let offset = usize::try_from(record["payload_offset"].as_u64().unwrap()).unwrap();
+            assert_eq!(&payload[offset + 256..offset + 264], &123u64.to_be_bytes());
+        }
+        let decoded = Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&video)
+            .args([
+                "-fps_mode",
+                "passthrough",
+                "-pix_fmt",
+                "gray",
+                "-f",
+                "rawvideo",
+                "-",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            decoded.status.success(),
+            "{}",
+            String::from_utf8_lossy(&decoded.stderr)
+        );
+        let expected = (1..=3u8)
+            .flat_map(|value| std::iter::repeat_n(value, 16 * 16))
+            .collect::<Vec<_>>();
+        assert_eq!(decoded.stdout, expected);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires FFmpeg and ffprobe"]
+    fn indexed_recording_matches_decoded_frames_and_presentation_times() {
+        let directory = temp_dir("indexed-real");
+        let video = directory.join("video.mkv");
+        let index = directory.join("frames.jsonl");
+        let mut config = ForwardConfig {
+            output: video.display().to_string(),
+            codec: "ffv1".into(),
+            encoder: "ffv1".into(),
+            fps: 10.0,
+            bitrate: "1M".into(),
+            max_file_bytes: None,
+            min_free: None,
+            timeline: Some(timeline::Config {
+                path: index.display().to_string(),
+                acquisition_end_ns: u64::MAX,
+            }),
+        };
+        config.validate().unwrap();
+        let mut forward = Forwarder::new(config.clone()).unwrap();
+        forward.wait_for_writer();
+        for id in 1..=5u8 {
+            forward
+                .push(Frame {
+                    pixel_encoding: None,
+                    id: u64::from(id),
+                    width: 16,
+                    height: 16,
+                    pixel_format: crate::types::MONO8,
+                    data: vec![id; 16 * 16].into(),
+                    received_monotonic_ns: Some(u64::from(id) * 100),
+                    device_ts_ns: Some(u64::from(id) * 1000),
+                    ..Frame::default()
+                })
+                .unwrap();
+        }
+        forward.stop().unwrap();
+        let records = fs::read_to_string(&index)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<timeline::FrameRecord>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 5);
+        assert_eq!(forward.stats().written, 5);
+        for (position, record) in records.iter().enumerate() {
+            assert_eq!(record.frame_index, u64::try_from(position).unwrap());
+            assert_eq!(record.frame_id, u64::try_from(position + 1).unwrap());
+            assert_eq!(
+                record.video_time_ns,
+                u64::try_from(position).unwrap() * 100_000_000
+            );
+        }
+        let exe = executable().unwrap();
+        let decoded = command(&exe)
+            .args(["-v", "error", "-i"])
+            .arg(&video)
+            .args([
+                "-fps_mode",
+                "passthrough",
+                "-pix_fmt",
+                "gray",
+                "-f",
+                "rawvideo",
+                "-",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            decoded.status.success(),
+            "{}",
+            String::from_utf8_lossy(&decoded.stderr)
+        );
+        let expected = (1..=5u8)
+            .flat_map(|value| std::iter::repeat_n(value, 16 * 16))
+            .collect::<Vec<_>>();
+        assert_eq!(decoded.stdout, expected);
+        let probed = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "frame=best_effort_timestamp_time",
+                "-of",
+                "json",
+            ])
+            .arg(&video)
+            .output()
+            .unwrap();
+        assert!(
+            probed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&probed.stderr)
+        );
+        let document: Value = serde_json::from_slice(&probed.stdout).unwrap();
+        let frames = document["frames"].as_array().unwrap();
+        assert_eq!(frames.len(), records.len());
+        for (frame, record) in frames.iter().zip(&records) {
+            let seconds = frame["best_effort_timestamp_time"]
+                .as_str()
+                .unwrap()
+                .parse::<f64>()
+                .unwrap();
+            let actual = Duration::from_secs_f64(seconds);
+            assert!(
+                actual.abs_diff(Duration::from_nanos(record.video_time_ns))
+                    <= Duration::from_millis(1)
+            );
+        }
+        // H.264/MP4 must preserve the same presentation correspondence,
+        // independently of its lossy pixel format conversion and muxer.
+        for extension in ["mp4", "mov", "mkv", "ts"] {
+            let h264_video = directory.join(format!("h264-video.{extension}"));
+            let h264_index = directory.join(format!("h264-{extension}.frames.jsonl"));
+            let mut h264_config = config.clone();
+            h264_config.output = h264_video.display().to_string();
+            h264_config.codec = "h264".into();
+            h264_config.encoder = "libx264".into();
+            h264_config.timeline = Some(timeline::Config {
+                path: h264_index.display().to_string(),
+                acquisition_end_ns: u64::MAX,
+            });
+            let mut h264 = Forwarder::new(h264_config).unwrap();
+            h264.wait_for_writer();
+            for id in 1..=5u8 {
+                h264.push(Frame {
+                    pixel_encoding: None,
+                    id: u64::from(id),
+                    width: 16,
+                    height: 16,
+                    pixel_format: crate::types::MONO8,
+                    data: vec![id * 40; 16 * 16].into(),
+                    received_monotonic_ns: Some(u64::from(id) * 100),
+                    ..Frame::default()
+                })
+                .unwrap();
+            }
+            h264.stop().unwrap();
+            let h264_records = fs::read_to_string(&h264_index)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<timeline::FrameRecord>(line).unwrap())
+                .collect::<Vec<_>>();
+            let decoded = command(&exe)
+                .args(["-v", "error", "-i"])
+                .arg(&h264_video)
+                .args([
+                    "-fps_mode",
+                    "passthrough",
+                    "-pix_fmt",
+                    "gray",
+                    "-f",
+                    "rawvideo",
+                    "-",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                decoded.status.success(),
+                "{}",
+                String::from_utf8_lossy(&decoded.stderr)
+            );
+            assert_eq!(decoded.stdout.len(), 5 * 16 * 16);
+            assert_eq!(h264_records.len(), 5);
+            for (position, pixels) in decoded
+                .stdout
+                .as_chunks::<{ 16 * 16 }>()
+                .0
+                .iter()
+                .enumerate()
+            {
+                let mean = pixels.iter().map(|&pixel| u64::from(pixel)).sum::<u64>() / (16 * 16);
+                let expected = u64::try_from(position + 1).unwrap() * 40;
+                assert!(
+                    mean.abs_diff(expected) <= 3,
+                    "frame {position}: mean {mean}, expected {expected}"
+                );
+            }
+            let probed = Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "frame=best_effort_timestamp_time",
+                    "-of",
+                    "json",
+                ])
+                .arg(&h264_video)
+                .output()
+                .unwrap();
+            assert!(
+                probed.status.success(),
+                "{}",
+                String::from_utf8_lossy(&probed.stderr)
+            );
+            let document: Value = serde_json::from_slice(&probed.stdout).unwrap();
+            let frames = document["frames"].as_array().unwrap();
+            assert_eq!(frames.len(), h264_records.len());
+            for (frame, record) in frames.iter().zip(&h264_records) {
+                let actual = Duration::from_secs_f64(
+                    frame["best_effort_timestamp_time"]
+                        .as_str()
+                        .unwrap()
+                        .parse()
+                        .unwrap(),
+                );
+                assert!(
+                    actual.abs_diff(Duration::from_nanos(record.video_time_ns))
+                        <= Duration::from_millis(1)
+                );
+            }
+        }
+        // The deadline excludes future host frames before an encoder/index opens.
+        config.output = directory.join("late.mkv").display().to_string();
+        config.timeline = Some(timeline::Config {
+            path: directory.join("late.jsonl").display().to_string(),
+            acquisition_end_ns: 100,
+        });
+        let mut late = Forwarder::new(config).unwrap();
+        assert!(
+            !late
+                .push(Frame {
+                    received_monotonic_ns: Some(101),
+                    ..Frame::default()
+                })
+                .unwrap()
+        );
+        late.stop().unwrap();
+        assert!(!directory.join("late.mkv").exists());
+        assert_eq!(
+            fs::read(directory.join("late.jsonl")).unwrap(),
+            [] as [u8; 0]
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn ids_grouped_video_reuses_exact_unpacked_intensity_and_retains_source_declaration() {
+        use crate::types::IdsPixelFormat;
+        for (format, bytes, samples) in [
+            (
+                IdsPixelFormat::Mono10g40,
+                vec![0, 85, 170, 255, 249, 255, 170, 85, 0, 6],
+                vec![1_u16, 342, 683, 1023, 1022, 681, 340, 0],
+            ),
+            (
+                IdsPixelFormat::Mono12g24,
+                vec![
+                    0x12, 0xab, 0xc3, 0x45, 0xde, 0xf6, 0, 0xff, 0xf0, 0x78, 0x13, 0x59,
+                ],
+                vec![0x123_u16, 0xabc, 0x456, 0xdef, 0, 0xfff, 0x789, 0x135],
+            ),
+        ] {
+            let frame = Frame {
+                width: 4,
+                height: 2,
+                pixel_format: format.code(),
+                pixel_encoding: Some(format.encoding(None)),
+                data: bytes.clone().into(),
+                ..Frame::default()
+            };
+            let raw = RawInput::for_frame(&frame).unwrap();
+            let lossless = raw.for_encoder("ffv1");
+            lossless.check(&frame).unwrap();
+            let mut scratch = Vec::new();
+            lossless.prepare(&frame, &mut scratch).unwrap();
+            assert_eq!(
+                scratch,
+                samples
+                    .iter()
+                    .flat_map(|sample| sample.to_le_bytes())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                lossless.input_pix_fmt("ffv1"),
+                if format.bits() == 10 {
+                    "gray10le"
+                } else {
+                    "gray12le"
+                }
+            );
+            assert_eq!(lossless.pixel_encoding, frame.pixel_encoding);
+            let eight = raw.for_encoder("libx264");
+            eight.check(&frame).unwrap();
+            eight.prepare(&frame, &mut scratch).unwrap();
+            assert_eq!(
+                scratch,
+                samples
+                    .iter()
+                    .map(|sample| u8::try_from(sample >> (format.bits() - 8)).unwrap())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(eight.input_pix_fmt("libx264"), "gray");
+            assert_eq!(&*frame.data, &bytes);
+            let bare = Frame {
+                pixel_encoding: None,
+                ..frame.clone()
+            };
+            assert!(
+                RawInput::for_frame(&bare)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unsupported")
+            );
+            assert!(
+                lossless
+                    .check(&bare)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("changed")
+            );
+            let job = crate::scheduling::JobFrame {
+                width: 4,
+                height: 2,
+                pixel_format: format.code(),
+                pixel_encoding: frame.pixel_encoding,
+            };
+            let restored: crate::scheduling::JobFrame =
+                serde_json::from_value(serde_json::to_value(job).unwrap()).unwrap();
+            assert_eq!(restored, job);
+        }
+    }
+    #[test]
+    fn ids_bayer_video_keeps_exact_mosaic_for_ffv1_and_color_for_lossy_encoders() {
+        use crate::types::IdsPixelFormat;
+        for (format, input_format) in [
+            (IdsPixelFormat::BayerRg10g40, "bayer_rggb8"),
+            (IdsPixelFormat::BayerRg12g24, "bayer_rggb8"),
+            (IdsPixelFormat::BayerGr10g40, "bayer_grbg8"),
+            (IdsPixelFormat::BayerGr12g24, "bayer_grbg8"),
+            (IdsPixelFormat::BayerGb10g40, "bayer_gbrg8"),
+            (IdsPixelFormat::BayerGb12g24, "bayer_gbrg8"),
+            (IdsPixelFormat::BayerBg10g40, "bayer_bggr8"),
+            (IdsPixelFormat::BayerBg12g24, "bayer_bggr8"),
+        ] {
+            let (frame, samples) = crate::frame::ids_bayer_tests::image(format);
+            let raw = RawInput::for_frame(&frame).unwrap();
+            assert!(raw.color);
+            let lossless = raw.for_encoder("ffv1");
+            lossless.check(&frame).unwrap();
+            assert_eq!(lossless.input_pix_fmt("ffv1"), "gray16le");
+            assert_eq!(lossless.pixel_encoding, frame.pixel_encoding);
+            let mut scratch = Vec::new();
+            lossless.prepare(&frame, &mut scratch).unwrap();
+            assert_eq!(
+                scratch,
+                samples
+                    .iter()
+                    .flat_map(|sample| (sample << (16 - format.bits())).to_le_bytes())
+                    .collect::<Vec<_>>()
+            );
+            for encoder in ["libx264", "h264_vaapi", "h264_videotoolbox"] {
+                let lossy = raw.for_encoder(encoder);
+                lossy.check(&frame).unwrap();
+                assert_eq!(lossy.input_pix_fmt(encoder), input_format);
+                assert!(lossy.color);
+                lossy.prepare(&frame, &mut scratch).unwrap();
+                assert_eq!(
+                    scratch,
+                    samples
+                        .iter()
+                        .map(|sample| u8::try_from(sample >> (format.bits() - 8)).unwrap())
+                        .collect::<Vec<_>>()
+                );
+            }
+            let standard = crate::frame::unpacked(&frame).unwrap();
+            let (mut source, mut converted) = (Vec::new(), Vec::new());
+            crate::frame::decode_into(&frame, crate::frame::Channels::Rgb, &mut source).unwrap();
+            crate::frame::decode_into(&standard, crate::frame::Channels::Rgb, &mut converted)
+                .unwrap();
+            assert_eq!(source, converted);
+        }
     }
 }

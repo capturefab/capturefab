@@ -1,0 +1,485 @@
+{
+ "version": 1,
+ "freeze": "Independent scratch-only scientific mixed-AI oracle, frozen before mixed product/native implementation or reading. Hand-declared ABI arguments and IEEE words; no product encoder, SDK, driver, native call, compiler or runtime.",
+ "scope": "Scientific quantities/units/constructor selection and scan-major raw values are independent of future JSON naming. Proposed public row/config/protocol names are recorded separately as boundaries, not used to derive words.",
+ "task_profile": "one fresh owned analog-input task; all selected channel measurements are AI, not mixed I/O types",
+ "constructor_abi_sources": "All fixed constructor signatures/types and constants remain in six immutable prior oracles; no variadic getter/setter, conversion or unqualified new ABI is added.",
+ "immutable_prior_oracles_sha256": {
+  "abi.json": "1bbc016312c3aab6093483cfa3aeee442e6bc3aaeb74eaa8113641a090329b6b",
+  "thermocouple.json": "2a8109877c63aa7448965c0d0ac9ec060355d8dde41e98496b4ff8050ac65cb1",
+  "current.json": "14f428f82a6cf94704ac47ff2b42d18bf71553435437ae4f0345bf4260779bff",
+  "voltage-scale-null.json": "5764fe41ecab45d8b5795d15dc82f723c566d5ba0af565048224337ed321ba63",
+  "on-demand.json": "b87122de19d2bdb77f16c0511d1759925b84697ad59e97375197d1b54e81fe89",
+  "rtd.json": "5f83a52d2ce10c71d6e1f7498bb6bd020828365a734fbe235cb7bbcadd2cb6a5"
+ },
+ "manual_argument_words": [
+  {
+   "name": "voltage_min",
+   "exact_rational": "-10",
+   "bits_hex": "c024000000000000",
+   "ieee754_le_hex": "00000000000024c0"
+  },
+  {
+   "name": "voltage_max",
+   "exact_rational": "10",
+   "bits_hex": "4024000000000000",
+   "ieee754_le_hex": "0000000000002440"
+  },
+  {
+   "name": "tc_min",
+   "exact_rational": "-50",
+   "bits_hex": "c049000000000000",
+   "ieee754_le_hex": "00000000000049c0"
+  },
+  {
+   "name": "tc_max",
+   "exact_rational": "500",
+   "bits_hex": "407f400000000000",
+   "ieee754_le_hex": "0000000000407f40"
+  },
+  {
+   "name": "current_min",
+   "exact_rational": "-1/32",
+   "bits_hex": "bfa0000000000000",
+   "ieee754_le_hex": "000000000000a0bf"
+  },
+  {
+   "name": "current_max",
+   "exact_rational": "1/32",
+   "bits_hex": "3fa0000000000000",
+   "ieee754_le_hex": "000000000000a03f"
+  },
+  {
+   "name": "rtd_min",
+   "exact_rational": "-40",
+   "bits_hex": "c044000000000000",
+   "ieee754_le_hex": "00000000000044c0"
+  },
+  {
+   "name": "rtd_max",
+   "exact_rational": "300",
+   "bits_hex": "4072c00000000000",
+   "ieee754_le_hex": "0000000000c07240"
+  },
+  {
+   "name": "tc_builtin_cjc_abi_zero",
+   "exact_rational": "0",
+   "bits_hex": "0000000000000000",
+   "ieee754_le_hex": "0000000000000000"
+  },
+  {
+   "name": "current_external_shunt_ohms",
+   "exact_rational": "250",
+   "bits_hex": "406f400000000000",
+   "ieee754_le_hex": "0000000000406f40"
+  },
+  {
+   "name": "rtd_excitation_amperes",
+   "exact_rational": "1/512",
+   "bits_hex": "3f60000000000000",
+   "ieee754_le_hex": "000000000000603f"
+  },
+  {
+   "name": "rtd_r0_ohms_at_0c",
+   "exact_rational": "1000",
+   "bits_hex": "408f400000000000",
+   "ieee754_le_hex": "0000000000408f40"
+  },
+  {
+   "name": "override_voltage_min",
+   "exact_rational": "-5/2",
+   "bits_hex": "c004000000000000",
+   "ieee754_le_hex": "00000000000004c0"
+  },
+  {
+   "name": "override_voltage_max",
+   "exact_rational": "5/2",
+   "bits_hex": "4004000000000000",
+   "ieee754_le_hex": "0000000000000440"
+  }
+ ],
+ "ordered_four_channel_constructor_controls": [
+  {
+   "column_index": 0,
+   "measurement": "voltage",
+   "physical": "Mixed/ai0",
+   "quantity": "voltage",
+   "units": "volts",
+   "finite_value_key": "volts",
+   "constructor": "DAQmxCreateAIVoltageChan",
+   "virtual_name": "",
+   "terminal_config_code": 10106,
+   "min_word": "voltage_min",
+   "max_word": "voltage_max",
+   "units_code": 10348,
+   "custom_scale_pointer": "NULL"
+  },
+  {
+   "column_index": 1,
+   "measurement": "thermocouple",
+   "physical": "Mixed/ai1",
+   "quantity": "temperature",
+   "units": "deg_c",
+   "finite_value_key": "temperature",
+   "constructor": "DAQmxCreateAIThrmcplChan",
+   "virtual_name": "",
+   "min_word": "tc_min",
+   "max_word": "tc_max",
+   "units_code": 10143,
+   "thermocouple_type_code": 10073,
+   "cjc_source_code": 10200,
+   "cjc_value_word": "tc_builtin_cjc_abi_zero",
+   "cjc_channel": "",
+   "terminal_request": "omitted, driver default unqueried, no terminal setter"
+  },
+  {
+   "column_index": 2,
+   "measurement": "current",
+   "physical": "Mixed/ai2",
+   "quantity": "current",
+   "units": "amps",
+   "finite_value_key": "amperes",
+   "constructor": "DAQmxCreateAICurrentChan",
+   "virtual_name": "",
+   "terminal_config_code": 10078,
+   "min_word": "current_min",
+   "max_word": "current_max",
+   "units_code": 10342,
+   "shunt_source_code": 10167,
+   "external_ohms_word": "current_external_shunt_ohms",
+   "custom_scale_pointer": "NULL"
+  },
+  {
+   "column_index": 3,
+   "measurement": "rtd",
+   "physical": "Mixed/ai3",
+   "quantity": "temperature",
+   "units": "deg_f",
+   "finite_value_key": "temperature",
+   "constructor": "DAQmxCreateAIRTDChan",
+   "virtual_name": "",
+   "min_word": "rtd_min",
+   "max_word": "rtd_max",
+   "units_code": 10144,
+   "rtd_type_code": 12483,
+   "resistance_config_code": 4,
+   "excitation_source_code": 10167,
+   "excitation_amperes_word": "rtd_excitation_amperes",
+   "r0_word": "rtd_r0_ohms_at_0c",
+   "absent_arguments": [
+    "terminal_config",
+    "custom_scale_name",
+    "CJC"
+   ]
+  }
+ ],
+ "constructor_call_order": [
+  "DAQmxCreateAIVoltageChan column0",
+  "DAQmxCreateAIThrmcplChan column1",
+  "DAQmxCreateAICurrentChan column2",
+  "DAQmxCreateAIRTDChan column3"
+ ],
+ "selected_exports": {
+  "resolve_before_create": [
+   "DAQmxCreateAICurrentChan",
+   "DAQmxCreateAIRTDChan",
+   "DAQmxCreateAIThrmcplChan",
+   "DAQmxCreateAIVoltageChan"
+  ],
+  "continuous_common_count": 14,
+  "continuous_common": [
+   "DAQmxCreateTask",
+   "DAQmxGetTaskNumChans",
+   "DAQmxGetNthTaskReadChannel",
+   "DAQmxStartTask",
+   "DAQmxReadAnalogF64",
+   "DAQmxStopTask",
+   "DAQmxClearTask",
+   "DAQmxGetErrorString",
+   "DAQmxGetExtendedErrorInfo",
+   "DAQmxCfgSampClkTiming",
+   "DAQmxCfgInputBuffer",
+   "DAQmxSetReadOverWrite",
+   "DAQmxGetReadAvailSampPerChan",
+   "DAQmxGetSampClkRate"
+  ],
+  "on_demand_common_count": 9,
+  "on_demand_common": [
+   "DAQmxCreateTask",
+   "DAQmxGetTaskNumChans",
+   "DAQmxGetNthTaskReadChannel",
+   "DAQmxStartTask",
+   "DAQmxReadAnalogF64",
+   "DAQmxStopTask",
+   "DAQmxClearTask",
+   "DAQmxGetErrorString",
+   "DAQmxGetExtendedErrorInfo"
+  ],
+  "rule": "Resolve only union of constructors actually requested plus chosen timing common functions BEFORE CreateTask. Missing selected symbol has no task effect; missing unselected constructors never blocks.",
+  "tc_terminal_setter": "Resolve DAQmxSetAITermCfg only if at least one TC channel explicitly requests nondefault terminal; apply immediately after that TC constructor, before next channel. No setter for RTD or other families.",
+  "tc_variants": [
+   {
+    "terminal_request": "omitted",
+    "setter_required": false,
+    "provenance": "driver_default_unqueried"
+   },
+   {
+    "terminal_request": "explicit_default",
+    "setter_required": false,
+    "provenance": "driver_default_unqueried; retain explicit requested enum"
+   },
+   {
+    "terminal_request": "explicit_differential",
+    "setter_required": true,
+    "setter_arguments": [
+     "owned TaskHandle",
+     "Mixed/ai1",
+     10106
+    ],
+    "provenance": "explicit_request_not_read_back"
+   }
+  ]
+ },
+ "same_family_override_control": {
+  "profile": "explicit mixed with two voltage channels is valid, no mandatory two-kind rule",
+  "selected_constructor_union": [
+   "DAQmxCreateAIVoltageChan"
+  ],
+  "channels": [
+   {
+    "ordinal": 0,
+    "physical": "VoltageRange/ai0",
+    "terminal_config_code": 10106,
+    "min_word": "voltage_min",
+    "max_word": "voltage_max",
+    "units_code": 10348,
+    "custom_scale_pointer": "NULL"
+   },
+   {
+    "ordinal": 1,
+    "physical": "VoltageRange/ai1",
+    "terminal_config_code": 10083,
+    "min_word": "override_voltage_min",
+    "max_word": "override_voltage_max",
+    "units_code": 10348,
+    "custom_scale_pointer": "NULL"
+   }
+  ],
+  "rule": "Do not copy one task-global range/terminal into both columns."
+ },
+ "actual_channel_contract": {
+  "configured_count": 4,
+  "actual_driver_count": 4,
+  "ordered_names": [
+   "Mixed/ai0",
+   "Mixed/ai1",
+   "Mixed/ai2",
+   "Mixed/ai3"
+  ],
+  "query": "Validate TaskNumChans and bounded1-based NthTaskReadChannel; normalize individual names and require exact requested order before Start.",
+  "reject": [
+   "count0/over64/mismatch",
+   "reordered names",
+   "duplicate or foreign names",
+   "unterminated/invalid names",
+   "missing per-channel kind or unrequested fields"
+  ],
+  "ordinal": "zero-based output column identity is attached to the actual ordered read-channel vector, not guessed solely from constructor order"
+ },
+ "manual_scan_major_patterns": [
+  {
+   "name": "scan0_voltage_one",
+   "scan_index": 0,
+   "column_index": 0,
+   "bits_hex": "3ff0000000000000",
+   "ieee754_le_hex": "000000000000f03f",
+   "classification": "normal",
+   "sign_bit": false,
+   "finite": true,
+   "finite_decimal": "1"
+  },
+  {
+   "name": "scan0_tc_twenty_five",
+   "scan_index": 0,
+   "column_index": 1,
+   "bits_hex": "4039000000000000",
+   "ieee754_le_hex": "0000000000003940",
+   "classification": "normal",
+   "sign_bit": false,
+   "finite": true,
+   "finite_decimal": "25"
+  },
+  {
+   "name": "scan0_current_one_over_64",
+   "scan_index": 0,
+   "column_index": 2,
+   "bits_hex": "3f90000000000000",
+   "ieee754_le_hex": "000000000000903f",
+   "classification": "normal",
+   "sign_bit": false,
+   "finite": true,
+   "finite_decimal": "0.015625"
+  },
+  {
+   "name": "scan0_rtd_twenty_five",
+   "scan_index": 0,
+   "column_index": 3,
+   "bits_hex": "4039000000000000",
+   "ieee754_le_hex": "0000000000003940",
+   "classification": "normal",
+   "sign_bit": false,
+   "finite": true,
+   "finite_decimal": "25"
+  },
+  {
+   "name": "scan1_voltage_negative_zero",
+   "scan_index": 1,
+   "column_index": 0,
+   "bits_hex": "8000000000000000",
+   "ieee754_le_hex": "0000000000000080",
+   "classification": "zero",
+   "sign_bit": true,
+   "finite": true,
+   "finite_decimal": "-0"
+  },
+  {
+   "name": "scan1_tc_quiet_nan_a5",
+   "scan_index": 1,
+   "column_index": 1,
+   "bits_hex": "7ff80000000000a5",
+   "ieee754_le_hex": "a50000000000f87f",
+   "classification": "nan",
+   "sign_bit": false,
+   "finite": false
+  },
+  {
+   "name": "scan1_current_positive_infinity",
+   "scan_index": 1,
+   "column_index": 2,
+   "bits_hex": "7ff0000000000000",
+   "ieee754_le_hex": "000000000000f07f",
+   "classification": "infinity",
+   "sign_bit": false,
+   "finite": false
+  },
+  {
+   "name": "scan1_rtd_negative_two_point_five",
+   "scan_index": 1,
+   "column_index": 3,
+   "bits_hex": "c004000000000000",
+   "ieee754_le_hex": "00000000000004c0",
+   "classification": "normal",
+   "sign_bit": true,
+   "finite": true,
+   "finite_decimal": "-2.5"
+  }
+ ],
+ "two_scan_four_column_control": {
+  "shape": [
+   2,
+   4
+  ],
+  "layout": "scan_major; each scan visits ordered actual read channels0,1,2,3",
+  "all_words_le_hex": "000000000000f03f0000000000003940000000000000903f00000000000039400000000000000080a50000000000f87f000000000000f07f00000000000004c0",
+  "continuous_read": {
+   "requested_per_channel": 2,
+   "actual_per_channel": 2,
+   "capacity_f64": 8,
+   "initial_bits_hex": "0000000000000000 for each of eight elements",
+   "fill_bool32": 1,
+   "reserved_pointer": "NULL",
+   "status": 0
+  },
+  "on_demand_reads": [
+   {
+    "requested_per_channel": 1,
+    "actual_per_channel": 1,
+    "capacity_f64": 4,
+    "sample_index": 0,
+    "valid_words_le_hex": "000000000000f03f0000000000003940000000000000903f0000000000003940"
+   },
+   {
+    "requested_per_channel": 1,
+    "actual_per_channel": 1,
+    "capacity_f64": 4,
+    "sample_index": 1,
+    "valid_words_le_hex": "0000000000000080a50000000000f87f000000000000f07f00000000000004c0"
+   }
+  ],
+  "on_demand_rule": "Two software attempts concatenate to exactly the same two-scan words. Positive original remaining timeout and worker HOST attempt/frontier pacing follow immutable on-demand oracle; no exact physical-entry gap law."
+ },
+ "negative_valid_prefix_control": {
+  "native_status": -200284,
+  "continuous_requested_per_channel": 2,
+  "continuous_capacity_f64": 8,
+  "on_demand_requested_per_channel": 1,
+  "on_demand_capacity_f64": 4,
+  "actual_per_channel": 1,
+  "valid_shape": [
+   1,
+   4
+  ],
+  "valid_words_le_hex": "000000000000f03f0000000000003940000000000000903f0000000000003940",
+  "rule": "One complete scan in actual channel order precedes original failure and optional diagnostics; never publish second unreceived scan or lose valid prefix to diagnostic hang."
+ },
+ "scientific_rules": {
+  "finite_per_column": [
+   "volts",
+   "temperature",
+   "amperes",
+   "temperature"
+  ],
+  "tc_and_rtd": "Shared finite temperature field is not shared sensor kind or shared unit; column1 is TC Celsius, column3 RTD Fahrenheit. Their first25.0 words are identical, not locally converted.",
+  "nonfinite": "Preserve complete raw IEEE word/sign/payload, omit only the finite numeric quantity key; no JSON null or zero substitution.",
+  "signed_zero": "Voltage column0 second scan is negative zero; finite numeric roundtrip and raw bits retain its sign.",
+  "no_global_unit": "Each column owns its constructor quantity/units; a task-wide F64 buffer has no global volts/temperature/amperes interpretation.",
+  "no_local_physics": [
+   "V/R or local shunt conversion",
+   "multiply amps by1000",
+   "temperature conversion",
+   "Callendar-Van-Dusen/resistance calculation",
+   "ADC integer conversion",
+   "device-time interpolation"
+  ],
+  "excitation": "RTD external1/512A is an operator-supplied input-excitation declaration, not a source created by Capturefab. An internal variant can energize sensor; neither variant is physical hardware qualification.",
+  "r0": "R0=1000ohms always refers to sensor resistance at0C despite RTD output Fahrenheit.",
+  "legacy_builtin_current": "Existing249.0 filler convention remains only immutable ABI behavior for builtin shunts, never measured resistance or implicit metadata."
+ },
+ "lifecycle_and_limits": {
+  "setup": "One owned Task, requested per-channel constructors in order, selected optional TC setter, exact actual channel count/order, selected timing then Start. A later constructor failure cleans that one task, no acquisition from partial setup, fallback, restart, reset or task splitting.",
+  "status": "Retain positive warnings and negative first cause exactly; data and raw native Read code precede deferred optional diagnostics.",
+  "finish": "No Read. Existing bounded Stop/Clear ownership and diagnostic cleanup; original deadlines/cutoff, post-Read completion clocks and accepted queued prefix unchanged.",
+  "repeats": "Retain repeats including documented slow-module duplicates; no simultaneous-conversion, unique-freshness, sample-loss or cross-module hardware skew claim.",
+  "source_time": "omitted; no per-column physical timestamps invented",
+  "bounds": "1..64 ordered channels;4096 F64 words;96 notices;512KiB private/public row and1MiB existing batch. Worst-case mixed serialization requires meaningful proof before a fitting-capacity claim."
+ },
+ "future_contract_boundary": {
+  "public_selection": "measurement:mixed with required per-channel measurement tag and typed family fields; allow same-family differing requests; old homogeneous config/rows unchanged",
+  "row_selection": "mixed_analog_block / driver_scaled_f64_mixed_analog, measurement:mixed, requested_not_read_back",
+  "column_metadata": "one ordered channel_measurements array with zero-based channel_index, actual physical, measurement kind, quantity, units and existing family request/provenance fields",
+  "word_metadata": "no repeated kind tags per word; finite keys are selected by column, raw bytes authoritative",
+  "private_protocol_proposed": 6,
+  "not_scientific_input": "These names describe future integration only; scientific bit/argument controls above were independently declared."
+ },
+ "primary_provenance": {
+  "accepted_plan": {
+   "path": "/private/tmp/capturefab-ni-daqmx-mixed-ai-next-plan.md",
+   "bytes": 11252,
+   "sha256": "9b1d81149e66ef3beb2da08b247d5ed459b92dce8cafa3779c21734176fa0d98"
+  },
+  "c_series_multiple_create_and_slow_duplicates": "https://www.ni.com/en/support/documentation/supplemental/21/signal-based-synchronization-of-analog-input-c-series-modules-wi.html",
+  "scaled_f64": {
+   "url": "https://www.ni.com/docs/en-US/bundle/ni-daqmx/page/dataformats.html",
+   "backend_bytes": 12880,
+   "backend_sha256": "d5b0239b57046aed78787764d534180f751e8daab27e176af228e01785a8be2a"
+  },
+  "scan_interleaving": {
+   "url": "https://www.ni.com/docs/en-US/bundle/ni-daqmx/page/interleaving.html",
+   "backend_bytes": 7214,
+   "backend_sha256": "1c268de236801fefa82f084477cf4aeb6ff792d15b201871a88f41a951f6a617"
+  },
+  "read_f64_and_per_constructor_units": "Exact fixed ReadAnalogF64 and constructor unit contracts are pinned by immutable six prior ABI/oracles. The scaled-per-channel interpretation composes those documented contracts.",
+  "independent_reads": "Reviewer independently reopened C-Series multiCreate/different-units/slow-repeat, scaledF64 and interleaving pages. Mixed-task KB returned502 to this reviewer; its7.3 historical claim is from the accepted plan author, not independently re-read here."
+ },
+ "qualification": "Synthetic pre-product scientific/ABI composition oracle only. No named device/driver/chassis/OS, multi-device mixed task, synchronization, physical excitation, conversion freshness or hardware measurement is qualified."
+}

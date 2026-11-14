@@ -1,0 +1,12 @@
+<!-- Minimal functional layout from Basler_acA1600_20gm.xml, captured by
+areaDetector/aravisGigE at commit 6d6171d0a82d669ca1fb1ebcb9b3fd5b8b055125.
+Names, IDs and register layouts only; vendor descriptions are not redistributed. -->
+<RegisterDescription>
+  <Category Name="Root"><pFeature>ChunkTimestamp</pFeature><pFeature>ChunkFramecounter</pFeature></Category>
+  <Integer Name="ChunkTimestamp"><pValue>ChunkTimestampValue</pValue></Integer>
+  <IntReg Name="ChunkTimestampValue"><Address>0</Address><Length>8</Length><AccessMode>RO</AccessMode><pPort>TimestampPort</pPort><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
+  <Port Name="TimestampPort"><ChunkID>c91613db</ChunkID></Port>
+  <Integer Name="ChunkFramecounter"><pValue>ChunkFramecounterValue</pValue></Integer>
+  <IntReg Name="ChunkFramecounterValue"><Address>0</Address><Length>4</Length><AccessMode>RO</AccessMode><pPort>FrameCounterPort</pPort><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
+  <Port Name="FrameCounterPort"><ChunkID>8c0f1cd8</ChunkID></Port>
+</RegisterDescription>

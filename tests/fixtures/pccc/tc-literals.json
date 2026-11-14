@@ -1,0 +1,75 @@
+{
+  "qualification": "Independently hand-authored from manufacturer A2 field tables and native three-word layouts; not published wire captures, stock execution, or hardware evidence.",
+  "endianness": "little",
+  "packet_scope": "PCCC command/status/TNS/function payload only; existing transport supplies routing, encapsulation or DF1 framing/checksum",
+  "cases": [
+    {
+      "name": "timer_native_control_and_counts",
+      "address": "T4:0",
+      "elements": 1,
+      "transaction_raw": 4660,
+      "request_hex": "0f003412a20604860000",
+      "response_hex": "4f00341205c064001100",
+      "data_hex": "05c064001100",
+      "expected": [
+        {
+          "control_word_raw": 49157,
+          "preset": 100,
+          "accumulator": 17,
+          "native_words_raw": [49157, 100, 17],
+          "portable_flags": {"en": true, "tt": true, "dn": false}
+        }
+      ]
+    },
+    {
+      "name": "counter_two_whole_elements",
+      "address": "C5:7",
+      "elements": 2,
+      "transaction_raw": 22136,
+      "request_hex": "0f007856a20c05870700",
+      "response_hex": "4f00785601a40080ff7f0258ffff0000",
+      "data_hex": "01a40080ff7f0258ffff0000",
+      "expected": [
+        {
+          "control_word_raw": 41985,
+          "preset": -32768,
+          "accumulator": 32767,
+          "native_words_raw": [41985, 32768, 32767],
+          "portable_flags": {"cu": true, "cd": false, "dn": true, "ov": false, "un": false}
+        },
+        {
+          "control_word_raw": 22530,
+          "preset": -1,
+          "accumulator": 0,
+          "native_words_raw": [22530, 65535, 0],
+          "portable_flags": {"cu": false, "cd": true, "dn": false, "ov": true, "un": true}
+        }
+      ],
+      "status_limit": "Counter bit10 is preserved in control_word_raw, without an unconditional UA label. Bit0/bit1 are likewise retained."
+    },
+    {
+      "name": "element255_encoding_and_negative_timer_words",
+      "address": "T4:255",
+      "elements": 1,
+      "transaction_raw": 1,
+      "request_hex": "0f000100a2060486ffff0000",
+      "response_hex": "4f000100000000800080",
+      "data_hex": "000000800080",
+      "expected": [
+        {
+          "control_word_raw": 0,
+          "preset": -32768,
+          "accumulator": -32768,
+          "native_words_raw": [0, 32768, 32768],
+          "portable_flags": {"en": false, "tt": false, "dn": false}
+        }
+      ],
+      "status_limit": "Negative timer words are observable native application-error states, not malformed transport. Index255 is a documented SLC boundary, not a guarantee every controller allocates it."
+    }
+  ],
+  "chunk_arithmetic": [
+    {"address": "T4:0", "elements": 38, "max_read_bytes": 224, "first_elements": 37, "first_bytes": 222, "next_element": 37, "next_bytes": 6},
+    {"address": "T4:0", "elements": 38, "max_read_bytes": 220, "first_elements": 36, "first_bytes": 216, "next_element": 36, "next_bytes": 12}
+  ],
+  "no_claims": ["No inferred timebase or engineering units", "No inferred freshness or PLC-wide snapshot", "No physical model/interface qualification", "No captured or unchanged-stock semantic decoder execution"]
+}

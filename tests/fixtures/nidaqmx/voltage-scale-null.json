@@ -1,0 +1,43 @@
+{
+  "version": 1,
+  "status": "frozen_independent_before_voltage_pointer_correction",
+  "scope": "Refine only the fixed-Volts custom-scale pointer constraint; existing voltage arguments, raw words and status fixtures remain unchanged.",
+  "extends_immutable_abi_sha256": "1bbc016312c3aab6093483cfa3aeee442e6bc3aaeb74eaa8113641a090329b6b",
+  "abi": {
+    "name": "DAQmxCreateAIVoltageChan",
+    "returns": "i32",
+    "convention": "fixed NI __CFUNC; Linux C / supported Windows system ABI",
+    "slots_unchanged": [
+      "TaskHandle",
+      "const char* physical",
+      "const char* virtual_name",
+      "i32 terminal_config",
+      "f64 min_volts",
+      "f64 max_volts",
+      "i32 units",
+      "const char* custom_scale_name"
+    ]
+  },
+  "fixed_voltage_arguments": {
+    "units_code": 10348,
+    "units": "DAQmx_Val_Volts",
+    "physical": "existing bounded explicit individual AI channel, unchanged",
+    "virtual_name": "",
+    "custom_scale_pointer": "NULL"
+  },
+  "negative_controls": [
+    "non-NULL pointer to an empty C string is rejected",
+    "non-NULL pointer to a named C string is rejected for fixed Volts"
+  ],
+  "normative_rule": "When units is not DAQmx_Val_FromCustomScale, the official constructor requires customScaleName to be NULL.",
+  "supersedes": "The previous synthetic C fixture's empty-string acceptance for the voltage scale slot only; not the immutable ABI prototype/constants/word oracle.",
+  "primary": {
+    "title": "DAQmxCreateAIVoltageChan - NI C API Reference",
+    "public_url": "https://www.ni.com/docs/en-US/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__channel__configuration__creation__create__analog__input__channels_1ga94c83a5df8579b4164e638018b7ee89f.html",
+    "backend_url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__channel__configuration__creation__create__analog__input__channels_1ga94c83a5df8579b4164e638018b7ee89f.html",
+    "backend_bytes": 21656,
+    "backend_sha256": "21ab1f6ecef3aa55fae652e80093a1a2f28afa27c4ba2b24c70ee91327a0918b",
+    "read_policy": "Official page followed from the official analog-input creation index; backend response fetched into bounded RAM only, no raw reference retained."
+  },
+  "qualification": "Synthetic pointer-contract oracle only; no SDK, installed-driver or hardware execution and no universal empty-string behavior inferred from wrapper defaults."
+}

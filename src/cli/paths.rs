@@ -74,7 +74,15 @@ pub(crate) fn canonical(path: &Path) -> std::io::Result<PathBuf> {
 pub(crate) fn resolve_outputs(command: &mut SessionCommand, base: &Path) -> Result<()> {
     match command {
         SessionCommand::Schedule { output, .. } => resolve_path(output, base),
-        SessionCommand::Forward { output, .. } => resolve_recording(output, base),
+        SessionCommand::Forward {
+            output, timeline, ..
+        } => {
+            resolve_recording(output, base)?;
+            if let Some(timeline) = timeline {
+                resolve_path(&mut timeline.path, base)?;
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }

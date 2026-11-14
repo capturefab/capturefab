@@ -1,0 +1,26 @@
+{
+  "qualification": "Independently hand-declared fixed-type representation vectors, not a controller capture or actual robot state. synthetic_vector_u32 demonstrates the published VECTOR6UINT32 wire type without claiming an observed robot field with that name. Other names appear in the vendor output table. No product helper/SDK was used to derive expected values.",
+  "recipe_id": 7,
+  "data_packet_bytes": 150,
+  "fields": [
+    {"field":"output_bit_register_64","wire_type":"BOOL","hex":"FF","value":{"raw_u8":255,"value":true}},
+    {"field":"tool_output_mode","wire_type":"UINT8","hex":"FF","value":255},
+    {"field":"robot_mode","wire_type":"INT32","hex":"80000000","value":-2147483648},
+    {"field":"runtime_state","wire_type":"UINT32","hex":"FFFFFFFF","value":4294967295},
+    {"field":"actual_digital_input_bits","wire_type":"UINT64","hex":"FFFFFFFFFFFFFFFF","value":18446744073709551615},
+    {"field":"timestamp","wire_type":"DOUBLE","hex":"8000000000000000","value":{"ieee754_hex":"8000000000000000","classification":"finite","value":-0.0}},
+    {"field":"actual_tool_accelerometer","wire_type":"VECTOR3D","hex":"7FF80000000000017FF0000000000000FFF0000000000000","value":[
+      {"ieee754_hex":"7FF8000000000001","classification":"nan"},
+      {"ieee754_hex":"7FF0000000000000","classification":"positive_infinity"},
+      {"ieee754_hex":"FFF0000000000000","classification":"negative_infinity"}]},
+    {"field":"actual_q","wire_type":"VECTOR6D","hex":"00000000000000003FF0000000000000BFF00000000000003FE000000000000040000000000000004008000000000000","value":[
+      {"ieee754_hex":"0000000000000000","classification":"finite","value":0.0},
+      {"ieee754_hex":"3FF0000000000000","classification":"finite","value":1.0},
+      {"ieee754_hex":"BFF0000000000000","classification":"finite","value":-1.0},
+      {"ieee754_hex":"3FE0000000000000","classification":"finite","value":0.5},
+      {"ieee754_hex":"4000000000000000","classification":"finite","value":2.0},
+      {"ieee754_hex":"4008000000000000","classification":"finite","value":3.0}]},
+    {"field":"joint_mode","wire_type":"VECTOR6INT32","hex":"800000007FFFFFFFFFFFFFFF000000000000000100000100","value":[-2147483648,2147483647,-1,0,1,256]},
+    {"field":"synthetic_vector_u32","wire_type":"VECTOR6UINT32","hex":"00000000FFFFFFFF80000000000000010123456789ABCDEF","value":[0,4294967295,2147483648,1,19088743,2309737967]}
+  ]
+}

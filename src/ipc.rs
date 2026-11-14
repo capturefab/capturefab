@@ -84,6 +84,15 @@ impl HeldCamera {
     /// Whether `selector`, as a person typed it, names this camera: 0 by
     /// its ID, 1 by its serial, address, MAC or a selector it was opened by.
     pub fn named_by(&self, selector: &str) -> Option<u8> {
+        // Monitor identities never enter the controller's serial/IP alias space,
+        // including descriptors written by a different process or older build.
+        if crate::transport::gige::monitor::is_selector(&self.id)
+            || crate::transport::gige::monitor::is_selector(selector)
+        {
+            let held = crate::transport::gige::monitor::MonitorSpec::parse(&self.id).ok()?;
+            let requested = crate::transport::gige::monitor::MonitorSpec::parse(selector).ok()?;
+            return (held.canonical() == requested.canonical()).then_some(0);
+        }
         let shown = crate::media::redact_url(selector);
         if shown == self.id {
             return Some(0);
@@ -1662,6 +1671,39 @@ pub(crate) fn process_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monitor_descriptors_match_only_the_complete_canonical_monitor_identity() {
+        let selector = "gige-monitor://192.0.2.10?interface=192.0.2.20&mac=020000000001";
+        let mut monitor = HeldCamera {
+            id: selector.into(),
+            serial: Some("CameraSerial".into()),
+            address: Some("192.0.2.10".into()),
+            mac: Some("020000000001".into()),
+            aliases: vec!["CameraSerial".into(), "192.0.2.10".into()],
+        };
+        assert_eq!(monitor.named_by(selector), Some(0));
+        assert_eq!(
+            monitor.named_by("gige-monitor://192.0.2.10?mac=020000000001&interface=192.0.2.20"),
+            Some(0)
+        );
+        for alias in [
+            "CameraSerial",
+            "192.0.2.10",
+            "020000000001",
+            "gige:020000000001",
+            "gige-monitor:",
+            "gige-monitor://192.0.2.10?interface=192.0.2.21&mac=020000000001",
+        ] {
+            assert_eq!(monitor.named_by(alias), None, "{alias}");
+        }
+        monitor.id = "gige:020000000001".into();
+        assert_eq!(monitor.named_by("CameraSerial"), Some(1));
+        assert_eq!(monitor.named_by(selector), None);
+        monitor.id = "gige-monitor:".into();
+        assert_eq!(monitor.named_by("CameraSerial"), None);
+        assert_eq!(monitor.named_by("gige-monitor:"), None);
+    }
 
     #[test]
     fn descriptor_reads_reject_growth_beyond_the_metadata_hint() {

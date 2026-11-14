@@ -1,0 +1,1081 @@
+{
+ "version": 1,
+ "freeze": "Independent additive scientific/ABI oracle frozen before new engineering native/C implementation is authored or read. Literal IEEE words, integers and asymmetric controls are manually declared; no product encoder/decoder, SDK, compiler/native call or runtime.",
+ "accepted_contract_sha256": "2f0ee94e27c12f14e1880f1ecda1573d62d021acd2fbadb7e6eb9849863f0eac",
+ "baseline_source": {
+  "sha256": "6f281c638b0e643fb83a46bbe7b77bfbb43ad9225d3ce958dccc3ef5b38de679",
+  "files": 864
+ },
+ "immutable_prior_oracles_sha256": {
+  "abi.json": "1bbc016312c3aab6093483cfa3aeee442e6bc3aaeb74eaa8113641a090329b6b",
+  "thermocouple.json": "2a8109877c63aa7448965c0d0ac9ec060355d8dde41e98496b4ff8050ac65cb1",
+  "current.json": "14f428f82a6cf94704ac47ff2b42d18bf71553435437ae4f0345bf4260779bff",
+  "voltage-scale-null.json": "5764fe41ecab45d8b5795d15dc82f723c566d5ba0af565048224337ed321ba63",
+  "on-demand.json": "b87122de19d2bdb77f16c0511d1759925b84697ad59e97375197d1b54e81fe89",
+  "rtd.json": "5f83a52d2ce10c71d6e1f7498bb6bd020828365a734fbe235cb7bbcadd2cb6a5",
+  "mixed-ai.json": "d4a74d1e2310b8f16648e296ab95ebffe175559fbe326655ac98dae6d31a9d78",
+  "digital-port.json": "78475d5d3a4dc0e02405b57887dfd9f3bfd3e7659b31613edde6aea674af9434",
+  "counter-input.json": "a056640e872e599b54413e18e7824ac114a6fe99b248693838b09b7a51a44d93"
+ },
+ "immutable_eight_c_word_arrays_text_sha256": {
+  "words": "d33dae464ecceaadc4899b09d31bf09af0546a822db79612680d2132caaa4d92",
+  "tc_words": "d42057e167b20a607f173cd2902ca57185b7633ea67f3894364e4d0757014496",
+  "current_words": "83d49b770ec0813b9f2a11b36e30e92303b4e8c3109f801e487465a9a8f464c2",
+  "rtd_words": "a0621fdea511efa372a8a5675070b773700cfd6f6b3325ebf1eada76ecc9a966",
+  "mixed_words": "67d1533c2be4a430a11f19b6cc9fd3cadcc4dd56db14b9d1f03cd7fdb49aed99",
+  "digital_words": "be6f5d896eabb2a6a053cde8f4dcc05f03d10d8d2ad81c49a8a48f6b7f5d5489",
+  "count_words": "89f06a5474da075b2dc5c0fc0ebeaf88c03aa1ecab3543e0b2f6355c84bb72f3",
+  "frequency_words": "8d8263d3c909d65d9d0ea5080d7b2d911664b3cc5b175eb39f0190ddf7df690d"
+ },
+ "abi_policy": {
+  "returns": "signed i32 status",
+  "TaskHandle": "pointer-sized owned opaque handle",
+  "calling_convention": "fixed NI __CFUNC; C Linux/system Windows",
+  "bool32": "u32, not one-byte bool",
+  "custom_scale": "NULL for all selected noncustom units",
+  "all_selected_exports_before_CreateTask": true,
+  "no_variadic_attributes": true
+ },
+ "ownership_common_exports": [
+  "DAQmxCreateTask",
+  "DAQmxGetTaskNumChans",
+  "DAQmxGetNthTaskReadChannel",
+  "DAQmxStartTask",
+  "DAQmxStopTask",
+  "DAQmxClearTask",
+  "DAQmxGetErrorString",
+  "DAQmxGetExtendedErrorInfo"
+ ],
+ "raw_rules": [
+  "Preserve every SDK-exposed binary64 bit/sign/NaN payload as canonical8-byte LE hex; add selected numeric key only if finite.",
+  "No clipping, engineering/unit conversion, local offset/sensitivity/excitation/Poisson/window/divisor/encoder math or reinterpretation of hardware width.",
+  "Actual count/ordered channel geometry qualifies received data; one complete negative-status prefix survives before optional diagnostics and original failure.",
+  "Host completion clock immediately after selected native read, before optional diagnostics/encoding; no hardware source_time/freshness/synchronization claim.",
+  "Same original deadline/cutoff and worker pre-FFI host attempt frontier; no exact physical-entry gap, catchup or Read in Finish; owned cleanup only."
+ ],
+ "status_geometry_controls": [
+  {
+   "native_status": 0,
+   "actual_per_channel": 0,
+   "result": "Incomplete/no block",
+   "timing_scope": "on_demand one-scan contract; existing continuous idle semantics unchanged"
+  },
+  {
+   "native_status": 12345,
+   "actual_per_channel": 0,
+   "result": "Incomplete with original warning/geometry/no block",
+   "timing_scope": "on_demand one-scan contract; existing continuous idle semantics unchanged"
+  },
+  {
+   "native_status": -200284,
+   "actual_per_channel": 0,
+   "result": "original negative failure/no block"
+  },
+  {
+   "native_status": 0,
+   "actual_per_channel": -1,
+   "result": "Incomplete/no unqualified buffer words"
+  },
+  {
+   "native_status": 0,
+   "actual_per_channel": "requested+1",
+   "result": "Incomplete/no unqualified buffer words"
+  },
+  {
+   "native_status": -200284,
+   "actual_per_channel": 1,
+   "result": "complete first scan/word before original error and deferred diagnostic hang"
+  }
+ ],
+ "qualification": "Synthetic generic ABI/request/data preservation. No NI device/driver/OS/chassis/sensor acceptance, electrical/routing/power-off/calibration/homing/freshness/real-time claim.",
+ "profiles": [
+  "strain",
+  "bridge_ratio",
+  "acceleration"
+ ],
+ "timing_modes": [
+  "continuous",
+  "on_demand"
+ ],
+ "private_protocol": 8,
+ "manual_argument_words": [
+  {
+   "name": "strain_min_a",
+   "exact_rational": "-1/64",
+   "bits_hex": "bf90000000000000",
+   "ieee754_le_hex": "00000000000090bf"
+  },
+  {
+   "name": "strain_max_a",
+   "exact_rational": "3/128",
+   "bits_hex": "3f98000000000000",
+   "ieee754_le_hex": "000000000000983f"
+  },
+  {
+   "name": "strain_min_b",
+   "exact_rational": "-1/128",
+   "bits_hex": "bf80000000000000",
+   "ieee754_le_hex": "00000000000080bf"
+  },
+  {
+   "name": "strain_max_b",
+   "exact_rational": "1/32",
+   "bits_hex": "3fa0000000000000",
+   "ieee754_le_hex": "000000000000a03f"
+  },
+  {
+   "name": "excitation_volts_a",
+   "exact_rational": "5/2",
+   "bits_hex": "4004000000000000",
+   "ieee754_le_hex": "0000000000000440"
+  },
+  {
+   "name": "excitation_volts_b",
+   "exact_rational": "5",
+   "bits_hex": "4014000000000000",
+   "ieee754_le_hex": "0000000000001440"
+  },
+  {
+   "name": "gage_factor_a",
+   "exact_rational": "2",
+   "bits_hex": "4000000000000000",
+   "ieee754_le_hex": "0000000000000040"
+  },
+  {
+   "name": "gage_factor_b",
+   "exact_rational": "9/4",
+   "bits_hex": "4002000000000000",
+   "ieee754_le_hex": "0000000000000240"
+  },
+  {
+   "name": "unloaded_volts_a",
+   "exact_rational": "1/1024",
+   "bits_hex": "3f50000000000000",
+   "ieee754_le_hex": "000000000000503f"
+  },
+  {
+   "name": "unloaded_volts_b",
+   "exact_rational": "-1/512",
+   "bits_hex": "bf60000000000000",
+   "ieee754_le_hex": "00000000000060bf"
+  },
+  {
+   "name": "gage_ohms_a",
+   "exact_rational": "120",
+   "bits_hex": "405e000000000000",
+   "ieee754_le_hex": "0000000000005e40"
+  },
+  {
+   "name": "gage_ohms_b_and_bridge_a",
+   "exact_rational": "350",
+   "bits_hex": "4075e00000000000",
+   "ieee754_le_hex": "0000000000e07540"
+  },
+  {
+   "name": "poisson_a",
+   "exact_rational": "1/4",
+   "bits_hex": "3fd0000000000000",
+   "ieee754_le_hex": "000000000000d03f"
+  },
+  {
+   "name": "poisson_b",
+   "exact_rational": "3/8",
+   "bits_hex": "3fd8000000000000",
+   "ieee754_le_hex": "000000000000d83f"
+  },
+  {
+   "name": "lead_ohms_a",
+   "exact_rational": "1/2",
+   "bits_hex": "3fe0000000000000",
+   "ieee754_le_hex": "000000000000e03f"
+  },
+  {
+   "name": "lead_ohms_b",
+   "exact_rational": "3/4",
+   "bits_hex": "3fe8000000000000",
+   "ieee754_le_hex": "000000000000e83f"
+  },
+  {
+   "name": "ratio_min_a",
+   "exact_rational": "-1/32",
+   "bits_hex": "bfa0000000000000",
+   "ieee754_le_hex": "000000000000a0bf"
+  },
+  {
+   "name": "ratio_max_a",
+   "exact_rational": "1/64",
+   "bits_hex": "3f90000000000000",
+   "ieee754_le_hex": "000000000000903f"
+  },
+  {
+   "name": "ratio_min_b",
+   "exact_rational": "-5/2",
+   "bits_hex": "c004000000000000",
+   "ieee754_le_hex": "00000000000004c0"
+  },
+  {
+   "name": "ratio_max_b",
+   "exact_rational": "15/4",
+   "bits_hex": "400e000000000000",
+   "ieee754_le_hex": "0000000000000e40"
+  },
+  {
+   "name": "bridge_ohms_b",
+   "exact_rational": "1000",
+   "bits_hex": "408f400000000000",
+   "ieee754_le_hex": "0000000000408f40"
+  },
+  {
+   "name": "acceleration_min_a",
+   "exact_rational": "-64",
+   "bits_hex": "c050000000000000",
+   "ieee754_le_hex": "00000000000050c0"
+  },
+  {
+   "name": "acceleration_max_a",
+   "exact_rational": "128",
+   "bits_hex": "4060000000000000",
+   "ieee754_le_hex": "0000000000006040"
+  },
+  {
+   "name": "acceleration_min_b",
+   "exact_rational": "-32",
+   "bits_hex": "c040000000000000",
+   "ieee754_le_hex": "00000000000040c0"
+  },
+  {
+   "name": "acceleration_max_b",
+   "exact_rational": "256",
+   "bits_hex": "4070000000000000",
+   "ieee754_le_hex": "0000000000007040"
+  },
+  {
+   "name": "acceleration_min_c",
+   "exact_rational": "-128",
+   "bits_hex": "c060000000000000",
+   "ieee754_le_hex": "00000000000060c0"
+  },
+  {
+   "name": "acceleration_max_c",
+   "exact_rational": "512",
+   "bits_hex": "4080000000000000",
+   "ieee754_le_hex": "0000000000008040"
+  },
+  {
+   "name": "sensitivity_a",
+   "exact_rational": "125",
+   "bits_hex": "405f400000000000",
+   "ieee754_le_hex": "0000000000405f40"
+  },
+  {
+   "name": "sensitivity_b",
+   "exact_rational": "1/8",
+   "bits_hex": "3fc0000000000000",
+   "ieee754_le_hex": "000000000000c03f"
+  },
+  {
+   "name": "sensitivity_c",
+   "exact_rational": "250",
+   "bits_hex": "406f400000000000",
+   "ieee754_le_hex": "0000000000406f40"
+  },
+  {
+   "name": "excitation_amperes_a",
+   "exact_rational": "1/512",
+   "bits_hex": "3f60000000000000",
+   "ieee754_le_hex": "000000000000603f"
+  },
+  {
+   "name": "excitation_amperes_b",
+   "exact_rational": "1/256",
+   "bits_hex": "3f70000000000000",
+   "ieee754_le_hex": "000000000000703f"
+  },
+  {
+   "name": "none_nonzero_amperes",
+   "exact_rational": "1/1024",
+   "bits_hex": "3f50000000000000",
+   "ieee754_le_hex": "000000000000503f"
+  },
+  {
+   "name": "none_nonzero_volts",
+   "exact_rational": "5/4",
+   "bits_hex": "3ff4000000000000",
+   "ieee754_le_hex": "000000000000f43f"
+  },
+  {
+   "name": "positive_zero",
+   "exact_rational": "0",
+   "bits_hex": "0000000000000000",
+   "ieee754_le_hex": "0000000000000000"
+  },
+  {
+   "name": "negative_zero",
+   "exact_rational": "0",
+   "bits_hex": "8000000000000000",
+   "ieee754_le_hex": "0000000000000080"
+  }
+ ],
+ "fixed_abis": [
+  {
+   "name": "DAQmxCreateAIStrainGageChan",
+   "returns": "i32",
+   "slot_count": 15,
+   "arguments": [
+    "H",
+    "const char* physical",
+    "const char* virtual",
+    "f64 min",
+    "f64 max",
+    "i32 units",
+    "i32 strain_config",
+    "i32 voltage_excit_source",
+    "f64 voltage_excit_value",
+    "f64 gage_factor",
+    "f64 initial_bridge_volts",
+    "f64 nominal_gage_ohms",
+    "f64 poisson_ratio",
+    "f64 lead_wire_ohms",
+    "const char* scale"
+   ]
+  },
+  {
+   "name": "DAQmxCreateAIBridgeChan",
+   "returns": "i32",
+   "slot_count": 11,
+   "arguments": [
+    "H",
+    "const char* physical",
+    "const char* virtual",
+    "f64 min",
+    "f64 max",
+    "i32 units",
+    "i32 bridge_config",
+    "i32 voltage_excit_source",
+    "f64 voltage_excit_value",
+    "f64 nominal_bridge_ohms",
+    "const char* scale"
+   ]
+  },
+  {
+   "name": "DAQmxCreateAIAccelChan",
+   "returns": "i32",
+   "slot_count": 12,
+   "arguments": [
+    "H",
+    "const char* physical",
+    "const char* virtual",
+    "i32 terminal",
+    "f64 min",
+    "f64 max",
+    "i32 units",
+    "f64 sensitivity",
+    "i32 sensitivity_units",
+    "i32 current_excit_source",
+    "f64 current_excit_value",
+    "const char* scale"
+   ]
+  },
+  {
+   "name": "DAQmxSetAICoupling",
+   "returns": "i32",
+   "slot_count": 3,
+   "arguments": [
+    "H",
+    "const char* exact_requested_physical",
+    "i32 coupling"
+   ]
+  },
+  {
+   "name": "DAQmxReadAnalogF64",
+   "returns": "i32",
+   "slot_count": 8,
+   "arguments": [
+    "H",
+    "i32 requested_per_channel",
+    "f64 timeout",
+    "u32 fill_mode",
+    "f64* zeroed_output",
+    "u32 capacity_f64_elements",
+    "i32* actual_per_channel",
+    "u32* reserved"
+   ]
+  }
+ ],
+ "strain_pair": [
+  {
+   "case": "strain_a",
+   "physical": "StrainSuccess/ai0",
+   "virtual_name": "",
+   "bridge_type": "half_bridge_i",
+   "bridge_type_code": 10188,
+   "min_word": "strain_min_a",
+   "max_word": "strain_max_a",
+   "units": "strain",
+   "units_code": 10299,
+   "excitation_source": "internal",
+   "excitation_code": 10200,
+   "volts_word": "excitation_volts_a",
+   "gage_factor_word": "gage_factor_a",
+   "initial_bridge_volts_word": "unloaded_volts_a",
+   "nominal_gage_ohms_word": "gage_ohms_a",
+   "poisson_ratio_word": "poisson_a",
+   "lead_wire_ohms_word": "lead_ohms_a",
+   "coupling": "ac",
+   "coupling_code": 10045,
+   "custom_scale": "NULL"
+  },
+  {
+   "case": "strain_b",
+   "physical": "StrainSuccess/ai1",
+   "virtual_name": "",
+   "bridge_type": "full_bridge_iii",
+   "bridge_type_code": 10185,
+   "min_word": "strain_min_b",
+   "max_word": "strain_max_b",
+   "units": "strain",
+   "units_code": 10299,
+   "excitation_source": "external",
+   "excitation_code": 10167,
+   "volts_word": "excitation_volts_b",
+   "gage_factor_word": "gage_factor_b",
+   "initial_bridge_volts_word": "unloaded_volts_b",
+   "nominal_gage_ohms_word": "gage_ohms_b_and_bridge_a",
+   "poisson_ratio_word": "poisson_b",
+   "lead_wire_ohms_word": "lead_ohms_b",
+   "coupling": "omitted",
+   "custom_scale": "NULL"
+  }
+ ],
+ "bridge_ratio_pair": [
+  {
+   "case": "ratio_a",
+   "physical": "RatioSuccess/ai0",
+   "virtual_name": "",
+   "bridge_config": "full_bridge",
+   "bridge_config_code": 10182,
+   "units": "volts_per_volt",
+   "units_code": 15896,
+   "min_word": "ratio_min_a",
+   "max_word": "ratio_max_a",
+   "excitation_source": "internal",
+   "excitation_code": 10200,
+   "volts_word": "excitation_volts_a",
+   "nominal_bridge_ohms_word": "gage_ohms_b_and_bridge_a",
+   "coupling": "dc",
+   "coupling_code": 10050,
+   "custom_scale": "NULL"
+  },
+  {
+   "case": "ratio_b",
+   "physical": "RatioSuccess/ai1",
+   "virtual_name": "",
+   "bridge_config": "quarter_bridge",
+   "bridge_config_code": 10270,
+   "units": "millivolts_per_volt",
+   "units_code": 15897,
+   "min_word": "ratio_min_b",
+   "max_word": "ratio_max_b",
+   "excitation_source": "external",
+   "excitation_code": 10167,
+   "volts_word": "excitation_volts_b",
+   "nominal_bridge_ohms_word": "bridge_ohms_b",
+   "coupling": "ground",
+   "coupling_code": 10066,
+   "custom_scale": "NULL"
+  }
+ ],
+ "acceleration_three_channel_cycle": [
+  {
+   "case": "acceleration_a",
+   "physical": "AccelSuccess/ai0",
+   "virtual_name": "",
+   "terminal_config": "pseudodifferential",
+   "terminal_code": 12529,
+   "units": "g",
+   "units_code": 10186,
+   "min_word": "acceleration_min_a",
+   "max_word": "acceleration_max_a",
+   "sensitivity_word": "sensitivity_a",
+   "sensitivity_units": "mv_per_g",
+   "sensitivity_units_code": 12509,
+   "excitation_source": "internal",
+   "excitation_code": 10200,
+   "amperes_word": "excitation_amperes_a",
+   "coupling": "ac",
+   "coupling_code": 10045,
+   "custom_scale": "NULL"
+  },
+  {
+   "case": "acceleration_b",
+   "physical": "AccelSuccess/ai1",
+   "virtual_name": "",
+   "terminal_config": "default",
+   "terminal_code": -1,
+   "units": "m_s2",
+   "units_code": 12470,
+   "min_word": "acceleration_min_b",
+   "max_word": "acceleration_max_b",
+   "sensitivity_word": "sensitivity_b",
+   "sensitivity_units": "v_per_g",
+   "sensitivity_units_code": 12510,
+   "excitation_source": "external",
+   "excitation_code": 10167,
+   "amperes_word": "excitation_amperes_b",
+   "coupling": "dc",
+   "coupling_code": 10050,
+   "custom_scale": "NULL"
+  },
+  {
+   "case": "acceleration_c",
+   "physical": "AccelSuccess/ai2",
+   "virtual_name": "",
+   "terminal_config": "differential",
+   "terminal_code": 10106,
+   "units": "in_s2",
+   "units_code": 12471,
+   "min_word": "acceleration_min_c",
+   "max_word": "acceleration_max_c",
+   "sensitivity_word": "sensitivity_c",
+   "sensitivity_units": "mv_per_g",
+   "sensitivity_units_code": 12509,
+   "excitation_source": "none",
+   "excitation_code": 10230,
+   "amperes_word": "none_nonzero_amperes",
+   "coupling": "ground",
+   "coupling_code": 10066,
+   "custom_scale": "NULL"
+  }
+ ],
+ "strain_layout_controls": [
+  {
+   "bridge_type": "full_bridge_i",
+   "code": 10183
+  },
+  {
+   "bridge_type": "full_bridge_ii",
+   "code": 10184
+  },
+  {
+   "bridge_type": "full_bridge_iii",
+   "code": 10185
+  },
+  {
+   "bridge_type": "half_bridge_i",
+   "code": 10188
+  },
+  {
+   "bridge_type": "half_bridge_ii",
+   "code": 10189
+  },
+  {
+   "bridge_type": "quarter_bridge_i",
+   "code": 10271
+  },
+  {
+   "bridge_type": "quarter_bridge_ii",
+   "code": 10272
+  }
+ ],
+ "bridge_configuration_controls": [
+  {
+   "bridge_config": "full_bridge",
+   "code": 10182
+  },
+  {
+   "bridge_config": "half_bridge",
+   "code": 10187
+  },
+  {
+   "bridge_config": "quarter_bridge",
+   "code": 10270
+  }
+ ],
+ "coupling_controls": [
+  {
+   "request": "omitted",
+   "selected_setter": false,
+   "provenance": "driver_default_unqueried"
+  },
+  {
+   "request": "ac",
+   "code": 10045,
+   "selected_setter": true,
+   "provenance": "explicit_request_not_read_back"
+  },
+  {
+   "request": "dc",
+   "code": 10050,
+   "selected_setter": true,
+   "provenance": "explicit_request_not_read_back"
+  },
+  {
+   "request": "ground",
+   "code": 10066,
+   "selected_setter": true,
+   "provenance": "explicit_request_not_read_back",
+   "semantics": "removes signal/measures ground, not sensor zero/calibration/power-off"
+  }
+ ],
+ "none_excitation_controls": [
+  {
+   "measurement": "strain",
+   "base_case": "strain_a",
+   "source": "none",
+   "source_code": 10230,
+   "amount_field": "volts",
+   "word": "none_nonzero_volts"
+  },
+  {
+   "measurement": "bridge_ratio",
+   "base_case": "ratio_a",
+   "source": "none",
+   "source_code": 10230,
+   "amount_field": "volts",
+   "word": "positive_zero"
+  },
+  {
+   "measurement": "acceleration",
+   "base_case": "acceleration_a",
+   "source": "none",
+   "source_code": 10230,
+   "amount_field": "amperes",
+   "word": "none_nonzero_amperes"
+  },
+  {
+   "measurement": "strain",
+   "base_case": "strain_a",
+   "source": "none",
+   "source_code": 10230,
+   "amount_field": "volts",
+   "word": "negative_zero"
+  }
+ ],
+ "none_policy": "Explicit amount passed bit-exact for every source. I/E positive finite, None nonnegative finite. None amount is neither rewritten nor asserted ignored/universally accepted or physically off. Native errors remain original.",
+ "coupling_policy": "Applies optionally to all three and MixedAI; resolve only when explicit before Create, call for exact owned requested physical channel after it exists/before Start. Omission no setter/getter; null invalid.",
+ "manual_homogeneous_patterns": [
+  {
+   "ordinal": 0,
+   "bits_hex": "3f90000000000000",
+   "ieee754_le_hex": "000000000000903f",
+   "classification": "finite",
+   "sign_bit": 0,
+   "exact_rational": "1/64",
+   "finite_decimal": "0.015625"
+  },
+  {
+   "ordinal": 1,
+   "bits_hex": "3f90000000000000",
+   "ieee754_le_hex": "000000000000903f",
+   "classification": "finite",
+   "sign_bit": 0,
+   "exact_rational": "1/64",
+   "finite_decimal": "0.015625"
+  },
+  {
+   "ordinal": 2,
+   "bits_hex": "3f90000000000000",
+   "ieee754_le_hex": "000000000000903f",
+   "classification": "finite",
+   "sign_bit": 0,
+   "exact_rational": "1/64",
+   "finite_decimal": "0.015625"
+  },
+  {
+   "ordinal": 3,
+   "bits_hex": "8000000000000000",
+   "ieee754_le_hex": "0000000000000080",
+   "classification": "zero",
+   "sign_bit": 1,
+   "exact_rational": "0",
+   "finite_decimal": "-0.0"
+  },
+  {
+   "ordinal": 4,
+   "bits_hex": "7ff0000000000000",
+   "ieee754_le_hex": "000000000000f07f",
+   "classification": "infinity",
+   "sign_bit": 0
+  },
+  {
+   "ordinal": 5,
+   "bits_hex": "fff0000000000000",
+   "ieee754_le_hex": "000000000000f0ff",
+   "classification": "infinity",
+   "sign_bit": 1
+  },
+  {
+   "ordinal": 6,
+   "bits_hex": "7ff80000000000a5",
+   "ieee754_le_hex": "a50000000000f87f",
+   "classification": "nan",
+   "sign_bit": 0,
+   "fraction_hex": "80000000000a5"
+  },
+  {
+   "ordinal": 7,
+   "bits_hex": "0000000000000000",
+   "ieee754_le_hex": "0000000000000000",
+   "classification": "zero",
+   "sign_bit": 0,
+   "exact_rational": "0",
+   "finite_decimal": "0.0"
+  },
+  {
+   "ordinal": 8,
+   "bits_hex": "3f50000000000000",
+   "ieee754_le_hex": "000000000000503f",
+   "classification": "finite",
+   "sign_bit": 0,
+   "exact_rational": "1/1024",
+   "finite_decimal": "0.0009765625"
+  },
+  {
+   "ordinal": 9,
+   "bits_hex": "bf80000000000000",
+   "ieee754_le_hex": "00000000000080bf",
+   "classification": "finite",
+   "sign_bit": 1,
+   "exact_rational": "-1/128",
+   "finite_decimal": "-0.0078125"
+  },
+  {
+   "ordinal": 10,
+   "bits_hex": "c004000000000000",
+   "ieee754_le_hex": "00000000000004c0",
+   "classification": "finite",
+   "sign_bit": 1,
+   "exact_rational": "-5/2",
+   "finite_decimal": "-2.5"
+  },
+  {
+   "ordinal": 11,
+   "bits_hex": "fff8000000000045",
+   "ieee754_le_hex": "450000000000f8ff",
+   "classification": "nan",
+   "sign_bit": 1,
+   "fraction_hex": "8000000000045"
+  }
+ ],
+ "homogeneous_raw_extent": {
+  "words": 12,
+  "bytes": 96,
+  "all_words_le_hex": "000000000000903f000000000000903f000000000000903f0000000000000080000000000000f07f000000000000f0ffa50000000000f87f0000000000000000000000000000503f00000000000080bf00000000000004c0450000000000f8ff",
+  "two_channel_shape": [
+   6,
+   2
+  ],
+  "three_channel_shape": [
+   4,
+   3
+  ],
+  "negative_two_channel_first_scan_le_hex": "000000000000903f000000000000903f",
+  "negative_three_channel_first_scan_le_hex": "000000000000903f000000000000903f000000000000903f",
+  "unit_control": "Identical first values across V/V and mV/V, or g/m_s2/in_s2, remain identical bits; no local unit/sensitivity/excitation conversion or clipping."
+ },
+ "public_rows": [
+  {
+   "measurement": "strain",
+   "event": "strain_block",
+   "representation": "driver_scaled_f64_strain",
+   "finite_key": "strain",
+   "units": "strain"
+  },
+  {
+   "measurement": "bridge_ratio",
+   "event": "bridge_ratio_block",
+   "representation": "driver_scaled_f64_bridge_ratio",
+   "finite_key": "ratio",
+   "units": "requested ratio enum"
+  },
+  {
+   "measurement": "acceleration",
+   "event": "acceleration_block",
+   "representation": "driver_scaled_f64_acceleration",
+   "finite_key": "acceleration",
+   "units": "requested acceleration enum"
+  }
+ ],
+ "setup_order": "Resolve selected union before CreateTask; create ordered individually owned AI channels, apply only explicitly requested coupling after own channel exists and before Start; continuous timing/buffer/overwrite then count/Nth then Start/rate; software count/Nth then Start/no clock calls.",
+ "selected_common_exports": {
+  "continuous": [
+   "DAQmxCreateTask",
+   "DAQmxGetTaskNumChans",
+   "DAQmxGetNthTaskReadChannel",
+   "DAQmxStartTask",
+   "DAQmxStopTask",
+   "DAQmxClearTask",
+   "DAQmxGetErrorString",
+   "DAQmxGetExtendedErrorInfo",
+   "DAQmxReadAnalogF64",
+   "DAQmxCfgSampClkTiming",
+   "DAQmxCfgInputBuffer",
+   "DAQmxSetReadOverWrite",
+   "DAQmxGetReadAvailSampPerChan",
+   "DAQmxGetSampClkRate"
+  ],
+  "on_demand": [
+   "DAQmxCreateTask",
+   "DAQmxGetTaskNumChans",
+   "DAQmxGetNthTaskReadChannel",
+   "DAQmxStartTask",
+   "DAQmxStopTask",
+   "DAQmxClearTask",
+   "DAQmxGetErrorString",
+   "DAQmxGetExtendedErrorInfo",
+   "DAQmxReadAnalogF64"
+  ]
+ },
+ "metadata": "measurement/requested_not_read_back; ordered actual physical plus channel_index and exact family request fields/units; coupling_request only explicit and coupling_provenance explicit_request_not_read_back or driver_default_unqueried. No calibration/excitation/power-off readback.",
+ "primary_ai_plan": {
+  "path": "/private/tmp/capturefab-ni-daqmx-strain-iepe-next-plan.md",
+  "sha256": "e4bb9a46e9d02c27ecc37f42d48f065d1dfcf1e3b5bef2df277a328c028b15a2"
+ },
+ "primary_policy": {
+  "path": "/private/tmp/capturefab-ni-seven-profile-policy-peer.md",
+  "sha256": "73bf0549ee88948259086c97f70b8b5b46b3d469ecf21b11e354f39103ecd18c"
+ },
+ "constants_primary": {
+  "url": "https://raw.githubusercontent.com/ni/nidaqmx-python/1d60b6c53ef11dead0ba6aa9d6e2855351835ad7/generated/nidaqmx/constants.py",
+  "bytes": 50365,
+  "sha256": "9d15eb38ccb03769f9e5ad94289a00658ee36b6685709e4f3d49dafb25b4ae57"
+ },
+ "scientific_boundaries": [
+  "Strain initial unloaded bridge voltage and native scaling are performed by driver, never application auto-null or extra subtraction.",
+  "Nominal gage versus nominal total bridge ohms and strain-layout versus general bridge enum are distinct.",
+  "Native strain is not converted to microstrain; native bridge ratio is not inferred force/pressure/torque.",
+  "Native acceleration uses requested units and sensitivity units; no g/m_s2/in_s2 conversion or default sensor calibration.",
+  "NI9237 may coerce/persist excitation; NI9234 model IEPE/coupling/rate limits are not universal acceptance; no Stop/Clear power-off promise."
+ ],
+ "mixed_seven_channel_control": {
+  "channels": [
+   {
+    "column_index": 0,
+    "measurement": "voltage",
+    "physical": "EngineeringMixed/ai0",
+    "prior_control": "mixed-ai.json ordered_four_channel_constructor_controls[0]",
+    "quantity": "voltage",
+    "units": "volts",
+    "finite_key": "volts",
+    "constructor": "DAQmxCreateAIVoltageChan"
+   },
+   {
+    "column_index": 1,
+    "measurement": "thermocouple",
+    "physical": "EngineeringMixed/ai1",
+    "prior_control": "mixed-ai.json ordered_four_channel_constructor_controls[1]",
+    "quantity": "temperature",
+    "units": "deg_c",
+    "finite_key": "temperature",
+    "constructor": "DAQmxCreateAIThrmcplChan"
+   },
+   {
+    "column_index": 2,
+    "measurement": "current",
+    "physical": "EngineeringMixed/ai2",
+    "prior_control": "mixed-ai.json ordered_four_channel_constructor_controls[2]",
+    "quantity": "current",
+    "units": "amps",
+    "finite_key": "amperes",
+    "constructor": "DAQmxCreateAICurrentChan"
+   },
+   {
+    "column_index": 3,
+    "measurement": "rtd",
+    "physical": "EngineeringMixed/ai3",
+    "prior_control": "mixed-ai.json ordered_four_channel_constructor_controls[3]",
+    "quantity": "temperature",
+    "units": "deg_f",
+    "finite_key": "temperature",
+    "constructor": "DAQmxCreateAIRTDChan"
+   },
+   {
+    "column_index": 4,
+    "measurement": "strain",
+    "physical": "EngineeringMixed/ai4",
+    "engineering_case": "strain_a",
+    "quantity": "strain",
+    "units": "strain",
+    "finite_key": "strain",
+    "constructor": "DAQmxCreateAIStrainGageChan"
+   },
+   {
+    "column_index": 5,
+    "measurement": "bridge_ratio",
+    "physical": "EngineeringMixed/ai5",
+    "engineering_case": "ratio_a",
+    "quantity": "bridge_ratio",
+    "units": "volts_per_volt",
+    "finite_key": "ratio",
+    "constructor": "DAQmxCreateAIBridgeChan"
+   },
+   {
+    "column_index": 6,
+    "measurement": "acceleration",
+    "physical": "EngineeringMixed/ai6",
+    "engineering_case": "acceleration_a",
+    "quantity": "acceleration",
+    "units": "g",
+    "finite_key": "acceleration",
+    "constructor": "DAQmxCreateAIAccelChan"
+   }
+  ],
+  "manual_scan_major_patterns": [
+   {
+    "scan_index": 0,
+    "channel_index": 0,
+    "bits_hex": "3ff0000000000000",
+    "ieee754_le_hex": "000000000000f03f",
+    "exact_rational": "1",
+    "finite_decimal": "1.0"
+   },
+   {
+    "scan_index": 0,
+    "channel_index": 1,
+    "bits_hex": "4039000000000000",
+    "ieee754_le_hex": "0000000000003940",
+    "exact_rational": "25",
+    "finite_decimal": "25.0"
+   },
+   {
+    "scan_index": 0,
+    "channel_index": 2,
+    "bits_hex": "3f90000000000000",
+    "ieee754_le_hex": "000000000000903f",
+    "exact_rational": "1/64",
+    "finite_decimal": "0.015625"
+   },
+   {
+    "scan_index": 0,
+    "channel_index": 3,
+    "bits_hex": "4039000000000000",
+    "ieee754_le_hex": "0000000000003940",
+    "exact_rational": "25",
+    "finite_decimal": "25.0"
+   },
+   {
+    "scan_index": 0,
+    "channel_index": 4,
+    "bits_hex": "3f50000000000000",
+    "ieee754_le_hex": "000000000000503f",
+    "exact_rational": "1/1024",
+    "finite_decimal": "0.0009765625"
+   },
+   {
+    "scan_index": 0,
+    "channel_index": 5,
+    "bits_hex": "3f90000000000000",
+    "ieee754_le_hex": "000000000000903f",
+    "exact_rational": "1/64",
+    "finite_decimal": "0.015625"
+   },
+   {
+    "scan_index": 0,
+    "channel_index": 6,
+    "bits_hex": "3ff0000000000000",
+    "ieee754_le_hex": "000000000000f03f",
+    "exact_rational": "1",
+    "finite_decimal": "1.0"
+   },
+   {
+    "scan_index": 1,
+    "channel_index": 0,
+    "bits_hex": "8000000000000000",
+    "ieee754_le_hex": "0000000000000080",
+    "exact_rational": "0",
+    "finite_decimal": "-0.0"
+   },
+   {
+    "scan_index": 1,
+    "channel_index": 1,
+    "bits_hex": "7ff80000000000a5",
+    "ieee754_le_hex": "a50000000000f87f"
+   },
+   {
+    "scan_index": 1,
+    "channel_index": 2,
+    "bits_hex": "7ff0000000000000",
+    "ieee754_le_hex": "000000000000f07f"
+   },
+   {
+    "scan_index": 1,
+    "channel_index": 3,
+    "bits_hex": "c004000000000000",
+    "ieee754_le_hex": "00000000000004c0",
+    "exact_rational": "-5/2",
+    "finite_decimal": "-2.5"
+   },
+   {
+    "scan_index": 1,
+    "channel_index": 4,
+    "bits_hex": "bf80000000000000",
+    "ieee754_le_hex": "00000000000080bf",
+    "exact_rational": "-1/128",
+    "finite_decimal": "-0.0078125"
+   },
+   {
+    "scan_index": 1,
+    "channel_index": 5,
+    "bits_hex": "fff0000000000000",
+    "ieee754_le_hex": "000000000000f0ff"
+   },
+   {
+    "scan_index": 1,
+    "channel_index": 6,
+    "bits_hex": "0000000000000000",
+    "ieee754_le_hex": "0000000000000000",
+    "exact_rational": "0",
+    "finite_decimal": "0.0"
+   }
+  ],
+  "shape": [
+   2,
+   7
+  ],
+  "word_count": 14,
+  "bytes": 112,
+  "all_words_le_hex": "000000000000f03f0000000000003940000000000000903f0000000000003940000000000000503f000000000000903f000000000000f03f0000000000000080a50000000000f87f000000000000f07f00000000000004c000000000000080bf000000000000f0ff0000000000000000",
+  "negative_one_scan_le_hex": "000000000000f03f0000000000003940000000000000903f0000000000003940000000000000503f000000000000903f000000000000f03f",
+  "negative_one_scan_bytes": 56,
+  "continuous": {
+   "requested_per_channel": 2,
+   "capacity_f64": 14,
+   "fill_mode": 1,
+   "reserved": "NULL"
+  },
+  "on_demand": {
+   "requested_per_channel": 1,
+   "capacity_f64": 7,
+   "fill_mode": 1,
+   "reserved": "NULL"
+  },
+  "selected_constructor_union": [
+   "DAQmxCreateAIVoltageChan",
+   "DAQmxCreateAIThrmcplChan",
+   "DAQmxCreateAICurrentChan",
+   "DAQmxCreateAIRTDChan",
+   "DAQmxCreateAIStrainGageChan",
+   "DAQmxCreateAIBridgeChan",
+   "DAQmxCreateAIAccelChan"
+  ],
+  "selected_optional_setters": [
+   "DAQmxSetAICoupling"
+  ],
+  "explicit_coupling_columns": [
+   4,
+   5,
+   6
+  ],
+  "old_tc_terminal_setter_selected": false,
+  "row": "existing mixed_analog_block/driver_scaled_f64_mixed_analog; no global units or per-word tags; finite key and unit follow each validated column"
+ },
+ "read_geometry": {
+  "selected_export": "DAQmxReadAnalogF64",
+  "fill_mode": 1,
+  "reserved": "NULL",
+  "zero_initialization": true,
+  "continuous": "positive requested_per_channel times exact validated actual_channels, capacity in binary64 elements and <=4096; no extra bytes treated as samples",
+  "on_demand": "requested_per_channel1, capacity exactly actual_channels, positive original remaining timeout",
+  "ordered_channels": "All count/1-based Nth names validated before read; no reordering/dedup/inferred physical layout"
+ }
+}

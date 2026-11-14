@@ -1,0 +1,575 @@
+{
+ "version": 1,
+ "freeze": "Independent scratch-only pre-RTD-product ABI/constants/manual scientific raw-value oracle. No RTD product-native source read, generator, native call, compiler, SDK or driver execution.",
+ "profile": "fresh_owned_analog_input_rtd_driver_temperature",
+ "scope": "Fixed ABI and native-word meaning; public config/wire/output names remain separate future contracts. Constructor controls are synthetic inputs, not manufacturer-approved sensor/module settings.",
+ "abi": {
+  "name": "DAQmxCreateAIRTDChan",
+  "returns": "i32",
+  "calling_convention": "existing NI __CFUNC / extern system on Windows; C on Linux",
+  "arguments": [
+   {
+    "slot": 1,
+    "name": "taskHandle",
+    "type": "pointer_sized_TaskHandle"
+   },
+   {
+    "slot": 2,
+    "name": "physicalChannel",
+    "type": "const char*",
+    "rule": "one explicit individual normalized physical name"
+   },
+   {
+    "slot": 3,
+    "name": "nameToAssignToChannel",
+    "type": "const char*",
+    "rule": "nonnull empty C string"
+   },
+   {
+    "slot": 4,
+    "name": "minVal",
+    "type": "f64",
+    "rule": "finite in selected output temperature unit"
+   },
+   {
+    "slot": 5,
+    "name": "maxVal",
+    "type": "f64",
+    "rule": "finite greater than minVal in selected output unit"
+   },
+   {
+    "slot": 6,
+    "name": "units",
+    "type": "i32"
+   },
+   {
+    "slot": 7,
+    "name": "rtdType",
+    "type": "i32"
+   },
+   {
+    "slot": 8,
+    "name": "resistanceConfig",
+    "type": "i32"
+   },
+   {
+    "slot": 9,
+    "name": "currentExcitSource",
+    "type": "i32"
+   },
+   {
+    "slot": 10,
+    "name": "currentExcitVal",
+    "type": "f64",
+    "rule": "explicit positive finite amperes"
+   },
+   {
+    "slot": 11,
+    "name": "r0",
+    "type": "f64",
+    "rule": "explicit positive finite sensor ohms at0 degrees Celsius regardless of selected output units"
+   }
+  ],
+  "absent_arguments": [
+   "terminal_config",
+   "custom_scale_name",
+   "cold_junction",
+   "Callendar_Van_Dusen_coefficients"
+  ],
+  "status": "0 success, positive warning, negative native failure, retained exactly"
+ },
+ "enums": {
+  "rtd_type": {
+   "pt3750": 12481,
+   "pt3851": 10071,
+   "pt3911": 12482,
+   "pt3916": 10069,
+   "pt3920": 10053,
+   "pt3928": 12483
+  },
+  "temperature_units": {
+   "deg_c": 10143,
+   "deg_f": 10144,
+   "kelvin": 10325,
+   "deg_r": 10145
+  },
+  "resistance_config": {
+   "two_wire": 2,
+   "three_wire": 3,
+   "four_wire": 4
+  },
+  "excitation_source": {
+   "internal": 10200,
+   "external": 10167
+  },
+  "known_but_out_of_scope": {
+   "custom_rtd_requires_coefficients": 10137,
+   "no_excitation": 10230,
+   "from_custom_scale_units": 10065
+  }
+ },
+ "required_exports": {
+  "resolve_before_create": [
+   "DAQmxCreateAIRTDChan"
+  ],
+  "continuous_common_count": 14,
+  "continuous_common": [
+   "DAQmxCreateTask",
+   "DAQmxGetTaskNumChans",
+   "DAQmxGetNthTaskReadChannel",
+   "DAQmxStartTask",
+   "DAQmxReadAnalogF64",
+   "DAQmxStopTask",
+   "DAQmxClearTask",
+   "DAQmxGetErrorString",
+   "DAQmxGetExtendedErrorInfo",
+   "DAQmxCfgSampClkTiming",
+   "DAQmxCfgInputBuffer",
+   "DAQmxSetReadOverWrite",
+   "DAQmxGetReadAvailSampPerChan",
+   "DAQmxGetSampClkRate"
+  ],
+  "on_demand_common_count": 9,
+  "on_demand_common": [
+   "DAQmxCreateTask",
+   "DAQmxGetTaskNumChans",
+   "DAQmxGetNthTaskReadChannel",
+   "DAQmxStartTask",
+   "DAQmxReadAnalogF64",
+   "DAQmxStopTask",
+   "DAQmxClearTask",
+   "DAQmxGetErrorString",
+   "DAQmxGetExtendedErrorInfo"
+  ],
+  "never_require_for_rtd": [
+   "DAQmxCreateAIVoltageChan",
+   "DAQmxCreateAIThrmcplChan",
+   "DAQmxCreateAICurrentChan",
+   "DAQmxSetAITermCfg"
+  ],
+  "on_demand_forbidden": [
+   "DAQmxCfgSampClkTiming",
+   "DAQmxCfgInputBuffer",
+   "DAQmxSetReadOverWrite",
+   "DAQmxGetReadAvailSampPerChan",
+   "DAQmxGetSampClkRate",
+   "DAQmxSetSampTimingType",
+   "DAQmxGetSampTimingType"
+  ],
+  "selected_constructor_only": "Missing unused constructors do not block RTD; missing RTD constructor fails before CreateTask."
+ },
+ "manual_argument_words": [
+  {
+   "name": "min_c",
+   "exact_rational": "-50",
+   "bits_hex": "c049000000000000",
+   "ieee754_le_hex": "00000000000049c0"
+  },
+  {
+   "name": "max_c",
+   "exact_rational": "500",
+   "bits_hex": "407f400000000000",
+   "ieee754_le_hex": "0000000000407f40"
+  },
+  {
+   "name": "min_f",
+   "exact_rational": "-40",
+   "bits_hex": "c044000000000000",
+   "ieee754_le_hex": "00000000000044c0"
+  },
+  {
+   "name": "max_f",
+   "exact_rational": "300",
+   "bits_hex": "4072c00000000000",
+   "ieee754_le_hex": "0000000000c07240"
+  },
+  {
+   "name": "internal_current",
+   "exact_rational": "1/1024",
+   "bits_hex": "3f50000000000000",
+   "ieee754_le_hex": "000000000000503f"
+  },
+  {
+   "name": "external_current",
+   "exact_rational": "1/512",
+   "bits_hex": "3f60000000000000",
+   "ieee754_le_hex": "000000000000603f"
+  },
+  {
+   "name": "reference_100_ohms",
+   "exact_rational": "100",
+   "bits_hex": "4059000000000000",
+   "ieee754_le_hex": "0000000000005940"
+  },
+  {
+   "name": "reference_1000_ohms",
+   "exact_rational": "1000",
+   "bits_hex": "408f400000000000",
+   "ieee754_le_hex": "0000000000408f40"
+  },
+  {
+   "name": "cycle_min",
+   "exact_rational": "32",
+   "bits_hex": "4040000000000000",
+   "ieee754_le_hex": "0000000000004040"
+  },
+  {
+   "name": "cycle_max",
+   "exact_rational": "256",
+   "bits_hex": "4070000000000000",
+   "ieee754_le_hex": "0000000000007040"
+  }
+ ],
+ "asymmetric_two_channel_constructor_controls": [
+  {
+   "physical": "RtdSuccess/ai0",
+   "virtual_name": "",
+   "min_word": "min_c",
+   "max_word": "max_c",
+   "units": "deg_c",
+   "units_code": 10143,
+   "rtd_type": "pt3851",
+   "rtd_code": 10071,
+   "resistance_config": "three_wire",
+   "resistance_code": 3,
+   "excitation_source": "internal",
+   "excitation_source_code": 10200,
+   "excitation_word": "internal_current",
+   "r0_word": "reference_100_ohms"
+  },
+  {
+   "physical": "RtdSuccess/ai1",
+   "virtual_name": "",
+   "min_word": "min_f",
+   "max_word": "max_f",
+   "units": "deg_f",
+   "units_code": 10144,
+   "rtd_type": "pt3928",
+   "rtd_code": 12483,
+   "resistance_config": "four_wire",
+   "resistance_code": 4,
+   "excitation_source": "external",
+   "excitation_source_code": 10167,
+   "excitation_word": "external_current",
+   "r0_word": "reference_1000_ohms"
+  }
+ ],
+ "six_channel_enum_controls": [
+  {
+   "channel_index": 0,
+   "rtd_type": "pt3750",
+   "rtd_code": 12481,
+   "units": "deg_c",
+   "units_code": 10143,
+   "wire": "two_wire",
+   "resistance_code": 2,
+   "excitation_source": "internal",
+   "excitation_source_code": 10200,
+   "excitation_word": "internal_current",
+   "r0_word": "reference_100_ohms",
+   "min_word": "cycle_min",
+   "max_word": "cycle_max"
+  },
+  {
+   "channel_index": 1,
+   "rtd_type": "pt3851",
+   "rtd_code": 10071,
+   "units": "deg_f",
+   "units_code": 10144,
+   "wire": "three_wire",
+   "resistance_code": 3,
+   "excitation_source": "external",
+   "excitation_source_code": 10167,
+   "excitation_word": "external_current",
+   "r0_word": "reference_1000_ohms",
+   "min_word": "cycle_min",
+   "max_word": "cycle_max"
+  },
+  {
+   "channel_index": 2,
+   "rtd_type": "pt3911",
+   "rtd_code": 12482,
+   "units": "kelvin",
+   "units_code": 10325,
+   "wire": "four_wire",
+   "resistance_code": 4,
+   "excitation_source": "internal",
+   "excitation_source_code": 10200,
+   "excitation_word": "internal_current",
+   "r0_word": "reference_100_ohms",
+   "min_word": "cycle_min",
+   "max_word": "cycle_max"
+  },
+  {
+   "channel_index": 3,
+   "rtd_type": "pt3916",
+   "rtd_code": 10069,
+   "units": "deg_r",
+   "units_code": 10145,
+   "wire": "two_wire",
+   "resistance_code": 2,
+   "excitation_source": "external",
+   "excitation_source_code": 10167,
+   "excitation_word": "external_current",
+   "r0_word": "reference_1000_ohms",
+   "min_word": "cycle_min",
+   "max_word": "cycle_max"
+  },
+  {
+   "channel_index": 4,
+   "rtd_type": "pt3920",
+   "rtd_code": 10053,
+   "units": "deg_c",
+   "units_code": 10143,
+   "wire": "three_wire",
+   "resistance_code": 3,
+   "excitation_source": "internal",
+   "excitation_source_code": 10200,
+   "excitation_word": "internal_current",
+   "r0_word": "reference_100_ohms",
+   "min_word": "cycle_min",
+   "max_word": "cycle_max"
+  },
+  {
+   "channel_index": 5,
+   "rtd_type": "pt3928",
+   "rtd_code": 12483,
+   "units": "deg_f",
+   "units_code": 10144,
+   "wire": "four_wire",
+   "resistance_code": 4,
+   "excitation_source": "external",
+   "excitation_source_code": 10167,
+   "excitation_word": "external_current",
+   "r0_word": "reference_1000_ohms",
+   "min_word": "cycle_min",
+   "max_word": "cycle_max"
+  }
+ ],
+ "control_qualification": "1/1024 and1/512 ampere controls are exactly representable ABI discriminators, NOT claimed supported internal/external module values. No convenience default or coercion/retry. The real driver may reject them; preserve that original status.",
+ "manual_temperature_patterns": [
+  {
+   "name": "twenty_five_c",
+   "bits_hex": "4039000000000000",
+   "ieee754_le_hex": "0000000000003940",
+   "classification": "normal",
+   "sign_bit": false,
+   "finite": true,
+   "round_trip_temperature_decimal": "25",
+   "exact_value_expression": "25"
+  },
+  {
+   "name": "twenty_five_f",
+   "bits_hex": "4039000000000000",
+   "ieee754_le_hex": "0000000000003940",
+   "classification": "normal",
+   "sign_bit": false,
+   "finite": true,
+   "round_trip_temperature_decimal": "25",
+   "exact_value_expression": "25"
+  },
+  {
+   "name": "negative_zero",
+   "bits_hex": "8000000000000000",
+   "ieee754_le_hex": "0000000000000080",
+   "classification": "zero",
+   "sign_bit": true,
+   "finite": true,
+   "round_trip_temperature_decimal": "-0",
+   "exact_value_expression": "0"
+  },
+  {
+   "name": "quiet_nan_payload_a5",
+   "bits_hex": "7ff80000000000a5",
+   "ieee754_le_hex": "a50000000000f87f",
+   "classification": "nan",
+   "sign_bit": false,
+   "finite": false
+  },
+  {
+   "name": "positive_infinity",
+   "bits_hex": "7ff0000000000000",
+   "ieee754_le_hex": "000000000000f07f",
+   "classification": "infinity",
+   "sign_bit": false,
+   "finite": false
+  },
+  {
+   "name": "negative_infinity",
+   "bits_hex": "fff0000000000000",
+   "ieee754_le_hex": "000000000000f0ff",
+   "classification": "infinity",
+   "sign_bit": true,
+   "finite": false
+  },
+  {
+   "name": "minimum_positive_subnormal",
+   "bits_hex": "0000000000000001",
+   "ieee754_le_hex": "0100000000000000",
+   "classification": "subnormal",
+   "sign_bit": false,
+   "finite": true,
+   "round_trip_temperature_decimal": "4.9406564584124654e-324",
+   "exact_value_expression": "2^-1074"
+  },
+  {
+   "name": "maximum_finite",
+   "bits_hex": "7fefffffffffffff",
+   "ieee754_le_hex": "ffffffffffffef7f",
+   "classification": "normal",
+   "sign_bit": false,
+   "finite": true,
+   "round_trip_temperature_decimal": "1.7976931348623157e308",
+   "exact_value_expression": "(2-2^-52)*2^1023"
+  },
+  {
+   "name": "positive_zero",
+   "bits_hex": "0000000000000000",
+   "ieee754_le_hex": "0000000000000000",
+   "classification": "zero",
+   "sign_bit": false,
+   "finite": true,
+   "round_trip_temperature_decimal": "0",
+   "exact_value_expression": "0"
+  },
+  {
+   "name": "minimum_positive_normal",
+   "bits_hex": "0010000000000000",
+   "ieee754_le_hex": "0000000000001000",
+   "classification": "normal",
+   "sign_bit": false,
+   "finite": true,
+   "round_trip_temperature_decimal": "2.2250738585072014e-308",
+   "exact_value_expression": "2^-1022"
+  },
+  {
+   "name": "minimum_negative_subnormal",
+   "bits_hex": "8000000000000001",
+   "ieee754_le_hex": "0100000000000080",
+   "classification": "subnormal",
+   "sign_bit": true,
+   "finite": true,
+   "round_trip_temperature_decimal": "-4.9406564584124654e-324",
+   "exact_value_expression": "-2^-1074"
+  },
+  {
+   "name": "negative_quiet_nan_payload_45",
+   "bits_hex": "fff8000000000045",
+   "ieee754_le_hex": "450000000000f8ff",
+   "classification": "nan",
+   "sign_bit": true,
+   "finite": false
+  }
+ ],
+ "two_channel_six_scan_sequence": {
+  "shape": [
+   6,
+   2
+  ],
+  "layout": "scan_major_in_exact_actual_driver_channel_order",
+  "all_words_le_hex": "000000000000394000000000000039400000000000000080a50000000000f87f000000000000f07f000000000000f0ff0100000000000000ffffffffffffef7f000000000000000000000000000010000100000000000080450000000000f8ff"
+ },
+ "negative_one_scan_control": {
+  "continuous_requested_per_channel": 3,
+  "on_demand_requested_per_channel": 1,
+  "actual_per_channel": 1,
+  "native_status": -200284,
+  "valid_words_le_hex": "00000000000039400000000000003940",
+  "rule": "Preserve valid words and first raw native code before deferred diagnostic or cleanup; do not reinterpret same25 as Celsius/Fahrenheit conversion."
+ },
+ "raw_rules": {
+  "representation": "driver-scaled f64 temperature, not ADC integer or sensor resistance",
+  "finite": "publish temperature numeric value only when finite; a numeric roundtrip must preserve each original word including negative zero",
+  "nonfinite": "retain raw IEEE LE hex and payload/sign; omit numeric temperature, do not replace it with JSON null",
+  "same_value_different_units": "25.0 bits4039000000000000 on both controls is unchanged; no local C/F/K/R conversion",
+  "r0_reference": "ohms at0C for all output units; never transform reference to0F/0K or infer R0 from type",
+  "no_local_physics": [
+   "Callendar-Van_Dusen calculation",
+   "V/I or resistance calculation",
+   "current/resistance readback",
+   "calibration or sensor identification",
+   "hardware conversion count or uniqueness"
+  ]
+ },
+ "configuration_boundary": {
+  "required_per_channel": [
+   "ordered individual physical name",
+   "six-standard-type enum",
+   "four-temperature-unit enum",
+   "finite min less than max",
+   "explicit2/3/4-wire request",
+   "positive finite R0 ohms",
+   "explicit internal/external source and positive finite amperes"
+  ],
+  "reject_before_any_source_effect": [
+   "missing/null required field",
+   "unknown or custom type/units",
+   "none excitation",
+   "terminal config or TC CJC fields",
+   "shunt/custom-scale/coefficients/TEDS fields",
+   "nonfinite or nonpositive excitation/R0",
+   "range/list/MAX/task physical names"
+  ],
+  "timing": "Use selected continuous/on-demand policy without fallback; no rate/buffer metadata in software mode. Existing one-scan zero/count/positive-original-timeout and host-attempt pacing oracle applies unchanged.",
+  "settings_provenance": "requested_not_read_back; external source declaration does not create that external supply; internal excitation configures a physical input-measurement source",
+  "no_defaults": "No inferred PT100/100ohm/wiring/type/current from sensor/module name or NI wrapper convenience defaults."
+ },
+ "lifecycle": "Resolve selected exports before fresh owned Create; per-channel constructor; exact actual channel count/order before allocation; unchanged selected timing/start/read/Stop/Clear/deferred diagnostic ownership. Finish never reads; original deadline/cutoff and read-complete clocks remain authoritative.",
+ "manufacturer_qualification": {
+  "ni_9217_and_9216": "Reviewed guides describe3/4-wire autodetection and1mA per-channel excitation with wiring-dependent terminals; product pages describe PT100 and aggregate limits. They do not qualify arbitrary generic enum/current/timing values.",
+  "unresolved": [
+   "two-wire API mode versus adapted physical wiring",
+   "external excitation acceptance on either model",
+   "requested current coercion or supported levels",
+   "six-type/R0 range support per hardware",
+   "chassis/OS/driver version and timing support",
+   "actual wiring/sensor/calibration/ADC mode",
+   "physical device capture"
+  ],
+  "physical_caveat": "AI-only does not mean physically passive: internal current excitation can drive the connected sensor. No AO/DO/output task, reset, takeover or unrequested excitation fallback is authorized by this profile."
+ },
+ "immutable_prior_oracles_sha256": {
+  "abi.json": "1bbc016312c3aab6093483cfa3aeee442e6bc3aaeb74eaa8113641a090329b6b",
+  "thermocouple.json": "2a8109877c63aa7448965c0d0ac9ec060355d8dde41e98496b4ff8050ac65cb1",
+  "current.json": "14f428f82a6cf94704ac47ff2b42d18bf71553435437ae4f0345bf4260779bff",
+  "voltage-scale-null.json": "5764fe41ecab45d8b5795d15dc82f723c566d5ba0af565048224337ed321ba63",
+  "on-demand.json": "b87122de19d2bdb77f16c0511d1759925b84697ad59e97375197d1b54e81fe89"
+ },
+ "primary": [
+  {
+   "id": "rtd_constructor",
+   "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__channel__configuration__creation__create__analog__input__channels_1ga3111dddf4f6eef35801096d09db7d574.html",
+   "bytes": 25520,
+   "sha256": "d2e596f58d958b9bcabe27df83f2f153078a284d1dfd37dd704225f54e53c07b"
+  },
+  {
+   "id": "ni_constants",
+   "url": "https://raw.githubusercontent.com/ni/nidaqmx-python/1d60b6c53ef11dead0ba6aa9d6e2855351835ad7/generated/nidaqmx/constants.py",
+   "bytes": 50365,
+   "sha256": "9d15eb38ccb03769f9e5ad94289a00658ee36b6685709e4f3d49dafb25b4ae57"
+  },
+  {
+   "id": "ni_ai_collection",
+   "url": "https://raw.githubusercontent.com/ni/nidaqmx-python/1d60b6c53ef11dead0ba6aa9d6e2855351835ad7/generated/nidaqmx/task/collections/_ai_channel_collection.py",
+   "bytes": 178880,
+   "sha256": "43afe14f318c456f07fec8fed232e6aef08ec71df07965be2c629c7d626cd350"
+  },
+  {
+   "id": "ni_9217_getting_started",
+   "url": "https://docs-be.ni.com/api/bundle/ni-9217-getting-started/page/overview.html",
+   "bytes": 14620,
+   "sha256": "ed104a13a66bba1e4101793102f08de5da202e07b40e8c0b206cc869e4f13f13"
+  },
+  {
+   "id": "ni_9216_getting_started",
+   "url": "https://docs-be.ni.com/api/bundle/ni-9216-getting-started/page/overview.html",
+   "bytes": 27261,
+   "sha256": "b0d4b26bcc3d04e9688220be5b37c4b82d6a21783959f84ea4970f55ed25f7f2"
+  }
+ ],
+ "independent_plan_pins": {
+  "/private/tmp/capturefab-ni-daqmx-rtd-next-plan.md": "14307bb9ca8fceb99a1406d525a09ed6baffd363f42daf0301b4ee9d671ae7da",
+  "/private/tmp/capturefab-ni-daqmx-rtd-independent-refinement.md": "0ddbfc5a5d46e6e60a5ac892af85e9b556ed37a97eb653970e6345e7602cbf3a"
+ },
+ "qualification": "Pre-code synthetic ABI/scientific native-word oracle only; no driver/SDK/native execution, physical NI qualification or product-native-derived expectation."
+}

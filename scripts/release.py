@@ -26,7 +26,13 @@ SITE = 'https://capturefab.com/'
 LINE_COMPUTER = SITE + 'guides/line-computer.md'
 # The udev rule for USB3 Vision cameras, shipped in Linux archives under share/udev/rules.d.
 UDEV_RULE = '70-capturefab-usb3vision.rules'
-SEMVER = re.compile(r'(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?')
+# Numeric prerelease identifiers cannot have leading zeroes; identifiers with
+# letters or hyphens can. Build metadata has no leading-zero restriction.
+PRERELEASE_IDENTIFIER = r'(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
+SEMVER = re.compile(
+    r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+    rf'(?:-({PRERELEASE_IDENTIFIER}(?:\.{PRERELEASE_IDENTIFIER})*))?'
+    r'(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?')
 # No 32-bit ARM: Raspberry Pi 3 and later run the 64-bit Raspberry Pi OS.
 TARGETS = [(os_, arch) for os_, arches in [('linux', ['x86_64', 'aarch64']), ('macos', ['x86_64', 'aarch64']), ('windows', ['x86_64', 'aarch64'])] for arch in arches]
 # The oldest systems release executables must start on: glibc 2.28 (RHEL,
@@ -41,8 +47,7 @@ LICENSE_FILE = re.compile(r'(licen[cs]e|copying|notice|unlicense)', re.I)
 def version(value=None):
     value = value or re.search(r'^version\s*=\s*"([^"]+)"', (ROOT / 'Cargo.toml').read_text(), re.M)[1]
     value = value[1:] if value.startswith('v') else value
-    match = SEMVER.fullmatch(value)
-    if not match or (match[4] and any(x.isdigit() and len(x) > 1 and x[0] == '0' for x in match[4].split('.'))):
+    if not SEMVER.fullmatch(value):
         raise ValueError('version must follow Semantic Versioning, such as 0.1.0 or 0.2.0-rc.1')
     return value
 

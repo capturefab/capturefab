@@ -35,6 +35,7 @@ enum Layout {
         bits: u32,
     },
     SignedMono,
+    BiColor(super::bicolor::Format),
     Rgb {
         bits: u32,
         channels: usize,
@@ -82,6 +83,9 @@ const NV12_709_FULL: u32 = 0x820c_0013;
 fn layout(format: u32) -> Option<(&'static str, Layout)> {
     use Layout::{Mono, Planes, Rgb, Rgb565, SignedMono, Yuv};
     use Matrix::{Bt601, Bt709, Full, Full709};
+    if let Some(format) = super::bicolor::Format::from_code(format) {
+        return Some((format.name(), Layout::BiColor(format)));
+    }
     let rgb = |bits, bgr, planar| Rgb {
         bits,
         channels: 3,
@@ -218,7 +222,17 @@ fn layout(format: u32) -> Option<(&'static str, Layout)> {
 }
 
 /// Every code `layout` knows, for looking a layout up by its name.
-const CODES: [u32; 70] = [
+const CODES: [u32; 80] = [
+    0x0210_00a5,
+    0x0210_00a6,
+    0x0220_00a7,
+    0x0220_00a9,
+    0x0220_00ab,
+    0x0220_00ad,
+    0x0214_00a8,
+    0x0214_00aa,
+    0x0218_00ac,
+    0x0218_00ae,
     0x0108_0002,
     0x0101_0037,
     0x0102_0038,
@@ -361,6 +375,7 @@ pub(super) fn name(format: u32) -> Option<&'static str> {
 pub(super) fn sample_bits(format: u32) -> Option<u32> {
     Some(match layout(format)?.1 {
         Layout::Mono { bits } | Layout::Rgb { bits, .. } => bits,
+        Layout::BiColor(format) => format.bits(),
         Layout::SignedMono | Layout::Yuv { .. } | Layout::Planes { .. } => 8,
         Layout::Rgb565 { .. } => 6,
     })
@@ -370,6 +385,7 @@ pub(super) fn sample_bits(format: u32) -> Option<u32> {
 pub(super) fn color_bits(format: u32) -> Option<u32> {
     match layout(format)?.1 {
         Layout::Rgb { bits, .. } => Some(bits),
+        Layout::BiColor(format) => Some(format.bits()),
         _ => None,
     }
 }
@@ -398,6 +414,9 @@ pub(super) fn unpacked_format(format: u32) -> Option<u32> {
 pub(super) fn validate(frame: &Frame) -> Option<Result<()>> {
     let (name, layout) = layout(frame.pixel_format)?;
     Some((|| {
+        if let Layout::BiColor(format) = layout {
+            format.validate_width(frame.width)?;
+        }
         if let Layout::Yuv { group: 4, .. } = layout {
             ensure!(
                 frame.width.is_multiple_of(4),
@@ -448,6 +467,8 @@ pub(super) struct Decoder<'a> {
     stride: usize,
     /// Where a planar layout keeps each pixel's chroma.
     chroma: ChromaAt,
+    /// Horizontal sample bounds for interpolation in a `BiColor` view.
+    bounds: (usize, usize),
 }
 
 /// Where the Cb and Cr covering a pixel lie in a planar layout.
@@ -510,7 +531,15 @@ impl<'a> Decoder<'a> {
             layout,
             stride: super::row_bytes(frame.width, frame.pixel_format),
             chroma,
+            bounds: (0, frame.width as usize),
         })
+    }
+
+    /// A region is decoded from its own samples at its own edges. Other
+    /// layouts keep their existing component/subsampling interpretation.
+    pub(super) const fn region(mut self, x0: usize, width: usize) -> Self {
+        self.bounds = (x0, x0 + width);
+        self
     }
 
     /// Row `y` of a layout of one plane.
@@ -522,6 +551,9 @@ impl<'a> Decoder<'a> {
     /// Native RGB components of pixel (x, y) and their bit depth, for an
     /// RGB layout; None for the others.
     pub(super) fn native_color(&self, x: usize, y: usize) -> Option<([u16; 3], u32)> {
+        if let Layout::BiColor(format) = self.layout {
+            return Some((format.rgb(self.row(y), x, self.bounds), format.bits()));
+        }
         let Layout::Rgb {
             bits,
             channels,
@@ -649,6 +681,9 @@ impl<'a> Decoder<'a> {
                 let (rgb, bits) = self.native_color(x, y).expect("an RGB layout");
                 rgb.map(|v| super::clamp8(v >> bits.saturating_sub(8)))
             }
+            Layout::BiColor(format) => format
+                .rgb(self.row(y), x, self.bounds)
+                .map(|v| super::clamp8(v >> (format.bits() - 8))),
             Layout::Rgb565 { bgr } => {
                 let value = u16::from_le_bytes([data[2 * i], data[2 * i + 1]]);
                 let expand = |v: u16, max: u16| {
@@ -821,9 +856,12 @@ pub(super) fn unpacked(frame: &Frame) -> Result<Option<Frame>> {
         }
     }
     Ok(Some(Frame {
+        pixel_encoding: None,
         data: data.into(),
         pixel_format: if mono { MONO8 } else { RGB8 },
         jpeg: None,
+        chunks: frame.chunks.clone(),
+        multipart: frame.multipart.clone(),
         ..*frame
     }))
 }
@@ -834,6 +872,7 @@ mod tests {
 
     fn frame(format: u32, width: u32, height: u32, data: Vec<u8>) -> Frame {
         Frame {
+            pixel_encoding: None,
             width,
             height,
             pixel_format: format,
@@ -1047,6 +1086,7 @@ mod tests {
             [255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]
         );
         let bgr = Frame {
+            pixel_encoding: None,
             pixel_format: 0x0210_0036,
             ..rgb
         };
@@ -1261,8 +1301,8 @@ mod tests {
         // including the newer alignment codes beyond the first 256 IDs, and
         // Capturefab's own planar codes.
         for format in [
-            0x0101, 0x0102, 0x0104, 0x0108, 0x020c, 0x0210, 0x0218, 0x021e, 0x0220, 0x0224, 0x0228,
-            0x0230, 0x0240,
+            0x0101, 0x0102, 0x0104, 0x0108, 0x020c, 0x0210, 0x0214, 0x0218, 0x021e, 0x0220, 0x0224,
+            0x0228, 0x0230, 0x0240,
         ]
         .into_iter()
         .flat_map(|size| (0..=0x12e).map(move |id| (size << 16) | id))
@@ -1328,20 +1368,41 @@ mod tests {
                 "bits {label}"
             );
             let cropped = crate::inspect::crop(&source, [3, 2, 5, 4]).unwrap();
-            let expected = crate::inspect::crop(&normalized, [3, 2, 5, 4]).unwrap();
-            assert_eq!(
-                (
-                    cropped.width,
-                    cropped.height,
-                    conversion::rgb(&cropped).unwrap()
-                ),
-                (
-                    expected.width,
-                    expected.height,
-                    conversion::rgb(&expected).unwrap()
-                ),
-                "crop {label}"
-            );
+            if matches!(layout(format), Some((_, Layout::BiColor(_)))) {
+                // A BiColor crop interpolates only its own native pairs;
+                // cropping previously rendered RGB includes outside neighbors.
+                let view = conversion::FrameRef::region(&source, [3, 2, 5, 4]);
+                assert_eq!(
+                    (cropped.width as usize, cropped.height as usize),
+                    (view.width, view.height),
+                    "crop dimensions {label}"
+                );
+                let expected = conversion::Pixels::new(view);
+                let actual = conversion::rgb(&cropped).unwrap();
+                assert_eq!(actual.len(), view.pixels() * 3, "crop RGB length {label}");
+                for (i, pixel) in actual.as_chunks::<3>().0.iter().enumerate() {
+                    assert_eq!(
+                        *pixel,
+                        expected.at(i % view.width, i / view.width),
+                        "bounded native crop {label}, pixel{i}"
+                    );
+                }
+            } else {
+                let expected = crate::inspect::crop(&normalized, [3, 2, 5, 4]).unwrap();
+                assert_eq!(
+                    (
+                        cropped.width,
+                        cropped.height,
+                        conversion::rgb(&cropped).unwrap()
+                    ),
+                    (
+                        expected.width,
+                        expected.height,
+                        conversion::rgb(&expected).unwrap()
+                    ),
+                    "crop {label}"
+                );
+            }
             assert_eq!(
                 conversion::encode(&source, "png").unwrap(),
                 conversion::encode(&normalized, "png").unwrap(),

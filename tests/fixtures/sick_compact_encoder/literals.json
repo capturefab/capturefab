@@ -1,0 +1,158 @@
+{
+  "schema": 1,
+  "provenance": "independent_predecoder_primary_hand_literals_not_device_capture",
+  "ksy_commit": "7ea18d7afce430a3ec02b1c20ca57aa86392809a",
+  "positive": [
+    {
+      "name": "v1_signed_zero_unsigned_edges",
+      "bytes": 88,
+      "hex": "0202020204000000080706050403020118171615141312110100000034000000d4c3b2a12827262524232221ffffffff0000008004030201000000800000000000000000ffffffffffffffff3837363534333231bb408086",
+      "sha256": "622e9ce05acec532b78b59ac54afcac8c89824edcca0cd74ed5032b24045e478",
+      "crc32": 2256552123,
+      "expected": {
+        "version": 1,
+        "payload_length": 52,
+        "sender_id": 2712847316,
+        "telegram_counter": 72623859790382856,
+        "transmit_timestamp_raw": 1230066625199609624,
+        "frame_number": 2387509390608836392,
+        "tick_count": 4294967295,
+        "reference_1_tick_count": 2147483648,
+        "reference_2_tick_count": 16909060,
+        "speed_bits": 2147483648,
+        "speed_classification": "finite",
+        "speed_value_annotation": "negative_zero",
+        "tick_timestamp_raw": 0,
+        "reference_1_timestamp_raw": 18446744073709551615,
+        "reference_2_timestamp_raw": 3544952156018063160
+      }
+    },
+    {
+      "name": "v2_nan_payload_unsigned_edges",
+      "bytes": 88,
+      "hex": "0202020204000000080706050403020118171615141312110200000030000000d4c3b2a12827262524232221ffffffff00000080040302013412c07f0000000000000000ffffffffffffffff38373635343332312782f056",
+      "sha256": "3ceb0ca367610f5e5396805b99af166e967d7c6d7aec1cb89673bdc03f2e9e8b",
+      "crc32": 1458602535,
+      "expected": {
+        "version": 2,
+        "payload_length": 48,
+        "sender_id": 2712847316,
+        "telegram_counter": 72623859790382856,
+        "transmit_timestamp_raw": 1230066625199609624,
+        "frame_number": 2387509390608836392,
+        "tick_count": 4294967295,
+        "reference_1_tick_count": 2147483648,
+        "reference_2_tick_count": 16909060,
+        "speed_bits": 2143294004,
+        "speed_classification": "nan",
+        "speed_value_annotation": null,
+        "tick_timestamp_raw": 0,
+        "reference_1_timestamp_raw": 18446744073709551615,
+        "reference_2_timestamp_raw": 3544952156018063160
+      }
+    },
+    {
+      "name": "v2_finite_1000",
+      "bytes": 88,
+      "hex": "0202020204000000080706050403020118171615141312110200000030000000d4c3b2a12827262524232221ffffffff000000800403020100007a440000000000000000ffffffffffffffff3837363534333231bf905538",
+      "sha256": "2a8ac0d223f7ed681c24196378a62cf21ae0f7d184ecabe78ca3daff506b8a48",
+      "crc32": 945131711,
+      "expected": {
+        "version": 2,
+        "payload_length": 48,
+        "sender_id": 2712847316,
+        "telegram_counter": 72623859790382856,
+        "transmit_timestamp_raw": 1230066625199609624,
+        "frame_number": 2387509390608836392,
+        "tick_count": 4294967295,
+        "reference_1_tick_count": 2147483648,
+        "reference_2_tick_count": 16909060,
+        "speed_bits": 1148846080,
+        "speed_classification": "finite",
+        "speed_value_annotation": 1000,
+        "tick_timestamp_raw": 0,
+        "reference_1_timestamp_raw": 18446744073709551615,
+        "reference_2_timestamp_raw": 3544952156018063160
+      }
+    }
+  ],
+  "negative": [
+    {
+      "name": "v1_payload_excludes_sender",
+      "hex": "0202020204000000080706050403020118171615141312110100000030000000d4c3b2a12827262524232221ffffffff0000008004030201000000800000000000000000ffffffffffffffff3837363534333231e70fd4f0",
+      "bytes": 88,
+      "sha256": "96ab7efba910de389eea870df142b2916efabb536436649a43aa4c6b28bc3fd2",
+      "expected_code": "incomplete",
+      "exit": 1
+    },
+    {
+      "name": "v2_payload_includes_sender",
+      "hex": "0202020204000000080706050403020118171615141312110200000034000000d4c3b2a12827262524232221ffffffff0000008004030201000000800000000000000000ffffffffffffffff38373635343332316bd58502",
+      "bytes": 88,
+      "sha256": "235d8c96b29e5b1bad97a1e4f37349cefa50ec6aec595bdff580da1308c130bd",
+      "expected_code": "incomplete",
+      "exit": 1
+    },
+    {
+      "name": "version_zero",
+      "hex": "0202020204000000080706050403020118171615141312110000000034000000d4c3b2a12827262524232221ffffffff0000008004030201000000800000000000000000ffffffffffffffff383736353433323134ce534c",
+      "bytes": 88,
+      "sha256": "7f66d2449e89fd55fe780b448b2553d34bfbb45693a0eba41cc522a0a41b8176",
+      "expected_code": "unsupported",
+      "exit": 5
+    },
+    {
+      "name": "version_three",
+      "hex": "0202020204000000080706050403020118171615141312110300000034000000d4c3b2a12827262524232221ffffffff0000008004030201000000800000000000000000ffffffffffffffff3837363534333231e45b56c8",
+      "bytes": 88,
+      "sha256": "2706fda73e2c3ea96230be9673cd44d53170e16d40a1280858f9af7c99d46794",
+      "expected_code": "unsupported",
+      "exit": 5
+    },
+    {
+      "name": "extent_87",
+      "hex": "0202020204000000080706050403020118171615141312110100000034000000d4c3b2a12827262524232221ffffffff0000008004030201000000800000000000000000ffffffffffffffff3837363534333231bb4080",
+      "bytes": 87,
+      "sha256": "0239c6764de0cd59c78d32e7670f29bb9b63506cea1e6ce421a06f6848866886",
+      "expected_code": "incomplete",
+      "exit": 1
+    },
+    {
+      "name": "extent_89",
+      "hex": "0202020204000000080706050403020118171615141312110100000034000000d4c3b2a12827262524232221ffffffff0000008004030201000000800000000000000000ffffffffffffffff3837363534333231bb4080865a",
+      "bytes": 89,
+      "sha256": "0ddb4966d38da5cb9fb154aaf92cdb3260f0168164664bd6d109fbe6f8af5ecf",
+      "expected_code": "incomplete",
+      "exit": 1
+    },
+    {
+      "name": "crc_mutation",
+      "hex": "0202020204000000080706050403020118171615141312110100000034000000d4c3b2a128272625242322217fffffff0000008004030201000000800000000000000000ffffffffffffffff3837363534333231bb408086",
+      "bytes": 88,
+      "sha256": "b940715d13764c5c5259f56aa56191ada6ef718a8a2eb6afd8a6fa7e4739b3d9",
+      "expected_code": "incomplete",
+      "exit": 1
+    },
+    {
+      "name": "bad_magic",
+      "hex": "0302020204000000080706050403020118171615141312110100000034000000d4c3b2a12827262524232221ffffffff0000008004030201000000800000000000000000ffffffffffffffff383736353433323174e083dc",
+      "bytes": 88,
+      "sha256": "c5cd400d444ea82d3f53c60639b2e6cfc322b5cc664d8042db0f9ad97967c34d",
+      "expected_code": "incomplete",
+      "exit": 1
+    },
+    {
+      "name": "unknown_type5",
+      "hex": "0202020205000000080706050403020118171615141312110100000034000000d4c3b2a12827262524232221ffffffff0000008004030201000000800000000000000000ffffffffffffffff3837363534333231aed8a79a",
+      "bytes": 88,
+      "sha256": "51ed277d8ceee83fcaa5dc8dd5771174cabd8f72cc0a1720f211c11a2051f735",
+      "expected_code": "unsupported",
+      "exit": 5
+    }
+  ],
+  "old_corpus_sha256": "4773e8ee8313727aa2fcf8cdf755c28eb4fcf74b1928add0e88c9e17f50ba119",
+  "mixed_references": {
+    "points": "v4_two_unequal_modules",
+    "imu": "plan_type2_imu_v1"
+  }
+}

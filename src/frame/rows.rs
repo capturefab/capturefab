@@ -6,7 +6,7 @@
 //! where it wants it (a preview's accumulator, an encoder's input buffer).
 #![deny(clippy::missing_const_for_fn)]
 #![deny(clippy::cast_precision_loss)]
-use super::{FrameRef, Packing, Pixels, bayer_pattern, is_bayer, packing, row_bytes};
+use super::{FrameRef, Packing, Pixels, is_bayer, packing};
 use crate::types::{MONO8, RGB8};
 
 /// What a decoded row holds for each pixel.
@@ -52,7 +52,19 @@ enum Mosaic {
     Packed(u32, Packing, u32),
 }
 
-fn kind(pixel_format: u32) -> Kind {
+fn kind(view: FrameRef<'_>) -> Kind {
+    let frame = view.frame;
+    let pixel_format = frame.pixel_format;
+    if let Some(ids) = super::frame_encoding(frame) {
+        return if ids.is_monochrome() {
+            Kind::Packed(ids.bits(), Packing::Ids, ids.bits() - 8)
+        } else {
+            Kind::Bayer(
+                super::view_bayer_pattern(view),
+                Mosaic::Packed(ids.bits(), Packing::Ids, ids.bits() - 8),
+            )
+        };
+    }
     if super::streamed(pixel_format) {
         return Kind::Pixels;
     }
@@ -64,19 +76,16 @@ fn kind(pixel_format: u32) -> Kind {
             None if shift > 0 => Mosaic::Wide(shift),
             None => Mosaic::Eight,
         };
-        return Kind::Bayer(bayer_pattern(pixel_format), mosaic);
+        return Kind::Bayer(super::view_bayer_pattern(view), mosaic);
     }
     match pixel_format {
         MONO8 | 0x0108_00b1 | 0x0108_00c6 => Kind::Gray8,
         RGB8 => Kind::Rgb8,
         0x0218_0015 => Kind::Bgr8,
-        _ => {
-            let shift = super::unpacked_shift(unpacked).unwrap_or(8);
-            match packing(pixel_format) {
-                Some((_, bits, packing)) => Kind::Packed(bits, packing, shift),
-                None => Kind::Wide(shift),
-            }
-        }
+        _ => match packing(pixel_format) {
+            Some((_, bits, packing)) => Kind::Packed(bits, packing, bits - 8),
+            None => Kind::Wide(super::unpacked_shift(unpacked).unwrap_or(8)),
+        },
     }
 }
 
@@ -102,11 +111,10 @@ pub(crate) struct RowReader<'a> {
 
 impl<'a> RowReader<'a> {
     pub(crate) fn new(view: FrameRef<'a>) -> Self {
-        let pixel_format = view.pixel_format();
         Self {
             view,
-            kind: kind(pixel_format),
-            stride: row_bytes(view.frame.width, pixel_format),
+            kind: kind(view),
+            stride: super::frame_row_bytes(view.frame),
             unpack: Vec::new(),
             ring: Default::default(),
             held: [None; 3],
@@ -684,6 +692,7 @@ pub(crate) mod tests {
         .take(len)
         .collect();
         Frame {
+            pixel_encoding: None,
             width,
             height,
             pixel_format: format,
@@ -824,6 +833,7 @@ pub(crate) mod tests {
                 })
                 .collect();
             let frame = Frame {
+                pixel_encoding: None,
                 width: u32::try_from(width).unwrap(),
                 height: u32::try_from(height).unwrap(),
                 pixel_format: RGB8,

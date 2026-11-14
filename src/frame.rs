@@ -3,8 +3,11 @@
 use crate::types::{Frame, MONO8, RGB8};
 use anyhow::{Context as _, Result, bail, ensure};
 
+pub(crate) mod bicolor;
 mod encoded;
 mod formats;
+#[cfg(test)]
+pub(crate) mod ids_bayer_tests;
 mod rows;
 mod view;
 pub(crate) use encoded::write_all_vectored;
@@ -17,6 +20,121 @@ pub(crate) use rows::{Channels, RowReader};
 #[cfg(any(feature = "jpeg", jpeg_helper))]
 pub(crate) use rows::{Chroma, Yuv420, ycbcr420};
 pub(crate) use view::FrameRef;
+
+pub(crate) const COORD3D_C10P: u32 = 0x010a_00d7;
+pub(crate) const COORD3D_C12P: u32 = 0x010c_00da;
+pub(crate) const COORD3D_AC16: u32 = 0x0220_00bb;
+pub(crate) const COORD3D_ABC16: u32 = 0x0230_00b9;
+pub(crate) const COORD3D_ABC32F: u32 = 0x0260_00c0;
+
+/// Original vendor layout only when the explicit descriptor agrees with its code.
+pub(crate) fn frame_encoding(frame: &Frame) -> Option<crate::types::IdsPixelFormat> {
+    frame.pixel_encoding?.ids(frame.pixel_format).ok()
+}
+pub(crate) fn validate_encoding(frame: &Frame) -> Result<()> {
+    ensure!(
+        !selection_required(frame),
+        crate::types::Categorized::new(
+            crate::types::ErrorKind::Unsupported,
+            "multipart block requires an explicit per-job part selection"
+        )
+        .hint("Pass --part-format and --part-index; table indices do not imply component names.")
+    );
+    if let Some(encoding) = frame.pixel_encoding {
+        encoding.check(frame.pixel_format)?;
+    }
+    if let Some(encoding) = frame.pixel_encoding
+        && let Ok(ids) = encoding.ids(frame.pixel_format)
+    {
+        ensure!(
+            frame.width.is_multiple_of(ids.group().0),
+            crate::types::Categorized::error(
+                crate::types::ErrorKind::Unsupported,
+                "IDS grouped decoding requires complete byte-aligned rows"
+            )
+        );
+        ensure!(
+            frame.multipart.is_none(),
+            "vendor encoding is not a multipart selection"
+        );
+    }
+    Ok(())
+}
+pub(crate) fn frame_format_name(frame: &Frame) -> &'static str {
+    frame
+        .pixel_encoding
+        .filter(|encoding| encoding.check(frame.pixel_format).is_ok())
+        .map_or_else(
+            || pixel_format_name(frame.pixel_format),
+            crate::types::PixelEncoding::name,
+        )
+}
+/// The qualified LUCID layout of this frame, never from the bare custom code.
+pub(crate) fn frame_lucid(frame: &Frame) -> Option<crate::types::LucidPixelFormat> {
+    frame.pixel_encoding?.lucid(frame.pixel_format).ok()
+}
+pub(crate) fn image_row_bytes(
+    width: u32,
+    pixel_format: u32,
+    encoding: Option<crate::types::PixelEncoding>,
+) -> Option<usize> {
+    encoding.map_or_else(
+        || checked_row_bytes(width, pixel_format),
+        |encoding| encoding.row_bytes(pixel_format, width),
+    )
+}
+#[cfg(any(feature = "usb", feature = "gentl"))]
+pub(crate) fn image_len(
+    pixel_format: u32,
+    encoding: Option<crate::types::PixelEncoding>,
+    width: u32,
+    height: u32,
+) -> Option<usize> {
+    match encoding {
+        Some(_) => image_row_bytes(width, pixel_format, encoding)?
+            .checked_mul(usize::try_from(height).ok()?),
+        None => frame_len(pixel_format, width, height),
+    }
+}
+pub(crate) fn frame_row_bytes(frame: &Frame) -> usize {
+    image_row_bytes(frame.width, frame.pixel_format, frame.pixel_encoding).unwrap_or(usize::MAX)
+}
+pub(crate) fn frame_packing(frame: &Frame) -> Option<(u32, u32, Packing)> {
+    frame_encoding(frame).map_or_else(
+        || packing(frame.pixel_format),
+        |ids| Some((ids.unpacked_format(), ids.bits(), Packing::Ids)),
+    )
+}
+pub(crate) fn frame_unpacked_format(frame: &Frame) -> u32 {
+    frame_packing(frame).map_or_else(
+        || unpacked_format(frame.pixel_format),
+        |(format, ..)| format,
+    )
+}
+pub(crate) fn frame_monochrome(frame: &Frame) -> bool {
+    frame_encoding(frame).map_or_else(
+        || monochrome(frame.pixel_format),
+        crate::types::IdsPixelFormat::is_monochrome,
+    )
+}
+/// A Bayer source only after resolving its qualified vendor descriptor, if present.
+pub(crate) fn frame_bayer(frame: &Frame) -> bool {
+    is_bayer(frame_unpacked_format(frame))
+}
+/// Color phase at the view's own origin, including odd crops inside a packed group.
+pub(crate) fn view_bayer_pattern(view: FrameRef<'_>) -> [u8; 4] {
+    let pattern = bayer_pattern(frame_unpacked_format(view.frame));
+    std::array::from_fn(|i| pattern[((i / 2 + view.y0) & 1) * 2 + ((i % 2 + view.x0) & 1)])
+}
+pub(crate) fn frame_convertible(frame: &Frame) -> bool {
+    frame_encoding(frame).is_some() || convertible(frame.pixel_format)
+}
+pub(crate) fn frame_sample_bits(frame: &Frame) -> Option<u32> {
+    frame_encoding(frame)
+        .map(crate::types::IdsPixelFormat::bits)
+        .or_else(|| frame_lucid(frame).map(|_| 16))
+        .or_else(|| sample_bits(frame.pixel_format))
+}
 
 #[must_use]
 pub fn pixel_format_name(format: u32) -> &'static str {
@@ -44,8 +162,13 @@ pub fn pixel_format_name(format: u32) -> &'static str {
         0x0110_010b => "BayerGB14",
         0x0110_010c => "BayerBG14",
         0x0108_00b1 => "Coord3D_C8",
+        COORD3D_C10P => "Coord3D_C10p",
+        COORD3D_C12P => "Coord3D_C12p",
         0x0110_00b8 => "Coord3D_C16",
         0x0120_00bf => "Coord3D_C32f",
+        COORD3D_AC16 => "Coord3D_AC16",
+        COORD3D_ABC16 => "Coord3D_ABC16",
+        COORD3D_ABC32F => "Coord3D_ABC32f",
         0x0108_00c6 => "Confidence8",
         0x0110_00c7 => "Confidence16",
         0x0108_0008 => "BayerGR8",
@@ -150,6 +273,8 @@ pub(crate) enum Packing {
     /// each in the outer bytes and both low parts in the middle one, the
     /// first sample's in its low nibble.
     GigE,
+    /// IDS high bytes followed by the low-bit groups; never selected by a bare code.
+    Ids,
 }
 /// The unpacked 16-bit format of a packed format's family, its sample bits
 /// and its packing.
@@ -158,6 +283,8 @@ pub(crate) const fn packing(pixel_format: u32) -> Option<(u32, u32, Packing)> {
     Some(match pixel_format {
         0x010a_0046 => (0x0110_0003, 10, Lsb),
         0x010c_0047 => (0x0110_0005, 12, Lsb),
+        COORD3D_C10P => (0x0110_00b8, 10, Lsb),
+        COORD3D_C12P => (0x0110_00b8, 12, Lsb),
         0x010c_0004 => (0x0110_0003, 10, GigE),
         0x010c_0006 => (0x0110_0005, 12, GigE),
         0x010e_0104 => (0x0110_0025, 14, Lsb),
@@ -174,6 +301,14 @@ pub(crate) const fn packing(pixel_format: u32) -> Option<(u32, u32, Packing)> {
         v @ 0x010c_002a..=0x010c_002d => (v - 0x010c_002a + 0x0110_0010, 12, GigE),
         _ => return None,
     })
+}
+/// Pixels per byte-aligned group for the packed coordinate formats.
+pub(crate) const fn packed_coordinate_group(pixel_format: u32) -> Option<u32> {
+    match pixel_format {
+        COORD3D_C10P => Some(4),
+        COORD3D_C12P => Some(2),
+        _ => None,
+    }
 }
 /// Layouts with continuous LSB packing that may need transport row alignment.
 pub(crate) const fn lsb_packed(pixel_format: u32) -> bool {
@@ -220,23 +355,25 @@ pub(crate) fn unpacked_format(pixel_format: u32) -> u32 {
 #[cfg(any(test, feature = "testing"))]
 pub fn unpacked(frame: &Frame) -> Result<std::borrow::Cow<'_, Frame>> {
     use std::borrow::Cow;
-    let pixel_format = unpacked_format(frame.pixel_format);
+    validate_encoding(frame)?;
+    let pixel_format = frame_unpacked_format(frame);
     if pixel_format == frame.pixel_format {
         return Ok(Cow::Borrowed(frame));
     }
+    validate_source(frame)?;
     let pixels = checked_pixels(frame)?;
     if let Some(converted) = formats::unpacked(frame)? {
         return Ok(Cow::Owned(converted));
     }
     let (width, height) = (frame.width as usize, frame.height as usize);
-    let row = row_bytes(frame.width, frame.pixel_format);
+    let row = frame_row_bytes(frame);
     ensure!(
         frame.data.len() >= row * height,
         "truncated {} frame",
-        pixel_format_name(frame.pixel_format)
+        frame_format_name(frame)
     );
     let rows = frame.data[..row * height].chunks_exact(row);
-    let data = if let Some((_, bits, packing)) = packing(frame.pixel_format) {
+    let data = if let Some((_, bits, packing)) = frame_packing(frame) {
         let mut data = vec![0; pixels * 2];
         for (line, out) in rows.zip(data.chunks_exact_mut(width * 2)) {
             unpack_row(line, bits, packing, out.as_chunks_mut::<2>().0);
@@ -268,8 +405,11 @@ pub fn unpacked(frame: &Frame) -> Result<std::borrow::Cow<'_, Frame>> {
     crate::copies::record(crate::copies::Site::Intermediate, data.len());
     Ok(Cow::Owned(Frame {
         pixel_format,
+        pixel_encoding: None,
         data: data.into(),
         jpeg: None,
+        chunks: frame.chunks.clone(),
+        multipart: frame.multipart.clone(),
         ..*frame
     }))
 }
@@ -292,6 +432,17 @@ pub(crate) fn unpack_row(row: &[u8], bits: u32, packing: Packing, out: &mut [[u8
         }
     }
     match (packing, bits) {
+        (Packing::Ids, 10) => groups(row, out, |[b0, b1, b2, b3, low]| {
+            [
+                (b0 << 2) | (low & 3),
+                (b1 << 2) | ((low >> 2) & 3),
+                (b2 << 2) | ((low >> 4) & 3),
+                (b3 << 2) | ((low >> 6) & 3),
+            ]
+        }),
+        (Packing::Ids, _) => groups(row, out, |[b0, b1, low]| {
+            [(b0 << 4) | (low & 15), (b1 << 4) | (low >> 4)]
+        }),
         (Packing::Lsb, 14) => groups(row, out, |[b0, b1, b2, b3, b4, b5, b6]| {
             [
                 b0 | ((b1 & 0x3f) << 8),
@@ -325,6 +476,14 @@ pub(crate) fn unpack_row(row: &[u8], bits: u32, packing: Packing, out: &mut [[u8
 #[deny(clippy::cast_precision_loss)]
 fn packed_sample(row: &[u8], x: usize, bits: u32, packing: Packing) -> u16 {
     match packing {
+        Packing::Ids => {
+            let count = if bits == 10 { 4 } else { 2 };
+            let first = x / count * (count + 1);
+            let shift = bits - 8;
+            (u16::from(row[first + x % count]) << shift)
+                | ((u16::from(row[first + count]) >> (x % count * shift as usize))
+                    & ((1 << shift) - 1))
+        }
         Packing::Lsb => {
             let bit = x * bits as usize;
             let at = bit / 8;
@@ -346,22 +505,31 @@ fn packed_sample(row: &[u8], x: usize, bits: u32, packing: Packing) -> u16 {
 
 /// Validate the original sensor layout, before any conversion or allocation.
 pub(crate) fn validate_source(frame: &Frame) -> Result<()> {
+    validate_encoding(frame)?;
     checked_pixels(frame)?;
     ensure!(
-        convertible(frame.pixel_format),
+        packed_coordinate_group(frame.pixel_format)
+            .is_none_or(|group| frame.width.is_multiple_of(group)),
+        crate::types::Categorized::error(
+            crate::types::ErrorKind::Unsupported,
+            "packed coordinate decoding requires byte-aligned rows"
+        )
+    );
+    ensure!(
+        frame_convertible(frame),
         "unsupported PFNC format 0x{:08x}; capture with --format raw to preserve bytes",
         frame.pixel_format
     );
     if let Some(result) = formats::validate(frame) {
         return result;
     }
-    let length = row_bytes(frame.width, frame.pixel_format)
+    let length = frame_row_bytes(frame)
         .checked_mul(frame.height as usize)
         .ok_or_else(|| anyhow::anyhow!("image size overflow"))?;
     ensure!(
         frame.data.len() >= length,
         "truncated {} frame",
-        pixel_format_name(frame.pixel_format)
+        frame_format_name(frame)
     );
     Ok(())
 }
@@ -383,10 +551,13 @@ fn sample8(frame: &Frame, x: usize, y: usize) -> u8 {
     ) {
         return frame.data[y * frame.width as usize + x];
     }
-    let unpacked = packing(format).map_or(format, |(v, ..)| v);
-    let shift = wide_bayer(unpacked)
-        .map(|(_, shift)| shift)
-        .or_else(|| unpacked_shift(unpacked));
+    let shift = frame_packing(frame)
+        .map(|(_, bits, _)| bits - 8)
+        .or_else(|| {
+            reduced(format)
+                .map(|(_, shift)| shift)
+                .or_else(|| unpacked_shift(format))
+        });
     let Some(shift) = shift else {
         return frame.data[y * frame.width as usize + x];
     };
@@ -396,8 +567,8 @@ fn sample8(frame: &Frame, x: usize, y: usize) -> u8 {
 /// A whole monochrome/Bayer sample at native precision, from a validated frame.
 pub(crate) fn native_sample(frame: &Frame, x: usize, y: usize) -> u16 {
     let format = frame.pixel_format;
-    if let Some((_, bits, packing)) = packing(format) {
-        let stride = row_bytes(frame.width, format);
+    if let Some((_, bits, packing)) = frame_packing(frame) {
+        let stride = frame_row_bytes(frame);
         packed_sample(&frame.data[y * stride..(y + 1) * stride], x, bits, packing)
     } else if ((format >> 16) & 0xff) == 8 {
         u16::from(frame.data[y * frame.width as usize + x])
@@ -474,11 +645,7 @@ fn bayer8(pixel_format: u32) -> Option<u32> {
 /// or not, and Mono8 for packed monochrome. None for every other format.
 pub(crate) fn reduced(pixel_format: u32) -> Option<(u32, u32)> {
     let unpacked = unpacked_format(pixel_format);
-    wide_bayer(unpacked).or_else(|| {
-        packing(pixel_format)
-            .and_then(|_| unpacked_shift(unpacked))
-            .map(|shift| (MONO8, shift))
-    })
+    wide_bayer(unpacked).or_else(|| packing(pixel_format).map(|(_, bits, _)| (MONO8, bits - 8)))
 }
 /// The 8-bit format whose samples a row reader decodes `pixel_format`'s
 /// into.
@@ -570,7 +737,7 @@ pub(crate) fn rgb_samples(frame: &Frame) -> Result<Samples<'_>> {
 /// color formats.
 pub(crate) fn gray8_samples(frame: &Frame) -> Result<Option<Samples<'_>>> {
     checked_pixels(frame)?;
-    if !monochrome(frame.pixel_format) {
+    if !frame_monochrome(frame) {
         return Ok(None);
     }
     samples(FrameRef::whole(frame), Channels::Gray).map(Some)
@@ -597,7 +764,7 @@ const fn unpacked_shift(format: u32) -> Option<u32> {
 #[cfg(any(test, feature = "testing"))]
 pub fn gray8(frame: &Frame) -> Result<Option<Vec<u8>>> {
     checked_pixels(frame)?;
-    if !monochrome(frame.pixel_format) {
+    if !frame_monochrome(frame) {
         return Ok(None);
     }
     validate_source(frame)?;
@@ -606,6 +773,54 @@ pub fn gray8(frame: &Frame) -> Result<Option<Vec<u8>>> {
     rows::decode(view, Channels::Gray, &mut out);
     Ok(Some(out))
 }
+/// Whether the format contains 16-bit coordinate or confidence samples.
+const fn scalar_map16(pixel_format: u32) -> bool {
+    matches!(pixel_format, 0x0110_00b8 | 0x0110_00c7)
+}
+
+/// Formats carrying geometric measurements or confidence samples.
+pub(crate) const fn is_measurement_format(pixel_format: u32) -> bool {
+    scalar_map16(pixel_format)
+        || packed_coordinate_group(pixel_format).is_some()
+        || matches!(pixel_format, COORD3D_AC16 | COORD3D_ABC16 | COORD3D_ABC32F)
+}
+
+/// No arbitrary internal representative may enter a pixel consumer.
+pub(crate) fn selection_required(frame: &Frame) -> bool {
+    frame
+        .multipart
+        .as_ref()
+        .is_some_and(|parts| parts.layout.selection_required)
+}
+
+/// Whether this frame carries typed measurement samples rather than intensity.
+pub(crate) fn is_measurement_frame(frame: &Frame) -> bool {
+    is_measurement_format(frame.pixel_format)
+        || frame_lucid(frame).is_some()
+        || frame.multipart.as_ref().is_some_and(|parts| {
+            parts
+                .layout
+                .projected_format
+                .is_some_and(crate::transport::multipart::GvspPartFormat::measurement)
+        })
+        || (frame.pixel_format == 0x0108_00c6
+            && frame.multipart.as_ref().is_some_and(|parts| {
+                parts.layout.selected_native_part_format()
+                    == Some(crate::transport::multipart::GvspPartFormat::Confidence8)
+            }))
+}
+
+/// Whether a native multipart `Mono16` part lacks an established component role.
+pub(crate) fn is_unclassified_mono16(frame: &Frame) -> bool {
+    frame.pixel_format == 0x0110_0007
+        && frame.multipart.as_ref().is_some_and(|parts| {
+            parts.layout.selected_native_part_format()
+                == Some(crate::transport::multipart::GvspPartFormat::Mono16)
+                || parts.layout.projected_format
+                    == Some(crate::transport::multipart::GvspPartFormat::Mono16)
+        })
+}
+
 /// The significant bits of each sample of `pixel_format`, from its PFNC
 /// name: 12 for Mono12, Mono12p and `BayerRG12`, 8 for RGB8, 10 for `RGB10p32`.
 /// None for a format this does not know.
@@ -619,6 +834,14 @@ pub fn sample_bits(pixel_format: u32) -> Option<u32> {
 /// whose digits say something else (10 for `RGB10p32`, 8 for `RGB8a32`).
 #[deny(clippy::arithmetic_side_effects)]
 pub(crate) fn name_bits(name: &str) -> Option<u32> {
+    // Group size is not sample depth. Names describe metadata, never code admission.
+    match name {
+        "Mono10g40IDS" | "BayerRG10g40IDS" | "BayerGR10g40IDS" | "BayerGB10g40IDS"
+        | "BayerBG10g40IDS" => return Some(10),
+        "Mono12g24IDS" | "BayerRG12g24IDS" | "BayerGR12g24IDS" | "BayerGB12g24IDS"
+        | "BayerBG12g24IDS" => return Some(12),
+        _ => {}
+    }
     if let Some(bits) = formats::name_bits(name) {
         return Some(bits);
     }
@@ -636,6 +859,28 @@ pub(crate) fn name_bits(name: &str) -> Option<u32> {
 /// The bit depth of `format` (png, jpeg, raw) for a frame of
 /// `pixel_format`, and the frame's own when the file keeps fewer: PNG keeps
 /// up to 16 bits of a monochrome format, raw every bit, the rest 8.
+#[must_use]
+pub(crate) fn bit_depth_with_encoding(
+    pixel_format: u32,
+    encoding: Option<crate::types::PixelEncoding>,
+    format: &str,
+) -> (u32, Option<u32>) {
+    if let Some(ids) = encoding.and_then(|encoding| encoding.ids(pixel_format).ok()) {
+        let bits = ids.bits();
+        let depth = match format {
+            "raw" => bits,
+            "png" if ids.is_monochrome() => 16,
+            _ => 8,
+        };
+        return (depth, (bits > depth).then_some(bits));
+    }
+    // LUCID ABCY16 is stored only as RAW, four 16-bit words per pixel.
+    if encoding.is_some_and(|encoding| encoding.lucid(pixel_format).is_ok()) {
+        return (16, None);
+    }
+    bit_depth(pixel_format, format)
+}
+
 #[must_use]
 pub fn bit_depth(pixel_format: u32, format: &str) -> (u32, Option<u32>) {
     let source = sample_bits(pixel_format).unwrap_or(8);
@@ -663,7 +908,7 @@ const fn wide_gray_bits(pixel_format: u32) -> Option<u8> {
 /// significant; None for any other format.
 #[deny(clippy::cast_possible_wrap)]
 fn gray16(frame: &Frame) -> Result<Option<(crate::framebuf::PoolVec, u8)>> {
-    let Some(bits) = wide_gray_bits(unpacked_format(frame.pixel_format)) else {
+    let Some(unpacked_bits) = wide_gray_bits(frame_unpacked_format(frame)) else {
         return Ok(None);
     };
     validate_source(frame)?;
@@ -671,8 +916,11 @@ fn gray16(frame: &Frame) -> Result<Option<(crate::framebuf::PoolVec, u8)>> {
         usize::try_from(frame.width)?,
         usize::try_from(frame.height)?,
     );
-    let stride = row_bytes(frame.width, frame.pixel_format);
-    let packed = packing(frame.pixel_format);
+    let stride = frame_row_bytes(frame);
+    let packed = frame_packing(frame);
+    let bits = packed.map_or(unpacked_bits, |(_, bits, _)| {
+        u8::try_from(bits).expect("known packed sample depth fits in a byte")
+    });
     let mut unpack = vec![[0; 2]; if packed.is_some() { width } else { 0 }];
     let mut out = crate::framebuf::transforms().take_stale(width * height * 2);
     let mask = u16::MAX >> (16 - bits);
@@ -784,9 +1032,9 @@ impl<'a> Quads<'a> {
     /// None for other formats, or a mosaic without a whole quad. The frame
     /// must have passed `validate_source`.
     fn of(view: FrameRef<'a>) -> Option<Self> {
-        (is_bayer(view.pixel_format()) && view.width >= 2 && view.height >= 2).then(|| Self {
+        (frame_bayer(view.frame) && view.width >= 2 && view.height >= 2).then(|| Self {
             view,
-            order: quad_order(bayer_pattern(view.pixel_format())),
+            order: quad_order(view_bayer_pattern(view)),
             columns: view.width / 2,
             rows: view.height / 2,
             eight: matches!(view.pixel_format(), 0x0108_0008..=0x0108_000b),
@@ -941,45 +1189,46 @@ enum Read<'a> {
 impl<'a> Pixels<'a> {
     pub(crate) fn new(view: FrameRef<'a>) -> Self {
         let frame = view.frame;
-        let read = formats::Decoder::new(frame).map_or_else(
-            || match frame.pixel_format {
-                MONO8 | 0x0108_00b1 | 0x0108_00c6 => Read::Gray8,
-                RGB8 => Read::Rgb {
-                    bytes: 3,
-                    order: [0, 1, 2],
-                },
-                0x0218_0015 => Read::Rgb {
-                    bytes: 3,
-                    order: [2, 1, 0],
-                },
-                0x0220_0016 => Read::Rgb {
-                    bytes: 4,
-                    order: [0, 1, 2],
-                },
-                0x0220_0017 => Read::Rgb {
-                    bytes: 4,
-                    order: [2, 1, 0],
-                },
-                v if yuv422(v).is_some() => Read::Yuv422 {
-                    order: yuv422(v).unwrap(),
-                    stride: row_bytes(frame.width, v),
-                },
-                v if packing(v).is_some() && !is_bayer(v) => {
-                    let (unpacked, bits, packing) = packing(v).unwrap();
-                    // As `sample8` reads a format it has no shift for.
-                    unpacked_shift(unpacked).map_or(Read::Gray8, |shift| Read::Packed {
-                        bits,
-                        packing,
-                        shift,
+        let read = formats::Decoder::new(frame)
+            .map(|decoder| decoder.region(view.x0, view.width))
+            .map_or_else(
+                || match frame.pixel_format {
+                    MONO8 | 0x0108_00b1 | 0x0108_00c6 => Read::Gray8,
+                    RGB8 => Read::Rgb {
+                        bytes: 3,
+                        order: [0, 1, 2],
+                    },
+                    0x0218_0015 => Read::Rgb {
+                        bytes: 3,
+                        order: [2, 1, 0],
+                    },
+                    0x0220_0016 => Read::Rgb {
+                        bytes: 4,
+                        order: [0, 1, 2],
+                    },
+                    0x0220_0017 => Read::Rgb {
+                        bytes: 4,
+                        order: [2, 1, 0],
+                    },
+                    v if yuv422(v).is_some() => Read::Yuv422 {
+                        order: yuv422(v).unwrap(),
                         stride: row_bytes(frame.width, v),
-                    })
-                }
-                0x0110_0003 | 0x0110_0005 | 0x0110_0025 | 0x0110_0007 | 0x0110_00b8
-                | 0x0110_00c7 => Read::Wide(unpacked_shift(frame.pixel_format).unwrap_or(8)),
-                v => Read::Bayer(bayer_pattern(v)),
-            },
-            Read::Layout,
-        );
+                    },
+                    _ if frame_packing(frame).is_some() && !frame_bayer(frame) => {
+                        let (_, bits, packing) = frame_packing(frame).unwrap();
+                        Read::Packed {
+                            bits,
+                            packing,
+                            shift: bits - 8,
+                            stride: frame_row_bytes(frame),
+                        }
+                    }
+                    0x0110_0003 | 0x0110_0005 | 0x0110_0025 | 0x0110_0007 | 0x0110_00b8
+                    | 0x0110_00c7 => Read::Wide(unpacked_shift(frame.pixel_format).unwrap_or(8)),
+                    _ => Read::Bayer(view_bayer_pattern(view)),
+                },
+                Read::Layout,
+            );
         Self {
             view,
             data: &frame.data,
@@ -1145,7 +1394,7 @@ pub(crate) fn exposure_in(view: FrameRef<'_>) -> Result<Exposure> {
     const _: () = assert!(SAMPLES <= (1 << f32::MANTISSA_DIGITS) / 255);
     validate_source(view.frame)?;
     let (w, pixels) = (view.width, view.pixels());
-    let mono = monochrome(view.pixel_format());
+    let mono = frame_monochrome(view.frame);
     let (mut luma_bins, mut channels) = ([0; 64], [[0; 64]; 3]);
     let (mut sum, mut samples, mut shadows, mut highlights) = (0u32, 0u32, 0u32, 0u32);
     let mut add = |rgb: [u8; 3]| {
@@ -1218,6 +1467,19 @@ pub(crate) fn clipping_in(view: FrameRef<'_>) -> Result<Clipping> {
     let format = frame.pixel_format;
     let (x0, y0, width) = (view.x0, view.y0, view.width);
     let pixels = view.pixels();
+    if let Some(format) = bicolor::Format::from_code(frame.pixel_format) {
+        validate_source(frame)?;
+        let full = (1u32 << format.bits()) - 1;
+        let stride = frame_row_bytes(frame);
+        let tally = Tally::rows(view, |tally, y| {
+            let row = &frame.data[y * stride..][..stride];
+            for x in x0..x0 + width {
+                let pair = format.pair(row, x);
+                tally.add(u32::from(pair[0].max(pair[1])), full);
+            }
+        });
+        return Ok(tally.finish(full, pixels));
+    }
     // Wide, packed, planar and padded color: each pixel's brightest component.
     if let Some(bits) = formats::color_bits(format) {
         validate_source(frame)?;
@@ -1239,10 +1501,10 @@ pub(crate) fn clipping_in(view: FrameRef<'_>) -> Result<Clipping> {
         return Ok(tally.finish(full, pixels));
     }
     // Packed monochrome and Bayer samples, each at its own depth.
-    if let Some((_, bits, packing)) = packing(format) {
+    if let Some((_, bits, packing)) = frame_packing(frame) {
         validate_source(frame)?;
         let full = (1u32 << bits) - 1;
-        let stride = row_bytes(frame.width, format);
+        let stride = frame_row_bytes(frame);
         let mut samples = Vec::new();
         let tally = Tally::rows(view, move |tally, y| {
             samples.resize(frame.width as usize, [0; 2]);
@@ -1598,6 +1860,39 @@ pub fn encode_parts<'a>(
     quality: Option<u8>,
     meta: Option<&serde_json::Value>,
 ) -> Result<Encoded<'a>> {
+    validate_encoding(frame)?;
+    if (matches!(
+        frame.pixel_format,
+        COORD3D_AC16 | COORD3D_ABC16 | COORD3D_ABC32F
+    ) || frame_lucid(frame).is_some())
+        && matches!(format, "png" | "jpeg")
+    {
+        let name = frame_format_name(frame);
+        let hint = if matches!(frame.pixel_format, COORD3D_ABC16 | COORD3D_ABC32F)
+            || frame_lucid(frame).is_some()
+        {
+            "Save the selected point cloud as .raw."
+        } else {
+            "Save the selected coordinate profile as .raw."
+        };
+        return Err(crate::types::Categorized::new(
+            crate::types::ErrorKind::Unsupported,
+            format!("{name} requires raw still output"),
+        )
+        .hint(hint)
+        .into());
+    }
+    if format == "jpeg"
+        && (packed_coordinate_group(frame.pixel_format).is_some()
+            || (frame.multipart.is_some() && scalar_map16(frame.pixel_format)))
+    {
+        return Err(crate::types::Categorized::new(
+            crate::types::ErrorKind::Unsupported,
+            "coordinate and confidence maps require a lossless still format",
+        )
+        .hint("Save the selected map as .raw or .png.")
+        .into());
+    }
     let json = meta.map(serde_json::to_string).transpose()?;
     if let Some(json) = &json {
         ensure!(
@@ -1811,6 +2106,7 @@ mod tests {
     #[test]
     fn raw_stills_borrow_the_frame() {
         let frame = |pixel_format, bytes: usize| Frame {
+            pixel_encoding: None,
             width: 7,
             height: 5,
             pixel_format,
@@ -1835,6 +2131,7 @@ mod tests {
     #[test]
     fn jpeg_comments_go_in_as_a_part_where_insert_com_puts_them() {
         let frame = Frame {
+            pixel_encoding: None,
             width: 31,
             height: 17,
             pixel_format: MONO8,
@@ -1897,6 +2194,7 @@ mod tests {
         let json = serde_json::to_string(&meta).unwrap();
         for source in [&jpeg, &bare] {
             let frame = Frame {
+                pixel_encoding: None,
                 width: u32::try_from(width).unwrap(),
                 height: u32::try_from(height).unwrap(),
                 pixel_format: RGB8,
@@ -1941,6 +2239,7 @@ mod tests {
         }
         // A JPEG of another size is not the frame's.
         let other = Frame {
+            pixel_encoding: None,
             width: 16,
             height: 16,
             pixel_format: MONO8,
@@ -1954,6 +2253,29 @@ mod tests {
                 .passthrough()
         );
     }
+    #[test]
+    fn abc16_keeps_unsigned_coordinate_words_and_refuses_image_encoding() {
+        let words = [0, 1, u16::MAX, 0x8000, 0xfffe, 0x1234];
+        let source = f(
+            COORD3D_ABC16,
+            words.into_iter().flat_map(u16::to_le_bytes).collect(),
+        );
+        assert_eq!(pixel_format_name(COORD3D_ABC16), "Coord3D_ABC16");
+        assert_eq!(frame_len(COORD3D_ABC16, 2, 1), Some(12));
+        assert_eq!(bit_depth(COORD3D_ABC16, "raw"), (16, None));
+        assert_eq!(encode(&source, "raw").unwrap(), source.data);
+        assert!(is_measurement_format(COORD3D_ABC16));
+        assert!(crate::auto::meter(&source).is_none());
+        for format in ["png", "jpeg"] {
+            let error = encode(&source, format).unwrap_err();
+            assert_eq!(
+                crate::types::error_transport_code(&error),
+                Some("unsupported")
+            );
+            assert!(error.to_string().contains("Coord3D_ABC16"));
+        }
+    }
+
     #[test]
     fn coordinate_and_confidence_formats_convert_but_raw_preserves_precision() {
         for format in [0x0110_00b8, 0x0110_00c7] {
@@ -1972,6 +2294,11 @@ mod tests {
     }
     fn f(fmt: u32, data: Vec<u8>) -> Frame {
         Frame {
+            pixel_encoding: None,
+            device_timestamp: None,
+            received_monotonic_ns: None,
+            chunks: None,
+            multipart: None,
             id: 1,
             width: 2,
             height: 1,
@@ -2143,6 +2470,7 @@ mod tests {
                 )
             };
             let demosaiced = Frame {
+                pixel_encoding: None,
                 pixel_format: RGB8,
                 data: rgb(&mosaic).unwrap().into(),
                 ..mosaic.clone()
@@ -2187,6 +2515,7 @@ mod tests {
                     };
                     let region = [100, 100, 400, 300];
                     let reference = Frame {
+                        pixel_encoding: None,
                         pixel_format: RGB8,
                         data: rgb(&soft).unwrap().into(),
                         ..soft.clone()
@@ -2270,22 +2599,28 @@ mod tests {
     }
     #[test]
     fn packed_and_wide_conversions_match_the_per_pixel_reference() {
-        // Every packed mono/Bayer layout and every unpacked wide mosaic goes
+        // Packed mono/Bayer/coordinate layouts and unpacked wide mosaics go
         // through `eight_bit`'s group-wise rows; `Pixels` reads each sample
         // on its own and is the reference for all of them.
         let formats = (0x0100_0000..=0x0110_0200)
             .filter(|&v| packing(v).is_some() || wide_bayer(v).is_some())
             .collect::<Vec<_>>();
-        assert_eq!(formats.len(), 41);
+        assert_eq!(formats.len(), 43);
         for format in formats {
             assert!(!streamed(format) && convertible(format), "{format:x}");
-            for (width, height) in [(1, 1), (2, 3), (3, 2), (5, 7), (33, 17)] {
+            for (width, height) in [(1, 1), (2, 3), (3, 2), (4, 3), (5, 7), (33, 17)] {
                 let bytes = row_bytes(width, format) * height as usize;
                 let frame = Frame {
                     width,
                     height,
                     ..f(format, random(u64::from(format ^ width), bytes))
                 };
+                if packed_coordinate_group(format).is_some_and(|group| !width.is_multiple_of(group))
+                {
+                    assert!(rgb(&frame).is_err(), "{format:x} {width}x{height}");
+                    assert!(gray8(&frame).is_err(), "{format:x} {width}x{height}");
+                    continue;
+                }
                 let pixels = Pixels::new(FrameRef::whole(&frame));
                 let reference = (0..height as usize)
                     .flat_map(|y| (0..width as usize).map(move |x| (x, y)))
@@ -2625,7 +2960,7 @@ mod tests {
                 (color, depth),
                 (png::ColorType::Grayscale, png::BitDepth::Sixteen),
                 "{}",
-                pixel_format_name(frame.pixel_format)
+                frame_format_name(frame)
             );
             let samples = samples
                 .as_chunks::<2>()
@@ -3096,7 +3431,7 @@ mod tests {
             sized(0x010c_0059, width, height, pfnc.collect()),
             sized(0x010c_002b, width, height, gige.collect()),
         ] {
-            let name = pixel_format_name(frame.pixel_format);
+            let name = frame_format_name(&frame);
             assert_eq!(rgb(&frame).unwrap(), rgb(&reference).unwrap(), "{name}");
             assert_eq!(exposure(&frame).unwrap(), exposure(&reference).unwrap());
             assert_eq!(
@@ -3162,5 +3497,173 @@ mod tests {
             assert!(gray8(&frame).unwrap().is_none());
         }
         rgb(&f(0x0220_0016, vec![0; 7])).unwrap_err();
+    }
+}
+
+#[cfg(test)]
+mod ids_grouped_tests {
+    use super::*;
+    use crate::types::{IdsPixelFormat, PixelEncoding};
+
+    fn image(format: IdsPixelFormat) -> (Frame, Vec<u16>) {
+        let (bytes, samples) = match format {
+            IdsPixelFormat::Mono10g40
+            | IdsPixelFormat::BayerRg10g40
+            | IdsPixelFormat::BayerGr10g40
+            | IdsPixelFormat::BayerGb10g40
+            | IdsPixelFormat::BayerBg10g40 => (
+                vec![0, 85, 170, 255, 249, 255, 170, 85, 0, 6],
+                vec![1, 342, 683, 1023, 1022, 681, 340, 0],
+            ),
+            IdsPixelFormat::Mono12g24
+            | IdsPixelFormat::BayerRg12g24
+            | IdsPixelFormat::BayerGr12g24
+            | IdsPixelFormat::BayerGb12g24
+            | IdsPixelFormat::BayerBg12g24 => (
+                vec![
+                    0x12, 0xab, 0xc3, 0x45, 0xde, 0xf6, 0, 0xff, 0xf0, 0x78, 0x13, 0x59,
+                ],
+                vec![0x123, 0xabc, 0x456, 0xdef, 0, 0xfff, 0x789, 0x135],
+            ),
+        };
+        (
+            Frame {
+                width: 4,
+                height: 2,
+                pixel_format: format.code(),
+                pixel_encoding: Some(format.encoding(None)),
+                data: bytes.into(),
+                ..Frame::default()
+            },
+            samples,
+        )
+    }
+
+    #[test]
+    fn ids_grouped_words_rows_png_raw_and_native_metering_are_exact() {
+        for format in [IdsPixelFormat::Mono10g40, IdsPixelFormat::Mono12g24] {
+            let (frame, samples) = image(format);
+            validate_source(&frame).unwrap();
+            assert_eq!(frame_format_name(&frame), format.name());
+            assert_eq!(frame_sample_bits(&frame), Some(format.bits()));
+            assert_eq!(frame_row_bytes(&frame) * 2, frame.data.len());
+            assert_eq!(encode(&frame, "raw").unwrap(), &*frame.data);
+            for (at, &sample) in samples.iter().enumerate() {
+                assert_eq!(native_sample(&frame, at % 4, at / 4), sample);
+            }
+            let gray: Vec<_> = samples
+                .iter()
+                .map(|sample| u8::try_from(sample >> (format.bits() - 8)).unwrap())
+                .collect();
+            assert_eq!(gray8(&frame).unwrap().unwrap(), gray);
+            let mut rows = RowReader::new(FrameRef::region(&frame, [1, 1, 2, 1]));
+            assert_eq!(rows.row(0, Channels::Gray), &gray[5..7]);
+            let raster = crate::jpeg::Raster::new(&frame).unwrap();
+            assert_eq!(raster.channels, 1);
+            assert_eq!(&*raster.data, &gray);
+            #[cfg(feature = "jpeg")]
+            {
+                let jpeg = encode(&frame, "jpeg").unwrap();
+                assert!(crate::jpeg::well_formed(&jpeg, 4, 2));
+            }
+            let png = encode(&frame, "png").unwrap();
+            let mut png = png::Decoder::new(png.as_slice()).read_info().unwrap();
+            assert_eq!(png.info().bit_depth, png::BitDepth::Sixteen);
+            assert_eq!(png.info().color_type, png::ColorType::Grayscale);
+            let mut pixels = vec![0; png.output_buffer_size()];
+            let info = png.next_frame(&mut pixels).unwrap();
+            let expected: Vec<_> = samples
+                .iter()
+                .flat_map(|sample| (sample << (16 - format.bits())).to_be_bytes())
+                .collect();
+            assert_eq!(&pixels[..info.buffer_size()], expected);
+            let meter = crate::auto::meter(&frame).unwrap();
+            let expected_mean = samples.iter().map(|&sample| f64::from(sample)).sum::<f64>()
+                / 8.0
+                / f64::from((1u32 << format.bits()) - 1);
+            assert!((meter.mean - expected_mean).abs() < 0.000_001);
+            let unpacked = unpacked(&frame).unwrap();
+            assert!(unpacked.pixel_encoding.is_none());
+            assert_eq!(unpacked.pixel_format, frame_unpacked_format(&frame));
+            assert_eq!(
+                &*unpacked.data,
+                samples
+                    .iter()
+                    .flat_map(|sample| sample.to_le_bytes())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn ids_custom_integer_without_matching_encoding_never_selects_a_decoder() {
+        for format in IdsPixelFormat::ALL {
+            let (mut frame, _) = image(format);
+            assert_eq!(pixel_format_name(format.code()), "Unknown");
+            assert!(!convertible(format.code()));
+            assert!(packing(format.code()).is_none());
+            frame.pixel_encoding = None;
+            assert!(
+                validate_source(&frame)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unsupported")
+            );
+            assert_eq!(frame_format_name(&frame), "Unknown");
+            frame.pixel_encoding = Some(PixelEncoding::Ids {
+                name: format,
+                code: format.code() + 1,
+                gentl_namespace: None,
+            });
+            assert!(
+                validate_source(&frame)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("does not match")
+            );
+            assert!(
+                encode(&frame, "raw")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("does not match")
+            );
+            frame.pixel_encoding = Some(format.encoding(Some(1001)));
+            assert!(
+                validate_source(&frame)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("namespace")
+            );
+            frame.pixel_encoding = Some(format.encoding(None));
+            frame.width = 3;
+            assert_eq!(
+                crate::types::classify(&validate_source(&frame).unwrap_err()).kind,
+                crate::types::ErrorKind::Unsupported
+            );
+            frame.width = 4;
+            frame.data = vec![1].into();
+            assert!(
+                validate_source(&frame)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("truncated")
+            );
+        }
+    }
+
+    #[test]
+    fn ids_encoding_survives_frame_serde_and_rejects_unknown_layout_names() {
+        let (frame, _) = image(IdsPixelFormat::Mono10g40);
+        let value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(
+            value["pixel_encoding"],
+            serde_json::json!({"namespace":"ids", "name":"Mono10g40IDS", "code":0x4000_000f_u32})
+        );
+        let decoded: Frame = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(decoded.pixel_encoding, frame.pixel_encoding);
+        assert_eq!(decoded.pixel_format, frame.pixel_format);
+        let mut invalid = value;
+        invalid["pixel_encoding"]["name"] = "Mono10p".into();
+        serde_json::from_value::<Frame>(invalid).unwrap_err();
     }
 }

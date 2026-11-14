@@ -1,0 +1,1068 @@
+{
+ "version": 1,
+ "freeze": "Independent additive scientific/ABI oracle frozen before new resistive/physical-bridge native or C implementation is authored or read. Literal IEEE words and ordered controls are manually declared; no product encoder/decoder, SDK, compiler/native or device runtime.",
+ "accepted_contract_sha256": "39a7c956e7660e36fdcdf8cffeab404ca031fed72fd10f45a9612ed87843e81b",
+ "baseline_source": {
+  "sha256": "983482df0c81dcb22c6d62ce6712f3eba11debd989b0cd22432921ced12518fc",
+  "files": 866
+ },
+ "immutable_prior_oracles_sha256": {
+  "abi.json": "1bbc016312c3aab6093483cfa3aeee442e6bc3aaeb74eaa8113641a090329b6b",
+  "thermocouple.json": "2a8109877c63aa7448965c0d0ac9ec060355d8dde41e98496b4ff8050ac65cb1",
+  "current.json": "14f428f82a6cf94704ac47ff2b42d18bf71553435437ae4f0345bf4260779bff",
+  "voltage-scale-null.json": "5764fe41ecab45d8b5795d15dc82f723c566d5ba0af565048224337ed321ba63",
+  "on-demand.json": "b87122de19d2bdb77f16c0511d1759925b84697ad59e97375197d1b54e81fe89",
+  "rtd.json": "5f83a52d2ce10c71d6e1f7498bb6bd020828365a734fbe235cb7bbcadd2cb6a5",
+  "mixed-ai.json": "d4a74d1e2310b8f16648e296ab95ebffe175559fbe326655ac98dae6d31a9d78",
+  "digital-port.json": "78475d5d3a4dc0e02405b57887dfd9f3bfd3e7659b31613edde6aea674af9434",
+  "counter-input.json": "a056640e872e599b54413e18e7824ac114a6fe99b248693838b09b7a51a44d93",
+  "engineering-ai.json": "889cba7a8fef9408df7dba6af195dda402df094387d39ee14a54f4eaa44797fb",
+  "counter-time-position.json": "1a3e1be6f66ff03ea3f41c776ca057339d5cc1ce3c985e38d935b13a8c21e63d"
+ },
+ "immutable_eleven_c_word_arrays_text_sha256": {
+  "words": "d33dae464ecceaadc4899b09d31bf09af0546a822db79612680d2132caaa4d92",
+  "tc_words": "d42057e167b20a607f173cd2902ca57185b7633ea67f3894364e4d0757014496",
+  "current_words": "83d49b770ec0813b9f2a11b36e30e92303b4e8c3109f801e487465a9a8f464c2",
+  "rtd_words": "a0621fdea511efa372a8a5675070b773700cfd6f6b3325ebf1eada76ecc9a966",
+  "mixed_words": "67d1533c2be4a430a11f19b6cc9fd3cadcc4dd56db14b9d1f03cd7fdb49aed99",
+  "engineering_words": "99c57d35c6d5dbb611e3271058b1164a505348f97bfe1268dafd899c8a621d36",
+  "engineering_mixed_words": "2993a8e268c34fc9fb21983ae37213bac9f23e573d81326185f72f60ba954602",
+  "engineering_counter_words": "41ade0ec88361c9cb8f5c75b253cba165dbdd9f10e3a3e40b94d390521e16d79",
+  "digital_words": "be6f5d896eabb2a6a053cde8f4dcc05f03d10d8d2ad81c49a8a48f6b7f5d5489",
+  "count_words": "89f06a5474da075b2dc5c0fc0ebeaf88c03aa1ecab3543e0b2f6355c84bb72f3",
+  "frequency_words": "8d8263d3c909d65d9d0ea5080d7b2d911664b3cc5b175eb39f0190ddf7df690d"
+ },
+ "abi_policy": {
+  "returns": "signed i32 status",
+  "TaskHandle": "pointer-sized opaque owned handle",
+  "calling_convention": "fixed NI __CFUNC; C Linux/system Windows",
+  "all_selected_exports_before_CreateTask": true,
+  "no_variadic_attributes_or_transmuted_signatures": true,
+  "scale_pointer": "NULL for ordinary scaled-tail units; thermistor constructors have no scale slot"
+ },
+ "common_exports": {
+  "on_demand": [
+   "DAQmxCreateTask",
+   "DAQmxGetTaskNumChans",
+   "DAQmxGetNthTaskReadChannel",
+   "DAQmxStartTask",
+   "DAQmxStopTask",
+   "DAQmxClearTask",
+   "DAQmxGetErrorString",
+   "DAQmxGetExtendedErrorInfo",
+   "DAQmxReadAnalogF64"
+  ],
+  "continuous": [
+   "DAQmxCreateTask",
+   "DAQmxGetTaskNumChans",
+   "DAQmxGetNthTaskReadChannel",
+   "DAQmxStartTask",
+   "DAQmxStopTask",
+   "DAQmxClearTask",
+   "DAQmxGetErrorString",
+   "DAQmxGetExtendedErrorInfo",
+   "DAQmxReadAnalogF64",
+   "DAQmxCfgSampClkTiming",
+   "DAQmxCfgInputBuffer",
+   "DAQmxSetReadOverWrite",
+   "DAQmxGetReadAvailSampPerChan",
+   "DAQmxGetSampClkRate"
+  ]
+ },
+ "read_abi": {
+  "name": "DAQmxReadAnalogF64",
+  "slot_count": 8,
+  "arguments": [
+   "H",
+   "i32 requested_per_channel",
+   "f64 timeout_seconds",
+   "u32 fill_mode",
+   "f64* zeroed_output",
+   "u32 capacity_f64_elements",
+   "i32* actual_per_channel",
+   "u32* reserved"
+  ],
+  "fill_mode": 1,
+  "reserved": "NULL",
+  "continuous": "positive bounded request times validated actual_channels, capacity<=4096, zero timeout; current idle semantics unchanged",
+  "on_demand": "request1, exact actual_channels capacity, positive original remaining timeout; no clocked5 exports",
+  "output_allocation": "zeroed exact F64 element capacity, not bytes or renewed budget"
+ },
+ "private_protocol": 9,
+ "scientific_rules": [
+  "Preserve SDK-exposed IEEE/sign/NaN payload in canonical8-byte LE words and numeric family key only when finite.",
+  "No host engineering/unit/coefficient/calibration interpolation, clipping, coordinate sorting/relinking, range enforcement on returned words or sensor fitting.",
+  "No device source_time, physical synchronization/freshness or hard native-entry cadence guarantee. Preserve old rows.",
+  "One original deadline/cutoff and worker pre-FFI host frontier; immediate post-native clock precedes optional diagnostics/encoding.",
+  "Negative qualified complete first scan is retained before original status/deferred diagnostics; owned Stop/Clear only, no Read in Finish.",
+  "All scientific settings/calibration/excitation/coupling are exact requests, not observed/performed calibration, physical-off or readback."
+ ],
+ "status_controls": [
+  {
+   "status": 0,
+   "actual_per_channel": 0,
+   "timing_scope": "on_demand",
+   "result": "Incomplete/no block"
+  },
+  {
+   "status": 12345,
+   "actual_per_channel": 0,
+   "timing_scope": "on_demand",
+   "result": "Incomplete with original warning/geometry/no block"
+  },
+  {
+   "status": -200284,
+   "actual_per_channel": 0,
+   "result": "original negative/no block"
+  },
+  {
+   "status": 0,
+   "actual_per_channel": -1,
+   "result": "Incomplete/no fabricated data"
+  },
+  {
+   "status": 0,
+   "actual_per_channel": "requested+1",
+   "result": "Incomplete/no fabricated data"
+  },
+  {
+   "status": -200284,
+   "actual_per_channel": 1,
+   "result": "complete first scan then original error; optional diagnostic may hang without losing data"
+  }
+ ],
+ "metadata": {
+  "measurement": "selected family",
+  "settings_provenance": "requested_not_read_back",
+  "channels": "actual validated read names, original order",
+  "channel_measurements": "zero-based channel_index, actual physical and exact typed requests/units",
+  "coupling_explicit": "coupling_request plus coupling_provenance:explicit_request_not_read_back",
+  "coupling_omitted": "no setter/getter/request; coupling_provenance:driver_default_unqueried",
+  "no_inferred_terminal_fields": true
+ },
+ "qualification": [
+  "Synthetic finite host ABI/data-preservation contract only; no actual module/driver/OS or sensor calibration qualification.",
+  "None, GND and Stop/Clear do not establish physical-off or sensor-zero. Persistent/coerced excitation/device restrictions remain native.",
+  "No TEDS, null/shunt calibration, saved task, reset, output, fallback or SDK/header/archive retained."
+ ],
+ "constants_primary": {
+  "url": "https://raw.githubusercontent.com/ni/nidaqmx-python/1d60b6c53ef11dead0ba6aa9d6e2855351835ad7/generated/nidaqmx/constants.py",
+  "bytes": 50365,
+  "sha256": "9d15eb38ccb03769f9e5ad94289a00658ee36b6685709e4f3d49dafb25b4ae57"
+ },
+ "profiles": [
+  "resistance",
+  "thermistor_current",
+  "thermistor_voltage"
+ ],
+ "primary_sources": [
+  {
+   "name": "resistance",
+   "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__channel__configuration__creation__create__analog__input__channels_1gaa8454a1de839ded8669cce2b4b25cca4.html",
+   "bytes": 22673,
+   "sha256": "8fab9462b94f58681888f60f3c7db51b553a763c94c0eb86eab906e1b9cba53f",
+   "prototype": "int32 __CFUNC DAQmxCreateAIResistanceChan(TaskHandle taskHandle, const char physicalChannel[], const char nameToAssignToChannel[], float64 minVal, float64 maxVal, int32 units, int32 resistanceConfig, int32 currentExcitSource, float64 currentExcitVal, const char customScaleName[])"
+  },
+  {
+   "name": "thermistor_iex",
+   "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__channel__configuration__creation__create__analog__input__channels_1gaf7dc57c48b676e22c788574fecb4f512.html",
+   "bytes": 25208,
+   "sha256": "a1e8a73dd3f6c89870a434de68938388748ecac0199ec0dbb4d66604504f3785",
+   "prototype": "int32 __CFUNC DAQmxCreateAIThrmstrChanIex(TaskHandle taskHandle, const char physicalChannel[], const char nameToAssignToChannel[], float64 minVal, float64 maxVal, int32 units, int32 resistanceConfig, int32 currentExcitSource, float64 currentExcitVal, float64 a, float64 b, float64 c)"
+  },
+  {
+   "name": "thermistor_vex",
+   "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__channel__configuration__creation__create__analog__input__channels_1ga79514ce1961338c419f0d6e1157e7b83.html",
+   "bytes": 26028,
+   "sha256": "307544cd8ca60b5d74970ccaf7b652bf30547358028f6fa22312a62653d938a4",
+   "prototype": "int32 __CFUNC DAQmxCreateAIThrmstrChanVex(TaskHandle taskHandle, const char physicalChannel[], const char nameToAssignToChannel[], float64 minVal, float64 maxVal, int32 units, int32 resistanceConfig, int32 voltageExcitSource, float64 voltageExcitVal, float64 a, float64 b, float64 c, float64 r1)"
+  }
+ ],
+ "fixed_abis": [
+  {
+   "name": "DAQmxCreateAIResistanceChan",
+   "returns": "i32",
+   "slot_count": 10,
+   "arguments": [
+    "H",
+    "const char* physical",
+    "const char* empty_virtual",
+    "f64 min",
+    "f64 max",
+    "i32 ohms_units",
+    "i32 resistance_config",
+    "i32 current_source",
+    "f64 amperes",
+    "const char* scale"
+   ]
+  },
+  {
+   "name": "DAQmxCreateAIThrmstrChanIex",
+   "returns": "i32",
+   "slot_count": 12,
+   "arguments": [
+    "H",
+    "const char* physical",
+    "const char* empty_virtual",
+    "f64 min",
+    "f64 max",
+    "i32 temperature_units",
+    "i32 resistance_config",
+    "i32 current_source",
+    "f64 amperes",
+    "f64 a",
+    "f64 b",
+    "f64 c"
+   ]
+  },
+  {
+   "name": "DAQmxCreateAIThrmstrChanVex",
+   "returns": "i32",
+   "slot_count": 13,
+   "arguments": [
+    "H",
+    "const char* physical",
+    "const char* empty_virtual",
+    "f64 min",
+    "f64 max",
+    "i32 temperature_units",
+    "i32 resistance_config",
+    "i32 voltage_source",
+    "f64 volts",
+    "f64 a",
+    "f64 b",
+    "f64 c",
+    "f64 r1_ohms"
+   ]
+  },
+  {
+   "name": "DAQmxSetAICoupling",
+   "returns": "i32",
+   "slot_count": 3,
+   "arguments": [
+    "H",
+    "const char* requested_physical",
+    "i32 coupling"
+   ]
+  }
+ ],
+ "manual_argument_words": [
+  {
+   "name": "zero",
+   "exact_rational": "0",
+   "bits_hex": "0000000000000000",
+   "ieee754_le_hex": "0000000000000000"
+  },
+  {
+   "name": "negative_zero",
+   "exact_rational": "0",
+   "bits_hex": "8000000000000000",
+   "ieee754_le_hex": "0000000000000080"
+  },
+  {
+   "name": "resistance_max_a",
+   "exact_rational": "512",
+   "bits_hex": "4080000000000000",
+   "ieee754_le_hex": "0000000000008040"
+  },
+  {
+   "name": "resistance_min_b",
+   "exact_rational": "32",
+   "bits_hex": "4040000000000000",
+   "ieee754_le_hex": "0000000000004040"
+  },
+  {
+   "name": "resistance_max_b",
+   "exact_rational": "2048",
+   "bits_hex": "40a0000000000000",
+   "ieee754_le_hex": "000000000000a040"
+  },
+  {
+   "name": "current_a",
+   "exact_rational": "1/1024",
+   "bits_hex": "3f50000000000000",
+   "ieee754_le_hex": "000000000000503f"
+  },
+  {
+   "name": "current_b",
+   "exact_rational": "3/2048",
+   "bits_hex": "3f58000000000000",
+   "ieee754_le_hex": "000000000000583f"
+  },
+  {
+   "name": "none_current",
+   "exact_rational": "1/2048",
+   "bits_hex": "3f40000000000000",
+   "ieee754_le_hex": "000000000000403f"
+  },
+  {
+   "name": "iex_min_a",
+   "exact_rational": "-32",
+   "bits_hex": "c040000000000000",
+   "ieee754_le_hex": "00000000000040c0"
+  },
+  {
+   "name": "iex_max_a",
+   "exact_rational": "256",
+   "bits_hex": "4070000000000000",
+   "ieee754_le_hex": "0000000000007040"
+  },
+  {
+   "name": "iex_min_b",
+   "exact_rational": "-64",
+   "bits_hex": "c050000000000000",
+   "ieee754_le_hex": "00000000000050c0"
+  },
+  {
+   "name": "iex_max_b",
+   "exact_rational": "512",
+   "bits_hex": "4080000000000000",
+   "ieee754_le_hex": "0000000000008040"
+  },
+  {
+   "name": "coefficient_a1",
+   "exact_rational": "9/8192",
+   "bits_hex": "3f52000000000000",
+   "ieee754_le_hex": "000000000000523f"
+  },
+  {
+   "name": "coefficient_b1",
+   "exact_rational": "1/4096",
+   "bits_hex": "3f30000000000000",
+   "ieee754_le_hex": "000000000000303f"
+  },
+  {
+   "name": "coefficient_c1",
+   "exact_rational": "1/8388608",
+   "bits_hex": "3e80000000000000",
+   "ieee754_le_hex": "000000000000803e"
+  },
+  {
+   "name": "coefficient_a2",
+   "exact_rational": "5/4096",
+   "bits_hex": "3f54000000000000",
+   "ieee754_le_hex": "000000000000543f"
+  },
+  {
+   "name": "coefficient_b2",
+   "exact_rational": "3/16384",
+   "bits_hex": "3f28000000000000",
+   "ieee754_le_hex": "000000000000283f"
+  },
+  {
+   "name": "coefficient_c2",
+   "exact_rational": "3/33554432",
+   "bits_hex": "3e78000000000000",
+   "ieee754_le_hex": "000000000000783e"
+  },
+  {
+   "name": "negative_coefficient_a1",
+   "exact_rational": "-9/8192",
+   "bits_hex": "bf52000000000000",
+   "ieee754_le_hex": "00000000000052bf"
+  },
+  {
+   "name": "negative_coefficient_b2",
+   "exact_rational": "-3/16384",
+   "bits_hex": "bf28000000000000",
+   "ieee754_le_hex": "00000000000028bf"
+  },
+  {
+   "name": "vex_min_a",
+   "exact_rational": "-16",
+   "bits_hex": "c030000000000000",
+   "ieee754_le_hex": "00000000000030c0"
+  },
+  {
+   "name": "vex_max_a",
+   "exact_rational": "128",
+   "bits_hex": "4060000000000000",
+   "ieee754_le_hex": "0000000000006040"
+  },
+  {
+   "name": "volts_a",
+   "exact_rational": "5/2",
+   "bits_hex": "4004000000000000",
+   "ieee754_le_hex": "0000000000000440"
+  },
+  {
+   "name": "volts_b",
+   "exact_rational": "5/4",
+   "bits_hex": "3ff4000000000000",
+   "ieee754_le_hex": "000000000000f43f"
+  },
+  {
+   "name": "reference_ohms_a",
+   "exact_rational": "10000",
+   "bits_hex": "40c3880000000000",
+   "ieee754_le_hex": "000000000088c340"
+  },
+  {
+   "name": "reference_ohms_b",
+   "exact_rational": "12000",
+   "bits_hex": "40c7700000000000",
+   "ieee754_le_hex": "000000000070c740"
+  }
+ ],
+ "constants": {
+  "ohms": 10384,
+  "deg_c": 10143,
+  "deg_f": 10144,
+  "kelvin": 10325,
+  "deg_r": 10145,
+  "two_wire": 2,
+  "three_wire": 3,
+  "four_wire": 4,
+  "internal": 10200,
+  "external": 10167,
+  "none": 10230,
+  "ac": 10045,
+  "dc": 10050,
+  "ground": 10066
+ },
+ "ordered_constructor_pairs": {
+  "resistance": [
+   {
+    "case": "resistance_a",
+    "physical": "ResistanceSuccess/ai0",
+    "virtual_name": "",
+    "min_word": "zero",
+    "max_word": "resistance_max_a",
+    "units": "ohms",
+    "units_code": 10384,
+    "resistance_config": "three_wire",
+    "resistance_config_code": 3,
+    "excitation_source": "internal",
+    "excitation_code": 10200,
+    "excitation_word": "current_a",
+    "custom_scale": "NULL",
+    "coupling": "ac",
+    "coupling_code": 10045
+   },
+   {
+    "case": "resistance_b",
+    "physical": "ResistanceSuccess/ai1",
+    "virtual_name": "",
+    "min_word": "resistance_min_b",
+    "max_word": "resistance_max_b",
+    "units": "ohms",
+    "units_code": 10384,
+    "resistance_config": "four_wire",
+    "resistance_config_code": 4,
+    "excitation_source": "external",
+    "excitation_code": 10167,
+    "excitation_word": "current_b",
+    "custom_scale": "NULL",
+    "coupling": "omitted"
+   }
+  ],
+  "thermistor_current": [
+   {
+    "case": "iex_a",
+    "physical": "ThermIexSuccess/ai0",
+    "virtual_name": "",
+    "min_word": "iex_min_a",
+    "max_word": "iex_max_a",
+    "units": "deg_c",
+    "units_code": 10143,
+    "resistance_config": "three_wire",
+    "resistance_config_code": 3,
+    "excitation_source": "internal",
+    "excitation_code": 10200,
+    "excitation_word": "current_a",
+    "coefficient_words": {
+     "a": "coefficient_a1",
+     "b": "coefficient_b1",
+     "c": "coefficient_c1"
+    },
+    "coupling": "dc",
+    "coupling_code": 10050,
+    "absent_arguments": [
+     "r1",
+     "custom_scale",
+     "rtd_type",
+     "r0",
+     "cjc",
+     "terminal_config"
+    ]
+   },
+   {
+    "case": "iex_b",
+    "physical": "ThermIexSuccess/ai1",
+    "virtual_name": "",
+    "min_word": "iex_min_b",
+    "max_word": "iex_max_b",
+    "units": "deg_f",
+    "units_code": 10144,
+    "resistance_config": "two_wire",
+    "resistance_config_code": 2,
+    "excitation_source": "external",
+    "excitation_code": 10167,
+    "excitation_word": "current_b",
+    "coefficient_words": {
+     "a": "coefficient_a2",
+     "b": "coefficient_b2",
+     "c": "coefficient_c2"
+    },
+    "coupling": "ground",
+    "coupling_code": 10066,
+    "absent_arguments": [
+     "r1",
+     "custom_scale",
+     "rtd_type",
+     "r0",
+     "cjc",
+     "terminal_config"
+    ]
+   }
+  ],
+  "thermistor_voltage": [
+   {
+    "case": "vex_a",
+    "physical": "ThermVexSuccess/ai0",
+    "virtual_name": "",
+    "min_word": "vex_min_a",
+    "max_word": "vex_max_a",
+    "units": "deg_c",
+    "units_code": 10143,
+    "resistance_config": "four_wire",
+    "resistance_config_code": 4,
+    "excitation_source": "external",
+    "excitation_code": 10167,
+    "excitation_word": "volts_a",
+    "coefficient_words": {
+     "a": "coefficient_a1",
+     "b": "coefficient_b1",
+     "c": "coefficient_c1"
+    },
+    "r1_word": "reference_ohms_a",
+    "coupling": "omitted",
+    "absent_arguments": [
+     "custom_scale",
+     "rtd_type",
+     "r0",
+     "cjc",
+     "terminal_config"
+    ]
+   },
+   {
+    "case": "vex_b",
+    "physical": "ThermVexSuccess/ai1",
+    "virtual_name": "",
+    "min_word": "zero",
+    "max_word": "iex_max_b",
+    "units": "kelvin",
+    "units_code": 10325,
+    "resistance_config": "two_wire",
+    "resistance_config_code": 2,
+    "excitation_source": "internal",
+    "excitation_code": 10200,
+    "excitation_word": "volts_b",
+    "coefficient_words": {
+     "a": "coefficient_a2",
+     "b": "coefficient_b2",
+     "c": "coefficient_c2"
+    },
+    "r1_word": "reference_ohms_b",
+    "coupling": "ac",
+    "coupling_code": 10045,
+    "absent_arguments": [
+     "custom_scale",
+     "rtd_type",
+     "r0",
+     "cjc",
+     "terminal_config"
+    ]
+   }
+  ]
+ },
+ "short_enum_cycles": {
+  "wiring": [
+   {
+    "name": "two_wire",
+    "code": 2
+   },
+   {
+    "name": "three_wire",
+    "code": 3
+   },
+   {
+    "name": "four_wire",
+    "code": 4
+   }
+  ],
+  "temperature_units": [
+   {
+    "name": "deg_c",
+    "code": 10143
+   },
+   {
+    "name": "deg_f",
+    "code": 10144
+   },
+   {
+    "name": "kelvin",
+    "code": 10325
+   },
+   {
+    "name": "deg_r",
+    "code": 10145
+   }
+  ],
+  "rule": "Reuse alternating asymmetric pair scalar controls with units/wiring varied in one short cycle per thermistor family, not a Cartesian matrix.",
+  "explicit_modes": {
+   "thermistor_current": [
+    {
+     "base": "iex_a",
+     "units": "deg_c",
+     "units_code": 10143,
+     "resistance_config": "three_wire",
+     "resistance_config_code": 3
+    },
+    {
+     "base": "iex_b",
+     "units": "deg_f",
+     "units_code": 10144,
+     "resistance_config": "two_wire",
+     "resistance_config_code": 2
+    },
+    {
+     "base": "iex_a",
+     "units": "kelvin",
+     "units_code": 10325,
+     "resistance_config": "four_wire",
+     "resistance_config_code": 4
+    },
+    {
+     "base": "iex_b",
+     "units": "deg_r",
+     "units_code": 10145,
+     "resistance_config": "three_wire",
+     "resistance_config_code": 3
+    }
+   ],
+   "thermistor_voltage": [
+    {
+     "base": "vex_a",
+     "units": "deg_c",
+     "units_code": 10143,
+     "resistance_config": "four_wire",
+     "resistance_config_code": 4
+    },
+    {
+     "base": "vex_b",
+     "units": "deg_f",
+     "units_code": 10144,
+     "resistance_config": "two_wire",
+     "resistance_config_code": 2
+    },
+    {
+     "base": "vex_a",
+     "units": "kelvin",
+     "units_code": 10325,
+     "resistance_config": "three_wire",
+     "resistance_config_code": 3
+    },
+    {
+     "base": "vex_b",
+     "units": "deg_r",
+     "units_code": 10145,
+     "resistance_config": "four_wire",
+     "resistance_config_code": 4
+    }
+   ]
+  }
+ },
+ "supplemental_exact_request_controls": [
+  {
+   "measurement": "resistance",
+   "base": "resistance_a",
+   "excitation_source": "none",
+   "excitation_code": 10230,
+   "excitation_word": "none_current",
+   "meaning": "nonzero exact request, not a universal ignored/accepted/off amount"
+  },
+  {
+   "measurement": "thermistor_current",
+   "base": "iex_b",
+   "excitation_source": "none",
+   "excitation_code": 10230,
+   "excitation_word": "zero"
+  },
+  {
+   "measurement": "thermistor_voltage",
+   "base": "vex_a",
+   "excitation_source": "none",
+   "excitation_code": 10230,
+   "excitation_word": "negative_zero"
+  },
+  {
+   "measurement": "thermistor_current",
+   "base": "iex_a",
+   "coefficient_words": {
+    "a": "negative_coefficient_a1",
+    "b": "coefficient_b1",
+    "c": "negative_zero"
+   },
+   "meaning": "finite signed coefficients/negativezero admitted unchanged, no local equation/fit/zero normalization"
+  },
+  {
+   "measurement": "thermistor_voltage",
+   "base": "vex_a",
+   "coefficient_words": {
+    "a": "coefficient_a1",
+    "b": "negative_coefficient_b2",
+    "c": "negative_zero"
+   }
+  }
+ ],
+ "admission": {
+  "all_numbers": "finite/bit-exact; min<max; no universal nonnegative-ohms/temperature bound",
+  "r1": "required positive finite Vex reference ohms as software admission; absent in Iex",
+  "coefficients": "required closed a,b,c finite with no invented sign/nonzero bound; signedzero preserved; operator must match NI Steinhart-Hart convention/fit",
+  "excitation": "explicit positive I/E; nonnegative None; preserve amount/zero sign, no universal ignored/off assumption",
+  "coupling": "missing-only optional ac/dc/ground, null rejected; only explicit setter",
+  "invalid_closed_shapes": [
+   "Iex r1",
+   "thermistor custom_scale",
+   "resistance units/rtd_type/r0/coefficients",
+   "omitted coefficient",
+   "unknown/duplicate/null fields",
+   "R1<=0/nonfinite",
+   "nonfinite coefficients",
+   "range equality/reversal"
+  ]
+ },
+ "thermistor_model": {
+  "equation": "1/T = A + B ln(R) + C[ln(R)]^3",
+  "temperature_basis": "Kelvin in NI model; requested output unit separate",
+  "source": "Fresh independent bounded RAM NI topic read; manufacturer A/B/C and Kelvin equation verified; no source body retained",
+  "r1_role": "voltage-divider reference resistor in ohms, not RTD R0 or nominal sensor resistance",
+  "primary": {
+   "url": "https://docs-be.ni.com/api/bundle/ni-daqmx/page/thermistors.html",
+   "bytes": 8214,
+   "sha256": "393b048697ed8263b3ac674d9375b3a0dcfcd12677f6340a3d26268e97ccb54a"
+  }
+ },
+ "manual_native_patterns": [
+  {
+   "ordinal": 0,
+   "bits_hex": "4039000000000000",
+   "ieee754_le_hex": "0000000000003940",
+   "classification": "finite",
+   "sign_bit": 0,
+   "exact_rational": "25",
+   "finite_decimal": "25.0"
+  },
+  {
+   "ordinal": 1,
+   "bits_hex": "4039000000000000",
+   "ieee754_le_hex": "0000000000003940",
+   "classification": "finite",
+   "sign_bit": 0,
+   "exact_rational": "25",
+   "finite_decimal": "25.0"
+  },
+  {
+   "ordinal": 2,
+   "bits_hex": "8000000000000000",
+   "ieee754_le_hex": "0000000000000080",
+   "classification": "zero",
+   "sign_bit": 1,
+   "exact_rational": "0",
+   "finite_decimal": "-0.0"
+  },
+  {
+   "ordinal": 3,
+   "bits_hex": "7ff80000000000a5",
+   "ieee754_le_hex": "a50000000000f87f",
+   "classification": "nan",
+   "sign_bit": 0,
+   "fraction_hex": "80000000000a5"
+  },
+  {
+   "ordinal": 4,
+   "bits_hex": "7ff0000000000000",
+   "ieee754_le_hex": "000000000000f07f",
+   "classification": "infinity",
+   "sign_bit": 0
+  },
+  {
+   "ordinal": 5,
+   "bits_hex": "fff0000000000000",
+   "ieee754_le_hex": "000000000000f0ff",
+   "classification": "infinity",
+   "sign_bit": 1
+  },
+  {
+   "ordinal": 6,
+   "bits_hex": "3f90000000000000",
+   "ieee754_le_hex": "000000000000903f",
+   "classification": "finite",
+   "sign_bit": 0,
+   "exact_rational": "1/64",
+   "finite_decimal": "0.015625"
+  },
+  {
+   "ordinal": 7,
+   "bits_hex": "bf80000000000000",
+   "ieee754_le_hex": "00000000000080bf",
+   "classification": "finite",
+   "sign_bit": 1,
+   "exact_rational": "-1/128",
+   "finite_decimal": "-0.0078125"
+  },
+  {
+   "ordinal": 8,
+   "bits_hex": "0000000000000000",
+   "ieee754_le_hex": "0000000000000000",
+   "classification": "zero",
+   "sign_bit": 0,
+   "exact_rational": "0",
+   "finite_decimal": "0.0"
+  },
+  {
+   "ordinal": 9,
+   "bits_hex": "4080000000000000",
+   "ieee754_le_hex": "0000000000008040",
+   "classification": "finite",
+   "sign_bit": 0,
+   "exact_rational": "512",
+   "finite_decimal": "512.0"
+  },
+  {
+   "ordinal": 10,
+   "bits_hex": "0000000000000001",
+   "ieee754_le_hex": "0100000000000000",
+   "classification": "finite",
+   "sign_bit": 0,
+   "exact_rational": "1/2^1074",
+   "finite_decimal": "5e-324",
+   "decimal_status": "shortest round-trip rendering, not exact decimal rational"
+  },
+  {
+   "ordinal": 11,
+   "bits_hex": "fff8000000000045",
+   "ieee754_le_hex": "450000000000f8ff",
+   "classification": "nan",
+   "sign_bit": 1,
+   "fraction_hex": "8000000000045"
+  }
+ ],
+ "raw_extent": {
+  "shape": [
+   6,
+   2
+  ],
+  "words": 12,
+  "bytes": 96,
+  "all_words_le_hex": "000000000000394000000000000039400000000000000080a50000000000f87f000000000000f07f000000000000f0ff000000000000903f00000000000080bf000000000000000000000000000080400100000000000000450000000000f8ff",
+  "negative_one_scan_le_hex": "00000000000039400000000000003940",
+  "negative_one_scan_bytes": 16,
+  "control": "same25 returned under C/F/K/R remains25 raw; resistance out-of-request-range words are not clipped; no host thermal/Ohm conversion"
+ },
+ "public_rows": [
+  {
+   "measurement": "resistance",
+   "event": "resistance_block",
+   "representation": "driver_scaled_f64_resistance",
+   "finite_key": "ohms",
+   "units": "ohms"
+  },
+  {
+   "measurement": "thermistor_current",
+   "event": "thermistor_current_block",
+   "representation": "driver_scaled_f64_thermistor_current",
+   "finite_key": "temperature",
+   "units": "requested temperature enum"
+  },
+  {
+   "measurement": "thermistor_voltage",
+   "event": "thermistor_voltage_block",
+   "representation": "driver_scaled_f64_thermistor_voltage",
+   "finite_key": "temperature",
+   "units": "requested temperature enum"
+  }
+ ],
+ "mixed_thirteen_channel_control": {
+  "columns": [
+   {
+    "column_index": 0,
+    "prior_control": "engineering-ai.json mixed_seven_channel_control.channels[0]",
+    "physical": "ResistiveMixed/ai0"
+   },
+   {
+    "column_index": 1,
+    "prior_control": "engineering-ai.json mixed_seven_channel_control.channels[1]",
+    "physical": "ResistiveMixed/ai1"
+   },
+   {
+    "column_index": 2,
+    "prior_control": "engineering-ai.json mixed_seven_channel_control.channels[2]",
+    "physical": "ResistiveMixed/ai2"
+   },
+   {
+    "column_index": 3,
+    "prior_control": "engineering-ai.json mixed_seven_channel_control.channels[3]",
+    "physical": "ResistiveMixed/ai3"
+   },
+   {
+    "column_index": 4,
+    "prior_control": "engineering-ai.json mixed_seven_channel_control.channels[4]",
+    "physical": "ResistiveMixed/ai4"
+   },
+   {
+    "column_index": 5,
+    "prior_control": "engineering-ai.json mixed_seven_channel_control.channels[5]",
+    "physical": "ResistiveMixed/ai5"
+   },
+   {
+    "column_index": 6,
+    "prior_control": "engineering-ai.json mixed_seven_channel_control.channels[6]",
+    "physical": "ResistiveMixed/ai6"
+   },
+   {
+    "column_index": 7,
+    "physical": "ResistiveMixed/ai7",
+    "measurement": "resistance",
+    "constructor_case": "resistance_a",
+    "quantity": "resistance",
+    "units": "ohms",
+    "finite_key": "ohms",
+    "constructor": "DAQmxCreateAIResistanceChan"
+   },
+   {
+    "column_index": 8,
+    "physical": "ResistiveMixed/ai8",
+    "measurement": "thermistor_current",
+    "constructor_case": "iex_a",
+    "quantity": "temperature",
+    "units": "deg_c",
+    "finite_key": "temperature",
+    "constructor": "DAQmxCreateAIThrmstrChanIex"
+   },
+   {
+    "column_index": 9,
+    "physical": "ResistiveMixed/ai9",
+    "measurement": "thermistor_voltage",
+    "constructor_case": "vex_a",
+    "quantity": "temperature",
+    "units": "deg_c",
+    "finite_key": "temperature",
+    "constructor": "DAQmxCreateAIThrmstrChanVex"
+   },
+   {
+    "column_index": 10,
+    "physical": "ResistiveMixed/ai10",
+    "measurement": "force_bridge",
+    "constructor_case": "force_a",
+    "quantity": "force",
+    "units": "newtons",
+    "finite_key": "force",
+    "constructor": "DAQmxCreateAIForceBridgeTwoPointLinChan"
+   },
+   {
+    "column_index": 11,
+    "physical": "ResistiveMixed/ai11",
+    "measurement": "pressure_bridge",
+    "constructor_case": "pressure_a",
+    "quantity": "pressure",
+    "units": "pascals",
+    "finite_key": "pressure",
+    "constructor": "DAQmxCreateAIPressureBridgeTwoPointLinChan"
+   },
+   {
+    "column_index": 12,
+    "physical": "ResistiveMixed/ai12",
+    "measurement": "torque_bridge",
+    "constructor_case": "torque_a",
+    "quantity": "torque",
+    "units": "newton_meters",
+    "finite_key": "torque",
+    "constructor": "DAQmxCreateAITorqueBridgeTwoPointLinChan"
+   }
+  ],
+  "shape": [
+   2,
+   13
+  ],
+  "words": 26,
+  "bytes": 208,
+  "literal_bits_scan0": [
+   "3ff0000000000000",
+   "4039000000000000",
+   "3f90000000000000",
+   "4039000000000000",
+   "3f50000000000000",
+   "3f90000000000000",
+   "3ff0000000000000",
+   "4039000000000000",
+   "4039000000000000",
+   "4039000000000000",
+   "3f90000000000000",
+   "3f90000000000000",
+   "3f90000000000000"
+  ],
+  "literal_bits_scan1": [
+   "8000000000000000",
+   "7ff80000000000a5",
+   "7ff0000000000000",
+   "c004000000000000",
+   "bf80000000000000",
+   "fff0000000000000",
+   "0000000000000000",
+   "8000000000000000",
+   "7ff0000000000000",
+   "7ff80000000000a5",
+   "c004000000000000",
+   "fff0000000000000",
+   "0000000000000000"
+  ],
+  "all_words_le_hex": "000000000000f03f0000000000003940000000000000903f0000000000003940000000000000503f000000000000903f000000000000f03f000000000000394000000000000039400000000000003940000000000000903f000000000000903f000000000000903f0000000000000080a50000000000f87f000000000000f07f00000000000004c000000000000080bf000000000000f0ff00000000000000000000000000000080000000000000f07fa50000000000f87f00000000000004c0000000000000f0ff0000000000000000",
+  "negative_one_scan_le_hex": "000000000000f03f0000000000003940000000000000903f0000000000003940000000000000503f000000000000903f000000000000f03f000000000000394000000000000039400000000000003940000000000000903f000000000000903f000000000000903f",
+  "negative_one_scan_bytes": 104,
+  "continuous": {
+   "request_per_channel": 2,
+   "capacity_f64": 26,
+   "fill_mode": 1,
+   "reserved": "NULL"
+  },
+  "on_demand": {
+   "request_per_channel": 1,
+   "capacity_f64": 13,
+   "fill_mode": 1,
+   "reserved": "NULL"
+  },
+  "constructor_order": [
+   "DAQmxCreateAIVoltageChan",
+   "DAQmxCreateAIThrmcplChan",
+   "DAQmxCreateAICurrentChan",
+   "DAQmxCreateAIRTDChan",
+   "DAQmxCreateAIStrainGageChan",
+   "DAQmxCreateAIBridgeChan",
+   "DAQmxCreateAIAccelChan",
+   "DAQmxCreateAIResistanceChan",
+   "DAQmxCreateAIThrmstrChanIex",
+   "DAQmxCreateAIThrmstrChanVex",
+   "DAQmxCreateAIForceBridgeTwoPointLinChan",
+   "DAQmxCreateAIPressureBridgeTwoPointLinChan",
+   "DAQmxCreateAITorqueBridgeTwoPointLinChan"
+  ],
+  "selected_optional_setters": [
+   "DAQmxSetAICoupling"
+  ],
+  "explicit_coupling_columns": [
+   4,
+   5,
+   6,
+   7,
+   8,
+   10,
+   11
+  ],
+  "tc_terminal_setter_selected": false,
+  "row": "unchanged mixed_analog_block/driver_scaled_f64_mixed_analog; one metadata vector, no global unit/per-word tags",
+  "old_seven_rule": "exact prior scientific requests/quantity/units/words preserved except physical device renamed to ResistiveMixed",
+  "new_word_rules": "finite key follows each column; no local calibration or thermistor/units conversion"
+ }
+}

@@ -22,6 +22,8 @@ pub(crate) enum SavedItem {
         width: u32,
         height: u32,
         pixel_format: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pixel_encoding: Option<crate::types::PixelEncoding>,
         /// The file is the JPEG the source sent, not an encoding of the
         /// frame.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -36,10 +38,21 @@ pub(crate) enum SavedItem {
 pub(crate) struct SavedFile {
     /// UTC Unix milliseconds, taken when the frame was received.
     pub wall_ms: u64,
+    /// Host receive time on the same monotonic clock as the data coordinator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received_monotonic_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_timestamp: Option<Box<crate::types::DeviceTimestamp>>,
     pub path: String,
     pub bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
+    /// Opaque camera chunk artifacts kept beside the image or recording.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunks: Option<Value>,
+    /// Complete multipart component companions, when the source delivered them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multipart: Option<Box<Value>>,
     #[serde(default, skip_serializing_if = "Context::is_empty")]
     pub context: Context,
     #[serde(flatten)]
@@ -56,6 +69,8 @@ pub(crate) struct RecordedFile {
     pub ended_ms: u64,
     pub codec: String,
     pub encoder: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunks: Option<Value>,
     /// The file reached its maximum size before `FFmpeg` finished it, and was
     /// cut there: it plays up to its last whole part, and holds fewer
     /// frames than were encoded.
@@ -74,6 +89,7 @@ impl SavedFile {
             width,
             height,
             pixel_format,
+            pixel_encoding,
             ..
         } = &self.item
         else {
@@ -84,12 +100,16 @@ impl SavedFile {
             "camera": crate::media::redact_url(camera),
             "time": crate::scheduling::rfc3339(self.wall_ms),
             "device_ts_ns": device_ts_ns,
+            "device_timestamp": self.device_timestamp,
             "frame_id": (*frame_id > 0).then_some(*frame_id),
             "width": width,
             "height": height,
-            "pixel_format": crate::inspect::pixel_format_label(*pixel_format),
+            "pixel_format": crate::inspect::pixel_format_label_with_encoding(*pixel_format, *pixel_encoding),
+            "pixel_encoding": pixel_encoding,
             "bytes": self.bytes,
             "sha256": self.sha256,
+            "chunks": self.chunks,
+            "multipart": self.multipart,
             "settings": settings(features),
             "tags": self.context,
         }))
@@ -233,12 +253,20 @@ mod tests {
     #[test]
     fn manifest_lines_describe_each_file_and_append_whole() {
         let file = SavedFile {
+            received_monotonic_ns: None,
+            device_timestamp: Some(Box::new(crate::types::DeviceTimestamp {
+                ticks: u64::MAX,
+                frequency_hz: None,
+            })),
             wall_ms: 1_793_000_000_123,
             path: "/data/shot-0001.png".into(),
             bytes: 2048,
             sha256: Some("ab".repeat(32)),
+            chunks: None,
+            multipart: None,
             context: Context::from([("lot".into(), "7".into())]),
             item: SavedItem::Capture {
+                pixel_encoding: None,
                 frame_id: 12,
                 device_ts_ns: Some(5_000),
                 width: 64,
@@ -256,6 +284,7 @@ mod tests {
                 "camera": "rtsp://<redacted>@cam/live",
                 "time": "2026-10-26T07:33:20.123Z",
                 "device_ts_ns": 5000,
+                "device_timestamp": {"ticks": u64::MAX},
                 "frame_id": 12,
                 "width": 64,
                 "height": 48,
@@ -273,6 +302,8 @@ mod tests {
         }
         let hosted = hosted.manifest_line("sim:0", &Value::Null);
         assert!(hosted.get("device_ts_ns").is_none(), "{hosted}");
+        assert_eq!(hosted["device_timestamp"]["ticks"], u64::MAX);
+        assert!(hosted["device_timestamp"].get("frequency_hz").is_none());
         let dir = std::env::temp_dir().join(format!("capturefab-manifest-{}", std::process::id()));
         let path = dir.join("runs/manifest.jsonl");
         let manifest = Manifest::open(&path).unwrap();

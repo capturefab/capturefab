@@ -6,8 +6,9 @@ use crate::types::Frame;
 /// A rectangle of a frame's pixels, read in place: pixel (x, y) of the view
 /// is the frame's (x0 + x, y0 + y). A region is an image of its own, as a
 /// crop of it would be: a demosaic at its edges reads only its own samples.
-/// A Bayer region starts on even coordinates (`inspect::crop_rect` makes
-/// it so), so it keeps the frame's color filter phase.
+/// Bayer readers derive the color filter phase from this origin, including
+/// odd regions; `inspect::crop_rect` rounds public crops to complete quads
+/// when both source dimensions contain a whole quad.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FrameRef<'a> {
     pub frame: &'a Frame,

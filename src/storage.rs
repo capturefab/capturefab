@@ -32,6 +32,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod staged;
+pub(crate) use staged::StagedRecording;
+
 /// Overrides the free-space floor: bytes, or a size such as `2G`; `0`
 /// turns it off.
 pub(crate) const MIN_FREE_ENV: &str = "CAPTUREFAB_MIN_FREE";
@@ -753,6 +756,30 @@ impl Recording {
         );
         result
     }
+    /// Ask the OS to sync the current file data and its directory entry. Directory
+    /// sync uses the same platform/filesystem qualifications as [`Folders::sync`].
+    /// This neither closes the recording nor promises power-loss durability or a
+    /// bounded filesystem call. A prior write failure/cut is never acknowledged.
+    pub(crate) fn checkpoint(&self) -> Result<()> {
+        if let Some(error) = self.alarm.error() {
+            return Err(error);
+        }
+        ensure!(
+            self.cut.is_none(),
+            "cannot checkpoint a recording cut short: {}",
+            self.path.display()
+        );
+        self.file
+            .as_ref()
+            .context("recording already finished")?
+            .sync_data()
+            .with_context(|| format!("cannot checkpoint recording {}", self.path.display()))?;
+        Folders::of(&self.path).sync()?;
+        if let Some(error) = self.alarm.error() {
+            return Err(error);
+        }
+        Ok(())
+    }
     /// Close the file with its bytes on disk, and its folder: its size. A
     /// file cut short keeps the bytes before the cut, as every recording
     /// container plays up to its last complete part.
@@ -1248,6 +1275,45 @@ mod tests {
         recording.write_all(b"video").unwrap();
         assert_eq!(recording.finish().unwrap(), 5);
         assert_eq!(SYNCED.take(), [temp.path("f/g")]);
+    }
+
+    #[test]
+    fn recording_checkpoints_sync_the_name_and_leave_append_position_and_count_intact() {
+        let temp = Temp::new("recording-checkpoint");
+        let path = temp.path("samples.jsonl");
+        let mut recording = Recording::create(&path, None, None).unwrap();
+        SYNCED.take();
+        recording.write_all(b"first\n").unwrap();
+        recording.checkpoint().unwrap();
+        assert_eq!(SYNCED.take(), std::slice::from_ref(&temp.0));
+        assert_eq!(recording.bytes_written(), 6);
+        assert_eq!(fs::read(&path).unwrap(), b"first\n");
+        recording.write_all(b"next\n").unwrap();
+        recording.checkpoint().unwrap();
+        assert_eq!(SYNCED.take(), std::slice::from_ref(&temp.0));
+        assert_eq!(recording.bytes_written(), 11);
+        assert_eq!(recording.finish().unwrap(), 11);
+        assert_eq!(fs::read(&path).unwrap(), b"first\nnext\n");
+    }
+
+    #[test]
+    fn recording_checkpoints_reject_prior_cuts_and_disk_alarms_without_syncing_a_receipt() {
+        let temp = Temp::new("recording-checkpoint-failure");
+        let mut recording = Recording::create(&temp.path("cut.jsonl"), Some(3), None).unwrap();
+        SYNCED.take();
+        recording.write_all(b"abcdef").unwrap_err();
+        recording.checkpoint().unwrap_err();
+        assert_eq!(recording.bytes_written(), 3);
+        assert_eq!(SYNCED.take(), Vec::<PathBuf>::new());
+        let recording = Recording::create(&temp.path("alarm.jsonl"), None, None).unwrap();
+        recording
+            .alarm
+            .raise(NoRoom::Refused("injected full disk".into()));
+        assert_eq!(
+            reason(&recording.checkpoint().unwrap_err()),
+            ErrorKind::StorageFull
+        );
+        assert_eq!(SYNCED.take(), Vec::<PathBuf>::new());
     }
 
     #[test]

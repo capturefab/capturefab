@@ -865,6 +865,23 @@ fn unhex(text: &str) -> Result<Vec<u8>> {
         .collect()
 }
 impl RegisterIo for Simulator {
+    fn read_memory_until(
+        &mut self,
+        address: u64,
+        length: usize,
+        deadline: Instant,
+    ) -> Result<Vec<u8>> {
+        crate::types::control_remaining(deadline)?;
+        let data = self.read_memory(address, length)?;
+        crate::types::control_remaining(deadline)?;
+        Ok(data)
+    }
+    fn write_memory_until(&mut self, address: u64, data: &[u8], deadline: Instant) -> Result<()> {
+        crate::types::control_remaining(deadline)?;
+        self.write_memory(address, data)?;
+        crate::types::control_remaining(deadline).map(|_| ())
+    }
+
     fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
         let a = usize::try_from(address)?;
         let end = a
@@ -1255,6 +1272,8 @@ impl Simulator {
             self.adjust(sum as f64 / pixels.max(1) as f64);
         }
         Frame {
+            pixel_encoding: None,
+            device_timestamp: None,
             id: self.frame_id,
             width,
             height,
@@ -1264,6 +1283,9 @@ impl Simulator {
                     .unwrap_or(u64::MAX),
             ),
             wall_ms: 0,
+            received_monotonic_ns: None,
+            chunks: None,
+            multipart: None,
             data: data.freeze(),
             jpeg: None,
         }

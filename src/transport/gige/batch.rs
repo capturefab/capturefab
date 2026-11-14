@@ -80,12 +80,10 @@ impl Batch {
         let mut fates: [_; BATCH] = std::array::from_fn(|_| Fate::Stray);
         for (index, message) in received.iter().enumerate() {
             let fate = match slots.get(index) {
-                _ if !message.from_camera => Fate::Stray,
+                _ if !message.from_camera || message.truncated => Fate::Stray,
                 Some(slot) => {
                     let header = &self.headers[index][..slot.header];
-                    if let Some(packet) =
-                        Assembler::lands(slot, (header, message.len, message.truncated))
-                    {
+                    if let Some(packet) = Assembler::lands(slot, (header, message.len, false)) {
                         Fate::Landed(packet)
                     } else {
                         let scratch = &mut self.scratch[index];

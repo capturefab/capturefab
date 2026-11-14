@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "provenance": "additive_independent_primary_Type1v4_dense_recipe_before_new_encoder_decoder_read",
+  "header_and_module_hex": "0202020201000000010000000000000008070605040302010400000048fa0000000000000000000001000000000000002a00000001000000803e0000010000006400000000000000c800000000000000000000800000803f000000400000003f0000000000030000",
+  "first_record_hex": "3412cdab",
+  "middle_zero_records": 15998,
+  "last_record_hex": "ffff0100",
+  "crc32": 1199645375,
+  "crc32_le_hex": "bf228147",
+  "packet_bytes": 64108,
+  "packet_sha256": "ac8001d81c23870e4903d4684f7d7408685001c5448a634c29c31f2781117268",
+  "native": {
+    "beams": 16000,
+    "lines": 1,
+    "echoes": 1,
+    "distance_prefix": [
+      4660
+    ],
+    "distance_last": 65535,
+    "rssi_prefix": [
+      43981
+    ],
+    "rssi_last": 1,
+    "middle_zero_words": 15998,
+    "clock_sync": "not_verified"
+  }
+}

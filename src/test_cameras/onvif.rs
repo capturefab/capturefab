@@ -140,12 +140,17 @@ impl OnvifServer {
                         }
                         match listener.accept() {
                             Ok((mut stream, _)) => {
+                                let deadline = Instant::now() + Duration::from_secs(3);
+                                if stream.set_nonblocking(false).is_err() {
+                                    continue;
+                                }
                                 if clients.load(Ordering::Relaxed) >= MAX_CLIENTS {
                                     let _ = response(
                                         &mut stream,
                                         503,
                                         "text/plain",
                                         b"Too many test camera clients",
+                                        deadline,
                                     );
                                     continue;
                                 }
@@ -153,7 +158,7 @@ impl OnvifServer {
                                 let service = service.clone();
                                 let clients = clients.clone();
                                 workers.push(thread::spawn(move || {
-                                    let _ = serve(&mut stream, &service);
+                                    let _ = serve(&mut stream, &service, deadline);
                                     clients.fetch_sub(1, Ordering::Relaxed);
                                 }));
                             }
@@ -437,10 +442,49 @@ fn scope_matches(probe: &str, scope: &str, rfc3986: bool) -> bool {
         _ => false,
     }
 }
-fn serve(stream: &mut TcpStream, service: &Service) -> Result<()> {
-    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    let deadline = Instant::now() + Duration::from_secs(3);
+fn http_remaining(deadline: Instant) -> std::io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|left| !left.is_zero())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "HTTP request timed out"))
+}
+
+fn read_request(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<usize> {
+    stream.set_read_timeout(Some(
+        http_remaining(deadline)?.min(Duration::from_millis(100)),
+    ))?;
+    let received = stream.read(buffer)?;
+    http_remaining(deadline)?;
+    Ok(received)
+}
+
+fn write_response(
+    stream: &mut TcpStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        stream.set_write_timeout(Some(http_remaining(deadline)?.min(Duration::from_secs(2))))?;
+        match stream.write(bytes) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "virtual ONVIF HTTP response stopped writing",
+                ));
+            }
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    http_remaining(deadline).map(drop)
+}
+
+fn serve(stream: &mut TcpStream, service: &Service, deadline: Instant) -> Result<()> {
     let mut bytes = Vec::new();
     let mut buffer = [0u8; 2048];
     let header_end = loop {
@@ -452,7 +496,7 @@ fn serve(stream: &mut TcpStream, service: &Service) -> Result<()> {
             Instant::now() < deadline && !service.shutdown.load(Ordering::Relaxed),
             "HTTP request timed out"
         );
-        match stream.read(&mut buffer) {
+        match read_request(stream, &mut buffer, deadline) {
             Ok(0) => return Ok(()),
             Ok(length) => bytes.extend(&buffer[..length]),
             Err(error)
@@ -482,17 +526,27 @@ fn serve(stream: &mut TcpStream, service: &Service) -> Result<()> {
     }
     ensure!(content_length <= 65536, "SOAP request size limit");
     if method == "GET" && path == "/snapshot.jpg" {
-        let Some((_, frame)) = service.frames.wait_after(0, Duration::from_secs(1)) else {
-            return response(stream, 503, "text/plain", b"No test frame available");
+        let Some((_, frame)) = service
+            .frames
+            .wait_after(0, http_remaining(deadline)?.min(Duration::from_secs(1)))
+        else {
+            return response(
+                stream,
+                503,
+                "text/plain",
+                b"No test frame available",
+                deadline,
+            );
         };
         let raster = crate::jpeg::Raster::new(&frame)?;
         return match crate::jpeg::software(&raster) {
-            Ok(jpeg) => response(stream, 200, "image/jpeg", &jpeg),
+            Ok(jpeg) => response(stream, 200, "image/jpeg", &jpeg, deadline),
             Err(_) => response(
                 stream,
                 503,
                 "text/plain",
                 b"JPEG snapshots require a JPEG-enabled build",
+                deadline,
             ),
         };
     }
@@ -504,6 +558,7 @@ fn serve(stream: &mut TcpStream, service: &Service) -> Result<()> {
             404,
             "text/plain",
             b"Use /onvif/device_service, /onvif/media_service or /snapshot.jpg",
+            deadline,
         );
     }
     while bytes.len() < header_end + content_length {
@@ -511,7 +566,7 @@ fn serve(stream: &mut TcpStream, service: &Service) -> Result<()> {
             Instant::now() < deadline && !service.shutdown.load(Ordering::Relaxed),
             "SOAP request timed out"
         );
-        match stream.read(&mut buffer) {
+        match read_request(stream, &mut buffer, deadline) {
             Ok(0) => anyhow::bail!("truncated SOAP request"),
             Ok(length) => bytes.extend(&buffer[..length]),
             Err(error)
@@ -529,21 +584,28 @@ fn serve(stream: &mut TcpStream, service: &Service) -> Result<()> {
         status,
         "application/soap+xml; charset=utf-8",
         reply.as_bytes(),
+        deadline,
     )
 }
-fn response(stream: &mut TcpStream, status: u16, content_type: &str, body: &[u8]) -> Result<()> {
+fn response(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    deadline: Instant,
+) -> Result<()> {
     let reason = match status {
         200 => "OK",
         404 => "Not Found",
         500 => "Internal Server Error",
         _ => "Service Unavailable",
     };
-    write!(
-        stream,
+    let header = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
         body.len()
-    )?;
-    stream.write_all(body)?;
+    );
+    write_response(stream, header.as_bytes(), deadline)?;
+    write_response(stream, body, deadline)?;
     Ok(())
 }
 /// Returns the HTTP status and SOAP envelope; faults use HTTP 500 (SOAP 1.2

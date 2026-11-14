@@ -18,12 +18,24 @@ use std::{
     time::{Duration, Instant},
 };
 
+pub(crate) mod action_key;
+mod forward;
+pub(crate) use forward::ForwardObservation;
 pub(crate) mod jobs;
+pub(crate) mod monitor;
+pub(crate) mod pinned;
 pub(crate) mod protocol;
+pub(crate) use pinned::LiveCameraBinding;
 mod run;
 mod worker;
 use jobs::{JobBook, JobKind};
 use protocol::WorkerCommand;
+#[cfg(any(
+    feature = "gentl",
+    feature = "usb",
+    all(feature = "ni-daqmx", any(target_os = "linux", windows))
+))]
+pub(crate) use run::protocol_output;
 pub(crate) use run::run_worker;
 #[cfg(jpeg_helper)]
 pub(crate) use worker::executable;
@@ -125,14 +137,25 @@ pub enum SessionCommand {
         strict: bool,
     },
     Auto {
+        /// Use this exact ordinary multipart image for software metering.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_selection: Option<crate::transport::multipart::PartSelection>,
         /// Keep adjusting as a job of the session, until stopped.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         continuous: bool,
         /// Meter only this normalized x, y, width, height part of the frame.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "optional_region"
+        )]
         region: Option<[f64; 4]>,
         /// The longest exposure, in microseconds, before gain is raised.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "optional_float"
+        )]
         max_exposure_us: Option<f64>,
         /// The job's number, which the coordinator assigns.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -173,6 +196,14 @@ pub enum SessionCommand {
         count: u32,
         timeout_ms: u64,
         format: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        part_format: Option<crate::transport::multipart::GvspPartFormat>,
+        #[serde(
+            default,
+            deserialize_with = "crate::config_number::optional_unsigned",
+            skip_serializing_if = "Option::is_none"
+        )]
+        part_index: Option<u32>,
         first_at_ms: u64,
         interval_ms: u64,
         /// What to do when an output name without {seq} exists; fail by default.
@@ -254,7 +285,11 @@ pub enum SessionCommand {
         format: crate::inspect::PreviewFormat,
         /// A normalized x, y, width, height crop of the full-resolution
         /// frame, also the focus region.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "optional_region"
+        )]
         region: Option<[f64; 4]>,
         /// The absolute file the preview is written to, which must not
         /// exist; the private inspect folder when unset.
@@ -272,6 +307,24 @@ pub enum SessionCommand {
         warmup_ms: Option<u64>,
     },
     Xml,
+    ReadRegister {
+        name: crate::controls::Name,
+        #[serde(deserialize_with = "crate::config_number::unsigned")]
+        timeout_ms: u64,
+    },
+    WriteRegister {
+        name: crate::controls::Name,
+        hex: String,
+        #[serde(deserialize_with = "crate::config_number::unsigned")]
+        timeout_ms: u64,
+    },
+    /// Assign the standard WO key in the exact currently live control epoch.
+    WriteActionDeviceKey {
+        #[serde(deserialize_with = "crate::config_number::unsigned")]
+        key: u32,
+        #[serde(deserialize_with = "crate::config_number::unsigned")]
+        timeout_ms: u64,
+    },
     ReadMemory {
         address: u64,
         length: usize,
@@ -284,6 +337,7 @@ pub enum SessionCommand {
         output: String,
         codec: String,
         encoder: String,
+        #[serde(deserialize_with = "finite_float")]
         fps: f64,
         bitrate: String,
         /// End the recording, as asked, at exactly this many bytes; none by
@@ -326,6 +380,9 @@ pub enum SessionCommand {
         /// (`same`), or in any codec a recording copies (`any`).
         #[serde(default, skip_serializing_if = "crate::types::is_default")]
         copy: crate::media::StreamCopy,
+        /// Optional input-frame correspondence for synchronized local video.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeline: Option<crate::media::timeline::Config>,
     },
 }
 /// Most values one `SetValues` writes.
@@ -337,7 +394,7 @@ pub(crate) const MAX_NAMES: usize = 64;
 pub(crate) fn deserialize_command<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<SessionCommand, D::Error> {
-    let StrictValue(value) = StrictValue::deserialize(deserializer)?;
+    let value = strict_json_value(deserializer)?;
     if let Value::Object(fields) = &value
         && fields.get("op").and_then(Value::as_str).is_some_and(|op| {
             matches!(
@@ -360,6 +417,53 @@ pub(crate) fn deserialize_command<'de, D: serde::Deserializer<'de>>(
         )));
     }
     serde_json::from_value(value).map_err(serde::de::Error::custom)
+}
+// Typed numeric fields bypass serde's internally-tagged Content buffering:
+// with arbitrary_precision, noncanonical decimal tokens use a private map.
+// Decode only these declared floating-point fields; domain Values stay exact.
+fn finite_value<E: serde::de::Error>(value: &Value) -> std::result::Result<f64, E> {
+    value
+        .as_f64()
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| E::custom("expected a finite JSON number"))
+}
+fn finite_float<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<f64, D::Error> {
+    finite_value(&Value::deserialize(deserializer)?)
+}
+fn optional_float<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<f64>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    if value.is_null() {
+        Ok(None)
+    } else {
+        finite_value(&value).map(Some)
+    }
+}
+fn optional_region<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<[f64; 4]>, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    let values = value
+        .as_array()
+        .filter(|values| values.len() == 4)
+        .ok_or_else(|| serde::de::Error::custom("region must contain four finite JSON numbers"))?;
+    let mut region = [0.0; 4];
+    for (out, value) in region.iter_mut().zip(values) {
+        *out = finite_value(value)?;
+    }
+    Ok(Some(region))
+}
+/// Strict object keys and lossless numeric tokens for typed JSON configurations.
+pub(crate) fn strict_json_value<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Value, D::Error> {
+    StrictValue::deserialize(deserializer).map(|StrictValue(value)| value)
 }
 struct StrictValue(Value);
 impl<'de> Deserialize<'de> for StrictValue {
@@ -387,6 +491,18 @@ impl<'de> Deserialize<'de> for StrictValue {
             fn visit_u64<E: serde::de::Error>(
                 self,
                 value: u64,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(StrictValue(Value::Number(value.into())))
+            }
+            fn visit_i128<E: serde::de::Error>(
+                self,
+                value: i128,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(StrictValue(Value::Number(value.into())))
+            }
+            fn visit_u128<E: serde::de::Error>(
+                self,
+                value: u128,
             ) -> std::result::Result<Self::Value, E> {
                 Ok(StrictValue(Value::Number(value.into())))
             }
@@ -432,6 +548,20 @@ impl<'de> Deserialize<'de> for StrictValue {
             ) -> std::result::Result<Self::Value, A::Error> {
                 let mut result = serde_json::Map::new();
                 while let Some(key) = values.next_key::<String>()? {
+                    // serde_json represents arbitrary-precision decimal tokens
+                    // through a private one-entry map in deserialize_any.
+                    if result.is_empty() && key == "$serde_json::private::Number" {
+                        let text: String = values.next_value()?;
+                        if values.next_key::<String>()?.is_some() {
+                            return Err(serde::de::Error::custom(
+                                "invalid JSON number representation",
+                            ));
+                        }
+                        let number = text
+                            .parse::<serde_json::Number>()
+                            .map_err(serde::de::Error::custom)?;
+                        return Ok(StrictValue(Value::Number(number)));
+                    }
                     if result.contains_key(&key) {
                         return Err(serde::de::Error::custom(format!("duplicate field `{key}`")));
                     }
@@ -524,6 +654,12 @@ impl SessionCommand {
                     value.validate()?;
                 }
             }
+            Self::WriteActionDeviceKey { timeout_ms, .. } => {
+                ensure!(
+                    (1..=30_000).contains(timeout_ms),
+                    crate::types::Usage("action key timeout must be 1..30000ms".into())
+                );
+            }
             Self::Exec { name } => name.validate()?,
             Self::FeatureList { filter } => filter.validate()?,
             Self::Frame {
@@ -566,8 +702,12 @@ impl SessionCommand {
             Self::Auto {
                 region,
                 max_exposure_us,
+                part_selection,
                 ..
             } => {
+                if let Some(selection) = part_selection {
+                    selection.validate()?;
+                }
                 ensure!(
                     max_exposure_us.is_none_or(|us| us.is_finite() && us > 0.0),
                     "the longest exposure must be a positive time"
@@ -607,6 +747,8 @@ impl SessionCommand {
                 count,
                 timeout_ms,
                 format,
+                part_format,
+                part_index,
                 on_exists,
                 context,
                 utc_offset_s,
@@ -626,6 +768,13 @@ impl SessionCommand {
                     ["png", "jpeg", "raw"].contains(&format.as_str()),
                     "format must be png, jpeg or raw"
                 );
+                crate::transport::multipart::GvspPartFormat::validate_index(
+                    *part_index,
+                    *part_format,
+                )?;
+                if let Some(selection) = part_format {
+                    selection.validate_output(output, format)?;
+                }
                 crate::engine::validate_capture_output(output)?;
                 crate::naming::validate_request(output, *count, *on_exists, context)?;
                 ensure!(
@@ -676,6 +825,25 @@ impl SessionCommand {
                 );
             }
             Self::StopJob { job } => validate_job(job)?,
+            Self::ReadRegister { name, timeout_ms } => {
+                name.validate()?;
+                ensure!(
+                    (1..=30_000).contains(timeout_ms),
+                    "register timeout must be 1..30000ms"
+                );
+            }
+            Self::WriteRegister {
+                name,
+                hex,
+                timeout_ms,
+            } => {
+                name.validate()?;
+                ensure!(
+                    (1..=30_000).contains(timeout_ms),
+                    "register timeout must be 1..30000ms"
+                );
+                crate::types::validate_hex(hex, 65536)?;
+            }
             Self::ReadMemory { address, length } => validate_memory(*address, *length)?,
             Self::WriteMemory { address, data } => validate_memory(*address, data.len())?,
             Self::Forward {
@@ -685,6 +853,8 @@ impl SessionCommand {
                 fps,
                 bitrate,
                 max_file_bytes,
+                timeline,
+                copy,
                 on_exists,
                 context,
                 duration_ms,
@@ -694,6 +864,10 @@ impl SessionCommand {
             } => {
                 crate::naming::validate_offset(*utc_offset_s)?;
                 validate_warmup(*warmup_ms)?;
+                ensure!(
+                    timeline.is_none() || copy.is_never(),
+                    "indexed video cannot copy compressed source packets"
+                );
                 // The range `record --for` accepts.
                 ensure!(
                     duration_ms.is_none_or(|duration| {
@@ -710,6 +884,7 @@ impl SessionCommand {
                     bitrate: bitrate.clone(),
                     max_file_bytes: *max_file_bytes,
                     min_free: None,
+                    timeline: timeline.clone(),
                 }
                 .validate()?;
             }
@@ -745,6 +920,7 @@ pub(crate) fn default_request_timeout(command: &SessionCommand) -> Duration {
             .saturating_add(15_000),
         // The worker bounds the writes to 90 s; a rollback may take as long,
         // and restarting the stream follows.
+        SessionCommand::WriteActionDeviceKey { timeout_ms, .. } => timeout_ms.saturating_add(1000),
         SessionCommand::ApplySetup { .. } => 240_000,
         SessionCommand::Wait { timeout_ms, .. } => timeout_ms.saturating_add(5_000),
         // A recording's encoder may take 10 s to finish its file.
@@ -787,6 +963,22 @@ pub(crate) fn validate_timeout(timeout_ms: u64) -> Result<()> {
 }
 pub(crate) fn validate_selector(camera: &str) -> Result<()> {
     crate::camera::validate_selector_shape(camera)
+}
+// Explicit monitor identities never enter the normal serial/IP/model alias space.
+fn canonical_selector(selector: &str) -> Result<String> {
+    if crate::transport::gige::monitor::is_selector(selector) {
+        Ok(crate::transport::gige::monitor::MonitorSpec::parse(selector)?.canonical())
+    } else {
+        Ok(selector.to_owned())
+    }
+}
+fn same_connect_mode(requested: &str, actual: &str) -> bool {
+    let monitor = crate::transport::gige::monitor::is_selector;
+    if monitor(requested) {
+        requested == actual
+    } else {
+        !monitor(actual)
+    }
 }
 /// Where a session client receives an image captured to stdout: a private
 /// file it names `<pid>-<hex>` in the runtime folder's `out`, or in this
@@ -1115,7 +1307,7 @@ pub struct SessionSnapshot {
     pub cameras: Vec<CameraSnapshot>,
     pub logs: Vec<LogEntry>,
 }
-type Reply = Receiver<Result<Value>>;
+pub(crate) type Reply = Receiver<Result<Value>>;
 /// The connected cameras an error offers instead, with credentials redacted.
 #[allow(
     single_use_lifetimes,
@@ -1152,6 +1344,8 @@ struct Held {
     worker: RwLock<Option<Arc<Worker>>>,
     /// Why its last worker exited, while no other runs.
     crash: Mutex<Option<Value>>,
+    /// Sticky terminal cause of this exact camera binding, never cleared by reconnect.
+    retired: Mutex<Option<Value>>,
     /// A worker ended in the middle of a settings change.
     config_unknown: AtomicBool,
     crashes: Mutex<VecDeque<Instant>>,
@@ -1225,6 +1419,31 @@ impl Drop for CameraUse {
     }
 }
 impl Held {
+    fn retired_error(&self) -> Option<anyhow::Error> {
+        let retired = locked(&self.retired).as_ref().map(protocol::from_wire);
+        if let Some(error) = retired {
+            return Some(error);
+        }
+        // Read the exact slot, including exited workers: an early event may
+        // precede this Held's attachment, and exit must not permit reconnect.
+        let worker = self
+            .worker
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(error) = worker.and_then(|worker| worker.shared().retirement()) {
+            self.remember_retirement(error);
+        }
+        locked(&self.retired).as_ref().map(protocol::from_wire)
+    }
+    fn remember_retirement(&self, error: Value) {
+        if !crate::engine::retirement::wire_is_retired(&error) {
+            return;
+        }
+        locked(&self.retired).get_or_insert(error);
+        self.live.store(false, Ordering::Release);
+        self.config_unknown.store(true, Ordering::Release);
+    }
     /// A request uses it, which wants it kept at least `keep` after; false
     /// once it is being let go.
     fn enter(&self, keep: Option<Duration>) -> bool {
@@ -1394,6 +1613,38 @@ struct Coordinator {
     /// Every worker started, connected yet or not, for `killer`.
     spawned: Mutex<Vec<Weak<worker::Shared>>>,
 }
+
+/// The single saved-file observation for an industrial capture job.
+#[derive(Debug, Default)]
+pub(crate) struct SavedCapture {
+    file: Mutex<Option<Result<crate::engine::saved::SavedFile>>>,
+}
+impl SavedCapture {
+    fn record(&self, file: &crate::engine::saved::SavedFile) {
+        let mut saved = locked(&self.file);
+        *saved = Some(if saved.is_some() {
+            Err(Categorized::error(
+                ErrorKind::Incomplete,
+                "camera capture returned duplicate saved-file metadata",
+            ))
+        } else {
+            Ok(file.clone())
+        });
+    }
+
+    pub(crate) fn try_take(&self) -> Option<Result<crate::engine::saved::SavedFile>> {
+        locked(&self.file).take()
+    }
+
+    pub(crate) fn take(&self) -> Result<crate::engine::saved::SavedFile> {
+        self.try_take().ok_or_else(|| {
+            Categorized::error(
+                ErrorKind::Incomplete,
+                "camera completed without saved-file metadata",
+            )
+        })?
+    }
+}
 /// Holds one of the bounded command slots; released even if the command panics.
 /// Frame inspections count against their own bound, so observing never
 /// takes a slot from camera actions.
@@ -1529,6 +1780,19 @@ impl Default for SessionHandle {
     }
 }
 impl SessionHandle {
+    /// Observe a single scheduled still's metadata without moving image bytes.
+    pub(crate) fn submit_observed_capture(
+        &self,
+        command: SessionCommand,
+    ) -> Result<(Reply, Arc<SavedCapture>)> {
+        ensure!(
+            matches!(&command, SessionCommand::Schedule { count: 1, .. }),
+            "saved capture observation requires one scheduled still"
+        );
+        let capture = Arc::new(SavedCapture::default());
+        let reply = self.submit_target(None, command, None, Some(Arc::downgrade(&capture)))?;
+        Ok((reply, capture))
+    }
     /// The workers of one command, outside any session.
     #[must_use]
     pub fn new() -> Self {
@@ -1621,7 +1885,12 @@ impl SessionHandle {
         if crate::camera::is_explicit_selector(&camera) {
             return camera;
         }
-        let resolution = crate::camera::resolve_selector(&camera, &self.devices());
+        let devices: Vec<_> = self
+            .devices()
+            .into_iter()
+            .filter(|info| !crate::transport::gige::monitor::is_selector(&info.id))
+            .collect();
+        let resolution = crate::camera::resolve_selector(&camera, &devices);
         match resolution {
             crate::camera::Resolution::Loose { info, matched_on } => {
                 self.note(
@@ -1689,8 +1958,13 @@ impl SessionHandle {
             .collect();
         let worker = held.worker();
         let report = worker.as_ref().map(|worker| worker.status(STATUS_WAIT));
-        let crash = locked(&held.crash).clone();
+        let crash = held
+            .retired_error()
+            .as_ref()
+            .map(protocol::wire_error)
+            .or_else(|| locked(&held.crash).clone());
         let error = match (&report, crash) {
+            (_, Some(error)) if crate::engine::retirement::wire_is_retired(&error) => Some(error),
             (Some(Err(error)), _) => Some(protocol::wire_error(error)),
             (_, crash) => crash,
         };
@@ -1756,7 +2030,7 @@ impl SessionHandle {
     /// The held camera `target` names, or the only one.
     fn target(&self, target: Option<&str>) -> Result<(String, Arc<Held>)> {
         let id = match target {
-            Some(target) => self.camera_id(target),
+            Some(target) => self.camera_id(&canonical_selector(target)?),
             None => self.only_camera()?,
         };
         let cameras = self
@@ -1767,10 +2041,11 @@ impl SessionHandle {
         if let Some(held) = cameras.get(&id) {
             return Ok((id, held.clone()));
         }
-        if let Some((key, held)) = cameras
-            .iter()
-            .find(|(_, held)| held.info.serial == id || held.info.address.as_deref() == Some(&id))
-        {
+        if let Some((key, held)) = cameras.iter().find(|(_, held)| {
+            !crate::transport::gige::monitor::is_selector(&id)
+                && !crate::transport::gige::monitor::is_selector(&held.info.id)
+                && (held.info.serial == id || held.info.address.as_deref() == Some(&id))
+        }) {
             return Ok((key.clone(), held.clone()));
         }
         Err(Categorized::new(
@@ -1783,6 +2058,35 @@ impl SessionHandle {
         .details(json!({"candidates": candidates(cameras.keys())}))
         .into())
     }
+    /// Resolve queued camera work against the exact binding seen at submission.
+    /// Explicit reconnect may install a new Held, but never transfers old work.
+    fn command_camera(
+        &self,
+        target: Option<&str>,
+        binding: Option<&(String, Arc<Held>)>,
+    ) -> Result<(String, Arc<Held>)> {
+        let Some((id, held)) = binding else {
+            return self.target(target);
+        };
+        if let Some(error) = held.retired_error() {
+            return Err(error);
+        }
+        let current = self
+            .inner
+            .cameras
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        ensure!(
+            current
+                .get(id)
+                .is_some_and(|current| Arc::ptr_eq(current, held)),
+            Categorized::error(
+                ErrorKind::Disconnected,
+                "camera binding changed before this command started"
+            )
+        );
+        Ok((id.clone(), held.clone()))
+    }
     /// Submit a command and return the channel carrying its eventual result.
     ///
     /// # Errors
@@ -1790,7 +2094,7 @@ impl SessionHandle {
     /// pending-command capacity, or failure to start the command thread. Command
     /// execution errors are delivered through the returned reply channel.
     pub fn submit(&self, c: SessionCommand) -> Result<Reply> {
-        self.submit_target(None, c, None)
+        self.submit_target(None, c, None, None)
     }
     /// Submit a command for a camera selector.
     ///
@@ -1798,7 +2102,7 @@ impl SessionHandle {
     /// Returns the submission errors described by [`Self::submit`], or an error
     /// for an invalid camera selector. Execution errors arrive through the reply.
     pub fn submit_to(&self, camera: &str, c: SessionCommand) -> Result<Reply> {
-        self.submit_target(Some(camera.to_owned()), c, None)
+        self.submit_target(Some(camera.to_owned()), c, None, None)
     }
     /// Run `command` for a client of the session, on `camera` when given,
     /// while `gone` tells whether that client went away. A job wait then
@@ -1820,6 +2124,7 @@ impl SessionHandle {
         let caller_only = matches!(
             &command,
             SessionCommand::Frame { .. }
+                | SessionCommand::WriteActionDeviceKey { .. }
                 | SessionCommand::Capture {
                     stdout: Some(_),
                     ..
@@ -1834,6 +2139,8 @@ impl SessionHandle {
             command.validate()?;
             if let Some(camera) = camera {
                 validate_selector(camera)?;
+                let camera = canonical_selector(camera)?;
+                monitor::validate_for_selector(&self.camera_id(&camera), &command)?;
             }
             if self.inner.quitting.load(Ordering::Relaxed) {
                 return Err(stopping());
@@ -1841,7 +2148,7 @@ impl SessionHandle {
             return self.wait_job_while(job, *after_seq, Duration::from_millis(*timeout_ms), gone);
         }
         let cancel = caller_only.then(|| Arc::new(Cancel::default()));
-        let reply = self.submit_target(camera.map(str::to_owned), command, cancel.clone())?;
+        let reply = self.submit_target(camera.map(str::to_owned), command, cancel.clone(), None)?;
         let Some(cancel) = cancel else {
             return reply.recv().context("coordinator stopped")?;
         };
@@ -1862,6 +2169,11 @@ impl SessionHandle {
     /// Resolve aliases from cached identities, without waiting for a busy
     /// worker. All names for one camera share an ordering gate.
     fn camera_id(&self, selector: &str) -> String {
+        if crate::transport::gige::monitor::is_selector(selector) {
+            // Submission/target reject invalid syntax. Even an invalid explicit
+            // monitor prefix must never fall through to a controller alias.
+            return canonical_selector(selector).unwrap_or_else(|_| selector.to_owned());
+        }
         let cameras = self.cameras();
         let devices = self.devices();
         let identities = || {
@@ -1869,11 +2181,14 @@ impl SessionHandle {
                 .iter()
                 .map(|(_, held)| &held.info)
                 .chain(devices.iter())
+                .filter(|info| !crate::transport::gige::monitor::is_selector(&info.id))
         };
         if identities().any(|info| info.id == selector) {
             return selector.to_owned();
         }
-        if let Some(id) = locked(&self.inner.aliases).get(selector) {
+        if let Some(id) = locked(&self.inner.aliases).get(selector)
+            && !crate::transport::gige::monitor::is_selector(id)
+        {
             return id.clone();
         }
         if let Some(info) = identities()
@@ -1884,9 +2199,10 @@ impl SessionHandle {
         // A connected camera named as clients see it, with its credentials
         // redacted.
         let redacted = crate::media::redact_url(selector);
-        let mut shown = cameras
-            .iter()
-            .filter(|(id, _)| crate::media::redact_url(id) == redacted);
+        let mut shown = cameras.iter().filter(|(id, _)| {
+            !crate::transport::gige::monitor::is_selector(id)
+                && crate::media::redact_url(id) == redacted
+        });
         match (shown.next(), shown.next()) {
             (Some((id, _)), None) if redacted != selector => id.clone(),
             _ => selector.to_owned(),
@@ -2028,10 +2344,36 @@ impl SessionHandle {
         target: Option<String>,
         command: SessionCommand,
         cancel: Option<Arc<Cancel>>,
+        capture: Option<Weak<SavedCapture>>,
     ) -> Result<Reply> {
+        self.submit_target_observed(target, command, cancel, capture, None)
+    }
+    fn submit_target_observed(
+        &self,
+        target: Option<String>,
+        command: SessionCommand,
+        cancel: Option<Arc<Cancel>>,
+        capture: Option<Weak<SavedCapture>>,
+        forward: Option<Arc<ForwardObservation>>,
+    ) -> Result<Reply> {
+        let mut command = command;
+        if let SessionCommand::Connect { camera, .. } = &mut command {
+            *camera = canonical_selector(camera)?;
+        }
+        let target = target
+            .map(|camera| canonical_selector(&camera))
+            .transpose()?;
         command.validate()?;
         if let Some(camera) = &target {
             validate_selector(camera)?;
+        }
+        let policy_camera = match &command {
+            SessionCommand::Connect { camera, .. } => Some(camera.clone()),
+            SessionCommand::NetworkScan { .. } => target.clone(),
+            _ => target.clone().or_else(|| self.only_camera().ok()),
+        };
+        if let Some(camera) = policy_camera {
+            monitor::validate_for_selector(&self.camera_id(&camera), &command)?;
         }
         if self.inner.quitting.load(Ordering::Relaxed) {
             return Err(stopping());
@@ -2040,9 +2382,10 @@ impl SessionHandle {
         // turn or an action slot.
         if inline(&command) {
             let (tx, rx) = mpsc::channel();
-            let _ = tx.send(self.process(target.as_deref(), command, None));
+            let _ = tx.send(self.process(target.as_deref(), command, None, None, None));
             return Ok(rx);
         }
+        let action_key = action_key::Admission::capture(self, target.as_deref(), &command)?;
         let inspection = matches!(command, SessionCommand::Frame { .. });
         let slot = PendingSlot::acquire(&self.inner, inspection)?;
         // A camera command that names no camera is for the only one, and
@@ -2058,6 +2401,15 @@ impl SessionHandle {
             }
         });
         let target = target.map(|camera| self.camera_id(&camera));
+        // Hold the old identity across command-order waits and explicit recovery.
+        let binding = if matches!(
+            command,
+            SessionCommand::Connect { .. } | SessionCommand::NetworkScan { .. }
+        ) {
+            None
+        } else {
+            self.target(target.as_deref()).ok()
+        };
         let turn = self.command_turn(target.as_deref(), &command);
         let h = self.clone();
         let (tx, rx) = mpsc::channel();
@@ -2065,17 +2417,43 @@ impl SessionHandle {
             .name("capturefab-command".into())
             .spawn(move || {
                 let command_turn = turn;
-                if let Some(turn) = &command_turn {
-                    turn.wait();
-                }
-                let result = if h.inner.quitting.load(Ordering::Acquire) {
+                let ordered = action_key.as_ref().map_or_else(
+                    || {
+                        forward.as_ref().map_or_else(
+                            || {
+                                if let Some(turn) = &command_turn {
+                                    turn.wait();
+                                }
+                                Ok(())
+                            },
+                            |observation| observation.wait_turn(command_turn.as_ref(), &h),
+                        )
+                    },
+                    |action| action.wait_turn(command_turn.as_ref(), &h, cancel.as_deref()),
+                );
+                let result = if let Err(error) = ordered {
+                    Err(error)
+                } else if h.inner.quitting.load(Ordering::Acquire) {
                     Err(stopping())
+                } else if let Some(action) = action_key {
+                    action.execute(&h, cancel.as_deref())
                 } else {
                     // The worker never reads the state directory: a named
                     // setup is loaded here, off the caller's thread.
                     crate::setup::resolve(command).and_then(|command| {
-                        h.process(target.as_deref(), command, cancel.as_deref())
+                        h.process_observed(
+                            target.as_deref(),
+                            command,
+                            cancel.as_deref(),
+                            capture,
+                            binding.as_ref(),
+                            forward.as_ref(),
+                        )
                     })
+                };
+                let result = match forward {
+                    Some(observation) => observation.admission(result),
+                    None => result,
                 };
                 // An inspection's failure is its caller's to report; a slow
                 // or triggered camera must not fill the session log.
@@ -2116,8 +2494,25 @@ impl SessionHandle {
         target: Option<&str>,
         command: SessionCommand,
         cancel: Option<&Cancel>,
+        capture: Option<Weak<SavedCapture>>,
+        binding: Option<&(String, Arc<Held>)>,
+    ) -> Result<Value> {
+        self.process_observed(target, command, cancel, capture, binding, None)
+    }
+    fn process_observed(
+        &self,
+        target: Option<&str>,
+        command: SessionCommand,
+        cancel: Option<&Cancel>,
+        capture: Option<Weak<SavedCapture>>,
+        binding: Option<&(String, Arc<Held>)>,
+        forward: Option<&Arc<ForwardObservation>>,
     ) -> Result<Value> {
         match command {
+            SessionCommand::WriteActionDeviceKey { .. } => Err(crate::types::Usage(
+                "action key requires exact live-worker admission".into(),
+            )
+            .into()),
             SessionCommand::NetworkScan { timeout_ms, tune } => {
                 self.scan_network(Duration::from_millis(timeout_ms), tune)
             }
@@ -2159,14 +2554,22 @@ impl SessionHandle {
                 login,
                 saved_login,
             }),
-            SessionCommand::Disconnect => self.disconnect(target),
+            SessionCommand::Disconnect => {
+                // Disconnect drains even a retired binding; unlike frame work it
+                // needs no successful retirement admission check.
+                if let Some((id, held)) = binding {
+                    self.disconnect_held(id, held)
+                } else {
+                    self.disconnect(target)
+                }
+            }
             command @ (SessionCommand::Schedule { .. }
             | SessionCommand::Forward { .. }
             | SessionCommand::Auto {
                 continuous: true, ..
-            }) => self.start_job(target, command),
+            }) => self.start_job(target, command, capture, binding, None, forward),
             command => {
-                let (_, held) = self.target(target)?;
+                let (_, held) = self.command_camera(target, binding)?;
                 let live = match &command {
                     SessionCommand::Start => Some(true),
                     SessionCommand::Stop => Some(false),
@@ -2206,10 +2609,16 @@ impl SessionHandle {
     /// The worker of `held`; one exited is replaced by a reconnect, unless
     /// it keeps crashing.
     fn worker_of(&self, held: &Arc<Held>) -> Result<Arc<Worker>> {
+        if let Some(error) = held.retired_error() {
+            return Err(error);
+        }
         if let Some(worker) = held.worker() {
             return Ok(worker);
         }
         let _turn = locked(&held.reconnecting);
+        if let Some(error) = held.retired_error() {
+            return Err(error);
+        }
         if let Some(worker) = held.worker() {
             return Ok(worker);
         }
@@ -2237,6 +2646,9 @@ impl SessionHandle {
     /// Start a worker for `held` again, as it was connected, streaming again
     /// if it streamed on its own.
     fn reconnect(&self, held: &Arc<Held>) -> Result<Arc<Worker>> {
+        if let Some(error) = held.retired_error() {
+            return Err(error);
+        }
         let worker = Arc::new(self.spawn_worker()?);
         locked(&worker.shared().label).clone_from(&held.info.id);
         let spec = &held.spec;
@@ -2322,17 +2734,42 @@ impl SessionHandle {
     fn on_signal(&self, shared: &worker::Shared, signal: Signal) {
         let key = locked(&shared.label).clone();
         match signal {
-            Signal::Output(protocol::Output::Log { level, message }) => {
-                let entry = camera_line(
-                    LogEntry::now(level, message),
-                    (!key.is_empty()).then_some(key.as_str()),
-                );
-                if self.inner.print_logs && entry.level != "info" {
-                    crate::eprintln!("capturefab: {}", entry.message);
+            Signal::Output(output) => match *output {
+                protocol::Output::Log { level, message } => {
+                    let entry = camera_line(
+                        LogEntry::now(level, message),
+                        (!key.is_empty()).then_some(key.as_str()),
+                    );
+                    if self.inner.print_logs && entry.level != "info" {
+                        crate::eprintln!("capturefab: {}", entry.message);
+                    }
+                    locked(&self.inner.log).note(entry);
                 }
-                locked(&self.inner.log).note(entry);
-            }
-            Signal::Output(output) => self.inner.jobs.event(&output),
+                protocol::Output::Retired { error } => {
+                    let held = self
+                        .inner
+                        .cameras
+                        .read()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .get(&key)
+                        .cloned();
+                    if let Some(held) = held
+                        && held
+                            .worker
+                            .read()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .as_ref()
+                            .is_some_and(|worker| std::ptr::eq(worker.shared().as_ref(), shared))
+                    {
+                        held.remember_retirement(error);
+                    }
+                    // The worker keeps saver/inspector-owned work alive. Its Saved
+                    // and JobEnd events, not this binding event, complete jobs.
+                }
+                output => {
+                    self.inner.jobs.event(&output);
+                }
+            },
             Signal::Exited(error) => {
                 let held = self
                     .inner
@@ -2353,6 +2790,7 @@ impl SessionHandle {
                 if !current || is_stopping(&error) {
                     return;
                 }
+                let error = held.retired_error().unwrap_or(error);
                 self.inner.jobs.fail_camera(&key, &error);
                 if shared.interrupted_change() {
                     held.config_unknown.store(true, Ordering::Release);
@@ -2373,8 +2811,9 @@ impl SessionHandle {
     /// Connect a camera, or find it already held. Concurrent connects to
     /// one camera share one attempt; a camera found under another name is
     /// the one already held.
-    fn connect(&self, spec: ConnectSpec) -> Result<Value> {
+    fn connect(&self, mut spec: ConnectSpec) -> Result<Value> {
         let typed = spec.selector.clone();
+        spec.selector = canonical_selector(&spec.selector)?;
         let remember = |id: &str| {
             if typed != id {
                 locked(&self.inner.aliases).insert(typed.clone(), id.to_owned());
@@ -2394,20 +2833,37 @@ impl SessionHandle {
             .into());
         }
         if let Ok((id, held)) = self.target(Some(&camera)) {
-            let worker = if let Some(worker) = held.worker() {
-                worker
+            // A warm descriptor is only a hint. This camera-thread barrier
+            // observes lease expiry even when the binding was otherwise idle.
+            let worker = if held.retired_error().is_some() {
+                None
+            } else if let Some(worker) = held.worker() {
+                match worker.call(WorkerCommand::CheckConnection) {
+                    Ok(_) => Some(worker),
+                    Err(error) if crate::transport::gige::ownership_retired(&error) => {
+                        held.remember_retirement(protocol::wire_error(&error));
+                        None
+                    }
+                    Err(error) => return Err(error),
+                }
             } else {
-                // Connecting it again by name clears its crash count.
+                // A nonterminal worker crash keeps the existing explicit
+                // reconnect policy. Terminal Held objects are never reused.
                 let _turn = locked(&held.reconnecting);
-                locked(&held.crashes).clear();
-                if let Some(worker) = held.worker() {
-                    worker
+                if held.retired_error().is_some() {
+                    None
                 } else {
-                    self.reconnect(&held)?
+                    locked(&held.crashes).clear();
+                    Some(held.worker().map_or_else(|| self.reconnect(&held), Ok)?)
                 }
             };
-            remember(&id);
-            return Ok(json!({"connected": held.info, "worker_pid": worker.pid()}));
+            if let Some(worker) = worker {
+                remember(&id);
+                return Ok(json!({"connected": held.info, "worker_pid": worker.pid()}));
+            }
+            // Only a new explicit Connect reaches here. Finish owned saves,
+            // release this exact old worker, then allocate a fresh binding.
+            self.disconnect_held(&id, &held)?;
         }
         crate::camera::validate_selector(&camera)?;
         let key = self.camera_id(&camera);
@@ -2471,7 +2927,7 @@ impl SessionHandle {
             Ok(reply) => reply,
             Err(error) => {
                 // Held by this session under another name: that camera.
-                if let Some(found) = self.held_by_us(&error) {
+                if let Some(found) = self.held_by_us(&error, &spec.selector) {
                     return Ok(found);
                 }
                 return Err(error);
@@ -2479,6 +2935,15 @@ impl SessionHandle {
         };
         let info: CameraInfo = serde_json::from_value(reply["connected"].clone())
             .context("worker connected without identity")?;
+        ensure!(
+            same_connect_mode(&spec.selector, &info.id)
+                && (!crate::transport::gige::monitor::is_selector(&info.id)
+                    || info.transport == crate::types::Transport::GigE),
+            Categorized::error(
+                ErrorKind::Incomplete,
+                "worker returned a different monitor/controller camera identity"
+            )
+        );
         locked(&worker.shared().label).clone_from(&info.id);
         let mut cameras = self
             .inner
@@ -2497,8 +2962,12 @@ impl SessionHandle {
             // worker clients already use.
             drop(cameras);
             worker.close();
-            let pid = existing.worker().map_or(0, |worker| worker.pid());
-            return Ok(json!({"connected": existing.info, "worker_pid": pid}));
+            if let Some(error) = existing.retired_error() {
+                return Err(error);
+            }
+            let current = self.worker_of(&existing)?;
+            current.call(WorkerCommand::CheckConnection)?;
+            return Ok(json!({"connected": existing.info, "worker_pid": current.pid()}));
         }
         let pid = worker.pid();
         cameras.insert(
@@ -2509,6 +2978,7 @@ impl SessionHandle {
                 live: AtomicBool::new(false),
                 worker: RwLock::new(Some(worker)),
                 crash: Mutex::default(),
+                retired: Mutex::default(),
                 config_unknown: AtomicBool::new(false),
                 crashes: Mutex::default(),
                 reconnecting: Mutex::default(),
@@ -2521,34 +2991,56 @@ impl SessionHandle {
         Ok(json!({"connected": info, "worker_pid": pid}))
     }
     /// The camera an error says is held by one of this session's workers.
-    fn held_by_us(&self, error: &anyhow::Error) -> Option<Value> {
+    fn held_by_us(&self, error: &anyhow::Error, selector: &str) -> Option<Value> {
         let classified = crate::types::classify(error);
         if classified.kind != ErrorKind::CameraBusy {
             return None;
         }
         let pid = classified.details?["held_by"]["pid"].as_u64()?;
         self.cameras().into_iter().find_map(|(_, held)| {
+            if !same_connect_mode(selector, &held.info.id) || held.retired_error().is_some() {
+                return None;
+            }
             let worker = held.worker()?;
-            (u64::from(worker.pid()) == pid)
-                .then(|| json!({"connected": held.info, "worker_pid": worker.pid()}))
+            if u64::from(worker.pid()) != pid {
+                return None;
+            }
+            match worker.call(WorkerCommand::CheckConnection) {
+                Ok(_) => Some(json!({"connected": held.info, "worker_pid": worker.pid()})),
+                Err(error) => {
+                    if crate::transport::gige::ownership_retired(&error) {
+                        held.remember_retirement(protocol::wire_error(&error));
+                    }
+                    None
+                }
+            }
         })
     }
     fn disconnect(&self, target: Option<&str>) -> Result<Value> {
         let (id, held) = self.target(target)?;
+        self.disconnect_held(&id, &held)
+    }
+    fn disconnect_held(&self, id: &str, held: &Arc<Held>) -> Result<Value> {
         let result = held.worker().map_or_else(
             || Ok(json!({"connected": null})),
             |worker| worker.call(SessionCommand::Disconnect),
         );
-        let removed = self
+        let mut cameras = self
             .inner
             .cameras
             .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&id);
-        if removed.is_some() {
+            .unwrap_or_else(PoisonError::into_inner);
+        let removed = cameras
+            .get(id)
+            .is_some_and(|current| Arc::ptr_eq(current, held));
+        if removed {
+            cameras.remove(id);
             self.inner.slots.fetch_sub(1, Ordering::AcqRel);
         }
-        locked(&self.inner.aliases).retain(|_, camera| *camera != id);
+        drop(cameras);
+        if removed {
+            locked(&self.inner.aliases).retain(|_, camera| camera != id);
+        }
         let worker = held
             .worker
             .write()
@@ -2561,8 +3053,19 @@ impl SessionHandle {
     }
     /// Run a capture, recording or continuous auto exposure as a job of the
     /// session: numbered here, then followed by its worker's events.
-    fn start_job(&self, target: Option<&str>, mut command: SessionCommand) -> Result<Value> {
-        let (key, held) = self.target(target)?;
+    fn start_job(
+        &self,
+        target: Option<&str>,
+        mut command: SessionCommand,
+        capture: Option<Weak<SavedCapture>>,
+        binding: Option<&(String, Arc<Held>)>,
+        pinned: Option<&pinned::Admission>,
+        forward: Option<&Arc<ForwardObservation>>,
+    ) -> Result<Value> {
+        if let Some(observation) = forward {
+            observation.check_pending(self)?;
+        }
+        let (key, held) = self.command_camera(target, binding)?;
         let (kind, planned, lease) = match &command {
             SessionCommand::Schedule { count, lease, .. } => {
                 (JobKind::Capture, Some(u64::from(*count)), *lease)
@@ -2570,12 +3073,26 @@ impl SessionHandle {
             SessionCommand::Forward { lease, .. } => (JobKind::Record, None, *lease),
             _ => (JobKind::Auto, None, false),
         };
-        let worker = self.worker_of(&held)?;
+        let worker =
+            pinned.map_or_else(|| self.worker_of(&held), |admission| admission.worker(self))?;
         let number = self
             .inner
             .jobs
             .start(kind, &key, planned, lease)
             .context("the session has no unused job numbers")?;
+        if pinned.is_some() || forward.is_some() {
+            self.inner.jobs.pin_owner(number, &worker);
+        }
+        if let Some(observation) = forward
+            && let Err(error) = observation.assign(self, number, worker.clone())
+        {
+            self.inner.jobs.refused(number);
+            return Err(error);
+        }
+        if let Some(capture) = capture {
+            // A worker can publish the file before its schedule reply.
+            self.inner.jobs.observe_capture(number, capture);
+        }
         match &mut command {
             SessionCommand::Schedule { job, .. }
             | SessionCommand::Forward { job, .. }
@@ -2583,10 +3100,37 @@ impl SessionHandle {
             _ => {}
         }
         let live = matches!(command, SessionCommand::Auto { .. });
-        let mut reply = match worker.call(command) {
+        let result = if let Some(observation) = forward {
+            (|| {
+                if let Some(admission) = pinned {
+                    admission.check(self)?;
+                }
+                let value = observation.call(self, &worker, command)?;
+                if let Some(admission) = pinned {
+                    admission.check(self)?;
+                }
+                Ok(value)
+            })()
+        } else {
+            match pinned {
+                Some(admission) => admission.call(self, command),
+                None => worker.call(command),
+            }
+        };
+        let mut reply = match result {
             Ok(reply) => reply,
             Err(error) => {
-                self.inner.jobs.refused(number);
+                if let Some(observation) = forward {
+                    self.inner.jobs.admission_failed(number, &error);
+                    let _ = observation.stop();
+                } else if let Some(admission) = pinned {
+                    admission.stop_job(number);
+                    // A local reply/epoch failure does not prove the worker
+                    // refused the job. Keep its late saved-file observer.
+                    self.inner.jobs.admission_failed(number, &error);
+                } else {
+                    self.inner.jobs.refused(number);
+                }
                 return Err(error);
             }
         };
@@ -2682,6 +3226,39 @@ impl SessionHandle {
             "detail": found.detail(),
         }))
     }
+    /// Send cleanup to a pinned job's old worker, or the usual current worker
+    /// for unkeyed jobs. Explicit stops and watchdog lease expiry share this.
+    fn request_job_stop(&self, number: u64, key: &str, owner: Option<&Weak<Worker>>) -> Result<()> {
+        if let Some(owner) = owner {
+            let result = owner
+                .upgrade()
+                .filter(|worker| !worker.exited())
+                .map_or_else(
+                    || {
+                        Err(Categorized::error(
+                            ErrorKind::Disconnected,
+                            "pinned job's original worker is gone",
+                        ))
+                    },
+                    |worker| worker.stop_job(number),
+                );
+            if let Err(error) = result {
+                self.inner.jobs.admission_failed(number, &error);
+            }
+        } else {
+            let worker = self
+                .inner
+                .cameras
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(key)
+                .and_then(|held| held.worker());
+            if let Some(worker) = worker {
+                worker.stop_job(number)?;
+            }
+        }
+        Ok(())
+    }
     /// Stop `job`, and wait for it to end: `{job, detail}`.
     pub(crate) fn stop_job(&self, job: &str) -> Result<Value> {
         let number = self.job_number(job)?;
@@ -2691,16 +3268,7 @@ impl SessionHandle {
             .stopping(number)
             .ok_or_else(|| self.no_job(job))?;
         if !found.state.ended() {
-            let worker = self
-                .inner
-                .cameras
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get(&key)
-                .and_then(|held| held.worker());
-            if let Some(worker) = worker {
-                worker.stop_job(number)?;
-            }
+            self.request_job_stop(number, &key, found.owner.as_ref())?;
         }
         let deadline = Instant::now() + STOP_WAIT;
         let mut seq = 0;
@@ -2732,6 +3300,7 @@ impl SessionHandle {
         let active: Vec<_> = before
             .cameras
             .iter()
+            .filter(|camera| !crate::transport::gige::monitor::is_selector(&camera.info.id))
             .map(|camera| camera.info.clone())
             .collect();
         let mut devices: Vec<_> = before
@@ -2754,6 +3323,7 @@ impl SessionHandle {
                 );
             }
         }
+        devices.retain(|info| !crate::transport::gige::monitor::is_selector(&info.id));
         for device in &mut devices {
             device.profile = before
                 .devices
@@ -2767,18 +3337,33 @@ impl SessionHandle {
         }
         let mut report = crate::network::scan(&devices, &active, timeout)?;
         report.warnings.extend(warnings);
+        if before
+            .cameras
+            .iter()
+            .any(|camera| crate::transport::gige::monitor::is_selector(&camera.info.id))
+        {
+            report.warnings.push("Read-only GigE monitor receivers are excluded from controller bandwidth sharing and tuning.".into());
+        }
         // One budget per physical receive interface, including connected cameras
         // that are idle now but may be started together later.
         let plans: Vec<_> = report
             .cameras
             .iter()
             .enumerate()
-            .filter(|(_, camera)| tune && camera.active && camera.reachable)
+            .filter(|(_, camera)| {
+                tune && camera.active
+                    && camera.reachable
+                    && !crate::transport::gige::monitor::is_selector(&camera.camera.id)
+            })
             .map(|(index, camera)| {
                 let sharers = report
                     .cameras
                     .iter()
-                    .filter(|other| other.active && other.interface == camera.interface)
+                    .filter(|other| {
+                        other.active
+                            && other.interface == camera.interface
+                            && !crate::transport::gige::monitor::is_selector(&other.camera.id)
+                    })
                     .count();
                 (
                     index,
@@ -3031,7 +3616,7 @@ fn watch(coordinator: &Weak<Coordinator>, stop: &(Mutex<bool>, Condvar)) {
             }
         }
         handle.release_unused();
-        for (key, number) in handle.inner.jobs.abandoned() {
+        for (_, number) in handle.inner.jobs.abandoned() {
             handle.note(
                 "warn",
                 format!(
@@ -3039,16 +3624,8 @@ fn watch(coordinator: &Weak<Coordinator>, stop: &(Mutex<bool>, Condvar)) {
                     handle.inner.name
                 ),
             );
-            let worker = handle
-                .inner
-                .cameras
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get(&key)
-                .and_then(|held| held.worker());
-            handle.inner.jobs.stopping(number);
-            if let Some(worker) = worker {
-                let _ = worker.stop_job(number);
+            if let Some((key, job)) = handle.inner.jobs.stopping(number) {
+                let _ = handle.request_job_stop(number, &key, job.owner.as_ref());
             }
         }
         handle.inner.jobs.flush();
@@ -3101,6 +3678,85 @@ mod tests {
                 "{camera}"
             );
         }
+    }
+
+    pub(super) fn held_for_retirement_test() -> Arc<Held> {
+        Arc::new(Held {
+            info: crate::transport::simulator::info(),
+            spec: ConnectSpec {
+                selector: "sim:0".into(),
+                timeout_ms: 1000,
+                login: None,
+                saved_login: true,
+            },
+            live: AtomicBool::new(true),
+            worker: RwLock::default(),
+            crash: Mutex::default(),
+            retired: Mutex::default(),
+            config_unknown: AtomicBool::new(false),
+            crashes: Mutex::default(),
+            reconnecting: Mutex::default(),
+            keep: Mutex::default(),
+        })
+    }
+    fn retirement_wire(reason: &str) -> Value {
+        protocol::wire_error(
+            &Categorized::new(ErrorKind::Disconnected, reason)
+                .details(json!({"controller_ownership":"retired","reason":reason}))
+                .into(),
+        )
+    }
+    #[test]
+    fn queued_work_keeps_its_original_held_across_explicit_replacement() {
+        let h = SessionHandle::new();
+        let old = held_for_retirement_test();
+        h.inner
+            .cameras
+            .write()
+            .unwrap()
+            .insert("sim:0".into(), old.clone());
+        h.inner.slots.store(1, Ordering::Release);
+        let barrier = h
+            .command_turn(Some("sim:0"), &SessionCommand::Info)
+            .unwrap();
+        let queued = h.submit_to("sim:0", SessionCommand::Info).unwrap();
+        let reason = retirement_wire("original ownership lease expired");
+        old.remember_retirement(reason.clone());
+        old.remember_retirement(retirement_wire("secondary cause"));
+        assert_eq!(locked(&old.retired).as_ref(), Some(&reason));
+        assert!(!old.live.load(Ordering::Acquire));
+        assert!(old.config_unknown.load(Ordering::Acquire));
+        // This is the exact Held boundary installed by explicit recovery.
+        let fresh = held_for_retirement_test();
+        h.inner
+            .cameras
+            .write()
+            .unwrap()
+            .insert("sim:0".into(), fresh.clone());
+        drop(barrier);
+        let error = queued
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(protocol::wire_error(&error), reason);
+        assert!(fresh.retired_error().is_none() && fresh.worker().is_none());
+        assert_eq!(
+            protocol::wire_error(&h.worker_of(&old).err().unwrap()),
+            reason
+        );
+        assert_eq!(
+            protocol::wire_error(&h.reconnect(&old).err().unwrap()),
+            reason
+        );
+        assert!(Arc::ptr_eq(&h.target(Some("sim:0")).unwrap().1, &fresh));
+        // Even an old nonterminal binding cannot move to a replacement.
+        let other = held_for_retirement_test();
+        let error = h
+            .command_camera(Some("sim:0"), Some(&("sim:0".into(), other)))
+            .err()
+            .unwrap();
+        assert_eq!(crate::types::classify(&error).kind, ErrorKind::Disconnected);
+        h.shutdown();
     }
 
     #[test]
@@ -3229,6 +3885,7 @@ mod tests {
             job: None,
             lease: false,
             copy: crate::media::StreamCopy::default(),
+            timeline: None,
             warmup_ms: None,
         };
         let max = crate::scheduling::MAX_DURATION_MS;
@@ -3245,6 +3902,32 @@ mod tests {
         // `record --for 500ms` must keep working.
         forward(Some(500)).validate().unwrap();
     }
+    #[test]
+    fn auto_part_indices_use_the_same_exact_numeric_contract_and_refuse_maps() {
+        for index in ["1", "1.0", "1e0"] {
+            let raw =
+                format!(r#"{{"op":"auto","part_selection":{{"format":"Mono8","index":{index}}}}}"#);
+            let command = SessionCommand::from_json_slice(raw.as_bytes()).unwrap();
+            command.validate().unwrap();
+            let SessionCommand::Auto { part_selection, .. } = command else {
+                panic!("auto");
+            };
+            assert_eq!(part_selection.unwrap().index, Some(1));
+        }
+        for raw in [
+            r#"{"op":"auto","part_selection":{"format":"Mono8","index":-1}}"#,
+            r#"{"op":"auto","part_selection":{"format":"Mono8","index":0.5}}"#,
+            r#"{"op":"auto","part_selection":{"format":"Mono8","index":32}}"#,
+            r#"{"op":"auto","part_selection":{"format":"Mono16","index":1}}"#,
+            r#"{"op":"auto","part_selection":{"format":"Confidence8","index":1}}"#,
+        ] {
+            let error = SessionCommand::from_json_slice(raw.as_bytes())
+                .and_then(|command| command.validate())
+                .unwrap_err();
+            assert_ne!(error.to_string(), "");
+        }
+    }
+
     #[test]
     fn stills_are_png_jpeg_or_raw() {
         let capture = |format: &str| SessionCommand::Capture {
@@ -3303,6 +3986,72 @@ mod tests {
             assert!(status.get(removed).is_none(), "{removed}");
         }
         handle.shutdown();
+    }
+    #[test]
+    fn strict_commands_keep_decimal_numbers_and_still_reject_duplicate_fps() {
+        for (lexical, expected) in [("1e1", 10.0), ("30.5000", 30.5), ("5.0", 5.0)] {
+            let raw = format!(
+                r#"{{"op":"forward","output":"decimal.mkv","codec":"h264","encoder":"auto","fps":{lexical},"bitrate":"1M"}}"#
+            );
+            for command in [
+                serde_json::from_str::<SessionCommand>(&raw).unwrap(),
+                SessionCommand::from_json_slice(raw.as_bytes()).unwrap(),
+            ] {
+                let SessionCommand::Forward { fps, .. } = command else {
+                    panic!("expected forwarding");
+                };
+                assert_eq!(fps, expected);
+            }
+        }
+        for raw in [
+            r#"{"op":"auto","region":[0.1000,2e-1,0.500,5e-1],"max_exposure_us":1e3}"#,
+            r#"{"op":"frame","region":[0.1000,2e-1,0.500,5e-1]}"#,
+        ] {
+            for command in [
+                serde_json::from_str::<SessionCommand>(raw).unwrap(),
+                SessionCommand::from_json_slice(raw.as_bytes()).unwrap(),
+            ] {
+                match command {
+                    SessionCommand::Auto {
+                        region,
+                        max_exposure_us,
+                        ..
+                    } => {
+                        assert_eq!(region, Some([0.1, 0.2, 0.5, 0.5]));
+                        assert_eq!(max_exposure_us, Some(1000.0));
+                    }
+                    SessionCommand::Frame { region, .. } => {
+                        assert_eq!(region, Some([0.1, 0.2, 0.5, 0.5]));
+                    }
+                    _ => panic!("expected measurement command"),
+                }
+            }
+        }
+        SessionCommand::from_json_slice(br#"{"op":"forward","output":"decimal.mkv","codec":"h264","encoder":"auto","fps":1e999,"bitrate":"1M"}"#).unwrap_err();
+        let command = SessionCommand::from_json_slice(br#"{"op":"forward","output":"decimal.mkv","codec":"h264","encoder":"auto","fps":30.5,"bitrate":"1M"}"#).unwrap();
+        match &command {
+            SessionCommand::Forward { fps, .. } => assert_eq!(*fps, 30.5),
+            _ => panic!("expected forward command"),
+        }
+        assert_eq!(serde_json::to_value(&command).unwrap()["fps"], json!(30.5));
+        let error=SessionCommand::from_json_slice(br#"{"op":"forward","output":"decimal.mkv","codec":"h264","encoder":"auto","fps":30.5,"fps":31.5,"bitrate":"1M"}"#).unwrap_err();
+        assert!(
+            error.to_string().contains("duplicate field `fps`"),
+            "{error}"
+        );
+        let StrictValue(value) =
+            serde_json::from_str::<StrictValue>("0.12345678901234567890123456789").unwrap();
+        assert_eq!(value.to_string(), "0.12345678901234567890123456789");
+    }
+    #[test]
+    fn strict_json_values_preserve_wide_integer_dispatch_without_rounding() {
+        let raw = r#"{"values":[18446744073709551616,-9223372036854775809,340282366920938463463374607431768211455,-170141183460469231731687303715884105728,340282366920938463463374607431768211456]}"#;
+        let StrictValue(value) = serde_json::from_str::<StrictValue>(raw).unwrap();
+        assert_eq!(value.to_string(), raw);
+        // Typed adapter dispatch deserializes a Value again. Its integer
+        // visitor may now be 128-bit rather than the parser's private map.
+        let StrictValue(reparsed) = serde_json::from_value::<StrictValue>(value).unwrap();
+        assert_eq!(reparsed.to_string(), raw);
     }
     #[test]
     fn strict_json_commands_reject_ignored_or_duplicate_fields() {
@@ -3474,12 +4223,14 @@ mod tests {
             SessionCommand::connect("sim:0".into(), 0),
             SessionCommand::Auto {
                 continuous: false,
+                part_selection: None,
                 job: None,
                 max_exposure_us: Some(f64::NAN),
                 region: None,
             },
             SessionCommand::Auto {
                 continuous: false,
+                part_selection: None,
                 job: None,
                 max_exposure_us: Some(0.0),
                 region: None,
@@ -3828,7 +4579,7 @@ mod tests {
     }
     /// A camera worker run by this test binary, whose events go nowhere.
     #[cfg(unix)]
-    fn test_worker() -> Worker {
+    pub(super) fn test_worker() -> Worker {
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
         command
             .args([
@@ -3844,6 +4595,118 @@ mod tests {
         let child = command.spawn().unwrap();
         Worker::attach(child, Arc::new(|_, _| {})).unwrap()
     }
+    #[test]
+    #[cfg(unix)]
+    fn retirement_before_held_attachment_survives_worker_exit() {
+        use std::os::unix::process::CommandExt as _;
+        let reason = retirement_wire("lease expired before attachment");
+        let hello = serde_json::to_string(&protocol::Line {
+            seq: 0,
+            output: protocol::Output::Hello {
+                protocol: protocol::PROTOCOL,
+                build: "early-retirement".into(),
+            },
+        })
+        .unwrap();
+        let retired = serde_json::to_string(&protocol::Line {
+            seq: 1,
+            output: protocol::Output::Retired {
+                error: reason.clone(),
+            },
+        })
+        .unwrap();
+        let child = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "printf '%s\n' \"$1\" \"$2\"; exit 1",
+                "worker",
+                &hello,
+                &retired,
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let worker = Arc::new(Worker::attach(child, Arc::new(|_, _| {})).unwrap());
+        assert!(worker.wait_exit(Instant::now() + Duration::from_secs(5)));
+        assert_eq!(worker.shared().retirement().as_ref(), Some(&reason));
+        let h = SessionHandle::new();
+        let held = held_for_retirement_test();
+        *held.worker.write().unwrap() = Some(worker);
+        h.inner
+            .cameras
+            .write()
+            .unwrap()
+            .insert("sim:0".into(), held.clone());
+        h.inner.slots.store(1, Ordering::Release);
+        assert_eq!(
+            protocol::wire_error(&h.worker_of(&held).err().unwrap()),
+            reason
+        );
+        assert_eq!(
+            protocol::wire_error(&h.reconnect(&held).err().unwrap()),
+            reason
+        );
+        assert_eq!(locked(&held.retired).as_ref(), Some(&reason));
+        h.shutdown();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn retired_event_is_bound_to_its_worker_and_keeps_owned_job_alive() {
+        let h = SessionHandle::new();
+        let held = held_for_retirement_test();
+        let current = Arc::new(test_worker());
+        let stale = test_worker();
+        *locked(&current.shared().label) = "sim:0".into();
+        *locked(&stale.shared().label) = "sim:0".into();
+        *held.worker.write().unwrap() = Some(current.clone());
+        h.inner
+            .cameras
+            .write()
+            .unwrap()
+            .insert("sim:0".into(), held.clone());
+        h.inner.slots.store(1, Ordering::Release);
+        let job = h
+            .inner
+            .jobs
+            .start(JobKind::Capture, "sim:0", Some(1), false)
+            .unwrap();
+        let reason = retirement_wire("first lease lost");
+        h.on_signal(
+            stale.shared(),
+            Signal::Output(Box::new(protocol::Output::Retired {
+                error: reason.clone(),
+            })),
+        );
+        assert!(held.retired_error().is_none());
+        h.on_signal(
+            current.shared(),
+            Signal::Output(Box::new(protocol::Output::Retired {
+                error: reason.clone(),
+            })),
+        );
+        h.on_signal(
+            current.shared(),
+            Signal::Output(Box::new(protocol::Output::Retired {
+                error: retirement_wire("later"),
+            })),
+        );
+        assert_eq!(locked(&held.retired).as_ref(), Some(&reason));
+        assert!(
+            !h.inner.jobs.get(job).unwrap().state.ended(),
+            "owned saves must complete through Saved/JobEnd"
+        );
+        assert_eq!(
+            protocol::wire_error(&h.worker_of(&held).err().unwrap()),
+            reason
+        );
+        stale.close();
+        h.shutdown();
+    }
+
     #[test]
     #[cfg(unix)]
     fn worker_error_categories_survive_the_pipe() {
@@ -4074,6 +4937,130 @@ mod tests {
             })
             .unwrap_err();
         assert!(missing.to_string().contains("has no job"), "{missing}");
+        handle.shutdown();
+    }
+
+    fn held_identity(info: CameraInfo) -> Arc<Held> {
+        let mut held = held_for_retirement_test();
+        let value = Arc::get_mut(&mut held).unwrap();
+        value.spec.selector.clone_from(&info.id);
+        value.info = info;
+        held
+    }
+    fn monitor_info(selector: &str) -> CameraInfo {
+        let spec = crate::transport::gige::monitor::MonitorSpec::parse(selector).unwrap();
+        let mut info = crate::transport::simulator::info_named("sim:0");
+        info.id = spec.canonical();
+        info.transport = crate::types::Transport::GigE;
+        info.serial = "same-physical-serial".into();
+        info.model = "Passive Monitor Model".into();
+        info.address = Some(spec.camera.to_string());
+        info
+    }
+    #[test]
+    fn explicit_monitor_canonicalization_shares_one_gate_but_never_controller_aliases() {
+        let handle = SessionHandle::new();
+        let alternate = "gige-monitor://192.0.2.10?mac=003053061A58&interface=192.0.2.20";
+        let canonical = "gige-monitor://192.0.2.10?interface=192.0.2.20&mac=003053061a58";
+        let monitor = monitor_info(alternate);
+        let original = held_identity(monitor.clone());
+        handle
+            .inner
+            .cameras
+            .write()
+            .unwrap()
+            .insert(monitor.id.clone(), original.clone());
+        handle.set_devices_for_test(vec![monitor.clone()]);
+        assert_eq!(canonical_selector(alternate).unwrap(), canonical);
+        assert_eq!(handle.camera_id(alternate), canonical);
+        assert!(Arc::ptr_eq(
+            &handle.target(Some(alternate)).unwrap().1,
+            &original
+        ));
+        for bare in ["192.0.2.10", "same-physical-serial", "gige:003053061a58"] {
+            assert_eq!(handle.camera_id(bare), bare);
+            assert_eq!(
+                crate::types::classify(&handle.target(Some(bare)).err().unwrap()).kind,
+                ErrorKind::CameraNotFound
+            );
+        }
+        assert_eq!(
+            handle.loose_camera("passive monitor model".into()),
+            "passive monitor model"
+        );
+        locked(&handle.inner.aliases).insert("stale-bare-alias".into(), canonical.into());
+        assert_eq!(handle.camera_id("stale-bare-alias"), "stale-bare-alias");
+        let mut controller = monitor;
+        controller.id = "gige:003053061a58".into();
+        let active = held_identity(controller.clone());
+        handle
+            .inner
+            .cameras
+            .write()
+            .unwrap()
+            .insert(controller.id.clone(), active.clone());
+        assert!(Arc::ptr_eq(
+            &handle.target(Some("192.0.2.10")).unwrap().1,
+            &active
+        ));
+        assert!(Arc::ptr_eq(
+            &handle.target(Some("same-physical-serial")).unwrap().1,
+            &active
+        ));
+        assert!(Arc::ptr_eq(
+            &handle.target(Some(canonical)).unwrap().1,
+            &original
+        ));
+        let first = handle
+            .command_turn(Some(alternate), &SessionCommand::Disconnect)
+            .unwrap();
+        let second = handle
+            .command_turn(None, &SessionCommand::connect(canonical.into(), 1000))
+            .unwrap();
+        let normal = handle
+            .command_turn(Some(&controller.id), &SessionCommand::Disconnect)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first.order, &second.order));
+        assert!(!Arc::ptr_eq(&first.order, &normal.order));
+        assert!(same_connect_mode(canonical, canonical));
+        assert!(!same_connect_mode(canonical, &controller.id));
+        assert!(!same_connect_mode(&controller.id, canonical));
+        assert!(!same_connect_mode(
+            canonical,
+            "gige-monitor://192.0.2.10?interface=192.0.2.21&mac=003053061a58"
+        ));
+        assert!(same_connect_mode("192.0.2.10", &controller.id));
+        let missing = "gige-monitor://192.0.2.10?interface=192.0.2.21&mac=003053061a58";
+        let mut spoof = controller;
+        spoof.id = "gige:003053061a59".into();
+        spoof.serial = missing.into();
+        spoof.address = Some(missing.into());
+        handle
+            .inner
+            .cameras
+            .write()
+            .unwrap()
+            .insert(spoof.id.clone(), held_identity(spoof));
+        assert_eq!(
+            crate::types::classify(&handle.target(Some(missing)).err().unwrap()).kind,
+            ErrorKind::CameraNotFound
+        );
+        handle.shutdown();
+    }
+    #[test]
+    fn monitor_mutation_admission_rejects_before_pending_slots_jobs_or_worker_lookup() {
+        let handle = SessionHandle::new();
+        let selector = "gige-monitor://192.0.2.10?mac=003053061A58&interface=192.0.2.20";
+        let error = handle.submit_to(selector, width_command()).unwrap_err();
+        assert_eq!(crate::types::classify(&error).kind, ErrorKind::Unsupported);
+        assert_eq!(handle.inner.pending.load(Ordering::Acquire), 0);
+        assert_eq!(handle.inner.jobs.all().len(), 0);
+        assert_eq!(handle.cameras().len(), 0);
+        let invalid = "gige-monitor://192.0.2.10?interface=192.0.2.20&mac=not-a-mac";
+        assert_eq!(
+            crate::types::classify(&handle.target(Some(invalid)).err().unwrap()).kind,
+            ErrorKind::Usage
+        );
         handle.shutdown();
     }
 }

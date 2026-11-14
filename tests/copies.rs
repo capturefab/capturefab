@@ -210,6 +210,16 @@ fn capture_delta_env(
         // Check each whole run too: a constant leak could cancel out of
         // the N-versus-2N difference.
         assert_pooled(&format!("{format} -n {count}"), &run.0);
+        // Counts, command results and byte totals are now owned in memory.
+        // Keep reports for later helper checks, but only one run's image files.
+        let output = home.path(&out);
+        assert_eq!(output.parent(), Some(home.work.as_path()));
+        std::fs::remove_dir_all(&output).unwrap_or_else(|error| {
+            panic!(
+                "remove completed copy-audit output {}: {error}",
+                output.display()
+            );
+        });
         runs.push(run);
     }
     let mut delta = runs[1].0.clone();

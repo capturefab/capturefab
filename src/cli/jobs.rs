@@ -629,7 +629,7 @@ fn job_failure(job: &Value) -> anyhow::Error {
 /// this.
 macro_rules! job_row {
     () => {
-        "{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}"
+        "{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,multipart?:{image_path:{format_version,storage,path,metadata_path,bytes,sha256?,selected,count}},multipart_truncated?,next_at?,ends_at?,started,ended?,error?:{code,message}}"
     };
 }
 pub(super) use job_row;

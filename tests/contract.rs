@@ -744,6 +744,60 @@ fn an_environment_session_yields_to_no_session_and_binary_stdout() {
 }
 
 #[test]
+fn debug_rpc_cannot_open_or_reconnect_a_camera_for_a_write_only_key() {
+    let home = Home::new("rpc-action-key");
+    let request = r#"{"op":"write_action_device_key","key":17,"timeout_ms":1000}"#;
+    let cold = home.run_stdin(
+        request,
+        &["--json", "--no-session", "debug", "rpc", "-c", "sim:0"],
+    );
+    let error = cold.failure(2);
+    assert_eq!(error["code"], "usage");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("set --write-only")
+    );
+    assert!(!home.sessions.exists());
+    let _session = home.serve("key-guard", &[]);
+    assert_eq!(
+        home.ok(&["session", "status", "key-guard"])["cameras"]
+            .as_array()
+            .unwrap()
+            .as_slice(),
+        [] as [Value; 0]
+    );
+    let named = home.run_stdin(
+        request,
+        &[
+            "--json",
+            "--session",
+            "key-guard",
+            "debug",
+            "rpc",
+            "-c",
+            "sim:0",
+        ],
+    );
+    let error = named.failure(2);
+    assert_eq!(error["code"], "usage");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("set --write-only")
+    );
+    assert_eq!(
+        home.ok(&["session", "status", "key-guard"])["cameras"]
+            .as_array()
+            .unwrap()
+            .as_slice(),
+        [] as [Value; 0]
+    );
+}
+
+#[test]
 fn debug_rpc_takes_public_commands_only() {
     let home = Home::new("rpc");
     for request in [
@@ -1581,6 +1635,111 @@ fn network_is_read_only_unless_asked_to_tune() {
     assert!(run.success()["interfaces"].is_array());
     let text = home.run(&["network", "--timeout", "100ms"]);
     assert_eq!(text.code, Some(0));
+}
+
+#[test]
+fn network_force_ip_has_an_explicit_cold_mutation_contract() {
+    let home = Home::new("force-ip-contract");
+    let args = [
+        "network",
+        "force-ip",
+        "--mac",
+        "003053061a58",
+        "--interface",
+        "192.168.50.1",
+        "--address",
+        "192.168.50.1",
+        "--netmask",
+        "255.255.255.0",
+        "--gateway",
+        "0.0.0.0",
+    ];
+    let error = home.fails(2, &args);
+    assert_eq!(error["code"], "usage");
+    assert!(error["message"].as_str().unwrap().contains("distinct"));
+    let mut explicit = vec!["--session", "bench"];
+    explicit.extend(args);
+    let error = home.fails(2, &explicit);
+    assert!(error["message"].as_str().unwrap().contains("runs locally"));
+    let mut json_args = vec!["--json"];
+    json_args.extend(args);
+    let ambient = home
+        .run_env(&[("CAPTUREFAB_SESSION", "not a valid session")], &json_args)
+        .failure(2);
+    assert!(ambient["message"].as_str().unwrap().contains("distinct"));
+    let mut bypass = vec!["--no-session"];
+    bypass.extend(args);
+    assert!(
+        home.fails(2, &bypass)["message"]
+            .as_str()
+            .unwrap()
+            .contains("distinct")
+    );
+    assert!(!home.sessions.join("auto.json").exists());
+    let schema = home.ok(&["schema", "network", "force-ip"]);
+    let text = serde_json::to_string(&schema).unwrap();
+    assert!(text.contains("disruptive"), "{text}");
+    assert!(text.contains("assignment_may_have_applied"), "{text}");
+    assert!(
+        text.contains("advisory_selected_runtime_native_mac"),
+        "{text}"
+    );
+    let run = home.run(&["network", "force-ip", "--help"]);
+    assert_eq!(run.code, Some(0));
+    let help = run.stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(help.contains("no open camera object"));
+    assert!(help.contains("no retry or rollback"));
+    for parent in ["--tune", "--timeout"] {
+        let arguments = if parent == "--tune" {
+            vec!["network", parent, "force-ip"]
+        } else {
+            vec!["network", parent, "1s", "force-ip"]
+        };
+        assert_eq!(home.fails(2, &arguments)["code"], "usage");
+    }
+}
+
+#[test]
+fn network_force_ip_rejects_bad_configuration_without_sending() {
+    let home = Home::new("force-ip-invalid");
+    let args = [
+        "--no-session",
+        "network",
+        "force-ip",
+        "--mac",
+        "003053061a58",
+        "--interface",
+        "192.168.50.1",
+        "--address",
+        "192.168.50.20",
+        "--netmask",
+        "255.255.255.0",
+        "--gateway",
+        "0.0.0.0",
+    ];
+    for (field, value) in [
+        ("--mac", "ffffffffffff"),
+        ("--mac", "000000000000"),
+        ("--mac", "003053061a5g"),
+        ("--mac", "00:30:53:06:"),
+        ("--mac", "003053061a5:"),
+        ("--address", "192.168.50.255"),
+        ("--address", "192.168.51.20"),
+        ("--netmask", "255.0.255.0"),
+        ("--gateway", "192.168.51.1"),
+    ] {
+        let mut bad = args;
+        let index = bad.iter().position(|item| *item == field).unwrap();
+        bad[index + 1] = value;
+        assert_eq!(home.fails(2, &bad)["code"], "usage");
+    }
+    for timeout in ["0ms", "31s"] {
+        let mut bad = args.to_vec();
+        bad.extend(["--timeout", timeout]);
+        assert_eq!(home.fails(2, &bad)["code"], "usage");
+    }
+    // No default camera, auto session or RPC is started for invalid input.
+    assert!(!home.sessions.join("auto.json").exists());
 }
 
 #[test]

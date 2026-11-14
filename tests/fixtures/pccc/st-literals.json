@@ -1,0 +1,162 @@
+{
+  "schema": 1,
+  "qualification": "Independent hand literals derived from manufacturer ST layout; no captured device packets or product decoder/fixture imports. Six explicit 14-byte chunks concatenate to each complete84-byte native element. Inactive bytes are deliberately arbitrary observations, not required padding.",
+  "primary_plan_sha256": "21d3d50ebcf43686bcbe7bb7ef082a264cfc3e3d4ecb65fa07d90324e484f63c",
+  "vectors": [
+    {
+      "id": "odd_abc",
+      "length_word_raw": 3,
+      "length_status": "valid",
+      "native_hex_chunks": [
+        "03004241e743a5a5a5a5a5a5a5a5",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
+      ],
+      "active_hex": "414243",
+      "ascii_text": "ABC",
+      "utf8_text": "ABC"
+    },
+    {
+      "id": "odd_one",
+      "length_word_raw": 1,
+      "length_status": "valid",
+      "native_hex_chunks": [
+        "0100e741a5a5a5a5a5a5a5a5a5a5",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
+      ],
+      "active_hex": "41",
+      "ascii_text": "A",
+      "utf8_text": "A"
+    },
+    {
+      "id": "embedded_nul",
+      "length_word_raw": 3,
+      "length_status": "valid",
+      "native_hex_chunks": [
+        "03000041ff425a5a5a5a5a5a5a5a",
+        "5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+      ],
+      "active_hex": "410042",
+      "ascii_text": "A\u0000B",
+      "utf8_text": "A\u0000B"
+    },
+    {
+      "id": "high_bytes",
+      "length_word_raw": 4,
+      "length_status": "valid",
+      "native_hex_chunks": [
+        "040080fffe00a5a5a5a5a5a5a5a5",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
+      ],
+      "active_hex": "ff8000fe",
+      "ascii_valid": false,
+      "utf8_valid": false
+    },
+    {
+      "id": "utf8_six",
+      "length_word_raw": 6,
+      "length_status": "valid",
+      "native_hex_chunks": [
+        "0600c241e2b5ac82a5a5a5a5a5a5",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
+      ],
+      "active_hex": "41c2b5e282ac",
+      "ascii_valid": false,
+      "utf8_text": "A\u00b5\u20ac"
+    },
+    {
+      "id": "empty_nonzero",
+      "length_word_raw": 0,
+      "length_status": "valid",
+      "native_hex_chunks": [
+        "0000fefefefefefefefefefefefe",
+        "fefefefefefefefefefefefefefe",
+        "fefefefefefefefefefefefefefe",
+        "fefefefefefefefefefefefefefe",
+        "fefefefefefefefefefefefefefe",
+        "fefefefefefefefefefefefefefe"
+      ],
+      "active_hex": "",
+      "ascii_text": "",
+      "utf8_text": ""
+    },
+    {
+      "id": "odd_81",
+      "length_word_raw": 81,
+      "length_status": "valid",
+      "native_hex_chunks": [
+        "5100010003020504070609080b0a",
+        "0d0c0f0e11101312151417161918",
+        "1b1a1d1c1f1e2120232225242726",
+        "29282b2a2d2c2f2e313033323534",
+        "373639383b3a3d3c3f3e41404342",
+        "4544474649484b4a4d4c4f4ee750"
+      ],
+      "active_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f50"
+    },
+    {
+      "id": "full_82",
+      "length_word_raw": 82,
+      "length_status": "valid",
+      "native_hex_chunks": [
+        "5200010003020504070609080b0a",
+        "0d0c0f0e11101312151417161918",
+        "1b1a1d1c1f1e2120232225242726",
+        "29282b2a2d2c2f2e313033323534",
+        "373639383b3a3d3c3f3e41404342",
+        "4544474649484b4a4d4c4f4e5150"
+      ],
+      "active_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f5051"
+    },
+    {
+      "id": "invalid_83",
+      "length_word_raw": 83,
+      "length_status": "invalid_length",
+      "native_hex_chunks": [
+        "5300a5a5a5a5a5a5a5a5a5a5a5a5",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+        "a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
+      ]
+    },
+    {
+      "id": "invalid_65535",
+      "length_word_raw": 65535,
+      "length_status": "invalid_length",
+      "native_hex_chunks": [
+        "ffff5a5a5a5a5a5a5a5a5a5a5a5a",
+        "5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+        "5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+      ]
+    }
+  ],
+  "a2_request_literals": [
+    {"case": "ST9:10_count3_cap220_first2", "hex": "0f003412a2a8098d0a00"},
+    {"case": "ST9:10_count3_cap220_last1", "hex": "0f003512a254098d0c00"},
+    {"case": "ST255:255_count1_extended_fields", "hex": "0f003612a254ffff008dffff0000"}
+  ]
+}

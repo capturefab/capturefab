@@ -714,6 +714,7 @@ impl Shell {
             })
         };
         let typed = |id: &str| takes(id) && leaf.value_source(id) == Some(ValueSource::CommandLine);
+        let camera_explicit = typed("camera");
         let mut extra = Vec::new();
         let default = self.shared.known().default.clone();
         if let Some(camera) = default
@@ -752,6 +753,9 @@ impl Shell {
                 return Ok(Parsed::Printed(self.clap_failure(&error, json, words)));
             }
         };
+        if let Some(Command::Set(args)) = cli.command.as_mut() {
+            args.camera_explicit = camera_explicit;
+        }
         if let Some(command) = &cli.command
             && let Some(why) = refused(command)
         {
@@ -1366,6 +1370,77 @@ mod platform {
 mod tests {
     use super::*;
     use clap::Parser as _;
+
+    #[test]
+    fn write_only_set_keeps_camera_provenance_before_shell_defaults() {
+        let (sender, events) = mpsc::channel();
+        let shell = Shell {
+            global: Global {
+                session: Some("held".into()),
+                ..Global::default()
+            },
+            session_typed: true,
+            keep: None,
+            keep_going: false,
+            shared: Arc::new(Shared {
+                global: Global::default(),
+                route: Route::default(),
+                interactive: false,
+                known: Mutex::new(Known {
+                    default: Some("sim:0".into()),
+                    ..Known::default()
+                }),
+            }),
+            sender,
+            events,
+        };
+        for (line, camera, explicit, session, write_only) in [
+            (
+                "--session line-owner set --write-only -c sim:1 ActionDeviceKey=17",
+                "sim:1",
+                true,
+                "line-owner",
+                true,
+            ),
+            (
+                "set --write-only -c sim:0 ActionDeviceKey=17",
+                "sim:0",
+                true,
+                "held",
+                true,
+            ),
+            (
+                "set --write-only ActionDeviceKey=17",
+                "sim:0",
+                false,
+                "held",
+                true,
+            ),
+            ("set Width=640", "sim:0", false, "held", false),
+        ] {
+            let Parsed::Command(cli, label) = shell.parse(&split(line).unwrap()).unwrap() else {
+                panic!("expected parsed command: {line}");
+            };
+            assert_eq!(label, "set", "{line}");
+            assert_eq!(cli.global.session.as_deref(), Some(session), "{line}");
+            assert!(!cli.global.session_from_env, "{line}");
+            let Some(Command::Set(args)) = cli.command else {
+                panic!("expected set: {line}");
+            };
+            assert_eq!(args.camera.camera.as_deref(), Some(camera), "{line}");
+            assert_eq!(args.camera_explicit, explicit, "{line}");
+            assert_eq!(args.write_only, write_only, "{line}");
+            assert_eq!(
+                args.values,
+                [if write_only {
+                    "ActionDeviceKey=17"
+                } else {
+                    "Width=640"
+                }],
+                "{line}"
+            );
+        }
+    }
 
     #[test]
     fn lines_split_like_a_posix_shell_without_expansions() {

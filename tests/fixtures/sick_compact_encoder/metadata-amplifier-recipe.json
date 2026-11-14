@@ -1,0 +1,91 @@
+{
+  "schema": 1,
+  "provenance": "independent_primary_Type1v4_zero_line_metadata_amplifier_no_product_encoder_or_decoder_import",
+  "module_count": 600,
+  "module_bytes": 44,
+  "header_hex": "020202020100000001000000000000000807060504030201040000002c000000",
+  "module_template_hex": "000000000000000001000000000000002a0000000000000000000000000000000000803f2c000000a500005a",
+  "segment_counter_start": 0,
+  "next_module_size_nonfinal": 44,
+  "next_module_size_final": 0,
+  "crc32": 1507401733,
+  "crc32_le_hex": "0520d959",
+  "packet_bytes": 26436,
+  "packet_sha256": "8277199c8a80558cba61d2f0fafbb625537042a7092e1bfe7a55d1da0893821d",
+  "expected_native_json_bytes": 609290,
+  "expected_module_template": {
+    "module_bytes": 44,
+    "segment_counter": 0,
+    "frame_number": 1,
+    "sender_id": 42,
+    "line_count": 0,
+    "beams_per_line": 0,
+    "echoes_per_beam": 0,
+    "timestamp_start": {
+      "encoding": "base64_le_u64",
+      "shape": [
+        0
+      ],
+      "order": "line",
+      "unit": "us",
+      "basis": "device_timebase_microseconds_declared",
+      "data": ""
+    },
+    "timestamp_stop": {
+      "encoding": "base64_le_u64",
+      "shape": [
+        0
+      ],
+      "order": "line",
+      "unit": "us",
+      "basis": "device_timebase_microseconds_declared",
+      "data": ""
+    },
+    "phi": {
+      "encoding": "ieee754_le_u32_bits",
+      "shape": [
+        0
+      ],
+      "order": "line",
+      "unit": "rad",
+      "data": ""
+    },
+    "theta_start": {
+      "encoding": "ieee754_le_u32_bits",
+      "shape": [
+        0
+      ],
+      "order": "line",
+      "unit": "rad",
+      "data": ""
+    },
+    "theta_stop": {
+      "encoding": "ieee754_le_u32_bits",
+      "shape": [
+        0
+      ],
+      "order": "line",
+      "unit": "rad",
+      "data": ""
+    },
+    "distance_scale": {
+      "bits": 1065353216,
+      "classification": "finite",
+      "sign_bit": false,
+      "value": 1.0
+    },
+    "next_module_size": 44,
+    "reserved_raw": [
+      165,
+      90
+    ],
+    "echo_mask_raw": 0,
+    "beam_mask_raw": 0,
+    "beam_line_count": 0,
+    "echo_cell_count": 0,
+    "distance_relation": "raw_times_distance_scale_mm",
+    "reflector_mask": 1,
+    "property_reserved_mask": 254
+  },
+  "formula": "header32+600*(fixed32+scale4+next4+masks4)+crc4; zero line/beam/echo counts imply no arrays or echo rows; native metadata is preserved, no geometry claimed"
+}

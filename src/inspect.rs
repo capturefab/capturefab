@@ -134,6 +134,21 @@ pub(crate) fn pixel_format_label(pixel_format: u32) -> String {
     }
 }
 
+pub(crate) fn pixel_format_label_with_encoding(
+    code: u32,
+    encoding: Option<crate::types::PixelEncoding>,
+) -> String {
+    encoding
+        .filter(|encoding| encoding.check(code).is_ok())
+        .map_or_else(
+            || pixel_format_label(code),
+            |encoding| encoding.name().into(),
+        )
+}
+pub(crate) fn frame_pixel_format_label(frame: &Frame) -> String {
+    pixel_format_label_with_encoding(frame.pixel_format, frame.pixel_encoding)
+}
+
 /// The pixels `crop` takes for `px`: clamped to the frame and, for Bayer
 /// frames, widened to whole 2×2 quads on even coordinates, so every pixel
 /// keeps its colour filter.
@@ -146,7 +161,7 @@ pub(crate) fn crop_rect(frame: &Frame, px: [u32; 4]) -> [u32; 4] {
     let y = px[1].min(fh - 1);
     let width = px[2].clamp(1, fw - x);
     let height = px[3].clamp(1, fh - y);
-    if !frame::is_bayer(frame.pixel_format) || fw < 2 || fh < 2 {
+    if !frame::frame_bayer(frame) || fw < 2 || fh < 2 {
         return [x, y, width, height];
     }
     let (even_width, even_height) = (fw & !1, fh & !1);
@@ -164,6 +179,43 @@ pub(crate) fn crop_rect(frame: &Frame, px: [u32; 4]) -> [u32; 4] {
 #[cfg(test)]
 pub(crate) fn crop(frame: &Frame, px: [u32; 4]) -> Result<Frame> {
     frame::validate_source(frame)?;
+    if let Some(format) = frame::bicolor::Format::from_code(frame.pixel_format) {
+        let [x, y, width, height] = crop_rect(frame, px);
+        let output = format.unpacked().shifted(x as usize);
+        let bytes = output.unpacked_pixel_bytes();
+        let stride = frame::frame_row_bytes(frame);
+        let row = width as usize * bytes;
+        let mut data = Vec::with_capacity(row * height as usize);
+        for yy in y..y + height {
+            if format.unpacked() == format {
+                let start = yy as usize * stride + x as usize * bytes;
+                data.extend_from_slice(&frame.data[start..start + row]);
+                continue;
+            }
+            let source = &frame.data[yy as usize * stride..][..stride];
+            for xx in x..x + width {
+                for value in format.pair(source, xx as usize) {
+                    if format.bits() == 8 {
+                        data.push(u8::try_from(value)?);
+                    } else {
+                        data.extend_from_slice(&value.to_le_bytes());
+                    }
+                }
+            }
+        }
+        crate::copies::record(crate::copies::Site::Crop, data.len());
+        return Ok(Frame {
+            pixel_encoding: None,
+            width,
+            height,
+            pixel_format: output.code(),
+            data: data.into(),
+            jpeg: None,
+            chunks: frame.chunks.clone(),
+            multipart: frame.multipart.clone(),
+            ..*frame
+        });
+    }
     if let Some((_, bits)) = frame::native_color(frame, 0, 0) {
         let [x, y, width, height] = crop_rect(frame, px);
         let pixel_format = match bits {
@@ -198,11 +250,14 @@ pub(crate) fn crop(frame: &Frame, px: [u32; 4]) -> Result<Frame> {
             }
         }
         return Ok(Frame {
+            pixel_encoding: None,
             width,
             height,
             pixel_format,
             data: data.into(),
             jpeg: None,
+            chunks: frame.chunks.clone(),
+            multipart: frame.multipart.clone(),
             ..*frame
         });
     }
@@ -226,6 +281,8 @@ pub(crate) fn crop(frame: &Frame, px: [u32; 4]) -> Result<Frame> {
         height,
         data: data.into(),
         jpeg: None,
+        chunks: frame.chunks.clone(),
+        multipart: frame.multipart.clone(),
         ..*frame
     })
 }
@@ -233,8 +290,9 @@ pub(crate) fn crop(frame: &Frame, px: [u32; 4]) -> Result<Frame> {
 /// The `rect` of `frame`, read in place. A region of a frame that cannot
 /// hold it is an error, as a crop of it would be.
 fn view(frame: &Frame, rect: [u32; 4]) -> Result<FrameRef<'_>> {
+    frame::validate_encoding(frame)?;
     let view = FrameRef::region(frame, rect);
-    if !view.is_whole() && frame::convertible(frame.pixel_format) {
+    if !view.is_whole() && frame::frame_convertible(frame) {
         frame::validate_source(frame)?;
     }
     Ok(view)
@@ -377,6 +435,17 @@ fn measure_view(
     rect: [u32; 4],
 ) -> Measurements {
     let mut measured = Measurements::default();
+    if frame::is_unclassified_mono16(frame) {
+        measured.notes.push("The Mono16 component purpose is unspecified. Exposure and focus require a verified intensity image.".into());
+        return measured;
+    }
+    if frame::is_measurement_frame(frame) {
+        measured.notes.push(format!(
+            "{} contains measurement samples. Exposure and focus require an intensity image.",
+            frame_pixel_format_label(frame)
+        ));
+        return measured;
+    }
     let scalar = match kind {
         CameraKind::Depth => Some("Depth images hold distances, not brightness"),
         CameraKind::Thermal => Some("Thermal images hold temperatures, not brightness"),
@@ -389,10 +458,10 @@ fn measure_view(
             .push(format!("{what}; exposure and focus are not measured"));
         return measured;
     }
-    if !frame::convertible(frame.pixel_format) {
+    if !frame::frame_convertible(frame) {
         measured.notes.push(format!(
             "{} frames cannot be decoded; exposure, focus and the preview are unavailable",
-            pixel_format_label(frame.pixel_format)
+            frame_pixel_format_label(frame)
         ));
         return measured;
     }
@@ -523,13 +592,13 @@ fn render_within(
     if max_dimension == 0
         || view.width == 0
         || view.height == 0
-        || !frame::convertible(view.pixel_format())
+        || !frame::frame_convertible(view.frame)
     {
         return Ok(None);
     }
     let jpeg = jpeg_preview(format, jpeg_available)?;
     frame::validate_source(view.frame)?;
-    let channels = if frame::monochrome(view.pixel_format()) {
+    let channels = if frame::frame_monochrome(view.frame) {
         frame::Channels::Gray
     } else {
         frame::Channels::Rgb
@@ -831,7 +900,7 @@ pub fn inspect(
         format,
         cfg!(feature = "jpeg"),
         MAX_IMAGE_BYTES,
-        !view.is_whole() && frame::convertible(frame.pixel_format),
+        !view.is_whole() && frame::frame_convertible(frame),
     )?;
     let [x, y, width, height] = rect;
     let share = |part: u32, whole: u32| round4(f64::from(part) / f64::from(whole.max(1)));
@@ -923,6 +992,11 @@ mod tests {
 
     fn frame(pixel_format: u32, width: u32, height: u32, data: Vec<u8>) -> Frame {
         Frame {
+            pixel_encoding: None,
+            device_timestamp: None,
+            received_monotonic_ns: None,
+            chunks: None,
+            multipart: None,
             id: 7,
             width,
             height,
@@ -1310,7 +1384,9 @@ mod tests {
         assert!(measured.auto_meter.is_none());
         assert_eq!(
             measured.notes,
-            ["Depth images hold distances, not brightness; exposure and focus are not measured"]
+            [
+                "Coord3D_C16 contains measurement samples. Exposure and focus require an intensity image."
+            ]
         );
         for kind in [CameraKind::Thermal, CameraKind::LineScan] {
             let measured = measure(&frame(MONO8, 16, 16, vec![9; 256]), kind, [0, 0, 16, 16]);

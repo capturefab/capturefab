@@ -148,7 +148,7 @@ pub(crate) fn managed_name(name: &str) -> bool {
 /// Register (`IntReg`, `StringReg`, …) and command nodes hold no value a
 /// setup may save or restore.
 pub(crate) fn not_a_value(kind: &str) -> bool {
-    kind == "Command" || kind.ends_with("Reg")
+    matches!(kind, "Command" | "Register") || kind.ends_with("Reg")
 }
 
 /// Writing this feature only changes how the image looks, frames or is
@@ -1260,6 +1260,8 @@ mod tests {
         assert!(managed("Anything", Some("FileAccessControl"), None));
         assert!(managed("Anything", Some("UserSetControl"), None));
         assert!(managed("AnyReg", None, Some("IntReg")));
+        assert!(managed("LUTValueAll", None, Some("Register")));
+        assert!(not_a_value("Register"));
         assert!(managed("TriggerSoftware", None, Some("Command")));
         assert!(!managed(
             "ExposureTime",

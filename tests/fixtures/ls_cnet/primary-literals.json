@@ -1,0 +1,32 @@
+{
+  "manual_sha256": "33a4c28ca4458f9a5b8505db49d22ccd09ccf9af0ef09c5d605f6872ed80ac65",
+  "vendor_request_7_6": {
+    "provenance": "Unchanged coherent rSS word request printed on physical97/printed7-6. Not a device capture.",
+    "hex": "05323072535330313036254d57313030044134",
+    "checksum_low_byte": 164
+  },
+  "reconstructed_7_8_request": {
+    "provenance": "Spec-derived lowercase rSS station01/two explicit words %MW020 and %PW001. Corrects the extra printed0 in the second name's ASCII cell and adds mandatory BCC68; not unchanged vendor bytes.",
+    "hex": "05303172535330323036254d573032303036255057303031043638"
+  },
+  "reconstructed_7_8_ack": {
+    "provenance": "Spec-derived rSS ACK with matching station01, blockcount02, bytecount02 per block, words1234/5678, ETX and BCC4C. Not a captured reply.",
+    "hex": "0630317253533032303231323334303235363738033443",
+    "expected": [
+      4660,
+      22136
+    ]
+  },
+  "reconstructed_nak": {
+    "provenance": "Spec-derived rSS NAK station01/error1132/ETX/BCC58; no device capture.",
+    "hex": "15303172535331313332033538"
+  },
+  "printed_inconsistencies_not_replayed_as_valid": [
+    "7-6 block maximum H10 (16) prints ASCII3030 (00); correct ASCII10 is3130, and prose/A3 independently confirm16",
+    "7-7 tail label ETX but ASCII cell H04",
+    "7-8 second variable %PW001 length06 but ASCII H25505730303031 spells %PW0001 (7 bytes)",
+    "7-10 SB bytecount H02 but ASCII H3134 spells14",
+    "7-11 SB %MW000 length06 but printed H254D303030 omits W/H57"
+  ],
+  "excluded": "The unresolved SB blockcount layout is not enabled or used by product/positive capture fixtures. Its contradictory primary/stock evidence is preserved separately."
+}

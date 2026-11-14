@@ -4,7 +4,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Serde's borrowed predicate for fields omitted at their declared default.
 pub(crate) fn is_default<T: Default + PartialEq>(value: &T) -> bool {
@@ -16,6 +16,8 @@ pub(crate) fn is_default<T: Default + PartialEq>(value: &T) -> bool {
 pub enum Transport {
     GigE,
     Usb3,
+    #[serde(rename = "gentl")]
+    GenTl,
     Simulator,
     Media,
 }
@@ -25,6 +27,7 @@ impl std::fmt::Display for Transport {
         f.write_str(match self {
             Self::GigE => "GigE",
             Self::Usb3 => "USB3",
+            Self::GenTl => "GenTL",
             Self::Simulator => "Simulator",
             Self::Media => "Media",
         })
@@ -42,30 +45,430 @@ pub struct CameraInfo {
     pub profile: crate::camera_profile::CameraProfile,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// A producer clock whose ticks have not been assigned an assumed time unit.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceTimestamp {
+    pub ticks: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_hz: Option<u64>,
+}
+
+/// An explicit vendor encoding; the integer pixel code alone never selects it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "namespace", rename_all = "lowercase", deny_unknown_fields)]
+pub enum PixelEncoding {
+    Ids {
+        name: IdsPixelFormat,
+        #[serde(deserialize_with = "crate::config_number::unsigned")]
+        code: u32,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::config_number::optional_unsigned"
+        )]
+        gentl_namespace: Option<u64>,
+    },
+    Lucid {
+        name: LucidPixelFormat,
+        #[serde(deserialize_with = "crate::config_number::unsigned")]
+        code: u32,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::config_number::optional_unsigned"
+        )]
+        gentl_namespace: Option<u64>,
+    },
+}
+
+/// LUCID Vision Labs custom 3D layouts. A custom code can mean something else for
+/// another vendor, so only real LUCID identity plus an exact static XML entry admits it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LucidPixelFormat {
+    /// Unsigned interleaved A, B, C coordinate codes and a Y intensity word,
+    /// each 16 bits, low byte first (LUCID Arena `PFNC.h` 0x82400403).
+    #[serde(rename = "Coord3D_ABCY16")]
+    Coord3dAbcy16,
+}
+impl LucidPixelFormat {
+    pub(crate) const ALL: [Self; 1] = [Self::Coord3dAbcy16];
+    pub(crate) fn vendor_matches(vendor: &str) -> bool {
+        vendor.trim().eq_ignore_ascii_case("Lucid Vision Labs")
+    }
+    pub(crate) const fn code(self) -> u32 {
+        match self {
+            Self::Coord3dAbcy16 => 0x8240_0403,
+        }
+    }
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Coord3dAbcy16 => "Coord3D_ABCY16",
+        }
+    }
+    /// Bytes per pixel and component names, in wire order.
+    pub(crate) const fn layout(self) -> (usize, &'static [&'static str]) {
+        match self {
+            Self::Coord3dAbcy16 => (8, &["A", "B", "C", "Y"]),
+        }
+    }
+    pub(crate) const fn encoding(self, gentl_namespace: Option<u64>) -> PixelEncoding {
+        PixelEncoding::Lucid {
+            name: self,
+            code: self.code(),
+            gentl_namespace,
+        }
+    }
+}
+
+/// The finite grouped monochrome and four-phase Bayer byte layouts documented by IDS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IdsPixelFormat {
+    #[serde(rename = "Mono10g40IDS")]
+    Mono10g40,
+    #[serde(rename = "Mono12g24IDS")]
+    Mono12g24,
+    #[serde(rename = "BayerRG10g40IDS")]
+    BayerRg10g40,
+    #[serde(rename = "BayerRG12g24IDS")]
+    BayerRg12g24,
+    #[serde(rename = "BayerGR10g40IDS")]
+    BayerGr10g40,
+    #[serde(rename = "BayerGR12g24IDS")]
+    BayerGr12g24,
+    #[serde(rename = "BayerGB10g40IDS")]
+    BayerGb10g40,
+    #[serde(rename = "BayerGB12g24IDS")]
+    BayerGb12g24,
+    #[serde(rename = "BayerBG10g40IDS")]
+    BayerBg10g40,
+    #[serde(rename = "BayerBG12g24IDS")]
+    BayerBg12g24,
+}
+impl IdsPixelFormat {
+    pub(crate) const ALL: [Self; 10] = [
+        Self::Mono10g40,
+        Self::Mono12g24,
+        Self::BayerRg10g40,
+        Self::BayerRg12g24,
+        Self::BayerGr10g40,
+        Self::BayerGr12g24,
+        Self::BayerGb10g40,
+        Self::BayerGb12g24,
+        Self::BayerBg10g40,
+        Self::BayerBg12g24,
+    ];
+    /// Recognition only enforces admission; a bare custom code never supplies a decoder.
+    #[cfg(any(feature = "usb", feature = "gentl"))]
+    pub(crate) const fn requires_qualification(code: u32) -> bool {
+        matches!(code, 0x4000_000f | 0x4000_001f | 0x4000_0001..=0x4000_0004 | 0x4000_0011..=0x4000_0014)
+    }
+    pub(crate) fn vendor_matches(vendor: &str) -> bool {
+        vendor
+            .trim()
+            .eq_ignore_ascii_case("IDS Imaging Development Systems GmbH")
+    }
+    pub(crate) const fn code(self) -> u32 {
+        match self {
+            Self::Mono10g40 => 0x4000_000f,
+            Self::Mono12g24 => 0x4000_001f,
+            Self::BayerRg10g40 => 0x4000_0001,
+            Self::BayerRg12g24 => 0x4000_0011,
+            Self::BayerGr10g40 => 0x4000_0003,
+            Self::BayerGr12g24 => 0x4000_0013,
+            Self::BayerGb10g40 => 0x4000_0002,
+            Self::BayerGb12g24 => 0x4000_0012,
+            Self::BayerBg10g40 => 0x4000_0004,
+            Self::BayerBg12g24 => 0x4000_0014,
+        }
+    }
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Mono10g40 => "Mono10g40IDS",
+            Self::Mono12g24 => "Mono12g24IDS",
+            Self::BayerRg10g40 => "BayerRG10g40IDS",
+            Self::BayerRg12g24 => "BayerRG12g24IDS",
+            Self::BayerGr10g40 => "BayerGR10g40IDS",
+            Self::BayerGr12g24 => "BayerGR12g24IDS",
+            Self::BayerGb10g40 => "BayerGB10g40IDS",
+            Self::BayerGb12g24 => "BayerGB12g24IDS",
+            Self::BayerBg10g40 => "BayerBG10g40IDS",
+            Self::BayerBg12g24 => "BayerBG12g24IDS",
+        }
+    }
+    pub(crate) const fn bits(self) -> u32 {
+        match self {
+            Self::Mono10g40
+            | Self::BayerRg10g40
+            | Self::BayerGr10g40
+            | Self::BayerGb10g40
+            | Self::BayerBg10g40 => 10,
+            Self::Mono12g24
+            | Self::BayerRg12g24
+            | Self::BayerGr12g24
+            | Self::BayerGb12g24
+            | Self::BayerBg12g24 => 12,
+        }
+    }
+    pub(crate) const fn group(self) -> (u32, usize) {
+        match self {
+            Self::Mono10g40
+            | Self::BayerRg10g40
+            | Self::BayerGr10g40
+            | Self::BayerGb10g40
+            | Self::BayerBg10g40 => (4, 5),
+            Self::Mono12g24
+            | Self::BayerRg12g24
+            | Self::BayerGr12g24
+            | Self::BayerGb12g24
+            | Self::BayerBg12g24 => (2, 3),
+        }
+    }
+    pub(crate) const fn is_monochrome(self) -> bool {
+        matches!(self, Self::Mono10g40 | Self::Mono12g24)
+    }
+    /// Interpretation after unpacking; the original custom code stays in source metadata.
+    pub(crate) const fn unpacked_format(self) -> u32 {
+        match self {
+            Self::Mono10g40 => 0x0110_0003,
+            Self::Mono12g24 => 0x0110_0005,
+            Self::BayerRg10g40 => 0x0110_000d,
+            Self::BayerRg12g24 => 0x0110_0011,
+            Self::BayerGr10g40 => 0x0110_000c,
+            Self::BayerGr12g24 => 0x0110_0010,
+            Self::BayerGb10g40 => 0x0110_000e,
+            Self::BayerGb12g24 => 0x0110_0012,
+            Self::BayerBg10g40 => 0x0110_000f,
+            Self::BayerBg12g24 => 0x0110_0013,
+        }
+    }
+    pub(crate) const fn reduced_format(self) -> u32 {
+        match self {
+            Self::Mono10g40 | Self::Mono12g24 => MONO8,
+            Self::BayerRg10g40 | Self::BayerRg12g24 => 0x0108_0009,
+            Self::BayerGr10g40 | Self::BayerGr12g24 => 0x0108_0008,
+            Self::BayerGb10g40 | Self::BayerGb12g24 => 0x0108_000a,
+            Self::BayerBg10g40 | Self::BayerBg12g24 => 0x0108_000b,
+        }
+    }
+    /// Color filter at the original first pixel, before any host view/crop.
+    pub(crate) const fn color_filter(self) -> Option<&'static str> {
+        match self {
+            Self::Mono10g40 | Self::Mono12g24 => None,
+            Self::BayerRg10g40 | Self::BayerRg12g24 => Some("RGGB"),
+            Self::BayerGr10g40 | Self::BayerGr12g24 => Some("GRBG"),
+            Self::BayerGb10g40 | Self::BayerGb12g24 => Some("GBRG"),
+            Self::BayerBg10g40 | Self::BayerBg12g24 => Some("BGGR"),
+        }
+    }
+    pub(crate) const fn encoding(self, gentl_namespace: Option<u64>) -> PixelEncoding {
+        PixelEncoding::Ids {
+            name: self,
+            code: self.code(),
+            gentl_namespace,
+        }
+    }
+}
+impl PixelEncoding {
+    pub(crate) fn ids(self, pixel_format: u32) -> Result<IdsPixelFormat> {
+        let Self::Ids {
+            name,
+            code,
+            gentl_namespace,
+        } = self
+        else {
+            anyhow::bail!("pixel encoding is not an IDS layout");
+        };
+        anyhow::ensure!(
+            code == name.code() && pixel_format == code,
+            "IDS pixel encoding does not match the original pixel code"
+        );
+        anyhow::ensure!(
+            gentl_namespace.is_none_or(|namespace| matches!(namespace, 1 | 4 | 1000)),
+            Categorized::error(
+                ErrorKind::Unsupported,
+                "unsupported IDS GenTL pixel namespace"
+            )
+        );
+        Ok(name)
+    }
+    pub(crate) fn lucid(self, pixel_format: u32) -> Result<LucidPixelFormat> {
+        let Self::Lucid {
+            name,
+            code,
+            gentl_namespace,
+        } = self
+        else {
+            anyhow::bail!("pixel encoding is not a LUCID layout");
+        };
+        anyhow::ensure!(
+            code == name.code() && pixel_format == code,
+            "LUCID pixel encoding does not match the original pixel code"
+        );
+        // GenTL producers report the PFNC namespace (custom bit set) or a custom one.
+        anyhow::ensure!(
+            gentl_namespace.is_none_or(|namespace| matches!(namespace, 1 | 1000)),
+            Categorized::error(
+                ErrorKind::Unsupported,
+                "unsupported LUCID GenTL pixel namespace"
+            )
+        );
+        Ok(name)
+    }
+    /// Validate whichever vendor layout this is against the frame's code.
+    pub(crate) fn check(self, pixel_format: u32) -> Result<()> {
+        match self {
+            Self::Ids { .. } => self.ids(pixel_format).map(drop),
+            Self::Lucid { .. } => self.lucid(pixel_format).map(drop),
+        }
+    }
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Ids { name, .. } => name.name(),
+            Self::Lucid { name, .. } => name.name(),
+        }
+    }
+    pub(crate) const fn code(self) -> u32 {
+        match self {
+            Self::Ids { code, .. } | Self::Lucid { code, .. } => code,
+        }
+    }
+    #[must_use]
+    #[cfg(any(feature = "gentl", test))]
+    pub(crate) const fn with_namespace(self, namespace: Option<u64>) -> Self {
+        match self {
+            Self::Ids { name, code, .. } => Self::Ids {
+                name,
+                code,
+                gentl_namespace: namespace,
+            },
+            Self::Lucid { name, code, .. } => Self::Lucid {
+                name,
+                code,
+                gentl_namespace: namespace,
+            },
+        }
+    }
+    pub(crate) const fn namespace(self) -> Option<u64> {
+        match self {
+            Self::Ids {
+                gentl_namespace, ..
+            }
+            | Self::Lucid {
+                gentl_namespace, ..
+            } => gentl_namespace,
+        }
+    }
+    pub(crate) fn row_bytes(self, pixel_format: u32, width: u32) -> Option<usize> {
+        if let Ok(lucid) = self.lucid(pixel_format) {
+            return usize::try_from(width).ok()?.checked_mul(lucid.layout().0);
+        }
+        let (pixels, bytes) = self.ids(pixel_format).ok()?.group();
+        width.is_multiple_of(pixels).then_some(())?;
+        usize::try_from(width / pixels).ok()?.checked_mul(bytes)
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Frame {
     pub id: u64,
     pub width: u32,
     pub height: u32,
     pub pixel_format: u32,
+    /// Explicit vendor byte layout, qualified at ingress and retained with original bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pixel_encoding: Option<PixelEncoding>,
     /// The camera's own clock when it took the frame, in nanoseconds, from a
     /// `GigE` Vision or USB3 Vision leader (or the simulator's clock). It is
     /// comparable only between frames of one camera, or of cameras that
     /// share a PTP clock, and is never a date.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_ts_ns: Option<u64>,
+    /// Original producer clock ticks, retained even when its frequency is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_timestamp: Option<DeviceTimestamp>,
     /// When the host received it, UTC Unix milliseconds; set by
     /// `Camera::next_frame`.
     #[serde(default)]
     pub wall_ms: u64,
+    /// The host-wide monotonic receive clock, for cross-process data timelines.
+    #[serde(skip)]
+    pub received_monotonic_ns: Option<u64>,
     /// The pixels, shared by every clone of the frame.
     #[serde(skip)]
     pub data: crate::framebuf::FrameBuf,
+    /// The complete original image-with-chunks payload and its opaque layout.
+    /// Pixel consumers use `data`; captures retain this payload separately.
+    #[serde(skip)]
+    pub chunks: Option<std::sync::Arc<crate::transport::chunks::ChunkData>>,
+    /// Every multipart component, archived without allocation gaps.
+    #[serde(skip)]
+    pub multipart: Option<std::sync::Arc<crate::transport::multipart::MultipartData>>,
     /// The JPEG the source sent the frame as (an MJPEG webcam, stream or
     /// file), whose decoding `data` is: a JPEG still of the frame is this,
     /// rather than a new encoding. A frame made from another never has it.
     #[serde(skip)]
     pub jpeg: Option<crate::framebuf::FrameBuf>,
+}
+
+impl Serialize for Frame {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::Error as _;
+        if crate::frame::selection_required(self) {
+            return Err(S::Error::custom(
+                "multipart frame requires an explicit part selection before serialization",
+            ));
+        }
+        // Preserve the prior metadata-only JSON contract exactly; payloads remain local.
+        #[derive(Serialize)]
+        struct Metadata<'a> {
+            id: u64,
+            width: u32,
+            height: u32,
+            pixel_format: u32,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            pixel_encoding: Option<&'a PixelEncoding>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            device_ts_ns: Option<u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            device_timestamp: Option<&'a DeviceTimestamp>,
+            wall_ms: u64,
+        }
+        Metadata {
+            id: self.id,
+            width: self.width,
+            height: self.height,
+            pixel_format: self.pixel_format,
+            pixel_encoding: self.pixel_encoding.as_ref(),
+            device_ts_ns: self.device_ts_ns,
+            device_timestamp: self.device_timestamp.as_ref(),
+            wall_ms: self.wall_ms,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl Frame {
+    /// Backing allocations retained by one queued frame, including unused
+    /// buffer capacity and its original chunks.
+    pub(crate) fn buffer_bytes(&self) -> usize {
+        self.data
+            .allocated_bytes()
+            .saturating_add(
+                self.jpeg
+                    .as_ref()
+                    .map_or(0, crate::framebuf::FrameBuf::allocated_bytes),
+            )
+            .saturating_add(
+                self.chunks
+                    .as_ref()
+                    .map_or(0, |chunks| chunks.buffer_bytes()),
+            )
+            .saturating_add(
+                self.multipart
+                    .as_ref()
+                    .map_or(0, |parts| parts.buffer_bytes()),
+            )
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -86,20 +489,112 @@ pub struct TransportStats {
     pub notes: Vec<String>,
 }
 
+/// Time left in one named-register operation; no new I/O starts after expiry.
+pub(crate) fn control_remaining(deadline: Instant) -> Result<Duration> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "camera register operation deadline expired",
+        )
+        .into());
+    }
+    Ok(left)
+}
+
 /// Reads/writes bytes in the camera's address space. `GenApi` nodes determine byte order.
 pub trait RegisterIo: Send {
+    /// Read under one absolute caller deadline, including every physical transaction.
+    /// A transport without this capability refuses rather than using an unbounded fallback.
+    fn read_memory_until(
+        &mut self,
+        _address: u64,
+        _length: usize,
+        _deadline: Instant,
+    ) -> Result<Vec<u8>> {
+        Err(Categorized::error(
+            ErrorKind::Unsupported,
+            "this transport does not support bounded named-register reads",
+        ))
+    }
+    /// Write under one absolute caller deadline; an error may leave a committed prefix.
+    fn write_memory_until(
+        &mut self,
+        _address: u64,
+        _data: &[u8],
+        _deadline: Instant,
+    ) -> Result<()> {
+        Err(Categorized::error(
+            ErrorKind::Unsupported,
+            "this transport does not support bounded named-register writes",
+        ))
+    }
+
     fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>>;
     fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()>;
+    /// Read an immutable camera chunk by its XML-declared ID and relative address.
+    /// Live transports do not bind chunk ports; frame snapshots implement this.
+    fn read_chunk_memory(
+        &mut self,
+        _chunk_id: u64,
+        _address: u64,
+        _length: usize,
+    ) -> Result<Vec<u8>> {
+        Err(Categorized::error(
+            ErrorKind::Unsupported,
+            "chunk ports require a retained frame payload",
+        ))
+    }
+}
+
+/// Immutable access granted by an opened camera transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CameraAccess {
+    Control,
+    ReadOnlyMonitor,
 }
 
 /// Owns transport resources; called exclusively by the camera worker thread.
 pub trait Backend: RegisterIo {
+    /// Access is captured once when the camera is constructed.
+    fn access(&self) -> CameraAccess {
+        CameraAccess::Control
+    }
+    /// Finish XML/profile initialization under the transport's original scope.
+    fn finish_initialization(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn xml(&mut self) -> Result<String>;
+    /// Admit bounded internal multipart representatives for explicitly selected still jobs.
+    fn enable_multipart_projection(&mut self) -> Result<()> {
+        Err(Categorized::error(
+            ErrorKind::Unsupported,
+            "this transport does not support per-job multipart selection",
+        ))
+    }
+    /// Supply statically verified vendor layouts before acquisition.
+    fn configure_pixel_encodings(&mut self, encodings: &[PixelEncoding]) -> Result<()> {
+        if encodings.is_empty() {
+            Ok(())
+        } else {
+            Err(Categorized::error(
+                ErrorKind::Unsupported,
+                "this transport does not support qualified vendor pixel encodings",
+            ))
+        }
+    }
     /// Forget the XML `xml` read from the disk cache, which did not parse
     /// or resolve, so the next call reads it from the device. Whether there
     /// was one.
     fn forget_xml(&mut self) -> bool {
         false
+    }
+    /// Required buffer size when the stream defines it independently of the camera.
+    ///
+    /// # Errors
+    /// Returns an error if the transport cannot read a declared stream size.
+    fn stream_payload_size(&mut self) -> Result<Option<usize>> {
+        Ok(None)
     }
     /// Configure receiving before the owner executes `AcquisitionStart`.
     fn start(&mut self, payload_size: usize) -> Result<()>;
@@ -110,7 +605,18 @@ pub trait Backend: RegisterIo {
         Ok(())
     }
     fn next_frame(&mut self, timeout: Duration) -> Result<Frame>;
+    /// A sticky terminal transport failure, observed without network I/O.
+    /// Other backends retain their existing recovery policy.
+    fn terminal_error(&self) -> Option<anyhow::Error> {
+        None
+    }
+    /// A terminal frame error needs the camera's remote and transport stop sequence now.
+    fn stop_after_frame_error(&self) -> bool {
+        false
+    }
     fn stop(&mut self) -> Result<()>;
+    /// Finish deferred transport cleanup after remote commands and unlock were attempted.
+    fn finish_stop(&mut self) {}
     /// The compressed video the source sends, tapped as it arrives so a
     /// recording in `codec` can copy it instead of encoding its frames:
     /// when the source has video `wanted` takes. Tapping may reopen the
@@ -465,6 +971,27 @@ pub(crate) fn parse_bytes(value: &str) -> Result<u64> {
         .context("the size is too large")?;
     anyhow::ensure!(bytes > 0, "a size must be positive");
     Ok(bytes)
+}
+
+/// Decode explicit raw hex without allocating beyond the declared byte cap.
+pub(crate) fn decode_hex(text: &str, maximum: usize) -> Result<Vec<u8>> {
+    validate_hex(text, maximum)?;
+    text.as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| Ok(u8::from_str_radix(std::str::from_utf8(pair)?, 16)?))
+        .collect()
+}
+pub(crate) fn validate_hex(text: &str, maximum: usize) -> Result<()> {
+    if text.is_empty()
+        || !text.len().is_multiple_of(2)
+        || text.len() / 2 > maximum
+        || !text.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(Usage(format!("hex data must contain 1..={maximum} bytes as an even number of ASCII hexadecimal digits")).into());
+    }
+    Ok(())
 }
 
 /// `bytes` in lowercase hex.
@@ -896,6 +1423,30 @@ pub(crate) fn frame_timeout(message: impl Into<String>) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn short_frame_pixels_and_jpeg_charge_their_full_backing_allocations() {
+        let mut pixels = Vec::with_capacity(1 << 20);
+        pixels.extend_from_slice(&[1, 2, 3]);
+        let mut jpeg = Vec::with_capacity(1 << 18);
+        jpeg.extend_from_slice(&[0xff, 0xd8]);
+        let allocated = pixels.capacity() + jpeg.capacity();
+        let frame = Frame {
+            data: pixels.into(),
+            jpeg: Some(jpeg.into()),
+            ..Frame::default()
+        };
+        assert_eq!(frame.data.len(), 3);
+        assert_eq!(frame.jpeg.as_ref().unwrap().len(), 2);
+        let cloned = frame.clone();
+        assert_eq!(cloned.data.as_ptr(), frame.data.as_ptr());
+        assert_eq!(
+            cloned.jpeg.as_ref().unwrap().as_ptr(),
+            frame.jpeg.as_ref().unwrap().as_ptr()
+        );
+        assert_eq!(cloned.buffer_bytes(), allocated);
+        assert_eq!(frame.buffer_bytes(), allocated);
+    }
+
     #[test]
     fn uuid_groups_preserve_every_input_byte() {
         assert_eq!(

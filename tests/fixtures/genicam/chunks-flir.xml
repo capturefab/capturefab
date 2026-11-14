@@ -1,0 +1,15 @@
+<!-- Minimal functional layout from PGR_BlackflyS_13Y3M.xml, captured by
+areaDetector/aravisGigE at commit 6d6171d0a82d669ca1fb1ebcb9b3fd5b8b055125.
+Names, IDs and register layouts only; vendor descriptions are not redistributed. -->
+<RegisterDescription>
+  <Category Name="Root"><pFeature>ChunkFrameID</pFeature><pFeature>ChunkTimestamp</pFeature></Category>
+  <Port Name="Device"/>
+  <MaskedIntReg Name="ChunkSelector_FrameID_Imp"><Address>0x00150050</Address><Length>4</Length><AccessMode>RO</AccessMode><pPort>Device</pPort><Bit>29</Bit><Sign>Unsigned</Sign><Endianess>BigEndian</Endianess></MaskedIntReg>
+  <MaskedIntReg Name="ChunkSelector_Timestamp_Imp"><Address>0x00150050</Address><Length>4</Length><AccessMode>RO</AccessMode><pPort>Device</pPort><Bit>18</Bit><Sign>Unsigned</Sign><Endianess>BigEndian</Endianess></MaskedIntReg>
+  <Integer Name="ChunkFrameID"><pIsImplemented>ChunkSelector_FrameID_Imp</pIsImplemented><ImposedAccessMode>RO</ImposedAccessMode><pValue>ChunkFrameID_Val</pValue></Integer>
+  <IntReg Name="ChunkFrameID_Val"><Address>0</Address><Length>8</Length><AccessMode>RO</AccessMode><pPort>FrameIDPort</pPort><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
+  <Port Name="FrameIDPort"><ChunkID>05040003</ChunkID></Port>
+  <Integer Name="ChunkTimestamp"><pIsImplemented>ChunkSelector_Timestamp_Imp</pIsImplemented><ImposedAccessMode>RO</ImposedAccessMode><pValue>ChunkTimestamp_Val</pValue></Integer>
+  <IntReg Name="ChunkTimestamp_Val"><Address>0</Address><Length>8</Length><AccessMode>RO</AccessMode><pPort>TimestampPort</pPort><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
+  <Port Name="TimestampPort"><ChunkID>0508000E</ChunkID></Port>
+</RegisterDescription>

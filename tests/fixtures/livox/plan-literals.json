@@ -1,0 +1,199 @@
+{
+  "schema": 1,
+  "provenance": "spec-derived immutable recipes copied from primary-qualified plan before product decoder; not physical or SDK capture",
+  "plan_sha256": "b3e0d6f7444bdce384b99aebf3009ca0c1ce9b587401bb1a7e36d29c5232d3b5",
+  "recipes": {
+    "sdk2_imu": {
+      "header_hex": "003c00000001000000000000a20102030405060708090a0b3a811ca6efcdab8967452301",
+      "prefix_hex": "0000803f000000bf00000080000000000000803f0100c07f",
+      "zero_tail_bytes": 0,
+      "bytes": 60,
+      "sha256": "0c30946d93d35fb2af57b8ead7c28a860fe32732707c0f99002c8f10386d707c",
+      "crc32_iso_hdlc": 2786885946,
+      "expected": {
+        "data_type": 0,
+        "records": 1,
+        "timestamp_raw": 81985529216486895,
+        "float32_words_raw": [
+          1065353216,
+          3204448256,
+          2147483648,
+          0,
+          1065353216,
+          2143289345
+        ],
+        "finite_status": [
+          "finite",
+          "finite",
+          "finite",
+          "finite",
+          "finite",
+          "nonfinite"
+        ],
+        "finite_values": [
+          1,
+          -0.5,
+          "negative_zero",
+          0,
+          1,
+          null
+        ]
+      }
+    },
+    "sdk2_cartesian32": {
+      "header_hex": "006405cf036000ffff7f017ea20102030405060708090a0b7ee8f278efcdab89674523f1",
+      "prefix_hex": "18fcffffd007000048f4ffff11e40000008000000000ffffff7fff3f",
+      "zero_tail_bytes": 1316,
+      "bytes": 1380,
+      "sha256": "d10d79e4dce3c5e732878c1d25a95d876951a1f336ca943aa8f02bfcc92ca5e4",
+      "crc32_iso_hdlc": 2029185150,
+      "expected": {
+        "data_type": 1,
+        "records": 96,
+        "timestamp_raw": 17375808098319191535,
+        "first_xyz_raw": [
+          -1000,
+          2000,
+          -3000
+        ],
+        "second_xyz_raw": [
+          -2147483648,
+          0,
+          2147483647
+        ],
+        "reflectivity_prefix": [
+          17,
+          255
+        ],
+        "tag_prefix": [
+          228,
+          63
+        ],
+        "zero_records": 94,
+        "coordinate_unit_mm": 1
+      }
+    },
+    "sdk2_cartesian16": {
+      "header_hex": "002403cf0360000000800200a20102030405060708090a0b84002875efcdab89674523f1",
+      "prefix_hex": "85ffc801ebfc805500800000ff7f00ff",
+      "zero_tail_bytes": 752,
+      "bytes": 804,
+      "sha256": "f3b3005219dda94106a6c844a5501be1396f897282c861599cbaa2869cacfd82",
+      "crc32_iso_hdlc": 1965555844,
+      "expected": {
+        "data_type": 2,
+        "records": 96,
+        "timestamp_raw": 17375808098319191535,
+        "first_xyz_raw": [
+          -123,
+          456,
+          -789
+        ],
+        "second_xyz_raw": [
+          -32768,
+          0,
+          32767
+        ],
+        "reflectivity_prefix": [
+          128,
+          0
+        ],
+        "tag_prefix": [
+          85,
+          255
+        ],
+        "zero_records": 94,
+        "coordinate_unit_mm": 10,
+        "first_xyz_mm": [
+          -1230,
+          4560,
+          -7890
+        ],
+        "second_xyz_mm": [
+          -327680,
+          0,
+          327670
+        ]
+      }
+    },
+    "sdk2_spherical": {
+      "header_hex": "00e403cf0360000100810302a20102030405060708090a0b19ca9189efcdab89674523f1",
+      "prefix_hex": "40e201005046a08c42e4000000000100ffff00ff",
+      "zero_tail_bytes": 940,
+      "bytes": 996,
+      "sha256": "d1da1fc19d9935ffc9454db0b57fb28ce712d06a42ebfc922876bf34ec58057d",
+      "crc32_iso_hdlc": 2308033049,
+      "expected": {
+        "data_type": 3,
+        "records": 96,
+        "timestamp_raw": 17375808098319191535,
+        "depth_prefix": [
+          123456,
+          0
+        ],
+        "zenith_prefix": [
+          18000,
+          1
+        ],
+        "azimuth_prefix": [
+          36000,
+          65535
+        ],
+        "reflectivity_prefix": [
+          66,
+          0
+        ],
+        "tag_prefix": [
+          228,
+          255
+        ],
+        "zero_records": 94,
+        "angle_range_prefix": [
+          "nominal",
+          "out_of_nominal"
+        ]
+      }
+    },
+    "legacy_imu_pps": {
+      "header_hex": "0501027f420000c0040618fcffffffffffff",
+      "prefix_hex": "0000803f000000bf00000080000000000000803f0100c07f",
+      "zero_tail_bytes": 0,
+      "bytes": 42,
+      "sha256": "87444c619856eb53992893f324ef1f75b25e48133482a1157ef383a2b3c16224",
+      "expected": {
+        "data_type": 6,
+        "records": 1,
+        "timestamp_type": 4,
+        "timestamp_signed_ns": -1000,
+        "status_raw": 3221225538,
+        "slot_raw": 1,
+        "lidar_id_raw": 2,
+        "reserved_raw": 127,
+        "float32_words_raw": [
+          1065353216,
+          3204448256,
+          2147483648,
+          0,
+          1065353216,
+          2143289345
+        ],
+        "finite_status": [
+          "finite",
+          "finite",
+          "finite",
+          "finite",
+          "finite",
+          "nonfinite"
+        ],
+        "finite_values": [
+          1,
+          -0.5,
+          "negative_zero",
+          0,
+          1,
+          null
+        ]
+      }
+    }
+  }
+}

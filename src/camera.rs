@@ -1,7 +1,7 @@
 #![deny(clippy::missing_const_for_fn)]
 use crate::{
     genicam::{Bounds, FeatureInfo, NodeMap},
-    types::{Backend, CameraInfo, Frame, Transport, TransportStats},
+    types::{Backend, CameraAccess, CameraInfo, Frame, Transport, TransportStats},
 };
 use anyhow::{Context as _, Result, ensure};
 use std::{
@@ -9,11 +9,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod action;
+mod register;
+
 /// The transports a discovery searches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Kinds {
     pub gige: bool,
     pub u3v: bool,
+    pub gentl: bool,
     /// Webcams and screen captures on this computer.
     pub host: bool,
     pub onvif: bool,
@@ -24,6 +28,7 @@ impl Kinds {
         Self {
             gige: true,
             u3v: true,
+            gentl: true,
             host: true,
             onvif: true,
             sim: true,
@@ -75,10 +80,14 @@ fn search(
     type Message = (&'static str, Result<Found>);
     type Search = Box<dyn FnOnce(&std::sync::mpsc::Sender<Message>) -> Result<Found> + Send>;
     // Whether it looks everywhere a camera can be.
-    let everywhere = kinds.gige && kinds.u3v && kinds.host && kinds.onvif;
-    // Without a network no broadcast can be answered: nothing to wait for.
+    let everywhere = kinds.gige && kinds.u3v && kinds.gentl && kinds.host && kinds.onvif;
+    // Without a LAN there is no reason to wait for an unqualified broadcast
+    // scan. An explicit lookup must still probe GigE's local interfaces:
+    // software producers can answer at loopback even on an isolated host.
     if (kinds.gige || kinds.onvif) && !networked() {
-        kinds.gige = false;
+        if want.is_none() {
+            kinds.gige = false;
+        }
         kinds.onvif = false;
     }
     let (sender, found) = std::sync::mpsc::channel::<Message>();
@@ -127,6 +136,29 @@ fn search(
         searches.push((
             "USB",
             Box::new(|_| crate::transport::usb::discover().map(Found::Cameras)),
+        ));
+    }
+    #[cfg(feature = "gentl")]
+    if kinds.gentl && crate::transport::gentl::configured() {
+        let want = want.cloned();
+        searches.push((
+            "GenTL",
+            Box::new(move |sender| {
+                let mut cameras = Vec::new();
+                let emit = stream("GenTL", sender, want.clone());
+                let discovered = crate::transport::gentl::discover_until(timeout, |info| {
+                    cameras.push(info.clone());
+                    want.as_ref().is_some_and(|want| want(info))
+                });
+                // A serial lookup can open the selected producer as soon as
+                // One arrives. Retire discovery owners before exposing it;
+                // preserve completed cameras when discovery reports warnings.
+                for info in &cameras {
+                    emit(info);
+                }
+                discovered?;
+                Ok(Found::Cameras(cameras))
+            }),
         ));
     }
     for (label, search) in searches {
@@ -187,6 +219,7 @@ fn search(
         let label = match info.transport {
             Transport::GigE => "GigE",
             Transport::Usb3 => "USB",
+            Transport::GenTl => "GenTL",
             Transport::Simulator => return false,
             Transport::Media if crate::onvif::is_source(&info.id) => "ONVIF",
             Transport::Media => "Native camera",
@@ -286,6 +319,7 @@ fn kinds_for(selector: &str) -> Kinds {
     let only = |gige, u3v| Kinds {
         gige,
         u3v,
+        gentl: false,
         host: false,
         onvif: false,
         sim: false,
@@ -317,7 +351,7 @@ pub(crate) fn still_there(info: &CameraInfo) -> bool {
             .is_some_and(|probed| probed.id == info.id && probed.serial == info.serial),
         Transport::Media if crate::onvif::is_source(&info.id) => false,
         Transport::Media => crate::media::host_camera_unchanged(info),
-        Transport::Usb3 | Transport::Simulator => false,
+        Transport::Usb3 | Transport::GenTl | Transport::Simulator => false,
     }
 }
 /// How long a `GigE` camera a recent discovery found has to answer at its
@@ -332,6 +366,7 @@ pub(crate) fn kind(info: &CameraInfo) -> &'static str {
     match info.transport {
         Transport::GigE => "gige",
         Transport::Usb3 => "u3v",
+        Transport::GenTl => "gentl",
         Transport::Simulator => "sim",
         Transport::Media if crate::onvif::is_source(source) => "onvif",
         Transport::Media if crate::media::is_host_camera(source) => {
@@ -379,6 +414,7 @@ const START_TRIGGERS: [&str; 3] = ["AcquisitionStart", "FrameBurstStart", "Frame
 pub struct Camera {
     pub info: CameraInfo,
     backend: Box<dyn Backend>,
+    access: CameraAccess,
     nodes: NodeMap,
     streaming: bool,
     xml: String,
@@ -393,6 +429,8 @@ pub struct Camera {
     /// each `TriggerSelector` value to fire under, or `None` for a camera
     /// without a selector.
     software_triggers: Option<Vec<Option<String>>>,
+    /// Device-backed chunk gates/scales, frozen between settings changes.
+    chunk_context: Option<crate::genicam::ChunkContext>,
     /// What says which frames may have been exposed before the last
     /// settings change.
     epoch: Epoch,
@@ -448,7 +486,11 @@ pub(crate) fn validate_selector_shape(selector: &str) -> Result<()> {
         !selector.trim().is_empty() && !selector.chars().any(char::is_control),
         "camera selector must be nonempty and contain no control characters"
     );
-    if selector.starts_with("sim:") {
+    if crate::transport::gige::monitor::is_selector(selector) {
+        crate::transport::gige::monitor::MonitorSpec::parse(selector)?;
+    } else if selector.starts_with("gentl:") {
+        crate::transport::gentl_selector::validate_selector_shape(selector)?;
+    } else if selector.starts_with("sim:") {
         crate::transport::simulator::validate_selector_shape(selector)?;
     } else if let Some(address) = selector.strip_prefix("gige:") {
         // Discovery names GigE cameras by their 48-bit MAC address.
@@ -514,7 +556,9 @@ pub(crate) enum Resolution {
 /// Selectors whose syntax already says what they open; they are never
 /// matched loosely against discovered cameras.
 pub(crate) fn is_explicit_selector(selector: &str) -> bool {
-    selector.starts_with("sim:")
+    crate::transport::gige::monitor::is_selector(selector)
+        || selector.starts_with("sim:")
+        || selector.starts_with("gentl:")
         || selector.starts_with("gige:")
         || selector.parse::<Ipv4Addr>().is_ok()
         || selector.contains("://")
@@ -818,6 +862,11 @@ fn selector_not_matched(
 /// Check both selector syntax and local source availability before opening.
 pub(crate) fn validate_selector(selector: &str) -> Result<()> {
     validate_selector_shape(selector)?;
+    if crate::transport::gige::monitor::is_selector(selector) {
+        // The explicit monitor URI is not a media source. Shape parsing above
+        // is pure; transport presence and identity are checked on open.
+        return Ok(());
+    }
     if let Some(source) = crate::transport::simulator::replay_source(selector) {
         crate::transport::simulator::replay::source_files(source)?;
     } else if crate::onvif::is_source(selector) {
@@ -829,6 +878,48 @@ pub(crate) fn validate_selector(selector: &str) -> Result<()> {
     }
     Ok(())
 }
+/// A monitor cannot mutate camera state or select a device register bank.
+pub(crate) fn monitor_error() -> anyhow::Error {
+    crate::types::Categorized::error(
+        crate::types::ErrorKind::Unsupported,
+        "read-only monitor access cannot change camera state or register banks",
+    )
+}
+
+fn monitor_deadline(timeout: Duration) -> Result<Instant> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .context("monitor initialization deadline overflow")?;
+    crate::types::control_remaining(deadline)?;
+    Ok(deadline)
+}
+
+fn monitor_login(login: Option<&crate::logins::CameraLogin>) -> Result<()> {
+    if login.is_some() {
+        return Err(crate::types::Categorized::error(
+            crate::types::ErrorKind::Usage,
+            "a GigE monitor does not accept a camera sign-in",
+        ));
+    }
+    Ok(())
+}
+
+fn monitor_identity(
+    spec: &crate::transport::gige::monitor::MonitorSpec,
+    info: &CameraInfo,
+) -> Result<()> {
+    if info.transport != Transport::GigE
+        || info.id != spec.canonical()
+        || info.address.as_deref() != Some(spec.camera.to_string().as_str())
+    {
+        return Err(crate::types::Categorized::error(
+            crate::types::ErrorKind::Usage,
+            "monitor identity does not match its original explicit selector",
+        ));
+    }
+    Ok(())
+}
+
 impl Camera {
     /// Open the camera named by `selector` without an explicit sign-in.
     ///
@@ -854,6 +945,15 @@ impl Camera {
         login: Option<&crate::logins::CameraLogin>,
     ) -> Result<Self> {
         validate_selector(selector)?;
+        if crate::transport::gige::monitor::is_selector(selector) {
+            let spec = crate::transport::gige::monitor::MonitorSpec::parse(selector)?;
+            monitor_login(login)?;
+            let deadline = monitor_deadline(timeout)?;
+            let info = crate::transport::gige::monitor::identify(&spec, deadline)?;
+            monitor_identity(&spec, &info)?;
+            let backend = crate::transport::gige::monitor::open(&spec, &info, deadline)?;
+            return Self::from_backend(info, backend);
+        }
         if crate::onvif::is_source(selector) {
             let (info, backend) = crate::onvif::connect_with(selector, login, timeout)?;
             return Self::from_backend(info, backend);
@@ -869,7 +969,12 @@ impl Camera {
     /// Returns an error if the selector cannot be matched uniquely, media-source
     /// information cannot be read, or the `GigE` identity probe fails or times out.
     pub fn identify(selector: &str, known: &[CameraInfo], timeout: Duration) -> Result<CameraInfo> {
-        Ok(if selector.starts_with("sim:") {
+        Ok(if crate::transport::gige::monitor::is_selector(selector) {
+            let spec = crate::transport::gige::monitor::MonitorSpec::parse(selector)?;
+            crate::transport::gige::monitor::identify(&spec, monitor_deadline(timeout)?)?
+        } else if selector.starts_with("gentl:") {
+            crate::transport::gentl_selector::identify(selector)?
+        } else if selector.starts_with("sim:") {
             crate::transport::simulator::info_named(selector)
         } else if crate::media::is_source(selector) {
             crate::media::info(selector)?
@@ -901,6 +1006,20 @@ impl Camera {
         timeout: Duration,
         login: Option<&crate::logins::CameraLogin>,
     ) -> Result<Self> {
+        if crate::transport::gige::monitor::is_selector(selector) {
+            let spec = crate::transport::gige::monitor::MonitorSpec::parse(selector)?;
+            monitor_identity(&spec, &info)?;
+            monitor_login(login)?;
+            let backend =
+                crate::transport::gige::monitor::open(&spec, &info, monitor_deadline(timeout)?)?;
+            return Self::from_backend(info, backend);
+        }
+        if crate::transport::gige::monitor::is_selector(&info.id) {
+            return Err(crate::types::Categorized::error(
+                crate::types::ErrorKind::Usage,
+                "a monitor identity requires its original explicit monitor selector",
+            ));
+        }
         let backend: Box<dyn Backend> = match info.transport {
             Transport::Simulator => crate::transport::simulator::open(&info.id, timeout)?,
             Transport::Media => {
@@ -915,6 +1034,20 @@ impl Camera {
                 }
             }
             Transport::GigE => crate::transport::gige::open(&info, timeout)?,
+            Transport::GenTl => {
+                #[cfg(feature = "gentl")]
+                {
+                    let (info, backend) = crate::transport::gentl::connect(&info.id, timeout)?;
+                    return Self::from_backend(info, backend);
+                }
+                #[cfg(not(feature = "gentl"))]
+                {
+                    return Err(crate::types::Categorized::error(
+                        crate::types::ErrorKind::Unsupported,
+                        "GenTL support requires a build with the gentl feature",
+                    ));
+                }
+            }
             Transport::Usb3 => {
                 #[cfg(feature = "usb")]
                 {
@@ -934,6 +1067,7 @@ impl Camera {
     /// Returns an error if the backend cannot load the camera XML or the XML
     /// cannot be parsed, including after discarding an invalid cached copy.
     pub fn from_backend(mut info: CameraInfo, mut backend: Box<dyn Backend>) -> Result<Self> {
+        let access = backend.access();
         let mut xml = backend.xml().context("load camera GenICam XML")?;
         let nodes = match NodeMap::parse(&xml) {
             // A copy from the disk cache that does not parse, or links to a
@@ -950,6 +1084,28 @@ impl Camera {
             parsed => parsed,
         }
         .context("parse camera GenICam XML")?;
+        if access == CameraAccess::Control
+            && matches!(
+                info.transport,
+                Transport::Usb3 | Transport::GenTl | Transport::GigE
+            )
+        {
+            // Each transport admits only the vendor layouts it has evidence for:
+            // IDS on USB3/GenTL, LUCID's GigE 3D layout on native GigE/GenTL.
+            let encodings = nodes
+                .pixel_encodings(&info.vendor)
+                .into_iter()
+                .filter(|encoding| {
+                    matches!(
+                        (info.transport, encoding),
+                        (Transport::Usb3, crate::types::PixelEncoding::Ids { .. })
+                            | (Transport::GigE, crate::types::PixelEncoding::Lucid { .. })
+                            | (Transport::GenTl, _)
+                    )
+                })
+                .collect::<Vec<_>>();
+            backend.configure_pixel_encodings(&encodings)?;
+        }
         let mut profile_metadata = nodes.profile_features(backend.as_mut());
         info.profile = crate::camera_profile::detect(&info, &profile_metadata);
         // Feature evidence must be implemented and available now. Only the
@@ -992,7 +1148,8 @@ impl Camera {
         // A host that ended without stopping, such as a killed worker, can
         // leave a device-side TLParamsLocked set, which would keep features
         // locked on a camera that is not streaming.
-        if nodes.has(TL_PARAMS_LOCKED)
+        if access == CameraAccess::Control
+            && nodes.has(TL_PARAMS_LOCKED)
             && nodes
                 .get(backend.as_mut(), TL_PARAMS_LOCKED)
                 .is_ok_and(|locked| locked != 0)
@@ -1000,9 +1157,11 @@ impl Camera {
         {
             let _ = nodes.set(backend.as_mut(), TL_PARAMS_LOCKED, "0");
         }
+        backend.finish_initialization()?;
         Ok(Self {
             info,
             backend,
+            access,
             nodes,
             streaming: false,
             xml,
@@ -1011,6 +1170,7 @@ impl Camera {
             tl_locked: false,
             transferring: false,
             software_triggers: None,
+            chunk_context: None,
             epoch: Epoch::default(),
         })
     }
@@ -1027,6 +1187,11 @@ impl Camera {
         }
         self.info.profile = crate::camera_profile::detect(&self.info, &features);
         features.truncate(visible_count);
+        if self.is_read_only_monitor() {
+            for feature in &mut features {
+                feature.writable = false;
+            }
+        }
         features
     }
     /// Read a named camera feature.
@@ -1043,7 +1208,8 @@ impl Camera {
     /// `TLParamsLocked` is acquisition state that start and stop own, so it
     /// is never a configuration value to record, restore or set.
     pub(crate) fn is_configuration_value(&mut self, name: &str) -> bool {
-        name != TL_PARAMS_LOCKED
+        !self.is_read_only_monitor()
+            && name != TL_PARAMS_LOCKED
             && self
                 .nodes
                 .is_configuration_value(self.backend.as_mut(), name)
@@ -1076,7 +1242,11 @@ impl Camera {
         self.nodes.feature_names()
     }
     pub(crate) fn feature(&mut self, name: &str) -> Option<FeatureInfo> {
-        self.nodes.feature(self.backend.as_mut(), name)
+        let mut feature = self.nodes.feature(self.backend.as_mut(), name)?;
+        if self.is_read_only_monitor() {
+            feature.writable = false;
+        }
+        Some(feature)
     }
     pub(crate) fn lock_owner(&self, name: &str) -> Option<String> {
         self.nodes.lock_owner(name)
@@ -1100,8 +1270,10 @@ impl Camera {
     /// unwritable feature, an invalid or out-of-range value, or a backend write
     /// failure.
     pub fn set(&mut self, name: &str, value: &str) -> Result<()> {
+        self.require_control()?;
         ensure!(name != TL_PARAMS_LOCKED, "{TL_PARAMS_LOCKED_MESSAGE}");
         self.software_triggers = None;
+        self.chunk_context = None;
         self.nodes.set(self.backend.as_mut(), name, value)
     }
     /// Check a proposed feature value without writing it.
@@ -1112,6 +1284,7 @@ impl Camera {
     /// register-read failure while evaluating feature constraints. Temporary
     /// locks are checked by the actual write.
     pub fn validate_set(&mut self, name: &str, value: &str) -> Result<()> {
+        self.require_control()?;
         ensure!(name != TL_PARAMS_LOCKED, "{TL_PARAMS_LOCKED_MESSAGE}");
         self.nodes.validate_set(self.backend.as_mut(), name, value)
     }
@@ -1126,7 +1299,7 @@ impl Camera {
         self.nodes.unit(name)
     }
     pub fn is_writable(&mut self, name: &str) -> bool {
-        self.nodes.is_writable(self.backend.as_mut(), name)
+        !self.is_read_only_monitor() && self.nodes.is_writable(self.backend.as_mut(), name)
     }
     /// Read the bounds of a numeric feature.
     ///
@@ -1173,6 +1346,7 @@ impl Camera {
     /// Returns an error while acquisition is active, if the payload size cannot
     /// be determined, or if the backend cannot probe or apply network settings.
     pub fn optimize_network(&mut self) -> Result<crate::network::NetworkTuning> {
+        self.require_control()?;
         ensure!(
             !self.streaming,
             "stop acquisition before optimizing the camera network"
@@ -1187,11 +1361,13 @@ impl Camera {
     /// start/stop, an unavailable command, a backend access failure, or a command
     /// that does not finish before its completion deadline.
     pub fn execute(&mut self, name: &str) -> Result<()> {
+        self.require_control()?;
         ensure!(
             !STREAM_COMMANDS.contains(&name),
             "use start/stop to manage transport and acquisition together"
         );
         self.software_triggers = None;
+        self.chunk_context = None;
         self.nodes.execute(self.backend.as_mut(), name)?;
         // Let a command such as UserSetLoad finish before its effects are
         // read back; one whose target never clears just returns later.
@@ -1199,6 +1375,10 @@ impl Camera {
             .wait_done(self.backend.as_mut(), name, Duration::from_secs(2))?;
         Ok(())
     }
+    pub(crate) fn enable_multipart_projection(&mut self) -> Result<()> {
+        self.backend.enable_multipart_projection()
+    }
+
     /// Start acquisition as a `GenTL` producer would: lock the transport
     /// layer parameters (SFNC `TLParamsLocked`), which many cameras require
     /// before `AcquisitionStart`, then size buffers from the locked payload.
@@ -1211,11 +1391,36 @@ impl Camera {
         if self.streaming {
             return Ok(());
         }
+        self.chunk_context = None;
+        if self.is_read_only_monitor() {
+            self.begin()?;
+            self.streaming = true;
+            self.epoch = Epoch::default();
+            return Ok(());
+        }
         self.acquire_continuously()?;
         if self.has(TL_PARAMS_LOCKED) && self.is_writable(TL_PARAMS_LOCKED) {
             self.nodes
                 .set(self.backend.as_mut(), TL_PARAMS_LOCKED, "1")?;
             self.tl_locked = true;
+        }
+        // Cameras normally omit chunks until enabled. Freeze dependencies
+        // before receiving frames when this standard control confirms them.
+        if self.nodes.has_chunk_features()
+            && self.nodes.has("ChunkModeActive")
+            && self
+                .nodes
+                .get(self.backend.as_mut(), "ChunkModeActive")
+                .is_ok_and(|mode| {
+                    mode.as_bool()
+                        .or_else(|| mode.as_u64().map(|value| value != 0))
+                        .unwrap_or(false)
+                })
+        {
+            self.chunk_context = Some(
+                self.nodes
+                    .prepare_chunk_context(self.backend.as_mut(), Duration::from_millis(250)),
+            );
         }
         if let Err(error) = self.begin() {
             let _ = self.unlock();
@@ -1247,8 +1452,14 @@ impl Camera {
         Ok(())
     }
     fn begin(&mut self) -> Result<()> {
-        let size = self.payload_size()?;
+        let size = self
+            .backend
+            .stream_payload_size()?
+            .map_or_else(|| self.payload_size(), Ok)?;
         self.backend.start(size)?;
+        if self.is_read_only_monitor() {
+            return Ok(());
+        }
         if let Err(e) = self
             .nodes
             .execute(self.backend.as_mut(), "AcquisitionStart")
@@ -1288,7 +1499,15 @@ impl Camera {
     /// or the backend fails to receive a frame.
     pub fn next_frame(&mut self, timeout: Duration) -> Result<Frame> {
         ensure!(self.streaming, "camera is not streaming");
-        let mut frame = self.backend.next_frame(timeout)?;
+        let began = Instant::now();
+        let result = self.backend.next_frame(timeout);
+        if result.is_err() && self.backend.stop_after_frame_error() {
+            // Keep the original selection error and its usable alternative IDs.
+            // The backend budgets its stop calls from the failed frame's deadline.
+            let _ = self.stop();
+        }
+        let mut frame = result?;
+        frame.received_monotonic_ns = crate::host::monotonic_ns();
         if frame.wall_ms == 0 {
             frame.wall_ms = crate::scheduling::now_ms();
         }
@@ -1309,6 +1528,29 @@ impl Camera {
         epoch.last_stale = counted || held || clocked;
         epoch.stale = epoch.stale.saturating_sub(1);
         epoch.pending = epoch.pending.saturating_sub(1);
+        if let Some(chunks) = &mut frame.chunks
+            && self.nodes.has_chunk_features()
+        {
+            let values = if self.access == CameraAccess::ReadOnlyMonitor {
+                // Interpret only dependencies contained in this immutable frame.
+                // A monitor never snapshots or changes a live chunk selector.
+                self.nodes
+                    .chunk_values(chunks, &crate::genicam::ChunkContext::default())
+            } else if epoch.last_stale {
+                serde_json::json!({"values":{}, "errors":{"context":"frame may predate changed settings; original chunk bytes retained"}, "truncated":false})
+            } else {
+                let context = self.chunk_context.get_or_insert_with(|| {
+                    self.nodes.prepare_chunk_context(
+                        self.backend.as_mut(),
+                        timeout
+                            .saturating_sub(began.elapsed())
+                            .min(Duration::from_millis(250)),
+                    )
+                });
+                self.nodes.chunk_values(chunks, context)
+            };
+            std::sync::Arc::make_mut(chunks).values = Some(values);
+        }
         Ok(frame)
     }
     /// Ask for the next frame. A camera whose start trigger is On with a
@@ -1334,6 +1576,10 @@ impl Camera {
     /// Note that settings were written: until frames exposed after the
     /// change come, `frame_predates_change` says so of each frame.
     pub(crate) fn settings_changed(&mut self, change: Change) {
+        if self.is_read_only_monitor() {
+            return;
+        }
+        self.chunk_context = None;
         if !self.streaming {
             return;
         }
@@ -1369,21 +1615,27 @@ impl Camera {
     /// Settings this process emulates for the camera; see
     /// `Backend::emulated_settings`.
     pub(crate) fn emulated_settings(&mut self) -> Option<serde_json::Value> {
-        self.backend.emulated_settings()
+        if self.is_read_only_monitor() {
+            None
+        } else {
+            self.backend.emulated_settings()
+        }
     }
     /// Take back settings another process emulated for the camera.
     pub(crate) fn restore_settings(&mut self, settings: &serde_json::Value) -> Result<()> {
+        self.require_control()?;
         self.software_triggers = None;
+        self.chunk_context = None;
         self.backend.restore_settings(settings)
     }
     /// Whether the frame `next_frame` returned last may have been exposed
     /// before the last settings change.
     pub(crate) const fn frame_predates_change(&self) -> bool {
-        self.epoch.last_stale
+        !self.is_read_only_monitor() && self.epoch.last_stale
     }
     /// Whether the camera sends frames only when software triggered.
     pub fn software_triggered(&mut self) -> bool {
-        !self.software_triggers().is_empty()
+        !self.is_read_only_monitor() && !self.software_triggers().is_empty()
     }
     fn software_triggers(&mut self) -> Vec<Option<String>> {
         if let Some(triggers) = &self.software_triggers {
@@ -1499,6 +1751,12 @@ impl Camera {
         if !self.streaming {
             return Ok(());
         }
+        if self.is_read_only_monitor() {
+            let result = self.backend.stop();
+            self.streaming = false;
+            self.backend.finish_stop();
+            return result;
+        }
         // Some cameras lock AcquisitionStop too until TLParamsLocked is set,
         // so the lock is released last.
         let acquisition = self.nodes.execute(self.backend.as_mut(), "AcquisitionStop");
@@ -1510,6 +1768,7 @@ impl Camera {
         let transport = self.backend.stop();
         self.streaming = false;
         let unlocked = self.unlock();
+        self.backend.finish_stop();
         acquisition?;
         transfer?;
         transport?;
@@ -1532,6 +1791,40 @@ impl Camera {
     pub fn xml(&self) -> &str {
         &self.xml
     }
+    /// Read exactly one XML-declared opaque register using one bounded operation.
+    pub(crate) fn read_register_feature(
+        &mut self,
+        name: &crate::controls::Name,
+        timeout: Duration,
+    ) -> Result<serde_json::Value> {
+        if !name.bank.is_empty() {
+            self.require_control()?;
+            self.software_triggers = None;
+            self.chunk_context = None;
+        }
+        register::transfer(self, name, None, timeout)
+    }
+    /// Write exactly one XML-declared opaque register, without implicit rollback.
+    pub(crate) fn write_register_feature(
+        &mut self,
+        name: &crate::controls::Name,
+        data: &[u8],
+        timeout: Duration,
+    ) -> Result<serde_json::Value> {
+        self.require_control()?;
+        self.software_triggers = None;
+        self.chunk_context = None;
+        register::transfer(self, name, Some(data), timeout)
+    }
+    /// Write the exact write-only `ActionDeviceKey` in the current control epoch.
+    /// No readable checkpoint, equality claim or rollback is available.
+    pub(crate) fn write_action_device_key(
+        &mut self,
+        key: u32,
+        deadline: Instant,
+    ) -> Result<serde_json::Value> {
+        action::write(self, key, deadline)
+    }
     /// Read raw device memory through the backend.
     ///
     /// # Errors
@@ -1546,7 +1839,9 @@ impl Camera {
     /// Returns the backend error for unsupported memory access, an invalid range,
     /// a write failure, or a timeout.
     pub fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
+        self.require_control()?;
         self.software_triggers = None;
+        self.chunk_context = None;
         self.backend.write_memory(address, data)
     }
     /// See `Backend::lingers`.
@@ -1559,8 +1854,30 @@ impl Camera {
     }
     /// See `Backend::rest`; a streaming camera keeps what it streams with.
     pub(crate) fn rest(&mut self) {
-        if !self.streaming {
+        if !self.streaming && !self.is_read_only_monitor() {
             self.backend.rest();
+        }
+    }
+    /// A sticky backend failure without acquiring a control transaction or sending I/O.
+    #[must_use]
+    pub(crate) fn terminal_error(&self) -> Option<anyhow::Error> {
+        self.backend.terminal_error()
+    }
+    /// Access captured from the transport when this camera was constructed.
+    #[must_use]
+    pub const fn access(&self) -> CameraAccess {
+        self.access
+    }
+    /// Whether this camera only receives a stream configured by another owner.
+    #[must_use]
+    pub const fn is_read_only_monitor(&self) -> bool {
+        matches!(self.access(), CameraAccess::ReadOnlyMonitor)
+    }
+    fn require_control(&self) -> Result<()> {
+        if self.is_read_only_monitor() {
+            Err(monitor_error())
+        } else {
+            Ok(())
         }
     }
     #[must_use]
@@ -1573,6 +1890,11 @@ impl Drop for Camera {
         let _ = self.stop();
     }
 }
+
+#[cfg(test)]
+mod chunks_tests;
+#[cfg(test)]
+mod monitor_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -1649,6 +1971,7 @@ pub(crate) mod tests {
         let only = |gige, u3v| Kinds {
             gige,
             u3v,
+            gentl: false,
             host: false,
             onvif: false,
             sim: false,
@@ -1889,6 +2212,11 @@ pub(crate) mod tests {
             }
             self.frames += 1;
             Ok(Frame {
+                pixel_encoding: None,
+                device_timestamp: None,
+                received_monotonic_ns: None,
+                chunks: None,
+                multipart: None,
                 id: self.frames,
                 width: 4,
                 height: 4,
@@ -2126,6 +2454,11 @@ pub(crate) mod tests {
         fn next_frame(&mut self, _: Duration) -> Result<Frame> {
             let stamped = self.frames.pop_front().context("frame timeout")?;
             Ok(Frame {
+                pixel_encoding: None,
+                device_timestamp: None,
+                received_monotonic_ns: None,
+                chunks: None,
+                multipart: None,
                 id: stamped,
                 width: 4,
                 height: 4,

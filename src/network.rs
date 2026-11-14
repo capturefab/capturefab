@@ -3,6 +3,9 @@
 //! others, and even a good wired route cannot prove a loss-free image stream.
 #![forbid(unsafe_code)]
 #![deny(clippy::missing_const_for_fn)]
+pub(crate) mod action;
+pub(crate) mod force_ip;
+
 use crate::{
     transport::gige,
     types::{CameraInfo, Categorized, ErrorKind, Transport},

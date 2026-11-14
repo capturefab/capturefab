@@ -51,8 +51,17 @@ pub(crate) enum Site {
     /// A GVSP packet that did not land where it was predicted, moved from
     /// the receive buffer: a resent, reordered or duplicate packet.
     GvspFallback,
+    /// A multipart GVSP fragment staged, placed, or compacted to retain only delivered part bytes.
+    GvspMultipart,
     /// A padded GVSP row moved to close up the camera's row padding.
     GigeRowCompact,
+    /// Pixels copied for normalization while preserving the camera's exact
+    /// image-with-chunk payload for measurement-data export.
+    ChunkImage,
+    /// A `GenTL` image normalized from producer padding or sample byte order.
+    GentlNormalize,
+    /// Selected multipart pixels copied while every raw component remains retained.
+    MultipartImage,
     /// Packed or wide samples unpacked, or a layout `FFmpeg` cannot read
     /// converted, for an encoder's input pipe.
     FfmpegUnpack,
@@ -99,7 +108,7 @@ pub(crate) enum Class {
 }
 
 impl Site {
-    pub(crate) const ALL: [Self; 25] = [
+    pub(crate) const ALL: [Self; 29] = [
         Self::GvspReceive,
         Self::PipeRead,
         Self::PipeWrite,
@@ -109,7 +118,11 @@ impl Site {
         Self::StreamCopy,
         Self::UsbAssemble,
         Self::GvspFallback,
+        Self::GvspMultipart,
         Self::GigeRowCompact,
+        Self::ChunkImage,
+        Self::GentlNormalize,
+        Self::MultipartImage,
         Self::FfmpegUnpack,
         Self::StillTransform,
         Self::PreviewTransform,
@@ -137,7 +150,11 @@ impl Site {
             Self::StreamCopy => "stream_copy",
             Self::UsbAssemble => "usb_assemble",
             Self::GvspFallback => "gvsp_fallback",
+            Self::GvspMultipart => "gvsp_multipart",
             Self::GigeRowCompact => "gige_row_compact",
+            Self::ChunkImage => "chunk_image",
+            Self::GentlNormalize => "gentl_normalize",
+            Self::MultipartImage => "multipart_image",
             Self::FfmpegUnpack => "ffmpeg_unpack",
             Self::StillTransform => "still_transform",
             Self::PreviewTransform => "preview_transform",
@@ -164,9 +181,14 @@ impl Site {
             | Self::FileWrite
             | Self::StdoutWrite
             | Self::StreamCopy => Class::Boundary,
-            Self::UsbAssemble | Self::GvspFallback | Self::GigeRowCompact | Self::GpuUpload => {
-                Class::Necessary
-            }
+            Self::UsbAssemble
+            | Self::GvspFallback
+            | Self::GvspMultipart
+            | Self::GigeRowCompact
+            | Self::ChunkImage
+            | Self::GentlNormalize
+            | Self::MultipartImage
+            | Self::GpuUpload => Class::Necessary,
             Self::FfmpegUnpack
             | Self::StillTransform
             | Self::PreviewTransform

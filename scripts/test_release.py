@@ -50,9 +50,20 @@ def published(version, date='2026-10-05', **asset):
 class ReleaseTests(unittest.TestCase):
     def test_version_requires_semver(self):
         self.assertEqual(release.version('v1.2.3-rc.1'), '1.2.3-rc.1')
-        for value in ['1.2', '01.2.3', '1.2.3-01', '1.2.3.4']:
-            with self.assertRaises(ValueError):
-                release.version(value)
+        for value in ['1.2', '01.2.3', '1.2.3-01', '1.2.3-rc.01', '1.2.3.4', '1٢.2.3']:
+            with self.subTest(value=value):
+                self.assertIsNone(release.SEMVER.fullmatch(value))
+                with self.assertRaises(ValueError):
+                    release.version(value)
+                with self.assertRaises(ValueError):
+                    release.precedence(value)
+
+    def test_version_allows_zeroes_in_build_metadata_and_alphanumeric_prereleases(self):
+        for value in ['0.0.0', '1.2.3-0', '1.2.3-0.3.7', '1.2.3-01a', '1.2.3-01-',
+                      '1.2.3+001', '1.2.3-rc.1+001.02']:
+            with self.subTest(value=value):
+                self.assertEqual(release.version(value), value)
+                self.assertEqual(release.precedence(value), release.precedence(value.split('+')[0]))
 
     def test_inspect_binary_checks_target_headers(self):
         headers = {
@@ -701,6 +712,13 @@ class SiteTests(unittest.TestCase):
     def test_precedence_follows_semver(self):
         versions = ['1.0.0-alpha', '1.0.0-alpha.1', '1.0.0-alpha.beta', '1.0.0-beta', '1.0.0-beta.2', '1.0.0-beta.11', '1.0.0-rc.1', '1.0.0']
         self.assertEqual(sorted(reversed(versions), key=site.precedence), versions)
+
+    def test_manifest_rejects_invalid_prerelease_versions(self):
+        manifest = dict(schema_version=1, latest='1.2.3-rc.01', releases=[published('1.2.3-rc.01')])
+        with self.assertRaisesRegex(ValueError, 'invalid release version'):
+            site.merge(dict(schema_version=1, releases=[]), manifest)
+        with self.assertRaisesRegex(ValueError, 'invalid release version'):
+            site.installers(manifest, SITE)
 
     def test_merge_keeps_only_the_latest_stable_release(self):
         empty = dict(schema_version=1, latest=None, releases=[])

@@ -11,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WEB = ROOT / 'web'
-GUIDES = ['camera-compatibility', 'cli-workflows', 'embedded', 'ffmpeg-build', 'line-computer', 'plant-floor', 'simulation']
+GUIDES = ['camera-compatibility', 'cli-workflows', 'embedded', 'ffmpeg-build', 'line-computer', 'industrial-data', 'plant-floor', 'simulation']
 # README sections and the site page that covers each one.
 README = {'build-from-source': '../downloads.html#source', 'for-ai-agents-and-scripts': '../agents.md',
           'sessions-and-jobs': '../docs.html#sessions', 'configuration': '../docs.html#environment'}

@@ -12,7 +12,7 @@ pub(super) const DOCTOR_FIELDS: &[(&str, &str)] = &[
     ("arch", "string"),
     (
         "features",
-        "{usb,jpeg,videotoolbox,nvjpeg,vaapi,keychain,shell} — what this build includes",
+        "{usb,gentl,ni_daqmx,jpeg,videotoolbox,nvjpeg,vaapi,keychain,shell,mqtt_tls} — what this build includes",
     ),
     (
         "jpeg",

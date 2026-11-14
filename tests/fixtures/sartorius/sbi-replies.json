@@ -1,0 +1,322 @@
+{
+  "primary_pdf_sha256": "59289c4996975b153eb9a7586fd1e0d45c87a512749b3c45c6427c0309e01c63",
+  "qualification": "Actual2024primaryp2/p3 originalnumeric +tablematerializations and separatelylabelled derivedliterals; no capturedhardware/stock claim",
+  "cases": [
+    {
+      "name": "published_numeric16",
+      "frame": "+   123.56 g  \r\n",
+      "format": "sbi16",
+      "origin": "Originalnumericexample",
+      "expected": {
+        "format": "sartorius_sbi",
+        "line_format": "sbi16",
+        "status": "numeric",
+        "raw": "+   123.56 g  \r\n",
+        "sign_raw": "+",
+        "value_raw": "   123.56",
+        "value": 123.56,
+        "unit_raw": "g  ",
+        "unit": "g"
+      }
+    },
+    {
+      "name": "published_numeric22",
+      "frame": "N     +   123.56 g  \r\n",
+      "format": "sbi22",
+      "origin": "Originalnumericexample",
+      "expected": {
+        "format": "sartorius_sbi",
+        "line_format": "sbi22",
+        "status": "numeric",
+        "raw": "N     +   123.56 g  \r\n",
+        "id_raw": "N     ",
+        "id": "N",
+        "sign_raw": "+",
+        "value_raw": "   123.56",
+        "value": 123.56,
+        "unit_raw": "g  ",
+        "unit": "g"
+      }
+    },
+    {
+      "name": "table_high16",
+      "frame": "      High    \r\n",
+      "format": "sbi16",
+      "origin": "Renderedtable positions; error123 is derived digitchoice",
+      "expected": {
+        "format": "sartorius_sbi",
+        "line_format": "sbi16",
+        "status": "overload",
+        "raw": "      High    \r\n",
+        "status_raw": "High"
+      }
+    },
+    {
+      "name": "table_low16",
+      "frame": "      Low     \r\n",
+      "format": "sbi16",
+      "origin": "Renderedtable positions; error123 is derived digitchoice",
+      "expected": {
+        "format": "sartorius_sbi",
+        "line_format": "sbi16",
+        "status": "underload",
+        "raw": "      Low     \r\n",
+        "status_raw": "Low"
+      }
+    },
+    {
+      "name": "table_cal16",
+      "frame": "   Cal.Ext.   \r\n",
+      "format": "sbi16",
+      "origin": "Renderedtable positions; error123 is derived digitchoice",
+      "expected": {
+        "format": "sartorius_sbi",
+        "line_format": "sbi16",
+        "status": "external_calibration",
+        "raw": "   Cal.Ext.   \r\n",
+        "status_raw": "Cal.Ext."
+      }
+    },
+    {
+      "name": "table_error16",
+      "frame": "   Err 123    \r\n",
+      "format": "sbi16",
+      "origin": "Renderedtable positions; error123 is derived digitchoice",
+      "expected": {
+        "format": "sartorius_sbi",
+        "line_format": "sbi16",
+        "status": "device_error",
+        "raw": "   Err 123    \r\n",
+        "status_raw": "Err",
+        "error_code_raw": "123"
+      }
+    },
+    {
+      "name": "table_app16",
+      "frame": "   APP.ERR    \r\n",
+      "format": "sbi16",
+      "origin": "Renderedtable positions; error123 is derived digitchoice",
+      "expected": {
+        "format": "sartorius_sbi",
+        "line_format": "sbi16",
+        "status": "device_error",
+        "raw": "   APP.ERR    \r\n",
+        "status_raw": "APP.ERR"
+      }
+    },
+    {
+      "name": "table_dis16",
+      "frame": "   DIS.ERR    \r\n",
+      "format": "sbi16",
+      "origin": "Renderedtable positions; error123 is derived digitchoice",
+      "expected": {
+        "format": "sartorius_sbi",
+        "line_format": "sbi16",
+        "status": "device_error",
+        "raw": "   DIS.ERR    \r\n",
+        "status_raw": "DIS.ERR"
+      }
+    },
+    {
+      "name": "table_prt16",
+      "frame": "   PRT.ERR    \r\n",
+      "format": "sbi16",
+      "origin": "Renderedtable positions; error123 is derived digitchoice",
+      "expected": {
+        "format": "sartorius_sbi",
+        "line_format": "sbi16",
+        "status": "device_error",
+        "raw": "   PRT.ERR    \r\n",
+        "status_raw": "PRT.ERR"
+      }
+    },
+    {
+      "name": "table_high22",
+      "frame": "Stat        High    \r\n",
+      "format": "sbi22",
+      "origin": "Renderedtable positions; error123 is derived digitchoice",
+      "expected": {
+        "format": "sartorius_sbi",
+        "line_format": "sbi22",
+        "status": "overload",
+        "raw": "Stat        High    \r\n",
+        "id_raw": "Stat  ",
+        "id": "Stat",
+        "status_raw": "High"
+      }
+    },
+    {
+      "name": "table_error22",
+      "frame": "Stat     ERR 123    \r\n",
+      "format": "sbi22",
+      "origin": "Renderedtable positions; error123 is derived digitchoice",
+      "expected": {
+        "format": "sartorius_sbi",
+        "line_format": "sbi22",
+        "status": "device_error",
+        "raw": "Stat     ERR 123    \r\n",
+        "id_raw": "Stat  ",
+        "id": "Stat",
+        "status_raw": "ERR",
+        "error_code_raw": "123"
+      }
+    },
+    {
+      "name": "synthetic_negative_zero16",
+      "frame": "-     0.00 g  \r\n",
+      "format": "sbi16",
+      "origin": "Syntheticlexemefidelity, nohardwareobservation",
+      "expected": {
+        "format": "sartorius_sbi",
+        "line_format": "sbi16",
+        "status": "numeric",
+        "raw": "-     0.00 g  \r\n",
+        "sign_raw": "-",
+        "value_raw": "     0.00",
+        "value": -0.00,
+        "unit_raw": "g  ",
+        "unit": "g"
+      }
+    },
+    {
+      "name": "table_low22",
+      "frame": "Stat        Low     \r\n",
+      "format": "sbi22",
+      "origin": "Specification-derived literal, not hardware traffic",
+      "expected": {
+        "format": "sartorius_sbi",
+        "line_format": "sbi22",
+        "status": "underload",
+        "raw": "Stat        Low     \r\n",
+        "id_raw": "Stat  ",
+        "id": "Stat",
+        "status_raw": "Low"
+      }
+    },
+    {
+      "name": "table_cal22",
+      "frame": "Stat     Cal.Ext.   \r\n",
+      "format": "sbi22",
+      "origin": "Specification-derived literal, not hardware traffic",
+      "expected": {
+        "format": "sartorius_sbi",
+        "line_format": "sbi22",
+        "status": "external_calibration",
+        "raw": "Stat     Cal.Ext.   \r\n",
+        "id_raw": "Stat  ",
+        "id": "Stat",
+        "status_raw": "Cal.Ext."
+      }
+    },
+    {
+      "name": "table_app22",
+      "frame": "Stat     APP.ERR    \r\n",
+      "format": "sbi22",
+      "origin": "Specification-derived literal, not hardware traffic",
+      "expected": {
+        "format": "sartorius_sbi",
+        "line_format": "sbi22",
+        "status": "device_error",
+        "raw": "Stat     APP.ERR    \r\n",
+        "id_raw": "Stat  ",
+        "id": "Stat",
+        "status_raw": "APP.ERR"
+      }
+    },
+    {
+      "name": "table_dis22",
+      "frame": "Stat     DIS.ERR    \r\n",
+      "format": "sbi22",
+      "origin": "Specification-derived literal, not hardware traffic",
+      "expected": {
+        "format": "sartorius_sbi",
+        "line_format": "sbi22",
+        "status": "device_error",
+        "raw": "Stat     DIS.ERR    \r\n",
+        "id_raw": "Stat  ",
+        "id": "Stat",
+        "status_raw": "DIS.ERR"
+      }
+    },
+    {
+      "name": "table_prt22",
+      "frame": "Stat     PRT.ERR    \r\n",
+      "format": "sbi22",
+      "origin": "Specification-derived literal, not hardware traffic",
+      "expected": {
+        "format": "sartorius_sbi",
+        "line_format": "sbi22",
+        "status": "device_error",
+        "raw": "Stat     PRT.ERR    \r\n",
+        "id_raw": "Stat  ",
+        "id": "Stat",
+        "status_raw": "PRT.ERR"
+      }
+    },
+    {
+      "name": "derived_nine_digits16",
+      "frame": "+123456789 pcs\r\n",
+      "format": "sbi16",
+      "origin": "Specification-derived literal, not hardware traffic",
+      "expected": {
+        "format": "sartorius_sbi",
+        "line_format": "sbi16",
+        "status": "numeric",
+        "raw": "+123456789 pcs\r\n",
+        "sign_raw": "+",
+        "value_raw": "123456789",
+        "value": 123456789,
+        "unit_raw": "pcs",
+        "unit": "pcs"
+      }
+    },
+    {
+      "name": "derived_negative22",
+      "frame": "G#    -   123.56 g  \r\n",
+      "format": "sbi22",
+      "origin": "Specification-derived literal, not hardware traffic",
+      "expected": {
+        "format": "sartorius_sbi",
+        "line_format": "sbi22",
+        "status": "numeric",
+        "raw": "G#    -   123.56 g  \r\n",
+        "id_raw": "G#    ",
+        "id": "G#",
+        "sign_raw": "-",
+        "value_raw": "   123.56",
+        "value": -123.56,
+        "unit_raw": "g  ",
+        "unit": "g"
+      }
+    },
+    {
+      "name": "derived_blank_unit16",
+      "frame": "      0.01    \r\n",
+      "format": "sbi16",
+      "origin": "Specification-derived literal, not hardware traffic",
+      "expected": {
+        "format": "sartorius_sbi",
+        "line_format": "sbi16",
+        "status": "numeric",
+        "raw": "      0.01    \r\n",
+        "sign_raw": " ",
+        "value_raw": "     0.01",
+        "value": 0.01,
+        "unit_raw": "   "
+      }
+    },
+    {
+      "name": "derived_blank_status16",
+      "frame": "              \r\n",
+      "format": "sbi16",
+      "origin": "Specification-derived literal, not hardware traffic",
+      "expected": {
+        "format": "sartorius_sbi",
+        "line_format": "sbi16",
+        "status": "blank",
+        "raw": "              \r\n",
+        "status_raw": ""
+      }
+    }
+  ]
+}

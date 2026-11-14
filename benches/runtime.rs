@@ -316,6 +316,11 @@ fn frame(width: u32, height: u32, pixel_format: u32) -> Frame {
         _ => panic!("missing benchmark fixture for {pixel_format:#010x}"),
     };
     Frame {
+        pixel_encoding: None,
+        device_timestamp: None,
+        received_monotonic_ns: None,
+        chunks: None,
+        multipart: None,
         id: 1,
         width,
         height,

@@ -1,0 +1,4258 @@
+{
+  "schema": 1,
+  "kind": "independent_manufacturer_literal_oracle",
+  "profile": "gopxl_1_3_measurement",
+  "authorship": {
+    "origin": "manual transcription of LMI GoPxL 1.3-1.5 manual literals (and LMI Classic support-screenshot literals labelled as corroboration) plus independently chosen asymmetric values, authored without reading any Capturefab GoPxL source",
+    "product_imports": false,
+    "device_capture": false,
+    "hardware_qualification": false,
+    "parser_authored_before_freeze": false
+  },
+  "sources": [
+    {
+      "label": "CMD13",
+      "url": "https://ap.lmi3d.com/manuals/gopxl/gopxl-1.3/LMILaserLineProfiler/Content/Protocols/ASCIIProtocol/EthernetCommunication/PollingCommands.htm"
+    },
+    {
+      "label": "CMD14",
+      "url": "https://ap.lmi3d.com/manuals/gopxl/gopxl-1.4/en-US/LMILaserLineProfiler/Content/Protocols/ASCIIProtocol/EthernetCommunication/PollingCommands.htm"
+    },
+    {
+      "label": "CMD15",
+      "url": "https://ap.lmi3d.com/manuals/gopxl/gopxl-1.5/en-US/LMILaserLineProfiler/Content/Protocols/ASCIIProtocol/EthernetCommunication/PollingCommands.htm"
+    },
+    {
+      "label": "CFG13",
+      "url": "https://ap.lmi3d.com/manuals/gopxl/gopxl-1.3/LMILaserLineProfiler/Content/WebInterface/Control/ASCIIProtocol/Ethernet_ASCII_Protocol.htm"
+    },
+    {
+      "label": "CFG15",
+      "url": "https://ap.lmi3d.com/manuals/gopxl/gopxl-1.5/en-US/LMILaserLineProfiler/Content/Control_topics/Ethernet_ASCII.htm"
+    },
+    {
+      "label": "SETTINGS_SCREENSHOT",
+      "url": "https://ap.lmi3d.com/manuals/gopxl/gopxl-1.3/LMILaserLineProfiler/Content/Resources/Images/Software/Interface/Control/Ethernet_ASCII_settings.png"
+    },
+    {
+      "label": "SC64_CLASSIC",
+      "url": "https://ap.lmi3d.com/manuals/gocator/gocator-6.4/G2/Content/Protocols/ASCIIProtocol/EthernetCommunication/SpecialCharacters.htm"
+    },
+    {
+      "label": "LMI_FANUC_ARTICLE",
+      "url": "https://support.lmi3d.com/hc/en-us/articles/34376747695771"
+    },
+    {
+      "label": "LMI_CLASSIC_SCREENSHOTS",
+      "url": "https://support.lmi3d.com/hc/en-us/articles/360033661531"
+    }
+  ],
+  "conventions": {
+    "value": "scaled_i32 / 1000 as an exact decimal string with exactly three fractional digits; no float",
+    "pass": "decision_raw bit 0",
+    "decision_invalid": "decision_raw bit 1",
+    "decision_reserved_bits": "decision_raw & 0xFC",
+    "leading_zeros": "accepted in M, V and D digits and recorded verbatim in raw_*_text",
+    "after_wire": "reply bytes are written in a single write; 'close' then closes the peer, 'keep_open' leaves it open with no further bytes",
+    "error_text": "ERROR remainder after 'ERROR'+delimiter, permitted trailing delimiter removed, otherwise verbatim; '' when no delimiter follows ERROR"
+  },
+  "base_config": {
+    "protocol": "gopxl_ascii",
+    "profile": "gopxl_1_3_measurement",
+    "address": "192.0.2.41:8190",
+    "delimiter": ",",
+    "terminator": "crlf",
+    "invalid_token": "INVALID",
+    "trailing_delimiter": "either",
+    "measurements": [
+      {
+        "name": "gap_width",
+        "id": 0
+      },
+      {
+        "name": "flush_height",
+        "id": 1
+      }
+    ]
+  },
+  "requests": [
+    {
+      "name": "manufacturer_example",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "6d6561737572656d656e742c302c310d0a",
+      "wire_text": "measurement,0,1\r\n",
+      "origin": "manufacturer literal (GoPxL Polling Commands example measurement,0,1; CRLF from LMI FANUC Karel CHR(13)+CHR(10) and %r%n setting)"
+    },
+    {
+      "name": "single_padded_reply_id",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "ids": [
+        6
+      ],
+      "wire_hex": "6d6561737572656d656e742c360d0a",
+      "wire_text": "measurement,6\r\n"
+    },
+    {
+      "name": "semicolon_cr_asymmetric",
+      "delimiter": ";",
+      "terminator": "cr",
+      "ids": [
+        65535,
+        0,
+        417
+      ],
+      "wire_hex": "6d6561737572656d656e743b36353533353b303b3431370d",
+      "wire_text": "measurement;65535;0;417\r"
+    },
+    {
+      "name": "pipe_lf",
+      "delimiter": "|",
+      "terminator": "lf",
+      "ids": [
+        65535
+      ],
+      "wire_hex": "6d6561737572656d656e747c36353533350a",
+      "wire_text": "measurement|65535\n"
+    },
+    {
+      "name": "hash_lf_unsorted",
+      "delimiter": "#",
+      "terminator": "lf",
+      "ids": [
+        40000,
+        500
+      ],
+      "wire_hex": "6d6561737572656d656e74233430303030233530300a",
+      "wire_text": "measurement#40000#500\n"
+    },
+    {
+      "name": "sixty_four_ids",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "ids": [
+        37,
+        1058,
+        2079,
+        3100,
+        4121,
+        5142,
+        6163,
+        7184,
+        8205,
+        9226,
+        10247,
+        11268,
+        12289,
+        13310,
+        14331,
+        15352,
+        16373,
+        17394,
+        18415,
+        19436,
+        20457,
+        21478,
+        22499,
+        23520,
+        24541,
+        25562,
+        26583,
+        27604,
+        28625,
+        29646,
+        30667,
+        31688,
+        32709,
+        33730,
+        34751,
+        35772,
+        36793,
+        37814,
+        38835,
+        39856,
+        40877,
+        41898,
+        42919,
+        43940,
+        44961,
+        45982,
+        47003,
+        48024,
+        49045,
+        50066,
+        51087,
+        52108,
+        53129,
+        54150,
+        55171,
+        56192,
+        57213,
+        58234,
+        59255,
+        60276,
+        61297,
+        62318,
+        63339,
+        64360
+      ],
+      "wire_hex": "6d6561737572656d656e742c33372c313035382c323037392c333130302c343132312c353134322c363136332c373138342c383230352c393232362c31303234372c31313236382c31323238392c31333331302c31343333312c31353335322c31363337332c31373339342c31383431352c31393433362c32303435372c32313437382c32323439392c32333532302c32343534312c32353536322c32363538332c32373630342c32383632352c32393634362c33303636372c33313638382c33323730392c33333733302c33343735312c33353737322c33363739332c33373831342c33383833352c33393835362c34303837372c34313839382c34323931392c34333934302c34343936312c34353938322c34373030332c34383032342c34393034352c35303036362c35313038372c35323130382c35333132392c35343135302c35353137312c35363139322c35373231332c35383233342c35393235352c36303237362c36313239372c36323331382c36333333392c36343336300d0a",
+      "wire_text": "measurement,37,1058,2079,3100,4121,5142,6163,7184,8205,9226,10247,11268,12289,13310,14331,15352,16373,17394,18415,19436,20457,21478,22499,23520,24541,25562,26583,27604,28625,29646,30667,31688,32709,33730,34751,35772,36793,37814,38835,39856,40877,41898,42919,43940,44961,45982,47003,48024,49045,50066,51087,52108,53129,54150,55171,56192,57213,58234,59255,60276,61297,62318,63339,64360\r\n"
+    }
+  ],
+  "replies": [
+    {
+      "name": "manufacturer_example_crlf_absent",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "absent",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "4f4b2c4d302c562d353030302c44302c4d312c56353030302c44310d0a",
+      "wire_text": "OK,M0,V-5000,D0,M1,V5000,D1\r\n",
+      "after_wire": "keep_open",
+      "expected": "ok",
+      "origin": "manufacturer literal (GoPxL 1.3/1.4/1.5 Polling Commands, measurement example output)",
+      "trailing_delimiter_observed": false,
+      "values": [
+        {
+          "id": 0,
+          "raw_id_text": "0",
+          "raw_value_text": "-5000",
+          "raw_decision_text": "0",
+          "value_invalid": false,
+          "scaled_i32": -5000,
+          "value": "-5.000",
+          "decision_raw": 0,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        },
+        {
+          "id": 1,
+          "raw_id_text": "1",
+          "raw_value_text": "5000",
+          "raw_decision_text": "1",
+          "value_invalid": false,
+          "scaled_i32": 5000,
+          "value": "5.000",
+          "decision_raw": 1,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        }
+      ]
+    },
+    {
+      "name": "manufacturer_example_crlf_either",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "4f4b2c4d302c562d353030302c44302c4d312c56353030302c44310d0a",
+      "wire_text": "OK,M0,V-5000,D0,M1,V5000,D1\r\n",
+      "after_wire": "keep_open",
+      "expected": "ok",
+      "origin": "manufacturer literal (GoPxL 1.3/1.4/1.5 Polling Commands, measurement example output)",
+      "trailing_delimiter_observed": false,
+      "values": [
+        {
+          "id": 0,
+          "raw_id_text": "0",
+          "raw_value_text": "-5000",
+          "raw_decision_text": "0",
+          "value_invalid": false,
+          "scaled_i32": -5000,
+          "value": "-5.000",
+          "decision_raw": 0,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        },
+        {
+          "id": 1,
+          "raw_id_text": "1",
+          "raw_value_text": "5000",
+          "raw_decision_text": "1",
+          "value_invalid": false,
+          "scaled_i32": 5000,
+          "value": "5.000",
+          "decision_raw": 1,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        }
+      ]
+    },
+    {
+      "name": "manufacturer_example_crlf_present_missing_trailer",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "present",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "4f4b2c4d302c562d353030302c44302c4d312c56353030302c44310d0a",
+      "wire_text": "OK,M0,V-5000,D0,M1,V5000,D1\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "origin": "manufacturer literal (GoPxL 1.3/1.4/1.5 Polling Commands, measurement example output)",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "trailing_comma_present",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "present",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "4f4b2c4d302c562d353030302c44302c4d312c56353030302c44312c0d0a",
+      "wire_text": "OK,M0,V-5000,D0,M1,V5000,D1,\r\n",
+      "after_wire": "keep_open",
+      "expected": "ok",
+      "trailing_delimiter_observed": true,
+      "values": [
+        {
+          "id": 0,
+          "raw_id_text": "0",
+          "raw_value_text": "-5000",
+          "raw_decision_text": "0",
+          "value_invalid": false,
+          "scaled_i32": -5000,
+          "value": "-5.000",
+          "decision_raw": 0,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        },
+        {
+          "id": 1,
+          "raw_id_text": "1",
+          "raw_value_text": "5000",
+          "raw_decision_text": "1",
+          "value_invalid": false,
+          "scaled_i32": 5000,
+          "value": "5.000",
+          "decision_raw": 1,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        }
+      ]
+    },
+    {
+      "name": "trailing_comma_either",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "4f4b2c4d302c562d353030302c44302c4d312c56353030302c44312c0d0a",
+      "wire_text": "OK,M0,V-5000,D0,M1,V5000,D1,\r\n",
+      "after_wire": "keep_open",
+      "expected": "ok",
+      "trailing_delimiter_observed": true,
+      "values": [
+        {
+          "id": 0,
+          "raw_id_text": "0",
+          "raw_value_text": "-5000",
+          "raw_decision_text": "0",
+          "value_invalid": false,
+          "scaled_i32": -5000,
+          "value": "-5.000",
+          "decision_raw": 0,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        },
+        {
+          "id": 1,
+          "raw_id_text": "1",
+          "raw_value_text": "5000",
+          "raw_decision_text": "1",
+          "value_invalid": false,
+          "scaled_i32": 5000,
+          "value": "5.000",
+          "decision_raw": 1,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        }
+      ]
+    },
+    {
+      "name": "trailing_comma_absent",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "absent",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "4f4b2c4d302c562d353030302c44302c4d312c56353030302c44312c0d0a",
+      "wire_text": "OK,M0,V-5000,D0,M1,V5000,D1,\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "double_trailing_comma_either",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "4f4b2c4d302c562d353030302c44302c4d312c56353030302c44312c2c0d0a",
+      "wire_text": "OK,M0,V-5000,D0,M1,V5000,D1,,\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "double_trailing_comma_present",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "present",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "4f4b2c4d302c562d353030302c44302c4d312c56353030302c44312c2c0d0a",
+      "wire_text": "OK,M0,V-5000,D0,M1,V5000,D1,,\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "zero_padded_id_invalid_value",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        6
+      ],
+      "wire_hex": "4f4b2c4d30362c56494e56414c49442c44320d0a",
+      "wire_text": "OK,M06,VINVALID,D2\r\n",
+      "after_wire": "keep_open",
+      "expected": "ok",
+      "origin": "value/decision literal from LMI Classic screenshot M06,VINVALID,D2 (Classic-only corroboration)",
+      "trailing_delimiter_observed": false,
+      "values": [
+        {
+          "id": 6,
+          "raw_id_text": "06",
+          "raw_value_text": "INVALID",
+          "raw_decision_text": "2",
+          "value_invalid": true,
+          "decision_raw": 2,
+          "pass": false,
+          "decision_invalid": true,
+          "decision_reserved_bits": 0
+        }
+      ]
+    },
+    {
+      "name": "zero_padded_ids_mixed",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0,
+        1,
+        8
+      ],
+      "wire_hex": "4f4b2c4d30302c56393236312c44302c4d30312c56353330372c44302c4d30382c56313135362c44300d0a",
+      "wire_text": "OK,M00,V9261,D0,M01,V5307,D0,M08,V1156,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "ok",
+      "origin": "literal from LMI Classic screenshot (Classic-only corroboration of zero padding)",
+      "trailing_delimiter_observed": false,
+      "values": [
+        {
+          "id": 0,
+          "raw_id_text": "00",
+          "raw_value_text": "9261",
+          "raw_decision_text": "0",
+          "value_invalid": false,
+          "scaled_i32": 9261,
+          "value": "9.261",
+          "decision_raw": 0,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        },
+        {
+          "id": 1,
+          "raw_id_text": "01",
+          "raw_value_text": "5307",
+          "raw_decision_text": "0",
+          "value_invalid": false,
+          "scaled_i32": 5307,
+          "value": "5.307",
+          "decision_raw": 0,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        },
+        {
+          "id": 8,
+          "raw_id_text": "08",
+          "raw_value_text": "1156",
+          "raw_decision_text": "0",
+          "value_invalid": false,
+          "scaled_i32": 1156,
+          "value": "1.156",
+          "decision_raw": 0,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        }
+      ]
+    },
+    {
+      "name": "heavily_zero_padded_id",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        417
+      ],
+      "wire_hex": "4f4b2c4d303030303431372c562d332c44310d0a",
+      "wire_text": "OK,M0000417,V-3,D1\r\n",
+      "after_wire": "keep_open",
+      "expected": "ok",
+      "trailing_delimiter_observed": false,
+      "values": [
+        {
+          "id": 417,
+          "raw_id_text": "0000417",
+          "raw_value_text": "-3",
+          "raw_decision_text": "1",
+          "value_invalid": false,
+          "scaled_i32": -3,
+          "value": "-0.003",
+          "decision_raw": 1,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        }
+      ]
+    },
+    {
+      "name": "invalid_with_pass_bit_recorded",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        12
+      ],
+      "wire_hex": "4f4b2c4d31322c56494e56414c49442c44310d0a",
+      "wire_text": "OK,M12,VINVALID,D1\r\n",
+      "after_wire": "keep_open",
+      "expected": "ok",
+      "trailing_delimiter_observed": false,
+      "values": [
+        {
+          "id": 12,
+          "raw_id_text": "12",
+          "raw_value_text": "INVALID",
+          "raw_decision_text": "1",
+          "value_invalid": true,
+          "decision_raw": 1,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        }
+      ]
+    },
+    {
+      "name": "invalid_token_lowercase_rejected",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        12
+      ],
+      "wire_hex": "4f4b2c4d31322c56696e76616c69642c44320d0a",
+      "wire_text": "OK,M12,Vinvalid,D2\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "custom_invalid_token",
+      "delimiter": ";",
+      "terminator": "crlf",
+      "invalid_token": "N/A",
+      "trailing_delimiter": "either",
+      "ids": [
+        3,
+        70
+      ],
+      "wire_hex": "4f4b3b4d333b564e2f413b44333b4d37303b562d313b44300d0a",
+      "wire_text": "OK;M3;VN/A;D3;M70;V-1;D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "ok",
+      "trailing_delimiter_observed": false,
+      "values": [
+        {
+          "id": 3,
+          "raw_id_text": "3",
+          "raw_value_text": "N/A",
+          "raw_decision_text": "3",
+          "value_invalid": true,
+          "decision_raw": 3,
+          "pass": true,
+          "decision_invalid": true,
+          "decision_reserved_bits": 0
+        },
+        {
+          "id": 70,
+          "raw_id_text": "70",
+          "raw_value_text": "-1",
+          "raw_decision_text": "0",
+          "value_invalid": false,
+          "scaled_i32": -1,
+          "value": "-0.001",
+          "decision_raw": 0,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        }
+      ]
+    },
+    {
+      "name": "default_invalid_with_custom_token_rejected",
+      "delimiter": ";",
+      "terminator": "crlf",
+      "invalid_token": "N/A",
+      "trailing_delimiter": "either",
+      "ids": [
+        3
+      ],
+      "wire_hex": "4f4b3b4d333b56494e56414c49443b44320d0a",
+      "wire_text": "OK;M3;VINVALID;D2\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "invalid_token_prefix_only_rejected",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        5
+      ],
+      "wire_hex": "4f4b2c4d352c56494e56414c4944582c44320d0a",
+      "wire_text": "OK,M5,VINVALIDX,D2\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "i32_extremes",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        2,
+        9
+      ],
+      "wire_hex": "4f4b2c4d322c56323134373438333634372c44312c4d392c562d323134373438333634382c44300d0a",
+      "wire_text": "OK,M2,V2147483647,D1,M9,V-2147483648,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "ok",
+      "trailing_delimiter_observed": false,
+      "values": [
+        {
+          "id": 2,
+          "raw_id_text": "2",
+          "raw_value_text": "2147483647",
+          "raw_decision_text": "1",
+          "value_invalid": false,
+          "scaled_i32": 2147483647,
+          "value": "2147483.647",
+          "decision_raw": 1,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        },
+        {
+          "id": 9,
+          "raw_id_text": "9",
+          "raw_value_text": "-2147483648",
+          "raw_decision_text": "0",
+          "value_invalid": false,
+          "scaled_i32": -2147483648,
+          "value": "-2147483.648",
+          "decision_raw": 0,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        }
+      ]
+    },
+    {
+      "name": "i32_overflow_positive",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        2
+      ],
+      "wire_hex": "4f4b2c4d322c56323134373438333634382c44310d0a",
+      "wire_text": "OK,M2,V2147483648,D1\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "i32_overflow_negative",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        2
+      ],
+      "wire_hex": "4f4b2c4d322c562d323134373438333634392c44310d0a",
+      "wire_text": "OK,M2,V-2147483649,D1\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "value_small_magnitudes",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16
+      ],
+      "wire_hex": "4f4b2c4d31302c56312c44312c4d31312c562d312c44302c4d31322c56302c44312c4d31332c562d3939392c44302c4d31342c56313030302c44312c4d31352c562d313030312c44302c4d31362c563132332c44310d0a",
+      "wire_text": "OK,M10,V1,D1,M11,V-1,D0,M12,V0,D1,M13,V-999,D0,M14,V1000,D1,M15,V-1001,D0,M16,V123,D1\r\n",
+      "after_wire": "keep_open",
+      "expected": "ok",
+      "trailing_delimiter_observed": false,
+      "values": [
+        {
+          "id": 10,
+          "raw_id_text": "10",
+          "raw_value_text": "1",
+          "raw_decision_text": "1",
+          "value_invalid": false,
+          "scaled_i32": 1,
+          "value": "0.001",
+          "decision_raw": 1,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        },
+        {
+          "id": 11,
+          "raw_id_text": "11",
+          "raw_value_text": "-1",
+          "raw_decision_text": "0",
+          "value_invalid": false,
+          "scaled_i32": -1,
+          "value": "-0.001",
+          "decision_raw": 0,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        },
+        {
+          "id": 12,
+          "raw_id_text": "12",
+          "raw_value_text": "0",
+          "raw_decision_text": "1",
+          "value_invalid": false,
+          "scaled_i32": 0,
+          "value": "0.000",
+          "decision_raw": 1,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        },
+        {
+          "id": 13,
+          "raw_id_text": "13",
+          "raw_value_text": "-999",
+          "raw_decision_text": "0",
+          "value_invalid": false,
+          "scaled_i32": -999,
+          "value": "-0.999",
+          "decision_raw": 0,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        },
+        {
+          "id": 14,
+          "raw_id_text": "14",
+          "raw_value_text": "1000",
+          "raw_decision_text": "1",
+          "value_invalid": false,
+          "scaled_i32": 1000,
+          "value": "1.000",
+          "decision_raw": 1,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        },
+        {
+          "id": 15,
+          "raw_id_text": "15",
+          "raw_value_text": "-1001",
+          "raw_decision_text": "0",
+          "value_invalid": false,
+          "scaled_i32": -1001,
+          "value": "-1.001",
+          "decision_raw": 0,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        },
+        {
+          "id": 16,
+          "raw_id_text": "16",
+          "raw_value_text": "123",
+          "raw_decision_text": "1",
+          "value_invalid": false,
+          "scaled_i32": 123,
+          "value": "0.123",
+          "decision_raw": 1,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        }
+      ]
+    },
+    {
+      "name": "value_leading_zeros_allowed",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        4,
+        7,
+        8
+      ],
+      "wire_hex": "4f4b2c4d342c5630352c44302c4d372c562d303034322c44312c4d382c5630303030303030303030323134373438333634372c44300d0a",
+      "wire_text": "OK,M4,V05,D0,M7,V-0042,D1,M8,V00000000002147483647,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "ok",
+      "trailing_delimiter_observed": false,
+      "values": [
+        {
+          "id": 4,
+          "raw_id_text": "4",
+          "raw_value_text": "05",
+          "raw_decision_text": "0",
+          "value_invalid": false,
+          "scaled_i32": 5,
+          "value": "0.005",
+          "decision_raw": 0,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        },
+        {
+          "id": 7,
+          "raw_id_text": "7",
+          "raw_value_text": "-0042",
+          "raw_decision_text": "1",
+          "value_invalid": false,
+          "scaled_i32": -42,
+          "value": "-0.042",
+          "decision_raw": 1,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        },
+        {
+          "id": 8,
+          "raw_id_text": "8",
+          "raw_value_text": "00000000002147483647",
+          "raw_decision_text": "0",
+          "value_invalid": false,
+          "scaled_i32": 2147483647,
+          "value": "2147483.647",
+          "decision_raw": 0,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        }
+      ]
+    },
+    {
+      "name": "value_negative_zero",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        4
+      ],
+      "wire_hex": "4f4b2c4d342c562d302c44300d0a",
+      "wire_text": "OK,M4,V-0,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "ok",
+      "trailing_delimiter_observed": false,
+      "values": [
+        {
+          "id": 4,
+          "raw_id_text": "4",
+          "raw_value_text": "-0",
+          "raw_decision_text": "0",
+          "value_invalid": false,
+          "scaled_i32": 0,
+          "value": "0.000",
+          "decision_raw": 0,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        }
+      ]
+    },
+    {
+      "name": "value_plus_sign_rejected",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        4
+      ],
+      "wire_hex": "4f4b2c4d342c562b352c44300d0a",
+      "wire_text": "OK,M4,V+5,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "value_inner_space_rejected",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        4
+      ],
+      "wire_hex": "4f4b2c4d342c5620352c44300d0a",
+      "wire_text": "OK,M4,V 5,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "value_trailing_space_rejected",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        4
+      ],
+      "wire_hex": "4f4b2c4d342c5635202c44300d0a",
+      "wire_text": "OK,M4,V5 ,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "value_empty_rejected",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        4
+      ],
+      "wire_hex": "4f4b2c4d342c562c44300d0a",
+      "wire_text": "OK,M4,V,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "value_sign_only_rejected",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        4
+      ],
+      "wire_hex": "4f4b2c4d342c562d2c44300d0a",
+      "wire_text": "OK,M4,V-,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "value_decimal_point_rejected",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        4
+      ],
+      "wire_hex": "4f4b2c4d342c56352e3030302c44300d0a",
+      "wire_text": "OK,M4,V5.000,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "value_double_minus_rejected",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        4
+      ],
+      "wire_hex": "4f4b2c4d342c562d2d352c44300d0a",
+      "wire_text": "OK,M4,V--5,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "decision_reserved_bits",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        20,
+        21,
+        22,
+        23
+      ],
+      "wire_hex": "4f4b2c4d32302c5637372c443235352c4d32312c562d37382c44342c4d32322c5637392c44332c4d32332c5638302c443030320d0a",
+      "wire_text": "OK,M20,V77,D255,M21,V-78,D4,M22,V79,D3,M23,V80,D002\r\n",
+      "after_wire": "keep_open",
+      "expected": "ok",
+      "trailing_delimiter_observed": false,
+      "values": [
+        {
+          "id": 20,
+          "raw_id_text": "20",
+          "raw_value_text": "77",
+          "raw_decision_text": "255",
+          "value_invalid": false,
+          "scaled_i32": 77,
+          "value": "0.077",
+          "decision_raw": 255,
+          "pass": true,
+          "decision_invalid": true,
+          "decision_reserved_bits": 252
+        },
+        {
+          "id": 21,
+          "raw_id_text": "21",
+          "raw_value_text": "-78",
+          "raw_decision_text": "4",
+          "value_invalid": false,
+          "scaled_i32": -78,
+          "value": "-0.078",
+          "decision_raw": 4,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 4
+        },
+        {
+          "id": 22,
+          "raw_id_text": "22",
+          "raw_value_text": "79",
+          "raw_decision_text": "3",
+          "value_invalid": false,
+          "scaled_i32": 79,
+          "value": "0.079",
+          "decision_raw": 3,
+          "pass": true,
+          "decision_invalid": true,
+          "decision_reserved_bits": 0
+        },
+        {
+          "id": 23,
+          "raw_id_text": "23",
+          "raw_value_text": "80",
+          "raw_decision_text": "002",
+          "value_invalid": false,
+          "scaled_i32": 80,
+          "value": "0.080",
+          "decision_raw": 2,
+          "pass": false,
+          "decision_invalid": true,
+          "decision_reserved_bits": 0
+        }
+      ]
+    },
+    {
+      "name": "decision_256_rejected",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        20
+      ],
+      "wire_hex": "4f4b2c4d32302c5637372c443235360d0a",
+      "wire_text": "OK,M20,V77,D256\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "decision_negative_rejected",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        20
+      ],
+      "wire_hex": "4f4b2c4d32302c5637372c442d310d0a",
+      "wire_text": "OK,M20,V77,D-1\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "decision_plus_rejected",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        20
+      ],
+      "wire_hex": "4f4b2c4d32302c5637372c442b310d0a",
+      "wire_text": "OK,M20,V77,D+1\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "decision_empty_rejected",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        20
+      ],
+      "wire_hex": "4f4b2c4d32302c5637372c440d0a",
+      "wire_text": "OK,M20,V77,D\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "decision_hex_rejected",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        20
+      ],
+      "wire_hex": "4f4b2c4d32302c5637372c443078310d0a",
+      "wire_text": "OK,M20,V77,D0x1\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "wrong_id_at_position",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "4f4b2c4d302c562d353030302c44302c4d322c56353030302c44310d0a",
+      "wire_text": "OK,M0,V-5000,D0,M2,V5000,D1\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "id_mismatch"
+    },
+    {
+      "name": "swapped_order",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "4f4b2c4d312c56353030302c44312c4d302c562d353030302c44300d0a",
+      "wire_text": "OK,M1,V5000,D1,M0,V-5000,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "id_mismatch"
+    },
+    {
+      "name": "duplicate_reply_id",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "4f4b2c4d302c562d353030302c44302c4d302c56353030302c44310d0a",
+      "wire_text": "OK,M0,V-5000,D0,M0,V5000,D1\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "id_mismatch"
+    },
+    {
+      "name": "padded_wrong_id",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        70
+      ],
+      "wire_hex": "4f4b2c4d3030372c56312c44310d0a",
+      "wire_text": "OK,M007,V1,D1\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "id_mismatch"
+    },
+    {
+      "name": "fewer_triplets",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "4f4b2c4d302c562d353030302c44300d0a",
+      "wire_text": "OK,M0,V-5000,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "missing_middle_triplet",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0,
+        1,
+        2
+      ],
+      "wire_hex": "4f4b2c4d302c562d353030302c44302c4d322c56352c44310d0a",
+      "wire_text": "OK,M0,V-5000,D0,M2,V5,D1\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "more_triplets",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "4f4b2c4d302c562d353030302c44302c4d312c56353030302c44312c4d322c56362c44300d0a",
+      "wire_text": "OK,M0,V-5000,D0,M1,V5000,D1,M2,V6,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "partial_triplet",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "4f4b2c4d302c562d353030302c44302c4d312c56353030300d0a",
+      "wire_text": "OK,M0,V-5000,D0,M1,V5000\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "ok_without_data",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0
+      ],
+      "wire_hex": "4f4b0d0a",
+      "wire_text": "OK\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "empty_middle_field",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0
+      ],
+      "wire_hex": "4f4b2c4d302c2c562d353030302c44300d0a",
+      "wire_text": "OK,M0,,V-5000,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "field_order_swapped",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0
+      ],
+      "wire_hex": "4f4b2c4d302c44302c562d353030300d0a",
+      "wire_text": "OK,M0,D0,V-5000\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "string_prefix_rejected",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0
+      ],
+      "wire_hex": "4f4b2c53302c562d353030302c44300d0a",
+      "wire_text": "OK,S0,V-5000,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "lowercase_prefix_rejected",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0
+      ],
+      "wire_hex": "4f4b2c6d302c762d353030302c64300d0a",
+      "wire_text": "OK,m0,v-5000,d0\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "id_with_sign_rejected",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0
+      ],
+      "wire_hex": "4f4b2c4d2d302c56312c44300d0a",
+      "wire_text": "OK,M-0,V1,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "id_empty_rejected",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0
+      ],
+      "wire_hex": "4f4b2c4d2c56312c44300d0a",
+      "wire_text": "OK,M,V1,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "empty_body",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0
+      ],
+      "wire_hex": "0d0a",
+      "wire_text": "\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "lowercase_ok",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0
+      ],
+      "wire_hex": "6f6b2c4d302c562d353030302c44300d0a",
+      "wire_text": "ok,M0,V-5000,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "lowercase_ok_trailing",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0
+      ],
+      "wire_hex": "6f6b2c0d0a",
+      "wire_text": "ok,\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "mixed_case_ok",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0
+      ],
+      "wire_hex": "4f6b2c4d302c562d353030302c44300d0a",
+      "wire_text": "Ok,M0,V-5000,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "status_glued_to_data",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0
+      ],
+      "wire_hex": "4f4b4d302c562d353030302c44300d0a",
+      "wire_text": "OKM0,V-5000,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "leading_space_status",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0
+      ],
+      "wire_hex": "204f4b2c4d302c562d353030302c44300d0a",
+      "wire_text": " OK,M0,V-5000,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "lowercase_error",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0
+      ],
+      "wire_hex": "6572726f722c496e76616c696420706172616d657465722e20506c656173652076657269667920796f757220696e7075740d0a",
+      "wire_text": "error,Invalid parameter. Please verify your input\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "error_no_data",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "4552524f522c5468657265206973206e6f206d6561737572656d656e74206461746120746f206f75747075742e20506c6561736520636f6e6669726d2074686174207468652073656e736f722069732072756e6e696e670d0a",
+      "wire_text": "ERROR,There is no measurement data to output. Please confirm that the sensor is running\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "origin": "manufacturer literal (GoPxL 1.3 Polling Commands, measurement ERROR row)",
+      "expected_error": "device_error",
+      "classification": "no_data",
+      "error_text": "There is no measurement data to output. Please confirm that the sensor is running"
+    },
+    {
+      "name": "error_invalid_parameter",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "4552524f522c496e76616c696420706172616d657465722e20506c656173652076657269667920796f757220696e7075740d0a",
+      "wire_text": "ERROR,Invalid parameter. Please verify your input\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "origin": "manufacturer literal (GoPxL 1.3 Polling Commands, measurement ERROR row)",
+      "expected_error": "device_error",
+      "classification": "invalid_parameter",
+      "error_text": "Invalid parameter. Please verify your input"
+    },
+    {
+      "name": "error_id_not_found",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "4552524f522c537065636966696564206d6561737572656d656e74204944206e6f7420666f756e642e20506c656173652076657269667920796f757220696e7075740d0a",
+      "wire_text": "ERROR,Specified measurement ID not found. Please verify your input\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "origin": "manufacturer literal (GoPxL 1.3 Polling Commands, measurement ERROR row)",
+      "expected_error": "device_error",
+      "classification": "id_not_found",
+      "error_text": "Specified measurement ID not found. Please verify your input"
+    },
+    {
+      "name": "error_id_required",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "4552524f522c4f6e65206f72206d6f7265206d6561737572656d656e74206964206d7573742062652070726f76696465640d0a",
+      "wire_text": "ERROR,One or more measurement id must be provided\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "origin": "manufacturer literal (GoPxL 1.3 Polling Commands, measurement ERROR row)",
+      "expected_error": "device_error",
+      "classification": "id_required",
+      "error_text": "One or more measurement id must be provided"
+    },
+    {
+      "name": "error_id_not_found_trailing_period",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        5
+      ],
+      "wire_hex": "4552524f522c537065636966696564206d6561737572656d656e74204944206e6f7420666f756e642e20506c656173652076657269667920796f757220696e7075742e0d0a",
+      "wire_text": "ERROR,Specified measurement ID not found. Please verify your input.\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "origin": "literal from LMI Classic screenshot (trailing period variant)",
+      "expected_error": "device_error",
+      "classification": "unclassified",
+      "error_text": "Specified measurement ID not found. Please verify your input."
+    },
+    {
+      "name": "error_no_data_trailing_period",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        5
+      ],
+      "wire_hex": "4552524f522c5468657265206973206e6f206d6561737572656d656e74206461746120746f206f75747075742e20506c6561736520636f6e6669726d2074686174207468652073656e736f722069732072756e6e696e672e0d0a",
+      "wire_text": "ERROR,There is no measurement data to output. Please confirm that the sensor is running.\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "device_error",
+      "classification": "unclassified",
+      "error_text": "There is no measurement data to output. Please confirm that the sensor is running."
+    },
+    {
+      "name": "error_id_required_1_4_capital_id",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        5
+      ],
+      "wire_hex": "4552524f522c4f6e65206f72206d6f7265206d6561737572656d656e74204944206d7573742062652070726f76696465640d0a",
+      "wire_text": "ERROR,One or more measurement ID must be provided\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "origin": "manufacturer literal (GoPxL 1.4/1.5 row; not a 1.3 string, so unclassified under this profile)",
+      "expected_error": "device_error",
+      "classification": "unclassified",
+      "error_text": "One or more measurement ID must be provided"
+    },
+    {
+      "name": "error_no_data_trailing_delim_either",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0
+      ],
+      "wire_hex": "4552524f522c5468657265206973206e6f206d6561737572656d656e74206461746120746f206f75747075742e20506c6561736520636f6e6669726d2074686174207468652073656e736f722069732072756e6e696e672c0d0a",
+      "wire_text": "ERROR,There is no measurement data to output. Please confirm that the sensor is running,\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "device_error",
+      "classification": "no_data",
+      "error_text": "There is no measurement data to output. Please confirm that the sensor is running"
+    },
+    {
+      "name": "error_no_data_trailing_delim_present",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "present",
+      "ids": [
+        0
+      ],
+      "wire_hex": "4552524f522c5468657265206973206e6f206d6561737572656d656e74206461746120746f206f75747075742e20506c6561736520636f6e6669726d2074686174207468652073656e736f722069732072756e6e696e672c0d0a",
+      "wire_text": "ERROR,There is no measurement data to output. Please confirm that the sensor is running,\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "device_error",
+      "classification": "no_data",
+      "error_text": "There is no measurement data to output. Please confirm that the sensor is running"
+    },
+    {
+      "name": "error_no_data_trailing_delim_absent",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "absent",
+      "ids": [
+        0
+      ],
+      "wire_hex": "4552524f522c5468657265206973206e6f206d6561737572656d656e74206461746120746f206f75747075742e20506c6561736520636f6e6669726d2074686174207468652073656e736f722069732072756e6e696e672c0d0a",
+      "wire_text": "ERROR,There is no measurement data to output. Please confirm that the sensor is running,\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "error_no_data_without_trailer_present",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "present",
+      "ids": [
+        0
+      ],
+      "wire_hex": "4552524f522c5468657265206973206e6f206d6561737572656d656e74206461746120746f206f75747075742e20506c6561736520636f6e6669726d2074686174207468652073656e736f722069732072756e6e696e670d0a",
+      "wire_text": "ERROR,There is no measurement data to output. Please confirm that the sensor is running\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "error_no_data_absent",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "absent",
+      "ids": [
+        0
+      ],
+      "wire_hex": "4552524f522c5468657265206973206e6f206d6561737572656d656e74206461746120746f206f75747075742e20506c6561736520636f6e6669726d2074686174207468652073656e736f722069732072756e6e696e670d0a",
+      "wire_text": "ERROR,There is no measurement data to output. Please confirm that the sensor is running\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "device_error",
+      "classification": "no_data",
+      "error_text": "There is no measurement data to output. Please confirm that the sensor is running"
+    },
+    {
+      "name": "error_text_with_delimiters",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0
+      ],
+      "wire_hex": "4552524f522c496e76616c696420706172616d657465722c20506c65617365207665726966792c796f757220696e7075740d0a",
+      "wire_text": "ERROR,Invalid parameter, Please verify,your input\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "device_error",
+      "classification": "unclassified",
+      "error_text": "Invalid parameter, Please verify,your input"
+    },
+    {
+      "name": "error_text_with_delimiters_trailing_either",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0
+      ],
+      "wire_hex": "4552524f522c616c7068612c626574612c0d0a",
+      "wire_text": "ERROR,alpha,beta,\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "device_error",
+      "classification": "unclassified",
+      "error_text": "alpha,beta"
+    },
+    {
+      "name": "error_without_text",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0
+      ],
+      "wire_hex": "4552524f520d0a",
+      "wire_text": "ERROR\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "device_error",
+      "classification": "unclassified",
+      "error_text": ""
+    },
+    {
+      "name": "error_semicolon_cr",
+      "delimiter": ";",
+      "terminator": "cr",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        9
+      ],
+      "wire_hex": "4552524f523b496e76616c696420706172616d657465722e20506c656173652076657269667920796f757220696e7075740d",
+      "wire_text": "ERROR;Invalid parameter. Please verify your input\r",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "device_error",
+      "classification": "invalid_parameter",
+      "error_text": "Invalid parameter. Please verify your input"
+    },
+    {
+      "name": "error_case_mismatch_unclassified",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0
+      ],
+      "wire_hex": "4552524f522c696e76616c696420706172616d657465722e20706c656173652076657269667920796f757220696e7075740d0a",
+      "wire_text": "ERROR,invalid parameter. please verify your input\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "device_error",
+      "classification": "unclassified",
+      "error_text": "invalid parameter. please verify your input"
+    },
+    {
+      "name": "lone_cr_in_body_crlf",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0
+      ],
+      "wire_hex": "4f4b2c4d302c562d353030300d2c44300d0a",
+      "wire_text": "OK,M0,V-5000\r,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "bytes_after_terminator",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0
+      ],
+      "wire_hex": "4f4b2c4d302c562d353030302c44300d0a4f4b2c4d302c562d353030302c44300d0a",
+      "wire_text": "OK,M0,V-5000,D0\r\nOK,M0,V-5000,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "one_byte_after_terminator",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0
+      ],
+      "wire_hex": "4f4b2c4d302c562d353030302c44300d0a58",
+      "wire_text": "OK,M0,V-5000,D0\r\nX",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "lf_after_cr_terminator",
+      "delimiter": ",",
+      "terminator": "cr",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0
+      ],
+      "wire_hex": "4f4b2c4d302c562d353030302c44300d0a",
+      "wire_text": "OK,M0,V-5000,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "crlf_under_lf_terminator",
+      "delimiter": ",",
+      "terminator": "lf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0
+      ],
+      "wire_hex": "4f4b2c4d302c562d353030302c44300d0a",
+      "wire_text": "OK,M0,V-5000,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "lf_only_under_crlf_closed",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "4f4b2c4d302c562d353030302c44302c4d312c56353030302c44310a",
+      "wire_text": "OK,M0,V-5000,D0,M1,V5000,D1\n",
+      "after_wire": "close",
+      "expected": "error",
+      "expected_error": "truncated_reply"
+    },
+    {
+      "name": "lf_only_under_crlf_open",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "4f4b2c4d302c562d353030302c44302c4d312c56353030302c44310a",
+      "wire_text": "OK,M0,V-5000,D0,M1,V5000,D1\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "timeout"
+    },
+    {
+      "name": "cr_only_under_crlf_closed",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "4f4b2c4d302c562d353030302c44302c4d312c56353030302c44310d",
+      "wire_text": "OK,M0,V-5000,D0,M1,V5000,D1\r",
+      "after_wire": "close",
+      "expected": "error",
+      "expected_error": "truncated_reply"
+    },
+    {
+      "name": "no_terminator_closed",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "4f4b2c4d302c562d353030302c44302c4d312c56353030302c4431",
+      "wire_text": "OK,M0,V-5000,D0,M1,V5000,D1",
+      "after_wire": "close",
+      "expected": "error",
+      "expected_error": "truncated_reply"
+    },
+    {
+      "name": "nothing_then_closed",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "",
+      "wire_text": "",
+      "after_wire": "close",
+      "expected": "error",
+      "expected_error": "truncated_reply"
+    },
+    {
+      "name": "partial_then_silent",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "4f4b2c4d302c562d35303030",
+      "wire_text": "OK,M0,V-5000",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "timeout"
+    },
+    {
+      "name": "cr_terminator_ok",
+      "delimiter": ",",
+      "terminator": "cr",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        31
+      ],
+      "wire_hex": "4f4b2c4d33312c562d31323334352c44310d",
+      "wire_text": "OK,M31,V-12345,D1\r",
+      "after_wire": "keep_open",
+      "expected": "ok",
+      "trailing_delimiter_observed": false,
+      "values": [
+        {
+          "id": 31,
+          "raw_id_text": "31",
+          "raw_value_text": "-12345",
+          "raw_decision_text": "1",
+          "value_invalid": false,
+          "scaled_i32": -12345,
+          "value": "-12.345",
+          "decision_raw": 1,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        }
+      ]
+    },
+    {
+      "name": "lf_terminator_ok_trailing",
+      "delimiter": "|",
+      "terminator": "lf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "present",
+      "ids": [
+        65535
+      ],
+      "wire_hex": "4f4b7c4d36353533357c56323436387c44307c0a",
+      "wire_text": "OK|M65535|V2468|D0|\n",
+      "after_wire": "keep_open",
+      "expected": "ok",
+      "trailing_delimiter_observed": true,
+      "values": [
+        {
+          "id": 65535,
+          "raw_id_text": "65535",
+          "raw_value_text": "2468",
+          "raw_decision_text": "0",
+          "value_invalid": false,
+          "scaled_i32": 2468,
+          "value": "2.468",
+          "decision_raw": 0,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        }
+      ]
+    },
+    {
+      "name": "semicolon_delimiter_crlf",
+      "delimiter": ";",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0,
+        1
+      ],
+      "wire_hex": "4f4b3b4d303b562d353030303b44303b4d313b56353030303b44310d0a",
+      "wire_text": "OK;M0;V-5000;D0;M1;V5000;D1\r\n",
+      "after_wire": "keep_open",
+      "expected": "ok",
+      "trailing_delimiter_observed": false,
+      "values": [
+        {
+          "id": 0,
+          "raw_id_text": "0",
+          "raw_value_text": "-5000",
+          "raw_decision_text": "0",
+          "value_invalid": false,
+          "scaled_i32": -5000,
+          "value": "-5.000",
+          "decision_raw": 0,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        },
+        {
+          "id": 1,
+          "raw_id_text": "1",
+          "raw_value_text": "5000",
+          "raw_decision_text": "1",
+          "value_invalid": false,
+          "scaled_i32": 5000,
+          "value": "5.000",
+          "decision_raw": 1,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        }
+      ]
+    },
+    {
+      "name": "comma_reply_under_semicolon",
+      "delimiter": ";",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        0
+      ],
+      "wire_hex": "4f4b2c4d302c562d353030302c44300d0a",
+      "wire_text": "OK,M0,V-5000,D0\r\n",
+      "after_wire": "keep_open",
+      "expected": "error",
+      "expected_error": "malformed_reply"
+    },
+    {
+      "name": "hash_delimiter_lf",
+      "delimiter": "#",
+      "terminator": "lf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        500,
+        40000
+      ],
+      "wire_hex": "4f4b234d35303023562d37234432234d34303030302356382344310a",
+      "wire_text": "OK#M500#V-7#D2#M40000#V8#D1\n",
+      "after_wire": "keep_open",
+      "expected": "ok",
+      "trailing_delimiter_observed": false,
+      "values": [
+        {
+          "id": 500,
+          "raw_id_text": "500",
+          "raw_value_text": "-7",
+          "raw_decision_text": "2",
+          "value_invalid": false,
+          "scaled_i32": -7,
+          "value": "-0.007",
+          "decision_raw": 2,
+          "pass": false,
+          "decision_invalid": true,
+          "decision_reserved_bits": 0
+        },
+        {
+          "id": 40000,
+          "raw_id_text": "40000",
+          "raw_value_text": "8",
+          "raw_decision_text": "1",
+          "value_invalid": false,
+          "scaled_i32": 8,
+          "value": "0.008",
+          "decision_raw": 1,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        }
+      ]
+    },
+    {
+      "name": "sixty_four_ids",
+      "delimiter": ",",
+      "terminator": "crlf",
+      "invalid_token": "INVALID",
+      "trailing_delimiter": "either",
+      "ids": [
+        37,
+        1058,
+        2079,
+        3100,
+        4121,
+        5142,
+        6163,
+        7184,
+        8205,
+        9226,
+        10247,
+        11268,
+        12289,
+        13310,
+        14331,
+        15352,
+        16373,
+        17394,
+        18415,
+        19436,
+        20457,
+        21478,
+        22499,
+        23520,
+        24541,
+        25562,
+        26583,
+        27604,
+        28625,
+        29646,
+        30667,
+        31688,
+        32709,
+        33730,
+        34751,
+        35772,
+        36793,
+        37814,
+        38835,
+        39856,
+        40877,
+        41898,
+        42919,
+        43940,
+        44961,
+        45982,
+        47003,
+        48024,
+        49045,
+        50066,
+        51087,
+        52108,
+        53129,
+        54150,
+        55171,
+        56192,
+        57213,
+        58234,
+        59255,
+        60276,
+        61297,
+        62318,
+        63339,
+        64360
+      ],
+      "wire_hex": "4f4b2c4d33372c56494e56414c49442c44302c4d313035382c562d333134313837302c4433372c4d323037392c562d333033373134312c4437342c4d333130302c562d323933323431322c443131312c4d343132312c562d323832373638332c443134382c4d353134322c562d323732323935342c443138352c4d363136332c562d323631383232352c443232322c4d373138342c562d323531333439362c44332c4d383230352c562d323430383736372c4434302c4d393232362c56494e56414c49442c4437372c4d31303234372c562d323139393330392c443131342c4d31313236382c562d323039343538302c443135312c4d31323238392c562d313938393835312c443138382c4d31333331302c562d313838353132322c443232352c4d31343333312c562d313738303339332c44362c4d31353335322c562d313637353636342c4434332c4d31363337332c562d313537303933352c4438302c4d31373339342c562d313436363230362c443131372c4d31383431352c56494e56414c49442c443135342c4d31393433362c562d313235363734382c443139312c4d32303435372c562d313135323031392c443232382c4d32313437382c562d313034373239302c44392c4d32323439392c562d3934323536312c4434362c4d32333532302c562d3833373833322c4438332c4d32343534312c562d3733333130332c443132302c4d32353536322c562d3632383337342c443135372c4d32363538332c562d3532333634352c443139342c4d32373630342c56494e56414c49442c443233312c4d32383632352c562d3331343138372c4431322c4d32393634362c562d3230393435382c4434392c4d33303636372c562d3130343732392c4438362c4d33313638382c56302c443132332c4d33323730392c563130343732392c443136302c4d33333733302c563230393435382c443139372c4d33343735312c563331343138372c443233342c4d33353737322c563431383931362c4431352c4d33363739332c56494e56414c49442c4435322c4d33373831342c563632383337342c4438392c4d33383833352c563733333130332c443132362c4d33393835362c563833373833322c443136332c4d34303837372c563934323536312c443230302c4d34313839382c56313034373239302c443233372c4d34323931392c56313135323031392c4431382c4d34333934302c56313235363734382c4435352c4d34343936312c56313336313437372c4439322c4d34353938322c56494e56414c49442c443132392c4d34373030332c56313537303933352c443136362c4d34383032342c56313637353636342c443230332c4d34393034352c56313738303339332c443234302c4d35303036362c56313838353132322c4432312c4d35313038372c56313938393835312c4435382c4d35323130382c56323039343538302c4439352c4d35333132392c56323139393330392c443133322c4d35343135302c56323330343033382c443136392c4d35353137312c56494e56414c49442c443230362c4d35363139322c56323531333439362c443234332c4d35373231332c56323631383232352c4432342c4d35383233342c56323732323935342c4436312c4d35393235352c56323832373638332c4439382c4d36303237362c56323933323431322c443133352c4d36313239372c56333033373134312c443137322c4d36323331382c56333134313837302c443230392c4d36333333392c56333234363539392c443234362c4d36343336302c56494e56414c49442c4432372c0d0a",
+      "wire_text": "OK,M37,VINVALID,D0,M1058,V-3141870,D37,M2079,V-3037141,D74,M3100,V-2932412,D111,M4121,V-2827683,D148,M5142,V-2722954,D185,M6163,V-2618225,D222,M7184,V-2513496,D3,M8205,V-2408767,D40,M9226,VINVALID,D77,M10247,V-2199309,D114,M11268,V-2094580,D151,M12289,V-1989851,D188,M13310,V-1885122,D225,M14331,V-1780393,D6,M15352,V-1675664,D43,M16373,V-1570935,D80,M17394,V-1466206,D117,M18415,VINVALID,D154,M19436,V-1256748,D191,M20457,V-1152019,D228,M21478,V-1047290,D9,M22499,V-942561,D46,M23520,V-837832,D83,M24541,V-733103,D120,M25562,V-628374,D157,M26583,V-523645,D194,M27604,VINVALID,D231,M28625,V-314187,D12,M29646,V-209458,D49,M30667,V-104729,D86,M31688,V0,D123,M32709,V104729,D160,M33730,V209458,D197,M34751,V314187,D234,M35772,V418916,D15,M36793,VINVALID,D52,M37814,V628374,D89,M38835,V733103,D126,M39856,V837832,D163,M40877,V942561,D200,M41898,V1047290,D237,M42919,V1152019,D18,M43940,V1256748,D55,M44961,V1361477,D92,M45982,VINVALID,D129,M47003,V1570935,D166,M48024,V1675664,D203,M49045,V1780393,D240,M50066,V1885122,D21,M51087,V1989851,D58,M52108,V2094580,D95,M53129,V2199309,D132,M54150,V2304038,D169,M55171,VINVALID,D206,M56192,V2513496,D243,M57213,V2618225,D24,M58234,V2722954,D61,M59255,V2827683,D98,M60276,V2932412,D135,M61297,V3037141,D172,M62318,V3141870,D209,M63339,V3246599,D246,M64360,VINVALID,D27,\r\n",
+      "after_wire": "keep_open",
+      "expected": "ok",
+      "trailing_delimiter_observed": true,
+      "values": [
+        {
+          "id": 37,
+          "raw_id_text": "37",
+          "raw_value_text": "INVALID",
+          "raw_decision_text": "0",
+          "value_invalid": true,
+          "decision_raw": 0,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 0
+        },
+        {
+          "id": 1058,
+          "raw_id_text": "1058",
+          "raw_value_text": "-3141870",
+          "raw_decision_text": "37",
+          "value_invalid": false,
+          "scaled_i32": -3141870,
+          "value": "-3141.870",
+          "decision_raw": 37,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 36
+        },
+        {
+          "id": 2079,
+          "raw_id_text": "2079",
+          "raw_value_text": "-3037141",
+          "raw_decision_text": "74",
+          "value_invalid": false,
+          "scaled_i32": -3037141,
+          "value": "-3037.141",
+          "decision_raw": 74,
+          "pass": false,
+          "decision_invalid": true,
+          "decision_reserved_bits": 72
+        },
+        {
+          "id": 3100,
+          "raw_id_text": "3100",
+          "raw_value_text": "-2932412",
+          "raw_decision_text": "111",
+          "value_invalid": false,
+          "scaled_i32": -2932412,
+          "value": "-2932.412",
+          "decision_raw": 111,
+          "pass": true,
+          "decision_invalid": true,
+          "decision_reserved_bits": 108
+        },
+        {
+          "id": 4121,
+          "raw_id_text": "4121",
+          "raw_value_text": "-2827683",
+          "raw_decision_text": "148",
+          "value_invalid": false,
+          "scaled_i32": -2827683,
+          "value": "-2827.683",
+          "decision_raw": 148,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 148
+        },
+        {
+          "id": 5142,
+          "raw_id_text": "5142",
+          "raw_value_text": "-2722954",
+          "raw_decision_text": "185",
+          "value_invalid": false,
+          "scaled_i32": -2722954,
+          "value": "-2722.954",
+          "decision_raw": 185,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 184
+        },
+        {
+          "id": 6163,
+          "raw_id_text": "6163",
+          "raw_value_text": "-2618225",
+          "raw_decision_text": "222",
+          "value_invalid": false,
+          "scaled_i32": -2618225,
+          "value": "-2618.225",
+          "decision_raw": 222,
+          "pass": false,
+          "decision_invalid": true,
+          "decision_reserved_bits": 220
+        },
+        {
+          "id": 7184,
+          "raw_id_text": "7184",
+          "raw_value_text": "-2513496",
+          "raw_decision_text": "3",
+          "value_invalid": false,
+          "scaled_i32": -2513496,
+          "value": "-2513.496",
+          "decision_raw": 3,
+          "pass": true,
+          "decision_invalid": true,
+          "decision_reserved_bits": 0
+        },
+        {
+          "id": 8205,
+          "raw_id_text": "8205",
+          "raw_value_text": "-2408767",
+          "raw_decision_text": "40",
+          "value_invalid": false,
+          "scaled_i32": -2408767,
+          "value": "-2408.767",
+          "decision_raw": 40,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 40
+        },
+        {
+          "id": 9226,
+          "raw_id_text": "9226",
+          "raw_value_text": "INVALID",
+          "raw_decision_text": "77",
+          "value_invalid": true,
+          "decision_raw": 77,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 76
+        },
+        {
+          "id": 10247,
+          "raw_id_text": "10247",
+          "raw_value_text": "-2199309",
+          "raw_decision_text": "114",
+          "value_invalid": false,
+          "scaled_i32": -2199309,
+          "value": "-2199.309",
+          "decision_raw": 114,
+          "pass": false,
+          "decision_invalid": true,
+          "decision_reserved_bits": 112
+        },
+        {
+          "id": 11268,
+          "raw_id_text": "11268",
+          "raw_value_text": "-2094580",
+          "raw_decision_text": "151",
+          "value_invalid": false,
+          "scaled_i32": -2094580,
+          "value": "-2094.580",
+          "decision_raw": 151,
+          "pass": true,
+          "decision_invalid": true,
+          "decision_reserved_bits": 148
+        },
+        {
+          "id": 12289,
+          "raw_id_text": "12289",
+          "raw_value_text": "-1989851",
+          "raw_decision_text": "188",
+          "value_invalid": false,
+          "scaled_i32": -1989851,
+          "value": "-1989.851",
+          "decision_raw": 188,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 188
+        },
+        {
+          "id": 13310,
+          "raw_id_text": "13310",
+          "raw_value_text": "-1885122",
+          "raw_decision_text": "225",
+          "value_invalid": false,
+          "scaled_i32": -1885122,
+          "value": "-1885.122",
+          "decision_raw": 225,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 224
+        },
+        {
+          "id": 14331,
+          "raw_id_text": "14331",
+          "raw_value_text": "-1780393",
+          "raw_decision_text": "6",
+          "value_invalid": false,
+          "scaled_i32": -1780393,
+          "value": "-1780.393",
+          "decision_raw": 6,
+          "pass": false,
+          "decision_invalid": true,
+          "decision_reserved_bits": 4
+        },
+        {
+          "id": 15352,
+          "raw_id_text": "15352",
+          "raw_value_text": "-1675664",
+          "raw_decision_text": "43",
+          "value_invalid": false,
+          "scaled_i32": -1675664,
+          "value": "-1675.664",
+          "decision_raw": 43,
+          "pass": true,
+          "decision_invalid": true,
+          "decision_reserved_bits": 40
+        },
+        {
+          "id": 16373,
+          "raw_id_text": "16373",
+          "raw_value_text": "-1570935",
+          "raw_decision_text": "80",
+          "value_invalid": false,
+          "scaled_i32": -1570935,
+          "value": "-1570.935",
+          "decision_raw": 80,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 80
+        },
+        {
+          "id": 17394,
+          "raw_id_text": "17394",
+          "raw_value_text": "-1466206",
+          "raw_decision_text": "117",
+          "value_invalid": false,
+          "scaled_i32": -1466206,
+          "value": "-1466.206",
+          "decision_raw": 117,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 116
+        },
+        {
+          "id": 18415,
+          "raw_id_text": "18415",
+          "raw_value_text": "INVALID",
+          "raw_decision_text": "154",
+          "value_invalid": true,
+          "decision_raw": 154,
+          "pass": false,
+          "decision_invalid": true,
+          "decision_reserved_bits": 152
+        },
+        {
+          "id": 19436,
+          "raw_id_text": "19436",
+          "raw_value_text": "-1256748",
+          "raw_decision_text": "191",
+          "value_invalid": false,
+          "scaled_i32": -1256748,
+          "value": "-1256.748",
+          "decision_raw": 191,
+          "pass": true,
+          "decision_invalid": true,
+          "decision_reserved_bits": 188
+        },
+        {
+          "id": 20457,
+          "raw_id_text": "20457",
+          "raw_value_text": "-1152019",
+          "raw_decision_text": "228",
+          "value_invalid": false,
+          "scaled_i32": -1152019,
+          "value": "-1152.019",
+          "decision_raw": 228,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 228
+        },
+        {
+          "id": 21478,
+          "raw_id_text": "21478",
+          "raw_value_text": "-1047290",
+          "raw_decision_text": "9",
+          "value_invalid": false,
+          "scaled_i32": -1047290,
+          "value": "-1047.290",
+          "decision_raw": 9,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 8
+        },
+        {
+          "id": 22499,
+          "raw_id_text": "22499",
+          "raw_value_text": "-942561",
+          "raw_decision_text": "46",
+          "value_invalid": false,
+          "scaled_i32": -942561,
+          "value": "-942.561",
+          "decision_raw": 46,
+          "pass": false,
+          "decision_invalid": true,
+          "decision_reserved_bits": 44
+        },
+        {
+          "id": 23520,
+          "raw_id_text": "23520",
+          "raw_value_text": "-837832",
+          "raw_decision_text": "83",
+          "value_invalid": false,
+          "scaled_i32": -837832,
+          "value": "-837.832",
+          "decision_raw": 83,
+          "pass": true,
+          "decision_invalid": true,
+          "decision_reserved_bits": 80
+        },
+        {
+          "id": 24541,
+          "raw_id_text": "24541",
+          "raw_value_text": "-733103",
+          "raw_decision_text": "120",
+          "value_invalid": false,
+          "scaled_i32": -733103,
+          "value": "-733.103",
+          "decision_raw": 120,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 120
+        },
+        {
+          "id": 25562,
+          "raw_id_text": "25562",
+          "raw_value_text": "-628374",
+          "raw_decision_text": "157",
+          "value_invalid": false,
+          "scaled_i32": -628374,
+          "value": "-628.374",
+          "decision_raw": 157,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 156
+        },
+        {
+          "id": 26583,
+          "raw_id_text": "26583",
+          "raw_value_text": "-523645",
+          "raw_decision_text": "194",
+          "value_invalid": false,
+          "scaled_i32": -523645,
+          "value": "-523.645",
+          "decision_raw": 194,
+          "pass": false,
+          "decision_invalid": true,
+          "decision_reserved_bits": 192
+        },
+        {
+          "id": 27604,
+          "raw_id_text": "27604",
+          "raw_value_text": "INVALID",
+          "raw_decision_text": "231",
+          "value_invalid": true,
+          "decision_raw": 231,
+          "pass": true,
+          "decision_invalid": true,
+          "decision_reserved_bits": 228
+        },
+        {
+          "id": 28625,
+          "raw_id_text": "28625",
+          "raw_value_text": "-314187",
+          "raw_decision_text": "12",
+          "value_invalid": false,
+          "scaled_i32": -314187,
+          "value": "-314.187",
+          "decision_raw": 12,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 12
+        },
+        {
+          "id": 29646,
+          "raw_id_text": "29646",
+          "raw_value_text": "-209458",
+          "raw_decision_text": "49",
+          "value_invalid": false,
+          "scaled_i32": -209458,
+          "value": "-209.458",
+          "decision_raw": 49,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 48
+        },
+        {
+          "id": 30667,
+          "raw_id_text": "30667",
+          "raw_value_text": "-104729",
+          "raw_decision_text": "86",
+          "value_invalid": false,
+          "scaled_i32": -104729,
+          "value": "-104.729",
+          "decision_raw": 86,
+          "pass": false,
+          "decision_invalid": true,
+          "decision_reserved_bits": 84
+        },
+        {
+          "id": 31688,
+          "raw_id_text": "31688",
+          "raw_value_text": "0",
+          "raw_decision_text": "123",
+          "value_invalid": false,
+          "scaled_i32": 0,
+          "value": "0.000",
+          "decision_raw": 123,
+          "pass": true,
+          "decision_invalid": true,
+          "decision_reserved_bits": 120
+        },
+        {
+          "id": 32709,
+          "raw_id_text": "32709",
+          "raw_value_text": "104729",
+          "raw_decision_text": "160",
+          "value_invalid": false,
+          "scaled_i32": 104729,
+          "value": "104.729",
+          "decision_raw": 160,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 160
+        },
+        {
+          "id": 33730,
+          "raw_id_text": "33730",
+          "raw_value_text": "209458",
+          "raw_decision_text": "197",
+          "value_invalid": false,
+          "scaled_i32": 209458,
+          "value": "209.458",
+          "decision_raw": 197,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 196
+        },
+        {
+          "id": 34751,
+          "raw_id_text": "34751",
+          "raw_value_text": "314187",
+          "raw_decision_text": "234",
+          "value_invalid": false,
+          "scaled_i32": 314187,
+          "value": "314.187",
+          "decision_raw": 234,
+          "pass": false,
+          "decision_invalid": true,
+          "decision_reserved_bits": 232
+        },
+        {
+          "id": 35772,
+          "raw_id_text": "35772",
+          "raw_value_text": "418916",
+          "raw_decision_text": "15",
+          "value_invalid": false,
+          "scaled_i32": 418916,
+          "value": "418.916",
+          "decision_raw": 15,
+          "pass": true,
+          "decision_invalid": true,
+          "decision_reserved_bits": 12
+        },
+        {
+          "id": 36793,
+          "raw_id_text": "36793",
+          "raw_value_text": "INVALID",
+          "raw_decision_text": "52",
+          "value_invalid": true,
+          "decision_raw": 52,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 52
+        },
+        {
+          "id": 37814,
+          "raw_id_text": "37814",
+          "raw_value_text": "628374",
+          "raw_decision_text": "89",
+          "value_invalid": false,
+          "scaled_i32": 628374,
+          "value": "628.374",
+          "decision_raw": 89,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 88
+        },
+        {
+          "id": 38835,
+          "raw_id_text": "38835",
+          "raw_value_text": "733103",
+          "raw_decision_text": "126",
+          "value_invalid": false,
+          "scaled_i32": 733103,
+          "value": "733.103",
+          "decision_raw": 126,
+          "pass": false,
+          "decision_invalid": true,
+          "decision_reserved_bits": 124
+        },
+        {
+          "id": 39856,
+          "raw_id_text": "39856",
+          "raw_value_text": "837832",
+          "raw_decision_text": "163",
+          "value_invalid": false,
+          "scaled_i32": 837832,
+          "value": "837.832",
+          "decision_raw": 163,
+          "pass": true,
+          "decision_invalid": true,
+          "decision_reserved_bits": 160
+        },
+        {
+          "id": 40877,
+          "raw_id_text": "40877",
+          "raw_value_text": "942561",
+          "raw_decision_text": "200",
+          "value_invalid": false,
+          "scaled_i32": 942561,
+          "value": "942.561",
+          "decision_raw": 200,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 200
+        },
+        {
+          "id": 41898,
+          "raw_id_text": "41898",
+          "raw_value_text": "1047290",
+          "raw_decision_text": "237",
+          "value_invalid": false,
+          "scaled_i32": 1047290,
+          "value": "1047.290",
+          "decision_raw": 237,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 236
+        },
+        {
+          "id": 42919,
+          "raw_id_text": "42919",
+          "raw_value_text": "1152019",
+          "raw_decision_text": "18",
+          "value_invalid": false,
+          "scaled_i32": 1152019,
+          "value": "1152.019",
+          "decision_raw": 18,
+          "pass": false,
+          "decision_invalid": true,
+          "decision_reserved_bits": 16
+        },
+        {
+          "id": 43940,
+          "raw_id_text": "43940",
+          "raw_value_text": "1256748",
+          "raw_decision_text": "55",
+          "value_invalid": false,
+          "scaled_i32": 1256748,
+          "value": "1256.748",
+          "decision_raw": 55,
+          "pass": true,
+          "decision_invalid": true,
+          "decision_reserved_bits": 52
+        },
+        {
+          "id": 44961,
+          "raw_id_text": "44961",
+          "raw_value_text": "1361477",
+          "raw_decision_text": "92",
+          "value_invalid": false,
+          "scaled_i32": 1361477,
+          "value": "1361.477",
+          "decision_raw": 92,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 92
+        },
+        {
+          "id": 45982,
+          "raw_id_text": "45982",
+          "raw_value_text": "INVALID",
+          "raw_decision_text": "129",
+          "value_invalid": true,
+          "decision_raw": 129,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 128
+        },
+        {
+          "id": 47003,
+          "raw_id_text": "47003",
+          "raw_value_text": "1570935",
+          "raw_decision_text": "166",
+          "value_invalid": false,
+          "scaled_i32": 1570935,
+          "value": "1570.935",
+          "decision_raw": 166,
+          "pass": false,
+          "decision_invalid": true,
+          "decision_reserved_bits": 164
+        },
+        {
+          "id": 48024,
+          "raw_id_text": "48024",
+          "raw_value_text": "1675664",
+          "raw_decision_text": "203",
+          "value_invalid": false,
+          "scaled_i32": 1675664,
+          "value": "1675.664",
+          "decision_raw": 203,
+          "pass": true,
+          "decision_invalid": true,
+          "decision_reserved_bits": 200
+        },
+        {
+          "id": 49045,
+          "raw_id_text": "49045",
+          "raw_value_text": "1780393",
+          "raw_decision_text": "240",
+          "value_invalid": false,
+          "scaled_i32": 1780393,
+          "value": "1780.393",
+          "decision_raw": 240,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 240
+        },
+        {
+          "id": 50066,
+          "raw_id_text": "50066",
+          "raw_value_text": "1885122",
+          "raw_decision_text": "21",
+          "value_invalid": false,
+          "scaled_i32": 1885122,
+          "value": "1885.122",
+          "decision_raw": 21,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 20
+        },
+        {
+          "id": 51087,
+          "raw_id_text": "51087",
+          "raw_value_text": "1989851",
+          "raw_decision_text": "58",
+          "value_invalid": false,
+          "scaled_i32": 1989851,
+          "value": "1989.851",
+          "decision_raw": 58,
+          "pass": false,
+          "decision_invalid": true,
+          "decision_reserved_bits": 56
+        },
+        {
+          "id": 52108,
+          "raw_id_text": "52108",
+          "raw_value_text": "2094580",
+          "raw_decision_text": "95",
+          "value_invalid": false,
+          "scaled_i32": 2094580,
+          "value": "2094.580",
+          "decision_raw": 95,
+          "pass": true,
+          "decision_invalid": true,
+          "decision_reserved_bits": 92
+        },
+        {
+          "id": 53129,
+          "raw_id_text": "53129",
+          "raw_value_text": "2199309",
+          "raw_decision_text": "132",
+          "value_invalid": false,
+          "scaled_i32": 2199309,
+          "value": "2199.309",
+          "decision_raw": 132,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 132
+        },
+        {
+          "id": 54150,
+          "raw_id_text": "54150",
+          "raw_value_text": "2304038",
+          "raw_decision_text": "169",
+          "value_invalid": false,
+          "scaled_i32": 2304038,
+          "value": "2304.038",
+          "decision_raw": 169,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 168
+        },
+        {
+          "id": 55171,
+          "raw_id_text": "55171",
+          "raw_value_text": "INVALID",
+          "raw_decision_text": "206",
+          "value_invalid": true,
+          "decision_raw": 206,
+          "pass": false,
+          "decision_invalid": true,
+          "decision_reserved_bits": 204
+        },
+        {
+          "id": 56192,
+          "raw_id_text": "56192",
+          "raw_value_text": "2513496",
+          "raw_decision_text": "243",
+          "value_invalid": false,
+          "scaled_i32": 2513496,
+          "value": "2513.496",
+          "decision_raw": 243,
+          "pass": true,
+          "decision_invalid": true,
+          "decision_reserved_bits": 240
+        },
+        {
+          "id": 57213,
+          "raw_id_text": "57213",
+          "raw_value_text": "2618225",
+          "raw_decision_text": "24",
+          "value_invalid": false,
+          "scaled_i32": 2618225,
+          "value": "2618.225",
+          "decision_raw": 24,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 24
+        },
+        {
+          "id": 58234,
+          "raw_id_text": "58234",
+          "raw_value_text": "2722954",
+          "raw_decision_text": "61",
+          "value_invalid": false,
+          "scaled_i32": 2722954,
+          "value": "2722.954",
+          "decision_raw": 61,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 60
+        },
+        {
+          "id": 59255,
+          "raw_id_text": "59255",
+          "raw_value_text": "2827683",
+          "raw_decision_text": "98",
+          "value_invalid": false,
+          "scaled_i32": 2827683,
+          "value": "2827.683",
+          "decision_raw": 98,
+          "pass": false,
+          "decision_invalid": true,
+          "decision_reserved_bits": 96
+        },
+        {
+          "id": 60276,
+          "raw_id_text": "60276",
+          "raw_value_text": "2932412",
+          "raw_decision_text": "135",
+          "value_invalid": false,
+          "scaled_i32": 2932412,
+          "value": "2932.412",
+          "decision_raw": 135,
+          "pass": true,
+          "decision_invalid": true,
+          "decision_reserved_bits": 132
+        },
+        {
+          "id": 61297,
+          "raw_id_text": "61297",
+          "raw_value_text": "3037141",
+          "raw_decision_text": "172",
+          "value_invalid": false,
+          "scaled_i32": 3037141,
+          "value": "3037.141",
+          "decision_raw": 172,
+          "pass": false,
+          "decision_invalid": false,
+          "decision_reserved_bits": 172
+        },
+        {
+          "id": 62318,
+          "raw_id_text": "62318",
+          "raw_value_text": "3141870",
+          "raw_decision_text": "209",
+          "value_invalid": false,
+          "scaled_i32": 3141870,
+          "value": "3141.870",
+          "decision_raw": 209,
+          "pass": true,
+          "decision_invalid": false,
+          "decision_reserved_bits": 208
+        },
+        {
+          "id": 63339,
+          "raw_id_text": "63339",
+          "raw_value_text": "3246599",
+          "raw_decision_text": "246",
+          "value_invalid": false,
+          "scaled_i32": 3246599,
+          "value": "3246.599",
+          "decision_raw": 246,
+          "pass": false,
+          "decision_invalid": true,
+          "decision_reserved_bits": 244
+        },
+        {
+          "id": 64360,
+          "raw_id_text": "64360",
+          "raw_value_text": "INVALID",
+          "raw_decision_text": "27",
+          "value_invalid": true,
+          "decision_raw": 27,
+          "pass": true,
+          "decision_invalid": true,
+          "decision_reserved_bits": 24
+        }
+      ]
+    }
+  ],
+  "chunkings": {
+    "name": "manufacturer_example_split",
+    "delimiter": ",",
+    "terminator": "crlf",
+    "invalid_token": "INVALID",
+    "trailing_delimiter": "either",
+    "ids": [
+      0,
+      1
+    ],
+    "wire_hex": "4f4b2c4d302c562d353030302c44302c4d312c56353030302c44310d0a",
+    "wire_text": "OK,M0,V-5000,D0,M1,V5000,D1\r\n",
+    "expected_reply": "manufacturer_example_crlf_either",
+    "splits": [
+      [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      [
+        28,
+        1
+      ],
+      [
+        27,
+        2
+      ],
+      [
+        27,
+        1,
+        1
+      ],
+      [
+        2,
+        27
+      ],
+      [
+        3,
+        9,
+        1,
+        16
+      ],
+      [
+        29
+      ],
+      [
+        14,
+        13,
+        1,
+        1
+      ]
+    ]
+  },
+  "size_limits": {
+    "max_reply_bytes_before_terminator": 65536,
+    "note": "wire = prefix_text + fill_char * fill_count + suffix_text; terminator bytes are not counted",
+    "cases": [
+      {
+        "name": "body_exactly_limit",
+        "delimiter": ",",
+        "terminator": "crlf",
+        "invalid_token": "INVALID",
+        "trailing_delimiter": "either",
+        "ids": [
+          0
+        ],
+        "prefix_text": "OK,M0,V",
+        "fill_char": "0",
+        "fill_count": 65525,
+        "suffix_text": "5,D0\r\n",
+        "body_bytes": 65536,
+        "after_wire": "keep_open",
+        "expected": "ok",
+        "trailing_delimiter_observed": false,
+        "values": [
+          {
+            "id": 0,
+            "raw_id_text": "0",
+            "raw_value_text_length": 65526,
+            "value_invalid": false,
+            "scaled_i32": 5,
+            "value": "0.005",
+            "decision_raw": 0,
+            "pass": false,
+            "decision_invalid": false,
+            "decision_reserved_bits": 0
+          }
+        ],
+        "wire_sha256": "2026d109d154269cfd81aca672f043b75888120cc7afb3d05469efdeac7d0b91",
+        "wire_bytes": 65538
+      },
+      {
+        "name": "body_one_over_limit",
+        "delimiter": ",",
+        "terminator": "crlf",
+        "invalid_token": "INVALID",
+        "trailing_delimiter": "either",
+        "ids": [
+          0
+        ],
+        "prefix_text": "OK,M0,V",
+        "fill_char": "0",
+        "fill_count": 65526,
+        "suffix_text": "5,D0\r\n",
+        "body_bytes": 65537,
+        "after_wire": "keep_open",
+        "expected": "error",
+        "expected_error": "reply_too_large",
+        "wire_sha256": "457b44064bb29947a558463ffe4e1a6dfe89c6be4c4b66d0be630f73904fe6d9",
+        "wire_bytes": 65539
+      },
+      {
+        "name": "unterminated_over_limit",
+        "delimiter": ",",
+        "terminator": "crlf",
+        "invalid_token": "INVALID",
+        "trailing_delimiter": "either",
+        "ids": [
+          0
+        ],
+        "prefix_text": "OK,M0,V",
+        "fill_char": "1",
+        "fill_count": 70000,
+        "suffix_text": "",
+        "body_bytes": 70007,
+        "after_wire": "keep_open",
+        "expected": "error",
+        "expected_error": "reply_too_large",
+        "wire_sha256": "b691071e2c2a0cdc6728d4d8a371ece588b05a4ae8a56a587acaa706e62ad993",
+        "wire_bytes": 70007
+      }
+    ]
+  },
+  "config_rejects": [
+    {
+      "name": "wrong_protocol",
+      "field": "protocol",
+      "reason": "unknown protocol",
+      "value": "gopxl"
+    },
+    {
+      "name": "wrong_profile",
+      "field": "profile",
+      "reason": "unknown profile",
+      "value": "gopxl_ascii_measurement"
+    },
+    {
+      "name": "profile_missing",
+      "field": "profile",
+      "reason": "profile is required",
+      "remove": true
+    },
+    {
+      "name": "delimiter_%",
+      "field": "delimiter",
+      "reason": "invalid delimiter: escape introducer",
+      "value": "%"
+    },
+    {
+      "name": "delimiter_5",
+      "field": "delimiter",
+      "reason": "invalid delimiter: digit",
+      "value": "5"
+    },
+    {
+      "name": "delimiter_0",
+      "field": "delimiter",
+      "reason": "invalid delimiter: digit",
+      "value": "0"
+    },
+    {
+      "name": "delimiter_-",
+      "field": "delimiter",
+      "reason": "invalid delimiter: value sign",
+      "value": "-"
+    },
+    {
+      "name": "delimiter_M",
+      "field": "delimiter",
+      "reason": "invalid delimiter: id prefix",
+      "value": "M"
+    },
+    {
+      "name": "delimiter_m",
+      "field": "delimiter",
+      "reason": "invalid delimiter: id prefix (case-insensitive)",
+      "value": "m"
+    },
+    {
+      "name": "delimiter_V",
+      "field": "delimiter",
+      "reason": "invalid delimiter: value prefix",
+      "value": "V"
+    },
+    {
+      "name": "delimiter_v",
+      "field": "delimiter",
+      "reason": "invalid delimiter: value prefix (case-insensitive)",
+      "value": "v"
+    },
+    {
+      "name": "delimiter_D",
+      "field": "delimiter",
+      "reason": "invalid delimiter: decision prefix",
+      "value": "D"
+    },
+    {
+      "name": "delimiter_d",
+      "field": "delimiter",
+      "reason": "invalid delimiter: decision prefix (case-insensitive)",
+      "value": "d"
+    },
+    {
+      "name": "delimiter_ ",
+      "field": "delimiter",
+      "reason": "invalid delimiter: space is not printable 0x21..0x7E",
+      "value": " "
+    },
+    {
+      "name": "delimiter_\\t",
+      "field": "delimiter",
+      "reason": "invalid delimiter: tab is not printable 0x21..0x7E",
+      "value": "\t"
+    },
+    {
+      "name": "delimiter_\\r",
+      "field": "delimiter",
+      "reason": "invalid delimiter: control",
+      "value": "\r"
+    },
+    {
+      "name": "delimiter_\\n",
+      "field": "delimiter",
+      "reason": "invalid delimiter: control",
+      "value": "\n"
+    },
+    {
+      "name": "delimiter_\\x7f",
+      "field": "delimiter",
+      "reason": "invalid delimiter: DEL is not printable",
+      "value": "\u007f"
+    },
+    {
+      "name": "delimiter_\\xe9",
+      "field": "delimiter",
+      "reason": "invalid delimiter: not ASCII",
+      "value": "\u00e9"
+    },
+    {
+      "name": "delimiter_empty",
+      "field": "delimiter",
+      "reason": "invalid delimiter: empty",
+      "value": ""
+    },
+    {
+      "name": "delimiter_,,",
+      "field": "delimiter",
+      "reason": "invalid delimiter: more than one character",
+      "value": ",,"
+    },
+    {
+      "name": "delimiter_;,",
+      "field": "delimiter",
+      "reason": "invalid delimiter: more than one character",
+      "value": ";,"
+    },
+    {
+      "name": "delimiter_missing",
+      "field": "delimiter",
+      "reason": "delimiter is required",
+      "remove": true
+    },
+    {
+      "name": "terminator_none",
+      "field": "terminator",
+      "reason": "terminator must be crlf, cr or lf",
+      "value": "none"
+    },
+    {
+      "name": "terminator_CRLF",
+      "field": "terminator",
+      "reason": "terminator must be crlf, cr or lf",
+      "value": "CRLF"
+    },
+    {
+      "name": "terminator_%r%n",
+      "field": "terminator",
+      "reason": "terminator must be crlf, cr or lf",
+      "value": "%r%n"
+    },
+    {
+      "name": "terminator_\\r\\n",
+      "field": "terminator",
+      "reason": "terminator must be crlf, cr or lf",
+      "value": "\r\n"
+    },
+    {
+      "name": "terminator_crcr",
+      "field": "terminator",
+      "reason": "terminator must be crlf, cr or lf",
+      "value": "crcr"
+    },
+    {
+      "name": "terminator_empty",
+      "field": "terminator",
+      "reason": "terminator must be crlf, cr or lf",
+      "value": ""
+    },
+    {
+      "name": "terminator_lfcr",
+      "field": "terminator",
+      "reason": "terminator must be crlf, cr or lf",
+      "value": "lfcr"
+    },
+    {
+      "name": "terminator_missing",
+      "field": "terminator",
+      "reason": "terminator is required",
+      "remove": true
+    },
+    {
+      "name": "invalid_token_empty",
+      "field": "invalid_token",
+      "reason": "invalid invalid_token: empty",
+      "value": ""
+    },
+    {
+      "name": "invalid_token_longer_than_32",
+      "field": "invalid_token",
+      "reason": "invalid invalid_token: longer than 32",
+      "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    },
+    {
+      "name": "invalid_token_contains_the_delimiter",
+      "field": "invalid_token",
+      "reason": "invalid invalid_token: contains the delimiter",
+      "value": "IN,VALID"
+    },
+    {
+      "name": "invalid_token_is_the_delimiter",
+      "field": "invalid_token",
+      "reason": "invalid invalid_token: is the delimiter",
+      "value": ","
+    },
+    {
+      "name": "invalid_token_integer",
+      "field": "invalid_token",
+      "reason": "invalid invalid_token: integer",
+      "value": "123"
+    },
+    {
+      "name": "invalid_token_integer",
+      "field": "invalid_token",
+      "reason": "invalid invalid_token: integer",
+      "value": "-5"
+    },
+    {
+      "name": "invalid_token_integer",
+      "field": "invalid_token",
+      "reason": "invalid invalid_token: integer",
+      "value": "007"
+    },
+    {
+      "name": "invalid_token_integer",
+      "field": "invalid_token",
+      "reason": "invalid invalid_token: integer",
+      "value": "0"
+    },
+    {
+      "name": "invalid_token_space_not_printable",
+      "field": "invalid_token",
+      "reason": "invalid invalid_token: space not printable",
+      "value": "NO DATA"
+    },
+    {
+      "name": "invalid_token_control",
+      "field": "invalid_token",
+      "reason": "invalid invalid_token: control",
+      "value": "BAD\r"
+    },
+    {
+      "name": "invalid_token_not_ASCII",
+      "field": "invalid_token",
+      "reason": "invalid invalid_token: not ASCII",
+      "value": "INVALID\u00e9"
+    },
+    {
+      "name": "invalid_token_control",
+      "field": "invalid_token",
+      "reason": "invalid invalid_token: control",
+      "value": "TAB\t"
+    },
+    {
+      "name": "invalid_token_missing",
+      "field": "invalid_token",
+      "reason": "invalid_token is required",
+      "remove": true
+    },
+    {
+      "name": "trailing_delimiter_maybe",
+      "field": "trailing_delimiter",
+      "reason": "trailing_delimiter must be absent, present or either",
+      "value": "maybe"
+    },
+    {
+      "name": "trailing_delimiter_Absent",
+      "field": "trailing_delimiter",
+      "reason": "trailing_delimiter must be absent, present or either",
+      "value": "Absent"
+    },
+    {
+      "name": "trailing_delimiter_empty",
+      "field": "trailing_delimiter",
+      "reason": "trailing_delimiter must be absent, present or either",
+      "value": ""
+    },
+    {
+      "name": "trailing_delimiter_true",
+      "field": "trailing_delimiter",
+      "reason": "trailing_delimiter must be absent, present or either",
+      "value": "true"
+    },
+    {
+      "name": "trailing_delimiter_bool",
+      "field": "trailing_delimiter",
+      "reason": "trailing_delimiter must be a string",
+      "value": true
+    },
+    {
+      "name": "measurements_empty",
+      "field": "measurements",
+      "reason": "1..64 measurements required",
+      "value": []
+    },
+    {
+      "name": "measurements_65",
+      "field": "measurements",
+      "reason": "more than 64 measurements",
+      "value": [
+        {
+          "name": "m0",
+          "id": 0
+        },
+        {
+          "name": "m1",
+          "id": 1
+        },
+        {
+          "name": "m2",
+          "id": 2
+        },
+        {
+          "name": "m3",
+          "id": 3
+        },
+        {
+          "name": "m4",
+          "id": 4
+        },
+        {
+          "name": "m5",
+          "id": 5
+        },
+        {
+          "name": "m6",
+          "id": 6
+        },
+        {
+          "name": "m7",
+          "id": 7
+        },
+        {
+          "name": "m8",
+          "id": 8
+        },
+        {
+          "name": "m9",
+          "id": 9
+        },
+        {
+          "name": "m10",
+          "id": 10
+        },
+        {
+          "name": "m11",
+          "id": 11
+        },
+        {
+          "name": "m12",
+          "id": 12
+        },
+        {
+          "name": "m13",
+          "id": 13
+        },
+        {
+          "name": "m14",
+          "id": 14
+        },
+        {
+          "name": "m15",
+          "id": 15
+        },
+        {
+          "name": "m16",
+          "id": 16
+        },
+        {
+          "name": "m17",
+          "id": 17
+        },
+        {
+          "name": "m18",
+          "id": 18
+        },
+        {
+          "name": "m19",
+          "id": 19
+        },
+        {
+          "name": "m20",
+          "id": 20
+        },
+        {
+          "name": "m21",
+          "id": 21
+        },
+        {
+          "name": "m22",
+          "id": 22
+        },
+        {
+          "name": "m23",
+          "id": 23
+        },
+        {
+          "name": "m24",
+          "id": 24
+        },
+        {
+          "name": "m25",
+          "id": 25
+        },
+        {
+          "name": "m26",
+          "id": 26
+        },
+        {
+          "name": "m27",
+          "id": 27
+        },
+        {
+          "name": "m28",
+          "id": 28
+        },
+        {
+          "name": "m29",
+          "id": 29
+        },
+        {
+          "name": "m30",
+          "id": 30
+        },
+        {
+          "name": "m31",
+          "id": 31
+        },
+        {
+          "name": "m32",
+          "id": 32
+        },
+        {
+          "name": "m33",
+          "id": 33
+        },
+        {
+          "name": "m34",
+          "id": 34
+        },
+        {
+          "name": "m35",
+          "id": 35
+        },
+        {
+          "name": "m36",
+          "id": 36
+        },
+        {
+          "name": "m37",
+          "id": 37
+        },
+        {
+          "name": "m38",
+          "id": 38
+        },
+        {
+          "name": "m39",
+          "id": 39
+        },
+        {
+          "name": "m40",
+          "id": 40
+        },
+        {
+          "name": "m41",
+          "id": 41
+        },
+        {
+          "name": "m42",
+          "id": 42
+        },
+        {
+          "name": "m43",
+          "id": 43
+        },
+        {
+          "name": "m44",
+          "id": 44
+        },
+        {
+          "name": "m45",
+          "id": 45
+        },
+        {
+          "name": "m46",
+          "id": 46
+        },
+        {
+          "name": "m47",
+          "id": 47
+        },
+        {
+          "name": "m48",
+          "id": 48
+        },
+        {
+          "name": "m49",
+          "id": 49
+        },
+        {
+          "name": "m50",
+          "id": 50
+        },
+        {
+          "name": "m51",
+          "id": 51
+        },
+        {
+          "name": "m52",
+          "id": 52
+        },
+        {
+          "name": "m53",
+          "id": 53
+        },
+        {
+          "name": "m54",
+          "id": 54
+        },
+        {
+          "name": "m55",
+          "id": 55
+        },
+        {
+          "name": "m56",
+          "id": 56
+        },
+        {
+          "name": "m57",
+          "id": 57
+        },
+        {
+          "name": "m58",
+          "id": 58
+        },
+        {
+          "name": "m59",
+          "id": 59
+        },
+        {
+          "name": "m60",
+          "id": 60
+        },
+        {
+          "name": "m61",
+          "id": 61
+        },
+        {
+          "name": "m62",
+          "id": 62
+        },
+        {
+          "name": "m63",
+          "id": 63
+        },
+        {
+          "name": "m64",
+          "id": 64
+        }
+      ]
+    },
+    {
+      "name": "measurements_duplicate_name",
+      "field": "measurements",
+      "reason": "duplicate name",
+      "value": [
+        {
+          "name": "a",
+          "id": 1
+        },
+        {
+          "name": "a",
+          "id": 2
+        }
+      ]
+    },
+    {
+      "name": "measurements_duplicate_id",
+      "field": "measurements",
+      "reason": "duplicate id",
+      "value": [
+        {
+          "name": "a",
+          "id": 3
+        },
+        {
+          "name": "b",
+          "id": 3
+        }
+      ]
+    },
+    {
+      "name": "measurements_id_65536",
+      "field": "measurements",
+      "reason": "id out of 0..65535",
+      "value": [
+        {
+          "name": "a",
+          "id": 65536
+        }
+      ]
+    },
+    {
+      "name": "measurements_id_negative",
+      "field": "measurements",
+      "reason": "id out of 0..65535",
+      "value": [
+        {
+          "name": "a",
+          "id": -1
+        }
+      ]
+    },
+    {
+      "name": "measurements_id_string",
+      "field": "measurements",
+      "reason": "id must be an integer",
+      "value": [
+        {
+          "name": "a",
+          "id": "5"
+        }
+      ]
+    },
+    {
+      "name": "measurements_id_fraction",
+      "field": "measurements",
+      "reason": "id must be an integer",
+      "value": [
+        {
+          "name": "a",
+          "id": 1.5
+        }
+      ]
+    },
+    {
+      "name": "measurements_missing_id",
+      "field": "measurements",
+      "reason": "id is required",
+      "value": [
+        {
+          "name": "a"
+        }
+      ]
+    },
+    {
+      "name": "measurements_missing_name",
+      "field": "measurements",
+      "reason": "name is required",
+      "value": [
+        {
+          "id": 4
+        }
+      ]
+    },
+    {
+      "name": "measurements_missing",
+      "field": "measurements",
+      "reason": "measurements is required",
+      "remove": true
+    }
+  ],
+  "config_accepts": [
+    {
+      "name": "sixty_four_measurements",
+      "field": "measurements",
+      "value": [
+        {
+          "name": "m0",
+          "id": 37
+        },
+        {
+          "name": "m1",
+          "id": 1058
+        },
+        {
+          "name": "m2",
+          "id": 2079
+        },
+        {
+          "name": "m3",
+          "id": 3100
+        },
+        {
+          "name": "m4",
+          "id": 4121
+        },
+        {
+          "name": "m5",
+          "id": 5142
+        },
+        {
+          "name": "m6",
+          "id": 6163
+        },
+        {
+          "name": "m7",
+          "id": 7184
+        },
+        {
+          "name": "m8",
+          "id": 8205
+        },
+        {
+          "name": "m9",
+          "id": 9226
+        },
+        {
+          "name": "m10",
+          "id": 10247
+        },
+        {
+          "name": "m11",
+          "id": 11268
+        },
+        {
+          "name": "m12",
+          "id": 12289
+        },
+        {
+          "name": "m13",
+          "id": 13310
+        },
+        {
+          "name": "m14",
+          "id": 14331
+        },
+        {
+          "name": "m15",
+          "id": 15352
+        },
+        {
+          "name": "m16",
+          "id": 16373
+        },
+        {
+          "name": "m17",
+          "id": 17394
+        },
+        {
+          "name": "m18",
+          "id": 18415
+        },
+        {
+          "name": "m19",
+          "id": 19436
+        },
+        {
+          "name": "m20",
+          "id": 20457
+        },
+        {
+          "name": "m21",
+          "id": 21478
+        },
+        {
+          "name": "m22",
+          "id": 22499
+        },
+        {
+          "name": "m23",
+          "id": 23520
+        },
+        {
+          "name": "m24",
+          "id": 24541
+        },
+        {
+          "name": "m25",
+          "id": 25562
+        },
+        {
+          "name": "m26",
+          "id": 26583
+        },
+        {
+          "name": "m27",
+          "id": 27604
+        },
+        {
+          "name": "m28",
+          "id": 28625
+        },
+        {
+          "name": "m29",
+          "id": 29646
+        },
+        {
+          "name": "m30",
+          "id": 30667
+        },
+        {
+          "name": "m31",
+          "id": 31688
+        },
+        {
+          "name": "m32",
+          "id": 32709
+        },
+        {
+          "name": "m33",
+          "id": 33730
+        },
+        {
+          "name": "m34",
+          "id": 34751
+        },
+        {
+          "name": "m35",
+          "id": 35772
+        },
+        {
+          "name": "m36",
+          "id": 36793
+        },
+        {
+          "name": "m37",
+          "id": 37814
+        },
+        {
+          "name": "m38",
+          "id": 38835
+        },
+        {
+          "name": "m39",
+          "id": 39856
+        },
+        {
+          "name": "m40",
+          "id": 40877
+        },
+        {
+          "name": "m41",
+          "id": 41898
+        },
+        {
+          "name": "m42",
+          "id": 42919
+        },
+        {
+          "name": "m43",
+          "id": 43940
+        },
+        {
+          "name": "m44",
+          "id": 44961
+        },
+        {
+          "name": "m45",
+          "id": 45982
+        },
+        {
+          "name": "m46",
+          "id": 47003
+        },
+        {
+          "name": "m47",
+          "id": 48024
+        },
+        {
+          "name": "m48",
+          "id": 49045
+        },
+        {
+          "name": "m49",
+          "id": 50066
+        },
+        {
+          "name": "m50",
+          "id": 51087
+        },
+        {
+          "name": "m51",
+          "id": 52108
+        },
+        {
+          "name": "m52",
+          "id": 53129
+        },
+        {
+          "name": "m53",
+          "id": 54150
+        },
+        {
+          "name": "m54",
+          "id": 55171
+        },
+        {
+          "name": "m55",
+          "id": 56192
+        },
+        {
+          "name": "m56",
+          "id": 57213
+        },
+        {
+          "name": "m57",
+          "id": 58234
+        },
+        {
+          "name": "m58",
+          "id": 59255
+        },
+        {
+          "name": "m59",
+          "id": 60276
+        },
+        {
+          "name": "m60",
+          "id": 61297
+        },
+        {
+          "name": "m61",
+          "id": 62318
+        },
+        {
+          "name": "m62",
+          "id": 63339
+        },
+        {
+          "name": "m63",
+          "id": 64360
+        }
+      ]
+    },
+    {
+      "name": "id_extremes",
+      "field": "measurements",
+      "value": [
+        {
+          "name": "hi",
+          "id": 65535
+        },
+        {
+          "name": "lo",
+          "id": 0
+        }
+      ]
+    },
+    {
+      "name": "delimiter_semicolon",
+      "field": "delimiter",
+      "value": ";"
+    },
+    {
+      "name": "delimiter_pipe",
+      "field": "delimiter",
+      "value": "|"
+    },
+    {
+      "name": "delimiter_tilde",
+      "field": "delimiter",
+      "value": "~"
+    },
+    {
+      "name": "delimiter_letter_x",
+      "field": "delimiter",
+      "value": "x"
+    },
+    {
+      "name": "terminator_cr",
+      "field": "terminator",
+      "value": "cr"
+    },
+    {
+      "name": "terminator_lf",
+      "field": "terminator",
+      "value": "lf"
+    },
+    {
+      "name": "invalid_token_32",
+      "field": "invalid_token",
+      "value": "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"
+    },
+    {
+      "name": "invalid_token_slash",
+      "field": "invalid_token",
+      "value": "N/A"
+    },
+    {
+      "name": "invalid_token_minus_letters",
+      "field": "invalid_token",
+      "value": "-X"
+    },
+    {
+      "name": "trailing_absent",
+      "field": "trailing_delimiter",
+      "value": "absent"
+    },
+    {
+      "name": "trailing_present",
+      "field": "trailing_delimiter",
+      "value": "present"
+    }
+  ],
+  "forbidden_commands": [
+    "start",
+    "stop",
+    "trigger",
+    "loadjob",
+    "align",
+    "clearalign",
+    "readprop",
+    "setdata",
+    "stamp",
+    "result",
+    "value",
+    "decision",
+    "time",
+    "encoder",
+    "frame",
+    "ping",
+    "help",
+    "string"
+  ]
+}

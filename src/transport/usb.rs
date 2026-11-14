@@ -2,6 +2,7 @@
 //! UVCP/UVSP wire fields and bootstrap register addresses follow USB3 Vision.
 #![deny(clippy::missing_const_for_fn)]
 
+use super::chunks::{ByteOrder, ChunkData, ImageLayout};
 use crate::{
     framebuf::{PoolVec, pool},
     genicam::decode_xml,
@@ -301,13 +302,16 @@ pub(crate) fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backe
         "camera is not a USB3 Vision device"
     );
     // Reading names may open a device, so only cameras of this model are.
-    let device_info = nusb::list_devices()
+    let (device_info, observed_info) = nusb::list_devices()
         .wait()?
         .filter(|d| {
             let model = format!("usb:{:04x}:{:04x}:", d.vendor_id(), d.product_id());
             info.id.starts_with(&model)
         })
-        .find(|d| camera_info(d).id == info.id)
+        .find_map(|device| {
+            let observed = camera_info(&device);
+            (observed.id == info.id).then_some((device, observed))
+        })
         .context("USB3 Vision camera disconnected or its USB address changed; discover again")?;
     let name = display_name(
         device_info.product_string(),
@@ -400,6 +404,8 @@ pub(crate) fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backe
         _control_interface: control_interface,
         sirm: 0,
         stream: None,
+        pixel_encodings: Vec::new(),
+        ids_vendor: crate::types::IdsPixelFormat::vendor_matches(&observed_info.vendor),
     };
     let response_ms = backend.u32(0x01cc)?;
     ensure!(
@@ -433,6 +439,8 @@ struct UsbBackend {
     _control_interface: Interface,
     sirm: u64,
     stream: Option<Stream>,
+    pixel_encodings: Vec<crate::types::PixelEncoding>,
+    ids_vendor: bool,
 }
 /// Longest stream transfer, as in Aravis: payload transfers are this long at
 /// most.
@@ -583,8 +591,9 @@ fn is_header(bytes: &[u8], magic: u32, min: usize, max: usize) -> bool {
 /// the same length. A payload transfer fills one exactly, while a leader,
 /// a trailer and a short last payload transfer each end theirs with a short
 /// packet, so a leader always starts a transfer. Frames are assembled from
-/// what each transfer holds rather than from its place in the queue, and
-/// the stream recovers at the next leader after any lost or extra data.
+/// what each transfer holds rather than from its place in the queue. Short
+/// packets/ZLPs or the configured maximum establish a trailer boundary. The
+/// stream resynchronizes at metadata boundaries without scanning pixel bytes.
 ///
 /// Where one transfer can take a whole image (`Layout::whole`), the
 /// transfers' buffers come from the frame pool, and the buffer that
@@ -592,8 +601,9 @@ fn is_header(bytes: &[u8], magic: u32, min: usize, max: usize) -> bool {
 /// pool: the image is never copied. Anything else is assembled by copying,
 /// as with smaller transfers.
 struct Stream {
-    /// Image bytes in each frame.
+    /// Configured upper bound of image and optional chunk bytes per frame.
     expected: usize,
+    pixel_encodings: Vec<crate::types::PixelEncoding>,
     /// Longest leader and trailer the camera sends.
     leader: usize,
     trailer: usize,
@@ -606,7 +616,7 @@ struct Stream {
     submitted: usize,
     /// The frame being received: its leader's fields, and its image so
     /// far, in a buffer taken once image bytes must be assembled.
-    frame: Option<(Frame, Option<PoolVec>)>,
+    frame: Option<PendingImage>,
     /// Frames, or why one was lost, taken in ahead of `next`.
     taken: VecDeque<Result<Frame>>,
     /// Linux refused a submit for lack of usbfs memory: hold buffers back
@@ -638,6 +648,7 @@ impl Stream {
     const fn new(expected: usize, leader: usize, trailer: usize, whole: Option<usize>) -> Self {
         Self {
             expected,
+            pixel_encodings: Vec::new(),
             leader,
             trailer,
             whole,
@@ -739,65 +750,189 @@ impl Stream {
     /// of the pool becomes the frame's buffer, `transfer` replaced.
     fn take(&mut self, transfer: &mut Buffer, full: bool) -> Result<Option<Frame>> {
         let bytes: &[u8] = transfer;
-        // Some cameras end the last payload transfer with a zero-length packet.
+        let held = |data: &Option<PoolVec>| data.as_ref().map_or(0, PoolVec::len);
+        // A ZLP may end a reduced payload on an exact packet boundary. A
+        // short/ZLP completion proves a boundary, but not a complete frame.
         if bytes.is_empty() {
+            if let Some(pending) = &mut self.frame
+                && held(&pending.data) > 0
+            {
+                pending.payload_ended = true;
+            }
             return Ok(None);
         }
-        let held = |data: &Option<PoolVec>| data.as_ref().map_or(0, PoolVec::len);
-        // A transfer holding exactly the rest of an open image is image data,
-        // even when its pixels start like a leader or trailer.
-        let rest = self
+        // Never inspect pixels for metadata while their payload is undecided.
+        // Recovery leaders are recognized only at an established boundary.
+        let metadata = self
             .frame
             .as_ref()
-            .is_some_and(|(_, data)| held(data) + bytes.len() == self.expected);
-        if !rest && is_header(bytes, LEADER_MAGIC, 52, self.leader) {
+            .is_none_or(|pending| pending.payload_ended || held(&pending.data) == self.expected);
+        if metadata && is_header(bytes, LEADER_MAGIC, 52, self.leader) {
             let open = self.frame.take().is_some();
-            let frame = parse_leader(bytes)?;
-            self.frame = Some((frame, None));
+            let mut leader = parse_leader(bytes)?;
+            leader.frame.pixel_encoding = self
+                .pixel_encodings
+                .iter()
+                .copied()
+                .find(|encoding| encoding.ids(leader.frame.pixel_format).is_ok());
+            ensure!(
+                !crate::types::IdsPixelFormat::requires_qualification(leader.frame.pixel_format)
+                    || leader.frame.pixel_encoding.is_some(),
+                Categorized::error(
+                    ErrorKind::Unsupported,
+                    "USB vendor pixel code requires verified IDS XML layout"
+                )
+            );
+            let maximum = ImageRows::new(&leader.frame, leader.frame.height, leader.x_padding)?;
+            ensure!(
+                maximum.image_bytes <= self.expected,
+                "USB leader image exceeds the configured payload ceiling"
+            );
+            self.frame = Some(PendingImage {
+                leader,
+                data: None,
+                payload_ended: false,
+            });
             ensure!(!open, "USB stream image ended without a trailer");
             return Ok(None);
         }
+        // Retire oversized metadata before allocating a trailer copy. Valid
+        // leaders were handled above and have their own negotiated bound.
+        if metadata && self.frame.is_some() && bytes.len() > self.trailer {
+            self.frame = None;
+            bail!("USB trailer exceeds its negotiated bound");
+        }
         // Without an open image, the data belongs to one already dropped or
         // was left over from before acquisition started.
-        let Some((_, data)) = self.frame.as_mut() else {
+        let Some(pending) = self.frame.as_mut() else {
             return Ok(None);
         };
-        let trailer = if !rest && is_header(bytes, TRAILER_MAGIC, 28, self.trailer) {
+        let trailer = if metadata {
             bytes.to_vec()
         } else {
-            let image = (self.expected - held(data)).min(bytes.len());
-            match self.whole {
-                // The whole image, in a transfer whose buffer is the pool's:
-                // the frame takes the buffer.
-                Some(len) if image == self.expected => {
+            let remaining = self
+                .expected
+                .checked_sub(held(&pending.data))
+                .context("USB payload exceeds its configured ceiling")?;
+            let image = remaining.min(bytes.len());
+            if bytes.len() - image > self.trailer {
+                self.frame = None;
+                bail!("USB trailer exceeds its negotiated bound");
+            }
+            let trailer = match self.whole {
+                // A single payload completion, including a reduced image,
+                // takes its pool buffer without copying. A trailer suffix is
+                // split ONLY at the independently known maximum byte count.
+                Some(len) if pending.data.is_none() => {
                     let mut received = std::mem::replace(transfer, whole_buffer(len)).into_vec();
                     let trailer = received.split_off(image);
-                    *data = Some(pool().adopt(received));
-                    if trailer.is_empty() {
-                        return Ok(None);
-                    }
+                    pending.data = Some(pool().adopt(received));
                     trailer
                 }
                 _ => {
                     crate::copies::record(crate::copies::Site::UsbAssemble, image);
-                    data.get_or_insert_with(|| pool().take_empty(self.expected))
+                    pending
+                        .data
+                        .get_or_insert_with(|| pool().take_empty(self.expected))
                         .extend_from_slice(&bytes[..image]);
-                    if image == bytes.len() {
-                        if full || held(data) == self.expected {
-                            return Ok(None);
-                        }
-                        self.frame = None;
-                        bail!("short USB image payload transfer");
-                    }
-                    // The image ended on a packet boundary within the
-                    // transfer, so the trailer followed in it.
                     bytes[image..].to_vec()
                 }
+            };
+            pending.payload_ended = !full || held(&pending.data) == self.expected;
+            if trailer.is_empty() {
+                return Ok(None);
             }
+            trailer
         };
-        let (mut frame, data) = self.frame.take().context("USB stream frame missing")?;
-        frame.data = data.map(PoolVec::freeze).unwrap_or_default();
-        validate_trailer(&trailer, &frame, self.expected)?;
+        let PendingImage { leader, data, .. } =
+            self.frame.take().context("USB stream frame missing")?;
+        let mut frame = leader.frame;
+        let mut data = data.unwrap_or_else(|| pool().take_empty(0));
+        ensure!(
+            trailer.len() <= self.trailer,
+            "USB trailer exceeds its negotiated bound"
+        );
+        validate_trailer(&trailer, frame.id, self.expected, data.len())?;
+        let trailer_size = le16(&trailer, 6)?;
+        if leader.chunks {
+            ensure!(trailer_size >= 36, "truncated USB extended chunk trailer");
+        }
+        ensure!(
+            trailer_size == 28 || trailer_size >= 32,
+            "truncated USB image trailer"
+        );
+        // Common-only legacy trailers cannot independently authorize a
+        // reduced height; their payload must match the complete leader image.
+        let height = if trailer_size >= 32 {
+            le32(&trailer, 28)?
+        } else {
+            frame.height
+        };
+        ensure!(
+            (1..=frame.height).contains(&height),
+            "USB trailer height does not fit image leader"
+        );
+        let rows = ImageRows::new(&frame, height, leader.x_padding)?;
+        ensure!(
+            if leader.chunks {
+                rows.image_bytes <= data.len()
+            } else {
+                rows.image_bytes == data.len()
+            },
+            "USB image size differs from its confirmed row geometry"
+        );
+        frame.height = height;
+        if leader.chunks {
+            let mut chunks = ChunkData::parse(
+                &data,
+                rows.image_bytes,
+                rows.image_bytes,
+                ByteOrder::Little,
+                le32(&trailer, 32)?,
+            )?;
+            chunks.image_layout = Some(ImageLayout {
+                pfnc_code: frame.pixel_encoding.is_none().then_some(frame.pixel_format),
+                pixel_encoding: frame.pixel_encoding,
+                width: frame.width,
+                height,
+                offset: 0,
+                row_bytes: rows.row_bytes,
+                row_stride: rows.row_stride,
+                padding_y: 0,
+                byte_order: Some(ByteOrder::Little),
+                continuous_packing: false,
+            });
+            frame.data = if leader.x_padding == 0 {
+                chunks.retain_shared(data.freeze())
+            } else {
+                // Keep every original row and chunk byte immutable; copy only
+                // the pixels, rather than copying and then compacting padding.
+                chunks.payload = data.freeze();
+                let mut pixels = pool().take_stale(rows.pixel_bytes);
+                crate::copies::record(crate::copies::Site::ChunkImage, rows.pixel_bytes);
+                for (source, target) in chunks.payload[..rows.image_bytes]
+                    .chunks_exact(rows.row_stride)
+                    .zip(pixels.chunks_exact_mut(rows.row_bytes))
+                {
+                    target.copy_from_slice(&source[..rows.row_bytes]);
+                }
+                pixels.freeze()
+            };
+            frame.chunks = Some(chunks.into());
+        } else {
+            if leader.x_padding > 0 {
+                crate::copies::record(
+                    crate::copies::Site::UsbAssemble,
+                    rows.pixel_bytes - rows.row_bytes,
+                );
+                for row in 1..frame.height as usize {
+                    let source = row * rows.row_stride;
+                    data.copy_within(source..source + rows.row_bytes, row * rows.row_bytes);
+                }
+                data.truncate(rows.pixel_bytes);
+            }
+            frame.data = data.freeze();
+        }
         Ok(Some(frame))
     }
     /// Cancel every submitted transfer and take its buffer back.
@@ -978,14 +1113,22 @@ impl<C: Channel> Control<C> {
     /// still answers it. A busy camera, which did not run the command, gets
     /// it again as a new command, as does one that cannot take a resend,
     /// which may then run a write whose acknowledgement was lost twice.
-    fn transact(&mut self, cmd: u16, payload: &[u8]) -> Result<Vec<u8>> {
+    fn transact(&mut self, cmd: u16, payload: &[u8], caller: Option<Instant>) -> Result<Vec<u8>> {
         ensure!(
             12 + payload.len() <= self.max_command,
             "UVCP command exceeds camera transfer limit"
         );
+        if let Some(deadline) = caller {
+            crate::types::control_remaining(deadline)?;
+        }
         let started = Instant::now();
-        let deadline = started + self.timeout;
-        let hard_deadline = started + self.timeout.max(Duration::from_secs(60));
+        let deadline = caller.map_or(started + self.timeout, |stop| {
+            stop.min(started + self.timeout)
+        });
+        let hard_deadline = caller.map_or_else(
+            || started + self.timeout.max(Duration::from_secs(60)),
+            |stop| stop.min(started + self.timeout.max(Duration::from_secs(60))),
+        );
         let window = self.response.max(self.timeout / ATTEMPTS);
         self.id = self.id.wrapping_add(1).max(1);
         let mut resend = false;
@@ -998,13 +1141,24 @@ impl<C: Channel> Control<C> {
             }
             sent += 1;
             let window = window.min(remaining);
-            let error = match self.attempt(cmd, payload, resend, window, hard_deadline) {
+            let error = match self.attempt(
+                cmd,
+                payload,
+                resend,
+                window,
+                hard_deadline,
+                caller.is_some(),
+            ) {
                 Ok(data) => return Ok(data),
                 Err(error) => error,
             };
             match error.downcast_ref::<UvcpStatus>().map(|status| status.0) {
                 Some(STATUS_BUSY) => {
-                    std::thread::sleep(Duration::from_millis(10));
+                    let pause = caller.map_or(Duration::from_millis(10), |stop| {
+                        Duration::from_millis(10)
+                            .min(stop.saturating_duration_since(Instant::now()))
+                    });
+                    std::thread::sleep(pause);
                     self.id = self.id.wrapping_add(1).max(1);
                     resend = false;
                 }
@@ -1013,15 +1167,19 @@ impl<C: Channel> Control<C> {
                     resend = false;
                 }
                 Some(_) => return Err(error),
-                None if error
-                    .chain()
-                    .any(|cause| cause.downcast_ref() == Some(&TransferError::Disconnected)) =>
+                None if error.chain().any(|cause| {
+                    cause.downcast_ref() == Some(&TransferError::Disconnected)
+                        || (caller.is_some() && cause.downcast_ref() == Some(&TransferError::Stall))
+                }) =>
                 {
                     return Err(error);
                 }
                 None => resend = true,
             }
             failure = error;
+        }
+        if let Some(deadline) = caller {
+            crate::types::control_remaining(deadline)?;
         }
         let plural = if sent == 1 { "" } else { "s" };
         Err(failure.context(format!(
@@ -1035,15 +1193,22 @@ impl<C: Channel> Control<C> {
         resend: bool,
         window: Duration,
         hard_deadline: Instant,
+        scoped: bool,
     ) -> Result<Vec<u8>> {
         let packet = command(cmd, self.id, resend, payload)?;
         let len = packet.len();
+        if scoped {
+            crate::types::control_remaining(hard_deadline)?;
+        }
         let sent = self.channel.send(packet, window);
+        if scoped {
+            crate::types::control_remaining(hard_deadline)?;
+        }
         let sent = self
-            .unhalt(sent)
+            .unhalt(sent, scoped)
             .context("USB control write failed or timed out")?;
         ensure!(sent == len, "short USB control write");
-        let mut deadline = Instant::now() + window;
+        let mut deadline = (Instant::now() + window).min(hard_deadline);
         for _ in 0..64 {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -1053,8 +1218,11 @@ impl<C: Channel> Control<C> {
                 ));
             }
             let response = self.channel.receive(self.max_ack, remaining);
+            if scoped {
+                crate::types::control_remaining(hard_deadline)?;
+            }
             let response = self
-                .unhalt(response)
+                .unhalt(response, scoped)
                 .context("USB control read failed or timed out")?;
             // A stale response may remain after a timed-out operation.
             if response.len() >= 12 && le16(&response, 10)? != self.id {
@@ -1080,15 +1248,29 @@ impl<C: Channel> Control<C> {
         bail!("too many pending or stale UVCP acknowledgements")
     }
     /// Clear a halt the camera signalled before the command is sent again.
-    fn unhalt<T>(&mut self, result: Result<T, TransferError>) -> Result<T, TransferError> {
-        if matches!(result, Err(TransferError::Stall)) {
+    fn unhalt<T>(
+        &mut self,
+        result: Result<T, TransferError>,
+        scoped: bool,
+    ) -> Result<T, TransferError> {
+        // nusb clear_halt().wait() has no timeout. Named bounded operations
+        // fail on Stall rather than entering unbounded endpoint recovery.
+        if !scoped && matches!(result, Err(TransferError::Stall)) {
             self.channel.clear_halt();
         }
         result
     }
 }
-impl<C: Channel> RegisterIo for Control<C> {
-    fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
+impl<C: Channel> Control<C> {
+    fn read_scoped(
+        &mut self,
+        address: u64,
+        length: usize,
+        caller: Option<Instant>,
+    ) -> Result<Vec<u8>> {
+        if let Some(deadline) = caller {
+            crate::types::control_remaining(deadline)?;
+        }
         ensure!(length <= MAX_FRAME, "USB memory request exceeds size limit");
         address
             .checked_add(length as u64)
@@ -1105,13 +1287,19 @@ impl<C: Channel> RegisterIo for Control<C> {
                     .context("USB read chunk exceeds u16")?
                     .to_le_bytes(),
             );
-            let bytes = self.transact(READ_CMD, &request)?;
+            let bytes = self.transact(READ_CMD, &request, caller)?;
             ensure!(bytes.len() == len, "camera returned short UVCP memory data");
             result.extend_from_slice(&bytes);
         }
+        if let Some(deadline) = caller {
+            crate::types::control_remaining(deadline)?;
+        }
         Ok(result)
     }
-    fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
+    fn write_scoped(&mut self, address: u64, data: &[u8], caller: Option<Instant>) -> Result<()> {
+        if let Some(deadline) = caller {
+            crate::types::control_remaining(deadline)?;
+        }
         ensure!(
             data.len() <= MAX_FRAME,
             "USB memory write exceeds size limit"
@@ -1130,12 +1318,35 @@ impl<C: Channel> RegisterIo for Control<C> {
             request.reserve(8 + chunk.len());
             request.extend_from_slice(&(address + (i * size) as u64).to_le_bytes());
             request.extend_from_slice(chunk);
-            let response = self.transact(WRITE_CMD, &request)?;
+            let response = self.transact(WRITE_CMD, &request, caller)?;
             write_acknowledged(&response, chunk.len())?;
+        }
+        if let Some(deadline) = caller {
+            crate::types::control_remaining(deadline)?;
         }
         Ok(())
     }
 }
+impl<C: Channel> RegisterIo for Control<C> {
+    fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
+        self.read_scoped(address, length, None)
+    }
+    fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
+        self.write_scoped(address, data, None)
+    }
+    fn read_memory_until(
+        &mut self,
+        address: u64,
+        length: usize,
+        deadline: Instant,
+    ) -> Result<Vec<u8>> {
+        self.read_scoped(address, length, Some(deadline))
+    }
+    fn write_memory_until(&mut self, address: u64, data: &[u8], deadline: Instant) -> Result<()> {
+        self.write_scoped(address, data, Some(deadline))
+    }
+}
+
 impl UsbBackend {
     fn u32(&mut self, address: u64) -> Result<u32> {
         le32(&self.read_memory(address, 4)?, 0)
@@ -1192,6 +1403,7 @@ impl UsbBackend {
         // Submit the transfers before AcquisitionStart.
         let whole = layout.whole.then_some(layout.request);
         let mut stream = Stream::new(expected, leader, trailer, whole);
+        stream.pixel_encodings.clone_from(&self.pixel_encodings);
         stream.queue(&mut self.stream_in, layout.transfers, layout.request);
         self.stream = Some(stream);
         self.put32(SIRM_CONTROL, 1)
@@ -1227,6 +1439,17 @@ impl UsbBackend {
     }
 }
 impl RegisterIo for UsbBackend {
+    fn read_memory_until(
+        &mut self,
+        address: u64,
+        length: usize,
+        deadline: Instant,
+    ) -> Result<Vec<u8>> {
+        self.control.read_memory_until(address, length, deadline)
+    }
+    fn write_memory_until(&mut self, address: u64, data: &[u8], deadline: Instant) -> Result<()> {
+        self.control.write_memory_until(address, data, deadline)
+    }
     fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
         self.control.read_memory(address, length)
     }
@@ -1261,7 +1484,74 @@ fn device_xml_entries(entries: &[u8]) -> Result<Vec<([u8; 64], u64, u64)>> {
         .map(|(_, entry, address, size)| (entry, address, size))
         .collect())
 }
-fn parse_leader(bytes: &[u8]) -> Result<Frame> {
+#[derive(Debug)]
+struct ImageLeader {
+    frame: Frame,
+    chunks: bool,
+    x_padding: usize,
+}
+
+/// An open frame owns both its bytes and the boundary proof for its trailer.
+/// Dropping it after an error or drain cannot leave state on the next frame.
+struct PendingImage {
+    leader: ImageLeader,
+    data: Option<PoolVec>,
+    payload_ended: bool,
+}
+
+struct ImageRows {
+    row_bytes: usize,
+    row_stride: usize,
+    image_bytes: usize,
+    pixel_bytes: usize,
+}
+impl ImageRows {
+    fn new(frame: &Frame, height: u32, x_padding: usize) -> Result<Self> {
+        crate::frame::validate_encoding(frame)?;
+        if let Some(format) = crate::frame::bicolor::Format::from_code(frame.pixel_format) {
+            format.validate_width(frame.width)?;
+        }
+        let row_bytes = crate::frame::frame_row_bytes(frame);
+        ensure!(row_bytes > 0, "invalid USB image pixel format");
+        let row_stride = row_bytes
+            .checked_add(x_padding)
+            .context("USB image row stride overflow")?;
+        let pixel_bytes = crate::frame::image_len(
+            frame.pixel_format,
+            frame.pixel_encoding,
+            frame.width,
+            height,
+        )
+        .context("USB normalized image size overflow")?;
+        // Odd planar/chroma dimensions can occupy more than their nominal
+        // bits-per-pixel row size. Without padding, use the complete PFNC size.
+        let image_bytes = if x_padding == 0 {
+            pixel_bytes
+        } else {
+            row_stride
+                .checked_mul(height as usize)
+                .context("USB image size overflow")?
+        };
+        ensure!(
+            height > 0 && image_bytes <= MAX_FRAME,
+            "USB image row geometry exceeds the frame limit"
+        );
+        if x_padding > 0 && crate::frame::planes(frame.pixel_format, frame.width, height).is_some()
+        {
+            return Err(Categorized::error(
+                ErrorKind::Unsupported,
+                "USB row padding for planar pixel formats requires an explicit plane layout",
+            ));
+        }
+        Ok(Self {
+            row_bytes,
+            row_stride,
+            image_bytes,
+            pixel_bytes,
+        })
+    }
+}
+fn parse_leader(bytes: &[u8]) -> Result<ImageLeader> {
     ensure!(
         le32(bytes, 0)? == LEADER_MAGIC,
         "USB stream is out of sync: expected image leader"
@@ -1271,32 +1561,47 @@ fn parse_leader(bytes: &[u8]) -> Result<Frame> {
         size >= 52 && size <= bytes.len(),
         "invalid UVSP leader size"
     );
-    ensure!(
-        le16(bytes, 18)? == 1,
-        "USB stream payload type is unsupported (only unchunked images are supported)"
-    );
-    ensure!(
-        le16(bytes, 48)? == 0,
-        "USB stream image row padding is not supported"
-    );
+    let payload_type = le16(bytes, 18)?;
+    if !matches!(payload_type, 1 | 0x4001) {
+        return Err(Categorized::error(
+            ErrorKind::Unsupported,
+            format!(
+                "unsupported USB stream payload type 0x{payload_type:04x}; select an image or image extended chunk mode"
+            ),
+        ));
+    }
     let width = le32(bytes, 32)?;
     let height = le32(bytes, 36)?;
     ensure!(
         width != 0 && height != 0,
         "camera returned zero image dimensions"
     );
-    Ok(Frame {
-        id: le64(bytes, 8)?,
-        width,
-        height,
-        pixel_format: le32(bytes, 28)?,
-        device_ts_ns: Some(le64(bytes, 20)?),
-        wall_ms: 0,
-        data: Vec::new().into(),
-        jpeg: None,
+    Ok(ImageLeader {
+        frame: Frame {
+            pixel_encoding: None,
+            device_timestamp: Some(crate::types::DeviceTimestamp {
+                ticks: le64(bytes, 20)?,
+                frequency_hz: Some(1_000_000_000),
+            }),
+            id: le64(bytes, 8)?,
+            width,
+            height,
+            pixel_format: le32(bytes, 28)?,
+            device_ts_ns: Some(le64(bytes, 20)?),
+            wall_ms: 0,
+            received_monotonic_ns: None,
+            data: Vec::new().into(),
+            jpeg: None,
+            chunks: None,
+            multipart: None,
+        },
+        chunks: payload_type == 0x4001,
+        // The following 16 bits are reserved, not vertical padding. See NI's
+        // U3V image_leader_info and Basler's Line Pitch feature documentation.
+        x_padding: usize::from(le16(bytes, 48)?),
     })
 }
-fn validate_trailer(bytes: &[u8], frame: &Frame, expected: usize) -> Result<()> {
+fn validate_trailer(bytes: &[u8], frame_id: u64, maximum: usize, received: usize) -> Result<()> {
     ensure!(
         le32(bytes, 0)? == TRAILER_MAGIC,
         "USB stream is out of sync: expected image trailer"
@@ -1306,18 +1611,54 @@ fn validate_trailer(bytes: &[u8], frame: &Frame, expected: usize) -> Result<()> 
         size >= 28 && size <= bytes.len(),
         "invalid UVSP trailer size"
     );
-    ensure!(le64(bytes, 8)? == frame.id, "USB stream frame ID mismatch");
+    ensure!(le64(bytes, 8)? == frame_id, "USB stream frame ID mismatch");
     ensure!(
         le16(bytes, 16)? == 0,
         "USB stream trailer reports an incomplete frame"
     );
     ensure!(
-        le64(bytes, 20)? == expected as u64 && frame.data.len() == expected,
+        received > 0 && received <= maximum && le64(bytes, 20)? == u64::try_from(received)?,
         "USB stream frame size mismatch"
     );
     Ok(())
 }
 impl Backend for UsbBackend {
+    fn configure_pixel_encodings(
+        &mut self,
+        encodings: &[crate::types::PixelEncoding],
+    ) -> Result<()> {
+        ensure!(
+            self.stream.is_none() && encodings.len() <= crate::types::IdsPixelFormat::ALL.len(),
+            "invalid USB pixel encoding configuration"
+        );
+        ensure!(
+            encodings.is_empty() || self.ids_vendor,
+            Categorized::error(
+                ErrorKind::Unsupported,
+                "IDS encoding requires an IDS USB identity"
+            )
+        );
+        for &encoding in encodings {
+            let crate::types::PixelEncoding::Ids {
+                code,
+                gentl_namespace,
+                ..
+            } = encoding
+            else {
+                return Err(Categorized::error(
+                    ErrorKind::Unsupported,
+                    "USB accepts only qualified IDS vendor layouts",
+                ));
+            };
+            encoding.ids(code)?;
+            ensure!(
+                gentl_namespace.is_none(),
+                "USB pixel encoding contains a GenTL namespace"
+            );
+        }
+        self.pixel_encodings = encodings.to_vec();
+        Ok(())
+    }
     fn xml(&mut self) -> Result<String> {
         let address = self.u64(0x01d0)?;
         let size = manifest_size(self.u64(address)?)?;
@@ -1835,6 +2176,152 @@ mod tests {
         assert!(format!("{error:#}").contains("timed out"));
         assert_eq!(silent.channel.sent.len(), ATTEMPTS as usize);
     }
+    /// A channel that returns a valid reply only after the caller budget on
+    /// one selected receive. It deliberately violates the requested timeout.
+    struct BudgetedChannel {
+        script: Script,
+        deadline: Instant,
+        expire_on: usize,
+        received: usize,
+        waits: Vec<Duration>,
+        sent_at: Vec<Instant>,
+    }
+    impl Channel for BudgetedChannel {
+        fn send(&mut self, packet: Vec<u8>, timeout: Duration) -> Result<usize, TransferError> {
+            self.sent_at.push(Instant::now());
+            self.script.send(packet, timeout)
+        }
+        fn receive(&mut self, length: usize, timeout: Duration) -> Result<Vec<u8>, TransferError> {
+            self.received += 1;
+            self.waits.push(timeout);
+            if self.received == self.expire_on {
+                std::thread::sleep(
+                    self.deadline.saturating_duration_since(Instant::now())
+                        + Duration::from_millis(1),
+                );
+            }
+            self.script.receive(length, timeout)
+        }
+        fn clear_halt(&mut self) {
+            self.script.clear_halt();
+        }
+    }
+    fn bounded_script(
+        replies: impl IntoIterator<Item = Result<Vec<u8>, TransferError>>,
+        expire_on: usize,
+    ) -> (Control<BudgetedChannel>, Instant) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        (
+            Control::new(
+                BudgetedChannel {
+                    script: Script {
+                        replies: replies.into_iter().collect(),
+                        ..Default::default()
+                    },
+                    deadline,
+                    expire_on,
+                    received: 0,
+                    waits: Vec::new(),
+                    sent_at: Vec::new(),
+                },
+                Duration::from_secs(2),
+            ),
+            deadline,
+        )
+    }
+    #[test]
+    fn bounded_memory_reads_and_writes_keep_one_deadline_across_chunks() {
+        for write in [false, true] {
+            let command = if write { WRITE_CMD } else { READ_CMD };
+            let value = [1, 2, 3, 4];
+            let replies =
+                (1..=3).map(|id| Ok(reply(0, command + 1, id, if write { &[] } else { &value })));
+            let (mut control, deadline) = bounded_script(replies, 2);
+            control.max_ack = 16; // four read bytes
+            control.max_command = 24; // four write bytes
+            let error = if write {
+                control
+                    .write_memory_until(0x1000, &[1; 12], deadline)
+                    .unwrap_err()
+            } else {
+                control.read_memory_until(0x1000, 12, deadline).unwrap_err()
+            };
+            assert_eq!(crate::types::error_transport_code(&error), Some("timeout"));
+            assert_eq!(control.channel.script.sent.len(), 2);
+            assert_eq!(control.channel.script.replies.len(), 1);
+            assert!(control.channel.sent_at.iter().all(|sent| *sent < deadline));
+            assert!(
+                control
+                    .channel
+                    .waits
+                    .iter()
+                    .all(|wait| *wait <= Duration::from_secs(1))
+            );
+            let addresses = control
+                .channel
+                .script
+                .sent
+                .iter()
+                .map(|packet| le64(packet, 12).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(addresses, [0x1000, 0x1004]);
+            // There is no persistent deadline scope. A later ordinary call
+            // can consume the next reply under its normal fresh budget.
+            if write {
+                control.write_memory(0x2000, &value).unwrap();
+            } else {
+                assert_eq!(control.read_memory(0x2000, 4).unwrap(), value);
+            }
+            assert_eq!(control.channel.script.sent.len(), 3);
+        }
+    }
+    #[test]
+    fn a_pending_ack_cannot_extend_the_bounded_caller_budget() {
+        let replies = [
+            Ok(reply(0, PENDING_ACK, 1, &[0, 0, 0x60, 0xea])),
+            Ok(reply(0, READ_CMD + 1, 1, &[1, 2, 3, 4])),
+        ];
+        let (mut control, deadline) = bounded_script(replies, 2);
+        let error = control.read_memory_until(0x1000, 4, deadline).unwrap_err();
+        assert_eq!(crate::types::error_transport_code(&error), Some("timeout"));
+        assert_eq!(control.channel.script.sent.len(), 1);
+        assert_eq!(control.channel.received, 2);
+        assert!(
+            control
+                .channel
+                .waits
+                .iter()
+                .all(|wait| *wait <= Duration::from_secs(1))
+        );
+    }
+    #[test]
+    fn expired_bounded_memory_sends_nothing_and_stall_does_not_enter_unbounded_recovery() {
+        let mut expired = control([]);
+        let deadline = Instant::now();
+        let read = expired.read_memory_until(0x1000, 4, deadline).unwrap_err();
+        let write = expired
+            .write_memory_until(0x1000, &[1; 4], deadline)
+            .unwrap_err();
+        assert_eq!(crate::types::error_transport_code(&read), Some("timeout"));
+        assert_eq!(crate::types::error_transport_code(&write), Some("timeout"));
+        assert_eq!(expired.channel.sent, [] as [Vec<u8>; 0]);
+        let mut halted = control([
+            Err(TransferError::Stall),
+            Ok(reply(0, READ_CMD + 1, 2, &[1, 2, 3, 4])),
+        ]);
+        let error = halted
+            .read_memory_until(0x1000, 4, Instant::now() + Duration::from_secs(1))
+            .unwrap_err();
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref() == Some(&TransferError::Stall))
+        );
+        assert_eq!(halted.channel.sent.len(), 1);
+        assert_eq!(halted.channel.halts_cleared, 0);
+        assert_eq!(halted.read_memory(0x1000, 4).unwrap(), [1, 2, 3, 4]);
+    }
+
     #[test]
     fn resends_stay_within_the_command_timeout() {
         let script = Script {
@@ -1859,17 +2346,18 @@ mod tests {
         leader[28..32].copy_from_slice(&crate::types::MONO8.to_le_bytes());
         leader[32..36].copy_from_slice(&4u32.to_le_bytes());
         leader[36..40].copy_from_slice(&2u32.to_le_bytes());
-        let mut frame = parse_leader(&leader).unwrap();
+        let mut frame = parse_leader(&leader).unwrap().frame;
         frame.data = vec![0; 8].into();
         let mut trailer = vec![0; 28];
         trailer[..4].copy_from_slice(&TRAILER_MAGIC.to_le_bytes());
         trailer[6..8].copy_from_slice(&28u16.to_le_bytes());
         trailer[8..16].copy_from_slice(&19u64.to_le_bytes());
         trailer[20..28].copy_from_slice(&8u64.to_le_bytes());
-        validate_trailer(&trailer, &frame, 8).unwrap();
-        assert!(validate_trailer(&trailer, &frame, 7).is_err());
+        validate_trailer(&trailer, frame.id, 8, frame.data.len()).unwrap();
+        validate_trailer(&trailer, frame.id, 7, frame.data.len()).unwrap_err();
+        validate_trailer(&trailer, frame.id, 8, 7).unwrap_err();
         trailer[16] = 1;
-        assert!(validate_trailer(&trailer, &frame, 8).is_err());
+        validate_trailer(&trailer, frame.id, 8, frame.data.len()).unwrap_err();
         leader[18] = 2;
         parse_leader(&leader).unwrap_err();
     }
@@ -2028,6 +2516,609 @@ mod tests {
             bus.send(&[]);
             bus.send(&trailer(id, 12 * MPS));
             assert_eq!(next(&mut stream, &mut bus).unwrap().id, id);
+        }
+    }
+    fn sized_trailer(id: u64, size: usize, height: u32) -> Vec<u8> {
+        let mut bytes = trailer(id, size);
+        bytes[28..32].copy_from_slice(&height.to_le_bytes());
+        bytes
+    }
+    fn padded_payload(pixels: &[u8], row: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for pixels in pixels.chunks_exact(row) {
+            bytes.extend_from_slice(pixels);
+            bytes.extend_from_slice(&[0xa5, 0x5a]);
+        }
+        bytes
+    }
+    #[test]
+    fn variable_height_short_packets_and_zlps_preserve_whole_and_split_frames() {
+        for (width, maximum_height, height, zlp) in [(3, 600, 400, false), (4, 600, 512, true)] {
+            let maximum = width as usize * maximum_height as usize;
+            let pixels = image(1, width as usize * height as usize);
+            for whole in [false, true] {
+                let request = if whole {
+                    aligned(maximum, MPS).unwrap()
+                } else {
+                    MPS
+                };
+                let (mut stream, mut bus) = requesting(maximum, request, whole);
+                bus.send(&leader(1, width, maximum_height));
+                bus.send(&pixels);
+                if zlp {
+                    bus.send(&[]);
+                }
+                bus.send(&sized_trailer(1, pixels.len(), height));
+                let complete = image(2, maximum);
+                bus.send(&leader(2, width, maximum_height));
+                bus.send(&complete);
+                bus.send(&sized_trailer(2, maximum, maximum_height));
+                let frame = next_requested(&mut stream, &mut bus).unwrap();
+                assert_eq!((frame.id, frame.width, frame.height), (1, width, height));
+                assert_eq!(frame.data, pixels);
+                assert_eq!(bus.buffers.contains(&(frame.data.as_ptr() as usize)), whole);
+                let frame = next_requested(&mut stream, &mut bus).unwrap();
+                assert_eq!((frame.id, frame.height), (2, maximum_height));
+                assert_eq!(frame.data, complete);
+            }
+        }
+    }
+    #[test]
+    fn variable_height_plain_padding_and_odd_planes_use_confirmed_geometry() {
+        let cases = [
+            (
+                0x0110_0007_u32,
+                2,
+                4,
+                3,
+                2_u16,
+                24,
+                (0_u8..12).collect::<Vec<_>>(),
+            ),
+            (0x020c_0112, 3, 5, 3, 0, 27, (0_u8..17).collect::<Vec<_>>()),
+        ];
+        for (format, width, maximum_height, height, padding, maximum, pixels) in cases {
+            let payload = if padding == 0 {
+                pixels.clone()
+            } else {
+                padded_payload(&pixels, 4)
+            };
+            for whole in [false, true] {
+                let (mut stream, mut bus) = requesting(maximum, MPS, whole);
+                let mut metadata = leader(1, width, maximum_height);
+                metadata[28..32].copy_from_slice(&format.to_le_bytes());
+                metadata[48..50].copy_from_slice(&padding.to_le_bytes());
+                bus.send(&metadata);
+                bus.send(&payload);
+                bus.send(&sized_trailer(1, payload.len(), height));
+                let frame = next_requested(&mut stream, &mut bus).unwrap();
+                assert_eq!(
+                    (frame.width, frame.height, frame.pixel_format),
+                    (width, height, format)
+                );
+                assert_eq!(frame.data, pixels);
+                assert!(frame.chunks.is_none());
+                bus.frame(2, &image(2, maximum), MPS);
+                assert_eq!(next_requested(&mut stream, &mut bus).unwrap().id, 2);
+            }
+        }
+    }
+    #[test]
+    fn variable_height_padded_chunks_preserve_original_rows_and_footer_offsets() {
+        for whole in [false, true] {
+            let (mut stream, mut bus) = requesting(40, MPS, whole);
+            for (id, height) in [(1, 3), (2, 4)] {
+                let pixels = image(id, height as usize * 4);
+                let mut payload = padded_payload(&pixels, 4);
+                let boundary = payload.len();
+                payload.extend_from_slice(&0x0123_4567_89ab_cdefu64.to_le_bytes());
+                payload.extend_from_slice(&0xffff_1234u32.to_le_bytes());
+                payload.extend_from_slice(&8u32.to_le_bytes());
+                let mut metadata = leader(id, 2, 4);
+                metadata[18..20].copy_from_slice(&0x4001u16.to_le_bytes());
+                metadata[28..32].copy_from_slice(&0x0110_0007u32.to_le_bytes());
+                metadata[48..50].copy_from_slice(&2u16.to_le_bytes());
+                let mut tail = sized_trailer(id, payload.len(), height);
+                tail.extend_from_slice(&0xaabb_ccddu32.to_le_bytes());
+                tail[6..8].copy_from_slice(&36u16.to_le_bytes());
+                bus.send(&metadata);
+                bus.send(&payload);
+                bus.send(&tail);
+                let frame = next_requested(&mut stream, &mut bus).unwrap();
+                assert_eq!((frame.id, frame.width, frame.height), (id, 2, height));
+                assert_eq!(frame.data, pixels);
+                let chunks = frame.chunks.unwrap();
+                assert_eq!(&*chunks.payload, &payload);
+                assert_eq!(
+                    (chunks.image_bytes, chunks.chunk_offset),
+                    (boundary, Some(boundary))
+                );
+                assert_eq!(
+                    (chunks.entries[0].offset, chunks.entries[0].length),
+                    (boundary, 8)
+                );
+                assert_eq!(chunks.image_layout.unwrap().height, height);
+                assert_eq!(
+                    bus.buffers.contains(&(chunks.payload.as_ptr() as usize)),
+                    whole
+                );
+            }
+        }
+    }
+    #[test]
+    fn variable_height_final_pixels_that_look_like_headers_remain_pixels() {
+        for whole in [false, true] {
+            for pixels in [leader(9, 4, 2), trailer(9, 8)] {
+                let (mut stream, mut bus) = requesting(128, MPS, whole);
+                bus.send(&leader(1, 1, 128));
+                bus.send(&pixels);
+                bus.send(&sized_trailer(
+                    1,
+                    pixels.len(),
+                    u32::try_from(pixels.len()).unwrap(),
+                ));
+                let frame = next_requested(&mut stream, &mut bus).unwrap();
+                assert_eq!(frame.height as usize, pixels.len());
+                assert_eq!(frame.data, pixels);
+            }
+        }
+    }
+    #[test]
+    fn variable_height_incoherent_trailers_fail_and_keep_the_next_valid_frame() {
+        for whole in [false, true] {
+            for mode in 0..8 {
+                let (mut stream, mut bus) =
+                    requesting(1800, if whole { 2 * MPS } else { MPS }, whole);
+                let mut tail = sized_trailer(1, 1200, 400);
+                match mode {
+                    0 => tail[20..28].copy_from_slice(&1201u64.to_le_bytes()),
+                    1 => tail[28..32].copy_from_slice(&0u32.to_le_bytes()),
+                    2 => tail[28..32].copy_from_slice(&601u32.to_le_bytes()),
+                    3 => tail[28..32].copy_from_slice(&399u32.to_le_bytes()),
+                    4 => {
+                        tail.truncate(28);
+                        tail[6..8].copy_from_slice(&28u16.to_le_bytes());
+                    }
+                    5 => tail[16] = 1,
+                    6 => tail[6..8].copy_from_slice(&64u16.to_le_bytes()),
+                    7 => tail[8..16].copy_from_slice(&9u64.to_le_bytes()),
+                    _ => unreachable!(),
+                }
+                bus.send(&leader(1, 3, 600));
+                bus.send(&image(1, 1200));
+                bus.send(&tail);
+                let complete = image(2, 1800);
+                bus.send(&leader(2, 3, 600));
+                bus.send(&complete);
+                bus.send(&sized_trailer(2, 1800, 600));
+                next_requested(&mut stream, &mut bus).unwrap_err();
+                let frame = next_requested(&mut stream, &mut bus).unwrap();
+                assert_eq!((frame.id, frame.height), (2, 600));
+                assert_eq!(frame.data, complete);
+            }
+            // Preserve common-only legacy trailers for a complete leader
+            // image; the same trailer cannot authorize a reduced image above.
+            let (mut stream, mut bus) = requesting(1800, if whole { 2 * MPS } else { MPS }, whole);
+            let pixels = image(1, 1800);
+            let mut tail = trailer(1, 1800);
+            tail.truncate(28);
+            tail[6..8].copy_from_slice(&28u16.to_le_bytes());
+            bus.send(&leader(1, 3, 600));
+            bus.send(&pixels);
+            bus.send(&tail);
+            let frame = next_requested(&mut stream, &mut bus).unwrap();
+            assert_eq!(frame.height, 600);
+            assert_eq!(frame.data, pixels);
+        }
+    }
+    #[test]
+    fn variable_height_without_a_proven_trailer_boundary_never_publishes() {
+        for whole in [false, true] {
+            let request = if whole { 3 * MPS } else { MPS };
+            let (mut stream, mut bus) = requesting(2400, request, whole);
+            bus.send(&leader(1, 4, 600));
+            // No short packet or ZLP separates this reduced image and trailer.
+            // In whole mode the host sees them in the same completion.
+            bus.send(&image(1, 2048));
+            bus.send(&sized_trailer(1, 2048, 512));
+            let complete = image(2, 2400);
+            bus.send(&leader(2, 4, 600));
+            bus.send(&complete);
+            bus.send(&sized_trailer(2, 2400, 600));
+            next_requested(&mut stream, &mut bus).unwrap_err();
+            let frame = next_requested(&mut stream, &mut bus).unwrap();
+            assert_eq!((frame.id, frame.height), (2, 600));
+            assert_eq!(frame.data, complete);
+        }
+    }
+    #[test]
+    fn oversized_trailer_completions_retire_the_frame_without_losing_the_next_leader() {
+        for whole in [false, true] {
+            let (mut stream, mut bus) = requesting(128, MPS, whole);
+            stream.trailer = 64;
+            // Oversized stale bytes without a frame remain ignored.
+            bus.send(&[0xbb; 80]);
+            bus.send(&leader(1, 1, 128));
+            bus.send(&image(1, 64));
+            let mut oversized = sized_trailer(1, 64, 64);
+            oversized.resize(80, 0xef);
+            bus.send(&oversized);
+            // A valid extended leader may exceed the trailer bound.
+            let mut metadata = leader(2, 128, 1);
+            metadata.resize(80, 0);
+            metadata[6..8].copy_from_slice(&80u16.to_le_bytes());
+            let complete = image(2, 128);
+            bus.send(&metadata);
+            bus.send(&complete);
+            bus.send(&trailer(2, 128));
+            let error = next_requested(&mut stream, &mut bus).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("trailer exceeds its negotiated bound"),
+                "{error:#}"
+            );
+            let frame = next_requested(&mut stream, &mut bus).unwrap();
+            assert_eq!(frame.id, 2);
+            assert_eq!(frame.data, complete);
+
+            // At an open frame's boundary, that same extended leader seeds
+            // recovery before the trailer-size check can reject its length.
+            bus.send(&leader(3, 1, 128));
+            bus.send(&image(3, 64));
+            metadata[8..16].copy_from_slice(&4u64.to_le_bytes());
+            bus.send(&metadata);
+            let complete = image(4, 128);
+            bus.send(&complete);
+            bus.send(&trailer(4, 128));
+            let error = next_requested(&mut stream, &mut bus).unwrap_err();
+            assert!(
+                error.to_string().contains("ended without a trailer"),
+                "{error:#}"
+            );
+            let frame = next_requested(&mut stream, &mut bus).unwrap();
+            assert_eq!(frame.id, 4);
+            assert_eq!(frame.data, complete);
+        }
+    }
+    #[test]
+    fn partial_size_y_trailers_fail_then_the_next_full_height_frame_recovers() {
+        for whole in [false, true] {
+            for (declared, received) in [
+                (29_u16, 29_usize),
+                (29, 32),
+                (30, 30),
+                (30, 32),
+                (31, 31),
+                (31, 32),
+                (32, 29),
+                (32, 30),
+                (32, 31),
+            ] {
+                let (mut stream, mut bus) = requesting(128, MPS, whole);
+                let mut partial = trailer(1, 128);
+                partial.truncate(received);
+                partial[6..8].copy_from_slice(&declared.to_le_bytes());
+                bus.send(&leader(1, 128, 1));
+                bus.send(&image(1, 128));
+                bus.send(&partial);
+                let complete = image(2, 128);
+                bus.frame(2, &complete, MPS);
+                let error = next_requested(&mut stream, &mut bus).unwrap_err();
+                let diagnostic = if declared < 32 {
+                    "truncated USB image trailer"
+                } else {
+                    "invalid UVSP trailer size"
+                };
+                assert!(
+                    error.to_string().contains(diagnostic),
+                    "declared {declared}, received {received}: {error:#}"
+                );
+                let frame = next_requested(&mut stream, &mut bus).unwrap();
+                assert_eq!((frame.id, frame.height), (2, 1));
+                assert_eq!(frame.data, complete);
+            }
+        }
+    }
+    #[test]
+    fn oversized_coalesced_trailer_suffixes_retire_before_copying_the_metadata() {
+        for whole in [false, true] {
+            let (mut stream, mut bus) = requesting(MPS, 2 * MPS, whole);
+            stream.trailer = 64;
+            bus.send(&leader(1, u32::try_from(MPS).unwrap(), 1));
+            // The full payload packet and80-byte trailer fill one host
+            // completion, so no preceding short completion proves a boundary.
+            bus.send(&image(1, MPS));
+            let mut oversized = trailer(1, MPS);
+            oversized.resize(80, 0xef);
+            bus.send(&oversized);
+            let complete = image(2, MPS);
+            bus.frame(2, &complete, 2 * MPS);
+            let error = next_requested(&mut stream, &mut bus).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("trailer exceeds its negotiated bound"),
+                "{error:#}"
+            );
+            let frame = next_requested(&mut stream, &mut bus).unwrap();
+            assert_eq!(frame.id, 2);
+            assert_eq!(frame.data, complete);
+        }
+    }
+    #[test]
+    fn lost_payload_and_trailer_do_not_turn_the_next_leader_into_a_false_frame() {
+        let (mut stream, mut bus) = streaming(8 * MPS, 4 * MPS);
+        bus.send(&leader(1, 8 * u32::try_from(MPS).unwrap(), 1));
+        bus.send(&image(1, 4 * MPS));
+        // Both the rest of frame1 and its trailer are lost. Leader2 arrives
+        // inside the still-undecided payload; do not guess at its magic.
+        bus.frame(2, &image(2, 8 * MPS), 4 * MPS);
+        bus.frame(3, &image(3, 8 * MPS), 4 * MPS);
+        next(&mut stream, &mut bus).unwrap_err();
+        let frame = next(&mut stream, &mut bus).unwrap();
+        assert_eq!(frame.id, 3);
+        assert_eq!(frame.data, image(3, 8 * MPS));
+    }
+    #[test]
+    fn variable_height_maximum_leader_geometry_stays_within_the_payload_ceiling() {
+        let (mut stream, mut bus) = requesting(1800, MPS, false);
+        bus.send(&leader(1, 3, 601));
+        bus.send(&image(1, 1200));
+        bus.send(&sized_trailer(1, 1200, 400));
+        let complete = image(2, 1800);
+        bus.send(&leader(2, 3, 600));
+        bus.send(&complete);
+        bus.send(&sized_trailer(2, 1800, 600));
+        let error = next_requested(&mut stream, &mut bus).unwrap_err();
+        assert!(error.to_string().contains("payload ceiling"), "{error:#}");
+        let frame = next_requested(&mut stream, &mut bus).unwrap();
+        assert_eq!(frame.id, 2);
+        assert_eq!(frame.data, complete);
+    }
+    #[test]
+    fn image_extended_chunks_retain_measurements_and_original_payload() {
+        for whole in [false, true] {
+            let pixels = image(1, 8);
+            let mut payload = pixels.clone();
+            payload.extend(0x0123_4567_89ab_cdefu64.to_le_bytes());
+            payload.extend(0xffff_1234u32.to_le_bytes());
+            payload.extend(8u32.to_le_bytes());
+            let mut metadata = leader(1, 4, 2);
+            metadata[18..20].copy_from_slice(&0x4001u16.to_le_bytes());
+            let mut tail = trailer(1, payload.len());
+            tail.extend(0xaabb_ccddu32.to_le_bytes());
+            tail[6..8].copy_from_slice(&36u16.to_le_bytes());
+            tail[28..32].copy_from_slice(&2u32.to_le_bytes());
+            let (mut stream, mut bus) = requesting(payload.len(), MPS, whole);
+            bus.send(&metadata);
+            bus.send(&payload);
+            bus.send(&tail);
+            let frame = stream
+                .next(&mut bus, Instant::now() + Duration::from_secs(1))
+                .unwrap();
+            assert_eq!(frame.data, pixels);
+            let chunks = frame.chunks.unwrap();
+            assert_eq!(
+                (chunks.layout_id, chunks.byte_order),
+                (Some(0xaabb_ccdd), Some(ByteOrder::Little))
+            );
+            assert_eq!(&*chunks.payload, &payload);
+            assert_eq!(
+                chunks.entries,
+                vec![super::super::chunks::Chunk {
+                    id: 0xffff_1234,
+                    offset: 8,
+                    length: 8
+                }]
+            );
+            assert_eq!(chunks.image_layout.unwrap().row_stride, 4);
+            if whole {
+                assert!(bus.buffers.contains(&(chunks.payload.as_ptr() as usize)));
+            }
+
+            // One malformed footer loses one frame, then ordinary capture
+            // resumes; it must never deliver an image while losing chunks.
+            let end = payload.len();
+            payload[end - 4..].copy_from_slice(&u32::MAX.to_le_bytes());
+            bus.send(&metadata);
+            bus.send(&payload);
+            bus.send(&tail);
+            let error = stream
+                .next(&mut bus, Instant::now() + Duration::from_secs(1))
+                .unwrap_err();
+            assert!(error.to_string().contains("chunk length exceeds payload"));
+            bus.frame(2, &image(2, payload.len()), MPS);
+            let frame = stream
+                .next(&mut bus, Instant::now() + Duration::from_secs(1))
+                .unwrap();
+            assert_eq!(frame.id, 2);
+            assert!(frame.chunks.is_none());
+        }
+    }
+    #[test]
+    fn padded_rows_normalize_whole_and_split_transfers_without_changing_samples() {
+        // Basler's Line Pitch feature appends bytes to each image line. The
+        // UVSP leader reports their count at48; the word at50 is reserved.
+        for (format, width, pair) in [
+            (crate::types::MONO8, 3, vec![1, 2, 3, 4, 5, 6]),
+            (
+                0x0110_0007,
+                2,
+                vec![0x34, 0x12, 0x78, 0x56, 0xbc, 0x9a, 0xf0, 0xde],
+            ),
+            (0x010a_0046, 3, vec![1, 8, 48, 0, 4, 20, 96, 0]),
+            (0x0210_00a5, 3, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
+            (0x0210_00a6, 3, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
+            (
+                0x0220_00a7,
+                3,
+                (1_u16..=12).flat_map(u16::to_le_bytes).collect(),
+            ),
+            (
+                0x0220_00a9,
+                3,
+                (1_u16..=12).flat_map(u16::to_le_bytes).collect(),
+            ),
+            (
+                0x0220_00ab,
+                3,
+                (1_u16..=12).flat_map(u16::to_le_bytes).collect(),
+            ),
+            (
+                0x0220_00ad,
+                3,
+                (1_u16..=12).flat_map(u16::to_le_bytes).collect(),
+            ),
+        ] {
+            let pixels = pair.repeat(300);
+            let row_bytes = crate::frame::row_bytes(width, format);
+            let mut payload = Vec::new();
+            for row in pixels.chunks_exact(row_bytes) {
+                payload.extend_from_slice(row);
+                payload.extend_from_slice(&[0xa5, 0x5a, 0xef]);
+            }
+            for whole in [false, true] {
+                let mut metadata = leader(1, width, 600);
+                metadata[28..32].copy_from_slice(&format.to_le_bytes());
+                metadata[48..50].copy_from_slice(&3u16.to_le_bytes());
+                metadata[50..52].copy_from_slice(&0xbeefu16.to_le_bytes());
+                let request = if whole {
+                    payload.len().div_ceil(MPS) * MPS
+                } else {
+                    MPS
+                };
+                let (mut stream, mut bus) = requesting(payload.len(), request, whole);
+                let mut tail = trailer(1, payload.len());
+                tail[28..32].copy_from_slice(&600u32.to_le_bytes());
+                bus.send(&metadata);
+                bus.send(&payload);
+                bus.send(&tail);
+                let frame = next_requested(&mut stream, &mut bus).unwrap();
+                assert_eq!(
+                    (frame.width, frame.height, frame.pixel_format),
+                    (width, 600, format)
+                );
+                assert_eq!(frame.data, pixels);
+                assert!(frame.chunks.is_none());
+                if format == 0x010a_0046 {
+                    assert_eq!(
+                        crate::frame::unpacked(&frame).unwrap().data,
+                        [1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0].repeat(300)
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn padded_chunk_image_keeps_wire_rows_footer_offsets_and_little_endian_words() {
+        let pixels = [0x34, 0x12, 0x78, 0x56, 0xbc, 0x9a, 0xf0, 0xde];
+        let mut payload = vec![
+            0x34, 0x12, 0x78, 0x56, 0xa5, 0x5a, 0xbc, 0x9a, 0xf0, 0xde, 0x11, 0x22,
+        ];
+        payload.extend_from_slice(&0x0123_4567_89ab_cdefu64.to_le_bytes());
+        payload.extend_from_slice(&0xffff_1234u32.to_le_bytes());
+        payload.extend_from_slice(&8u32.to_le_bytes());
+        for whole in [false, true] {
+            let mut metadata = leader(1, 2, 2);
+            metadata[18..20].copy_from_slice(&0x4001u16.to_le_bytes());
+            metadata[28..32].copy_from_slice(&0x0110_0007u32.to_le_bytes());
+            metadata[48..50].copy_from_slice(&2u16.to_le_bytes());
+            metadata[50..52].copy_from_slice(&0xbeefu16.to_le_bytes());
+            let mut tail = trailer(1, payload.len());
+            tail.extend_from_slice(&0xaabb_ccddu32.to_le_bytes());
+            tail[6..8].copy_from_slice(&36u16.to_le_bytes());
+            tail[28..32].copy_from_slice(&2u32.to_le_bytes());
+            let (mut stream, mut bus) = requesting(payload.len(), MPS, whole);
+            bus.send(&metadata);
+            bus.send(&payload);
+            bus.send(&tail);
+            let mut frame = next_requested(&mut stream, &mut bus).unwrap();
+            assert_eq!(frame.data, pixels);
+            let chunks = frame.chunks.as_ref().unwrap();
+            assert_eq!(&*chunks.payload, &payload);
+            assert_eq!((chunks.image_bytes, chunks.chunk_offset), (12, Some(12)));
+            assert_eq!(
+                (chunks.entries[0].offset, chunks.entries[0].length),
+                (12, 8)
+            );
+            let layout = chunks.image_layout.unwrap();
+            assert_eq!(
+                (
+                    layout.offset,
+                    layout.row_bytes,
+                    layout.row_stride,
+                    layout.padding_y
+                ),
+                (0, 4, 6, 0)
+            );
+            assert_eq!(layout.byte_order, Some(ByteOrder::Little));
+            if whole {
+                assert!(bus.buffers.contains(&(chunks.payload.as_ptr() as usize)));
+            }
+            frame.data.make_mut()[0] ^= 0xff;
+            assert_eq!(&*frame.chunks.as_ref().unwrap().payload, &payload);
+        }
+    }
+    #[test]
+    fn odd_semiplanar_chunk_images_use_the_complete_plane_size() {
+        // YCbCr420_8_YY_CbCr_Semiplanar: nine luma bytes and two four-byte
+        // chroma rows, rather than three rows of ceil(3*12/8) bytes.
+        let pixels: Vec<u8> = (0..17).collect();
+        let mut payload = pixels.clone();
+        payload.extend_from_slice(&0x0123_4567_89ab_cdefu64.to_le_bytes());
+        payload.extend_from_slice(&0xffff_1234u32.to_le_bytes());
+        payload.extend_from_slice(&8u32.to_le_bytes());
+        for whole in [false, true] {
+            let mut metadata = leader(1, 3, 3);
+            metadata[18..20].copy_from_slice(&0x4001u16.to_le_bytes());
+            metadata[28..32].copy_from_slice(&0x020c_0112u32.to_le_bytes());
+            let mut tail = trailer(1, payload.len());
+            tail.extend_from_slice(&7u32.to_le_bytes());
+            tail[6..8].copy_from_slice(&36u16.to_le_bytes());
+            tail[28..32].copy_from_slice(&3u32.to_le_bytes());
+            let (mut stream, mut bus) = requesting(payload.len(), MPS, whole);
+            bus.send(&metadata);
+            bus.send(&payload);
+            bus.send(&tail);
+            let frame = next_requested(&mut stream, &mut bus).unwrap();
+            assert_eq!(frame.data, pixels);
+            let chunks = frame.chunks.unwrap();
+            assert_eq!(chunks.image_bytes, 17);
+            assert_eq!(chunks.chunk_offset, Some(17));
+            assert_eq!(chunks.entries[0].offset, 17);
+            assert_eq!(&*chunks.payload, &payload);
+        }
+    }
+    #[test]
+    fn invalid_padded_geometry_and_ambiguous_planes_fail_then_the_stream_recovers() {
+        for (format, width, height, padding, diagnostic) in [
+            (crate::types::MONO8, 3, 2, 2u16, "size differs"),
+            (
+                crate::types::MONO8,
+                u32::MAX,
+                u32::MAX,
+                u16::MAX,
+                "overflow",
+            ),
+            (0x0218_0021, 1, 4, 1u16, "planar"),
+        ] {
+            let mut metadata = leader(1, width, height);
+            metadata[28..32].copy_from_slice(&format.to_le_bytes());
+            metadata[48..50].copy_from_slice(&padding.to_le_bytes());
+            let (mut stream, mut bus) = requesting(16, MPS, false);
+            bus.send(&metadata);
+            bus.send(&image(1, 16));
+            bus.send(&trailer(1, 16));
+            let error = next(&mut stream, &mut bus).unwrap_err();
+            assert!(error.to_string().contains(diagnostic), "{error:#}");
+            if diagnostic == "planar" {
+                assert_eq!(crate::types::classify(&error).kind, ErrorKind::Unsupported);
+            }
+            bus.frame(2, &image(2, 16), MPS);
+            let frame = next(&mut stream, &mut bus).unwrap();
+            assert_eq!(frame.id, 2);
+            assert_eq!(frame.data, image(2, 16));
         }
     }
     #[test]
@@ -2224,6 +3315,14 @@ mod tests {
         let mut bus = Bus::default();
         stream.queue(&mut bus, 4, request);
         (stream, bus)
+    }
+    /// The requested four-transfer window stays intact; whole-image buffers
+    /// come from the frame pool rather than the endpoint allocator.
+    fn next_requested(stream: &mut Stream, bus: &mut Bus) -> Result<Frame> {
+        let frame = stream.next(bus, Instant::now() + Duration::from_secs(1));
+        assert_eq!(bus.submitted.len() + stream.idle.len(), 4);
+        assert_eq!(bus.allocated, if stream.whole.is_some() { 0 } else { 4 });
+        frame
     }
     /// A frame's ID and image, or the error instead, and whether its image
     /// was a transfer's own buffer.
@@ -2448,5 +3547,242 @@ mod tests {
         }
         assert_eq!(aligned(53, 1024).unwrap(), 1024);
         aligned(53, 3).unwrap_err();
+    }
+    #[test]
+    fn ids_grouped_whole_and_split_images_keep_original_chunks_and_encoding() {
+        use crate::types::IdsPixelFormat;
+        for (format, pair) in [
+            (
+                IdsPixelFormat::Mono10g40,
+                vec![0, 85, 170, 255, 249, 255, 170, 85, 0, 6],
+            ),
+            (
+                IdsPixelFormat::Mono12g24,
+                vec![
+                    0x12, 0xab, 0xc3, 0x45, 0xde, 0xf6, 0, 0xff, 0xf0, 0x78, 0x13, 0x59,
+                ],
+            ),
+            (
+                IdsPixelFormat::BayerRg10g40,
+                vec![0xe8, 0x24, 0xb5, 0x78, 0x39, 0x2d, 0x8e, 0x70, 0xe3, 0xc6],
+            ),
+            (
+                IdsPixelFormat::BayerRg12g24,
+                vec![
+                    0xe7, 0x2a, 0x61, 0xb4, 0x58, 0x3d, 0x36, 0x95, 0xec, 0x74, 0xd1, 0x92,
+                ],
+            ),
+            (
+                IdsPixelFormat::BayerGr10g40,
+                vec![0xe8, 0x24, 0xb5, 0x78, 0x39, 0x2d, 0x8e, 0x70, 0xe3, 0xc6],
+            ),
+            (
+                IdsPixelFormat::BayerGr12g24,
+                vec![
+                    0xe7, 0x2a, 0x61, 0xb4, 0x58, 0x3d, 0x36, 0x95, 0xec, 0x74, 0xd1, 0x92,
+                ],
+            ),
+            (
+                IdsPixelFormat::BayerGb10g40,
+                vec![0xe8, 0x24, 0xb5, 0x78, 0x39, 0x2d, 0x8e, 0x70, 0xe3, 0xc6],
+            ),
+            (
+                IdsPixelFormat::BayerGb12g24,
+                vec![
+                    0xe7, 0x2a, 0x61, 0xb4, 0x58, 0x3d, 0x36, 0x95, 0xec, 0x74, 0xd1, 0x92,
+                ],
+            ),
+            (
+                IdsPixelFormat::BayerBg10g40,
+                vec![0xe8, 0x24, 0xb5, 0x78, 0x39, 0x2d, 0x8e, 0x70, 0xe3, 0xc6],
+            ),
+            (
+                IdsPixelFormat::BayerBg12g24,
+                vec![
+                    0xe7, 0x2a, 0x61, 0xb4, 0x58, 0x3d, 0x36, 0x95, 0xec, 0x74, 0xd1, 0x92,
+                ],
+            ),
+        ] {
+            let pixels = pair.repeat(300);
+            let row = pair.len() / 2;
+            let height = 600;
+            for chunks in [false, true] {
+                let mut payload = Vec::new();
+                for line in pixels.chunks_exact(row) {
+                    payload.extend_from_slice(line);
+                    payload.extend_from_slice(&[0xa5, 0x5a]);
+                }
+                let image_bytes = payload.len();
+                if chunks {
+                    payload.extend_from_slice(&u64::MAX.to_le_bytes());
+                    payload.extend_from_slice(&0xffff_1234_u32.to_le_bytes());
+                    payload.extend_from_slice(&8_u32.to_le_bytes());
+                }
+                for whole in [false, true] {
+                    let request = if whole {
+                        payload.len().div_ceil(MPS) * MPS
+                    } else {
+                        MPS
+                    };
+                    let (mut stream, mut bus) = requesting(payload.len(), request, whole);
+                    stream.pixel_encodings = vec![format.encoding(None)];
+                    let mut metadata = leader(1, 4, height);
+                    metadata[28..32].copy_from_slice(&format.code().to_le_bytes());
+                    metadata[48..50].copy_from_slice(&2_u16.to_le_bytes());
+                    let mut tail = trailer(1, payload.len());
+                    tail[28..32].copy_from_slice(&height.to_le_bytes());
+                    if chunks {
+                        metadata[18..20].copy_from_slice(&0x4001_u16.to_le_bytes());
+                        tail.extend_from_slice(&0xaabb_ccdd_u32.to_le_bytes());
+                        tail[6..8].copy_from_slice(&36_u16.to_le_bytes());
+                    }
+                    bus.send(&metadata);
+                    bus.send(&payload);
+                    bus.send(&tail);
+                    let frame = next_requested(&mut stream, &mut bus).unwrap();
+                    assert_eq!(&*frame.data, &pixels);
+                    assert_eq!(frame.pixel_encoding, Some(format.encoding(None)));
+                    crate::frame::validate_source(&frame).unwrap();
+                    if chunks {
+                        let retained = frame.chunks.unwrap();
+                        assert_eq!(&*retained.payload, &payload);
+                        assert_eq!(retained.image_bytes, image_bytes);
+                        let layout = retained.image_layout.unwrap();
+                        assert!(layout.pfnc_code.is_none());
+                        assert_eq!(layout.pixel_encoding, Some(format.encoding(None)));
+                        assert_eq!(layout.row_stride, row + 2);
+                        if whole {
+                            assert!(bus.buffers.contains(&(retained.payload.as_ptr() as usize)));
+                        }
+                    } else {
+                        assert!(frame.chunks.is_none());
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn ids_grouped_leader_requires_qualification_and_complete_groups_then_recovers() {
+        use crate::types::IdsPixelFormat;
+        for format in IdsPixelFormat::ALL {
+            for qualified in [false, true] {
+                let (mut stream, mut bus) = requesting(10, MPS, false);
+                if qualified {
+                    stream.pixel_encodings = vec![format.encoding(None)];
+                }
+                let mut metadata = leader(1, if qualified { 3 } else { 4 }, 2);
+                metadata[28..32].copy_from_slice(&format.code().to_le_bytes());
+                bus.send(&metadata);
+                bus.send(&[0; 10]);
+                bus.send(&trailer(1, 10));
+                let pixels = image(2, 10);
+                bus.frame(2, &pixels, MPS);
+                let error = next_requested(&mut stream, &mut bus).unwrap_err();
+                assert_eq!(crate::types::classify(&error).kind, ErrorKind::Unsupported);
+                let frame = next_requested(&mut stream, &mut bus).unwrap();
+                assert_eq!(frame.id, 2);
+                assert_eq!(frame.data, pixels);
+                assert!(frame.pixel_encoding.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn packed_bicolor_whole_and_split_rows_keep_exact_packed_chunks() {
+        let literal: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/bicolor/packed-literals.json"
+        ))
+        .unwrap();
+        for (case, codes) in [
+            (0, [0x0214_00a8_u32, 0x0214_00aa]),
+            (1, [0x0218_00ac, 0x0218_00ae]),
+        ] {
+            let case = &literal["cases"][case];
+            let width = u32::try_from(case["width"].as_u64().unwrap()).unwrap();
+            let pair = crate::types::decode_hex(case["tight_hex"].as_str().unwrap(), 128).unwrap();
+            let pixels = pair.repeat(300);
+            let row_bytes = usize::try_from(case["row_bytes"].as_u64().unwrap()).unwrap();
+            for format in codes {
+                for chunks in [false, true] {
+                    let mut payload = Vec::new();
+                    for row in pixels.chunks_exact(row_bytes) {
+                        payload.extend_from_slice(row);
+                        payload.extend_from_slice(&[0xa5, 0x5a, 0xef]);
+                    }
+                    let image_bytes = payload.len();
+                    if chunks {
+                        payload.extend_from_slice(&u64::MAX.to_le_bytes());
+                        payload.extend_from_slice(&0xffff_1234_u32.to_le_bytes());
+                        payload.extend_from_slice(&8_u32.to_le_bytes());
+                    }
+                    for whole in [false, true] {
+                        let request = if whole {
+                            payload.len().div_ceil(MPS) * MPS
+                        } else {
+                            MPS
+                        };
+                        let (mut stream, mut bus) = requesting(payload.len(), request, whole);
+                        let mut metadata = leader(1, width, 600);
+                        metadata[28..32].copy_from_slice(&format.to_le_bytes());
+                        metadata[48..50].copy_from_slice(&3_u16.to_le_bytes());
+                        let mut tail = trailer(1, payload.len());
+                        tail[28..32].copy_from_slice(&600_u32.to_le_bytes());
+                        if chunks {
+                            metadata[18..20].copy_from_slice(&0x4001_u16.to_le_bytes());
+                            tail.extend_from_slice(&0xaabb_ccdd_u32.to_le_bytes());
+                            tail[6..8].copy_from_slice(&36_u16.to_le_bytes());
+                        }
+                        bus.send(&metadata);
+                        bus.send(&payload);
+                        bus.send(&tail);
+                        let frame = next_requested(&mut stream, &mut bus).unwrap();
+                        assert_eq!(
+                            (frame.width, frame.height, frame.pixel_format),
+                            (width, 600, format)
+                        );
+                        assert_eq!(frame.data.as_ref(), pixels);
+                        crate::frame::validate_source(&frame).unwrap();
+                        if chunks {
+                            let retained = frame.chunks.unwrap();
+                            assert_eq!(retained.payload.as_ref(), payload);
+                            assert_eq!(retained.image_bytes, image_bytes);
+                            let layout = retained.image_layout.unwrap();
+                            assert_eq!(layout.pfnc_code, Some(format));
+                            assert_eq!(layout.row_bytes, row_bytes);
+                            assert_eq!(layout.row_stride, row_bytes + 3);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn odd10p_usb_leader_rejects_then_a_complete_packed_frame_recovers() {
+        for whole in [false, true] {
+            let (mut stream, mut bus) = requesting(64, MPS, whole);
+            let mut bad = leader(1, 3, 2);
+            bad[28..32].copy_from_slice(&0x0214_00a8_u32.to_le_bytes());
+            let mut good = leader(2, 4, 2);
+            good[28..32].copy_from_slice(&0x0214_00a8_u32.to_le_bytes());
+            let literal: serde_json::Value = serde_json::from_str(include_str!(
+                "../../tests/fixtures/bicolor/packed-literals.json"
+            ))
+            .unwrap();
+            let raw =
+                crate::types::decode_hex(literal["cases"][0]["tight_hex"].as_str().unwrap(), 128)
+                    .unwrap();
+            bus.send(&bad);
+            bus.send(&good);
+            bus.send(&raw);
+            let mut tail = trailer(2, raw.len());
+            tail[28..32].copy_from_slice(&2_u32.to_le_bytes());
+            bus.send(&tail);
+            let error = next_requested(&mut stream, &mut bus).unwrap_err();
+            assert_eq!(crate::types::classify(&error).kind, ErrorKind::Unsupported);
+            let frame = next_requested(&mut stream, &mut bus).unwrap();
+            assert_eq!(frame.id, 2);
+            assert_eq!(frame.data.as_ref(), raw);
+        }
     }
 }

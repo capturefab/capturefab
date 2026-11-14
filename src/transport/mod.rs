@@ -1,4 +1,10 @@
+pub(crate) mod chunks;
+pub(crate) mod gendc;
+#[cfg(feature = "gentl")]
+pub(crate) mod gentl;
+pub(crate) mod gentl_selector;
 pub(crate) mod gige;
+pub(crate) mod multipart;
 pub(crate) mod simulator;
 #[cfg(feature = "usb")]
 pub(crate) mod usb;

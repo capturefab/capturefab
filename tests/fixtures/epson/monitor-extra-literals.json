@@ -1,0 +1,46 @@
+{
+  "schema": 1,
+  "provenance": "independent spec-derived hand literals after owner confirmed actual primary grammar, before fixture/parser execution; no controller capture; login password is public synthetic test input",
+  "literals": {
+    "login_request": {
+      "hex": "244c6f67696e2c666978747572652d706173732d37330d0a",
+      "bytes": 24,
+      "sha256": "3cb2b9fac826ca17ef12e0ac2cb6b41d0a7778cdca9d045d07114cb1de10777e"
+    },
+    "login_reply": {
+      "hex": "234c6f67696e2c300d0a",
+      "bytes": 10,
+      "sha256": "194827e8d29ef0fa931f920b86b18e0c3ee24b110f6da4353fd4684012c9dfca"
+    },
+    "variable_scalar_request": {
+      "hex": "244765745661726961626c652c677363616c652c446f75626c650d0a",
+      "bytes": 28,
+      "sha256": "818288b5b807634aca5460c86520eb78e6f32ea5bcd00400754005199a82505e"
+    },
+    "variable_scalar_reply": {
+      "hex": "234765745661726961626c652c20312e323530300d0a",
+      "bytes": 22,
+      "sha256": "d2cd8f28decdc285da7dfeea4898bea8ec02dfdb99d9529221f9d476f33168fe"
+    },
+    "variable_array_reply": {
+      "hex": "234765745661726961626c652c3030312c2d30322c2b330d0a",
+      "bytes": 25,
+      "sha256": "f274f354ab042e8bfc5325059b098284fbb40a6358aeb1caaa21cd755a48e60e"
+    },
+    "current_robot_request": {
+      "hex": "24476574437572526f626f740d0a",
+      "bytes": 14,
+      "sha256": "ebbb17fb340347eb6b19258b6fa7d4f943b0bde455efea7bf7415f8d662d098a"
+    },
+    "current_robot_reply": {
+      "hex": "23476574437572526f626f742c303030320d0a",
+      "bytes": 19,
+      "sha256": "a3b7f25d9c5a995b025512a9a8b04ada470a45e62571e0b7c4775e9f47d98721"
+    },
+    "status_10_reply": {
+      "hex": "234765745374617475732c303031303030303030312c303034320d0a",
+      "bytes": 28,
+      "sha256": "ca6ff041f1e38357e0d462900b8decb4f3ca71222fcc1916d0b30b31d079c226"
+    }
+  }
+}

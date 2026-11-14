@@ -14,7 +14,7 @@ use std::{
     io::{BufRead, BufReader, Read as _, Write as _},
     process::{Child, ChildStdin, Command, ExitStatus, Stdio},
     sync::{
-        Arc, Condvar, Mutex, PoisonError,
+        Arc, Condvar, Mutex, PoisonError, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
@@ -33,7 +33,7 @@ const SHUTDOWN: Duration = Duration::from_secs(15);
 /// What a worker tells its coordinator besides replies.
 pub(super) enum Signal {
     /// Saved files, job progress and ends, and log lines.
-    Output(Output),
+    Output(Box<Output>),
     /// The process is gone and reaped, with what that means for requests.
     Exited(anyhow::Error),
 }
@@ -55,6 +55,8 @@ enum Waiter {
         started: Option<(Instant, Duration)>,
         /// It writes camera settings.
         changes: bool,
+        /// Independent observation survives a lost/local-expired reply wait.
+        forward: Option<Weak<super::ForwardObservation>>,
     },
     Ping,
 }
@@ -65,6 +67,8 @@ pub(super) struct Shared {
     child: Mutex<Child>,
     input: Mutex<Option<ChildStdin>>,
     calls: Mutex<BTreeMap<u64, Waiter>>,
+    /// Weak, local receipts outlive public ended-job history pruning.
+    forwards: Mutex<BTreeMap<u64, Weak<super::ForwardObservation>>>,
     next_id: AtomicU64,
     /// When it last wrote a line, or was given work while idle.
     heard: Mutex<Instant>,
@@ -78,6 +82,8 @@ pub(super) struct Shared {
     /// It ended in the middle of a settings change.
     interrupted_change: AtomicBool,
     exit: Mutex<Option<Value>>,
+    /// First terminal binding cause, retained even before Held attachment.
+    retired: Mutex<Option<Value>>,
     exited: Condvar,
     tail: Mutex<VecDeque<String>>,
     /// Its stderr reached its end, so the tail holds its last words.
@@ -169,6 +175,7 @@ impl Worker {
             child: Mutex::new(child),
             input: Mutex::new(Some(input)),
             calls: Mutex::default(),
+            forwards: Mutex::default(),
             next_id: AtomicU64::new(1),
             heard: Mutex::new(Instant::now()),
             watched: AtomicBool::new(false),
@@ -177,6 +184,7 @@ impl Worker {
             closing: AtomicBool::new(false),
             interrupted_change: AtomicBool::new(false),
             exit: Mutex::new(None),
+            retired: Mutex::default(),
             exited: Condvar::new(),
             tail: Mutex::default(),
             errors_ended: AtomicBool::new(false),
@@ -230,6 +238,35 @@ impl Worker {
         &self,
         command: WorkerCommand,
     ) -> Result<(u64, mpsc::Receiver<Result<Value>>)> {
+        self.submit_with_forward(command, None)
+    }
+    pub(super) fn observe_forward(
+        &self,
+        number: u64,
+        observation: Weak<super::ForwardObservation>,
+    ) -> Result<()> {
+        let mut forwards = locked(&self.0.forwards);
+        forwards.retain(|_, receipt| receipt.strong_count() > 0);
+        anyhow::ensure!(
+            forwards.len() < 64 && !forwards.contains_key(&number),
+            crate::types::Usage("camera worker already has 64 observed video jobs".into())
+        );
+        forwards.insert(number, observation);
+        Ok(())
+    }
+
+    pub(super) fn submit_forward(
+        &self,
+        command: WorkerCommand,
+        forward: Weak<super::ForwardObservation>,
+    ) -> Result<(u64, mpsc::Receiver<Result<Value>>)> {
+        self.submit_with_forward(command, Some(forward))
+    }
+    fn submit_with_forward(
+        &self,
+        command: WorkerCommand,
+        forward: Option<Weak<super::ForwardObservation>>,
+    ) -> Result<(u64, mpsc::Receiver<Result<Value>>)> {
         if let Some(error) = self.exit_error() {
             return Err(error);
         }
@@ -241,6 +278,7 @@ impl Worker {
                 sender,
                 started: None,
                 changes: command.changes_settings(),
+                forward,
             },
         );
         if let Err(error) = self.0.send(&Input::Run { id, command }) {
@@ -295,6 +333,7 @@ impl Worker {
                 sender,
                 started: None,
                 changes: false,
+                forward: None,
             },
         );
         let result = self.0.send(&Input::Status { id }).and_then(|()| {
@@ -402,7 +441,33 @@ impl Drop for Worker {
     }
 }
 
+/// A closed command pipe can precede the stdout reader's recorded process exit.
+/// Keep this classification local to actual worker-stdin I/O, preserving the
+/// original diagnostic and OS code without claiming an observed exit status.
+fn stdin_error(error: std::io::Error) -> anyhow::Error {
+    if error.kind() != std::io::ErrorKind::BrokenPipe {
+        return error.into();
+    }
+    Categorized::new(
+        ErrorKind::WorkerCrashed,
+        format!("camera worker input pipe closed: {error}"),
+    )
+    .details(json!({
+        "worker_ipc":"stdin_closed", "io_error_kind":"broken_pipe",
+        "io_error_raw":error.raw_os_error()
+    }))
+    .into()
+}
+
 impl Shared {
+    pub(super) fn retirement(&self) -> Option<Value> {
+        locked(&self.retired).clone()
+    }
+    fn remember_retirement(&self, error: &Value) {
+        if crate::engine::retirement::wire_is_retired(error) {
+            locked(&self.retired).get_or_insert_with(|| error.clone());
+        }
+    }
     /// Whether it ended in the middle of a settings change, which may have
     /// left the camera half-configured.
     pub(super) fn interrupted_change(&self) -> bool {
@@ -413,9 +478,14 @@ impl Shared {
         line.push(b'\n');
         let mut stdin = locked(&self.input);
         let stdin = stdin.as_mut().context("the camera worker is closing")?;
-        stdin.write_all(&line)?;
-        stdin.flush()?;
-        Ok(())
+        stdin
+            .write_all(&line)
+            .and_then(|()| stdin.flush())
+            .map_err(|error| {
+                locked(&self.exit)
+                    .as_ref()
+                    .map_or_else(|| stdin_error(error), protocol::from_wire)
+            })
     }
     /// The longest a busy worker may stay silent: the budget of the request
     /// its camera thread runs, and at least `HANG`.
@@ -450,6 +520,21 @@ impl Shared {
             let _ = child.kill();
         }
     }
+    pub(super) fn observe_forward_output(&self, output: &Output) {
+        let number = match output {
+            Output::IndexOwned { job, .. } | Output::JobEnd { job, .. } => *job,
+            _ => return,
+        };
+        let receipt = {
+            let mut forwards = locked(&self.forwards);
+            forwards.retain(|_, receipt| receipt.strong_count() > 0);
+            forwards.get(&number).and_then(Weak::upgrade)
+        };
+        if let Some(receipt) = receipt {
+            receipt.event(self, output);
+        }
+    }
+
     /// Read the worker's lines until it closes its end: hello first, then
     /// replies and events.
     fn read(
@@ -514,9 +599,18 @@ impl Shared {
                     result,
                     error,
                 } => {
+                    if !ok && let Some(error) = &error {
+                        self.remember_retirement(error);
+                    }
                     let waiter = locked(&self.calls).remove(&id);
                     match waiter {
-                        Some(Waiter::Reply { sender, .. }) => {
+                        Some(Waiter::Reply {
+                            sender, forward, ..
+                        }) => {
+                            if let Some(observation) = forward.and_then(|forward| forward.upgrade())
+                            {
+                                observation.reply(ok);
+                            }
                             let _ = sender.send(if ok {
                                 Ok(result.unwrap_or_default())
                             } else {
@@ -536,7 +630,16 @@ impl Shared {
                         None => {}
                     }
                 }
-                output => sink(&self, Signal::Output(output)),
+                Output::Retired { error } => {
+                    // Capture before the callback: Connect may not yet have
+                    // installed/labeled its Held, and the worker may exit next.
+                    self.remember_retirement(&error);
+                    sink(&self, Signal::Output(Box::new(Output::Retired { error })));
+                }
+                output => {
+                    self.observe_forward_output(&output);
+                    sink(&self, Signal::Output(Box::new(output)));
+                }
             }
         }
         if let Some(said) = hello.take() {
@@ -872,6 +975,92 @@ mod tree {
 mod tests {
     use super::*;
 
+    #[test]
+    fn only_closed_worker_stdin_io_gets_a_crash_category() {
+        let error = stdin_error(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "original closed-pipe diagnostic",
+        ));
+        assert!(error.chain().next().unwrap().is::<Categorized>());
+        assert!(
+            error
+                .to_string()
+                .contains("original closed-pipe diagnostic")
+        );
+        let classified = crate::types::classify(&error);
+        assert_eq!(classified.kind, ErrorKind::WorkerCrashed);
+        let details = classified.details.unwrap();
+        assert_eq!(details["worker_ipc"], "stdin_closed");
+        assert_eq!(details["io_error_kind"], "broken_pipe");
+        assert!(details.get("exit").is_none());
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::Other,
+        ] {
+            let error = stdin_error(std::io::Error::new(kind, "unchanged stdin diagnostic"));
+            assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), kind);
+            assert!(error.chain().all(|cause| !cause.is::<Categorized>()));
+            assert_eq!(error.to_string(), "unchanged stdin diagnostic");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closed_stdin_before_hello_is_typed_without_waiting_for_process_exit() {
+        use std::os::unix::process::CommandExt as _;
+
+        let hello = serde_json::to_string(&Line {
+            seq: 0,
+            output: Output::Hello {
+                protocol: PROTOCOL,
+                build: "closed-input-test".into(),
+            },
+        })
+        .unwrap();
+        // Closing stdin before hello causally proves there is no pipe reader,
+        // while stdout stays open in a live child: exit publication cannot race
+        // this stimulus or supply its classification.
+        let child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "exec 0<&-; printf '%s\\n' \"$1\"; exec sleep 30",
+                "worker",
+                &hello,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let worker = Worker::attach(child, Arc::new(|_, _| {})).unwrap();
+        let unpublished = worker.exit_error().is_none();
+        let submitted = worker.submit(WorkerCommand::CheckConnection);
+        let after_submit = locked(&worker.0.calls).len();
+        let status = worker.status(Duration::from_millis(50));
+        let after_status = locked(&worker.0.calls).len();
+        let still_unpublished = worker.exit_error().is_none();
+        worker.kill();
+        let reaped = worker.wait_exit(Instant::now() + Duration::from_secs(2));
+        let recorded = worker.exit_error();
+        let after_exit = worker.0.send(&Input::Status { id: 999 });
+        assert!(reaped);
+        assert!(unpublished && still_unpublished);
+        assert_eq!(after_submit, 0);
+        assert_eq!(after_status, 0);
+        for error in [submitted.unwrap_err(), status.unwrap_err()] {
+            let classified = crate::types::classify(&error);
+            assert_eq!(classified.kind, ErrorKind::WorkerCrashed);
+            assert_eq!(classified.details.unwrap()["io_error_raw"], libc::EPIPE);
+        }
+        let recorded = crate::types::classify(&recorded.unwrap());
+        let returned = crate::types::classify(&after_exit.unwrap_err());
+        assert_eq!(returned.kind, recorded.kind);
+        assert_eq!(returned.hint, recorded.hint);
+        assert_eq!(returned.details, recorded.details);
+    }
+
     #[cfg(unix)]
     #[test]
     fn failed_status_requests_remove_their_waiters() {
@@ -941,6 +1130,46 @@ mod tests {
         assert_eq!(pending, 0);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn old_and_future_worker_protocols_are_rejected_before_commands() {
+        use std::os::unix::process::CommandExt as _;
+        assert_eq!(PROTOCOL, 10);
+        for version in [9, 11] {
+            let hello = serde_json::to_string(&Line {
+                seq: 0,
+                output: Output::Hello {
+                    protocol: version,
+                    build: "other-worker".into(),
+                },
+            })
+            .unwrap();
+            let child = Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "printf '%s\\n' \"$1\"; exec sleep 30",
+                    "worker",
+                    &hello,
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .process_group(0)
+                .spawn()
+                .unwrap();
+            let error = match Worker::attach(child, Arc::new(|_, _| {})) {
+                Err(error) => error,
+                Ok(worker) => {
+                    worker.kill();
+                    panic!("accepted worker protocol {version}");
+                }
+            };
+            assert!(
+                format!("{error:#}").contains(&format!("speaks protocol {version}, not 10")),
+                "{error:#}"
+            );
+        }
+    }
     #[test]
     fn workers_start_in_the_hidden_worker_mode() {
         let options = Options {

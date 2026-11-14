@@ -1,0 +1,378 @@
+{
+  "version": 1,
+  "freeze": "independent pre-native thermocouple constructor/setter/constants/manual F64 oracle; no product code imported or executed",
+  "extends_immutable_abi_sha256": "1bbc016312c3aab6093483cfa3aeee442e6bc3aaeb74eaa8113641a090329b6b",
+  "profile": "owned_continuous_internal_clock_ai_thermocouple",
+  "abi": {
+    "returns": "i32",
+    "linux": "C ABI",
+    "windows": "fixed extern system / NI __CFUNC",
+    "TaskHandle": "pointer-sized opaque handle",
+    "exports": [
+      {
+        "name": "DAQmxCreateAIThrmcplChan",
+        "arguments": [
+          "TaskHandle",
+          "const char* physical",
+          "const char* virtual_name",
+          "f64 min",
+          "f64 max",
+          "i32 units",
+          "i32 thermocouple_type",
+          "i32 cjc_source",
+          "f64 cjc_value",
+          "const char* cjc_channel"
+        ]
+      },
+      {
+        "name": "DAQmxSetAITermCfg",
+        "arguments": [
+          "TaskHandle",
+          "const char* channel",
+          "i32 data"
+        ],
+        "selection": "only an explicit nondefault TC terminal request"
+      }
+    ],
+    "common_exports": [
+      "DAQmxCreateTask",
+      "DAQmxCfgSampClkTiming",
+      "DAQmxCfgInputBuffer",
+      "DAQmxSetReadOverWrite",
+      "DAQmxGetTaskNumChans",
+      "DAQmxGetNthTaskReadChannel",
+      "DAQmxStartTask",
+      "DAQmxGetSampClkRate",
+      "DAQmxGetReadAvailSampPerChan",
+      "DAQmxReadAnalogF64",
+      "DAQmxStopTask",
+      "DAQmxClearTask",
+      "DAQmxGetErrorString",
+      "DAQmxGetExtendedErrorInfo"
+    ],
+    "selection": "resolve common and selected constructor and any needed setter before CreateTask; unused measurement constructor/setter is not required"
+  },
+  "constants": {
+    "temperature_units": {
+      "deg_c": 10143,
+      "deg_f": 10144,
+      "kelvin": 10325,
+      "deg_r": 10145
+    },
+    "thermocouple_types": {
+      "j": 10072,
+      "k": 10073,
+      "n": 10077,
+      "r": 10082,
+      "s": 10085,
+      "t": 10086,
+      "b": 10047,
+      "e": 10055,
+      "a": 16208,
+      "c": 16209
+    },
+    "cjc_sources": {
+      "built_in": 10200,
+      "constant": 10116,
+      "external_channel_not_in_profile": 10113
+    },
+    "explicit_terminal_setter": {
+      "rse": 10083,
+      "nrse": 10078,
+      "differential": 10106,
+      "pseudodifferential": 12529
+    },
+    "terminal_omitted_or_default": "no setter; physical default unqueried; -1 is not passed to setter"
+  },
+  "two_channel_arguments": [
+    {
+      "physical_suffix": "ai0",
+      "thermocouple_type": "k",
+      "thermocouple_code": 10073,
+      "units": "deg_c",
+      "units_code": 10143,
+      "min_temperature": -50.0,
+      "min_bits_hex": "c049000000000000",
+      "max_temperature": 500.0,
+      "max_bits_hex": "407f400000000000",
+      "cjc": {
+        "source": "built_in",
+        "code": 10200,
+        "abi_dummy_bits_hex": "0000000000000000"
+      },
+      "virtual_name": "",
+      "cjc_channel": "",
+      "terminal_request": "omitted_no_setter"
+    },
+    {
+      "physical_suffix": "ai1",
+      "thermocouple_type": "t",
+      "thermocouple_code": 10086,
+      "units": "deg_f",
+      "units_code": 10144,
+      "min_temperature": -50.0,
+      "min_bits_hex": "c049000000000000",
+      "max_temperature": 300.0,
+      "max_bits_hex": "4072c00000000000",
+      "cjc": {
+        "source": "constant",
+        "code": 10116,
+        "value": 77.0,
+        "bits_hex": "4053400000000000",
+        "basis": "channel_measurement_units"
+      },
+      "virtual_name": "",
+      "cjc_channel": "",
+      "terminal_request": "omitted_no_setter"
+    }
+  ],
+  "explicit_terminal_case": {
+    "physical_suffix": "ai1",
+    "terminal_config": "differential",
+    "code": 10106,
+    "call_order": "immediately after this channel constructor, before timing; no setter on ai0"
+  },
+  "all_types_unit_cycle_arguments": [
+    {
+      "physical_suffix": "ai0",
+      "thermocouple_type": "j",
+      "thermocouple_code": 10072,
+      "units": "deg_c",
+      "units_code": 10143,
+      "min_temperature": -50.0,
+      "max_temperature": 500.0,
+      "cjc_source_code": 10200,
+      "cjc_value_bits_hex": "0000000000000000"
+    },
+    {
+      "physical_suffix": "ai1",
+      "thermocouple_type": "k",
+      "thermocouple_code": 10073,
+      "units": "deg_f",
+      "units_code": 10144,
+      "min_temperature": -50.0,
+      "max_temperature": 500.0,
+      "cjc_source_code": 10200,
+      "cjc_value_bits_hex": "0000000000000000"
+    },
+    {
+      "physical_suffix": "ai2",
+      "thermocouple_type": "n",
+      "thermocouple_code": 10077,
+      "units": "kelvin",
+      "units_code": 10325,
+      "min_temperature": -50.0,
+      "max_temperature": 500.0,
+      "cjc_source_code": 10200,
+      "cjc_value_bits_hex": "0000000000000000"
+    },
+    {
+      "physical_suffix": "ai3",
+      "thermocouple_type": "r",
+      "thermocouple_code": 10082,
+      "units": "deg_r",
+      "units_code": 10145,
+      "min_temperature": -50.0,
+      "max_temperature": 500.0,
+      "cjc_source_code": 10200,
+      "cjc_value_bits_hex": "0000000000000000"
+    },
+    {
+      "physical_suffix": "ai4",
+      "thermocouple_type": "s",
+      "thermocouple_code": 10085,
+      "units": "deg_c",
+      "units_code": 10143,
+      "min_temperature": -50.0,
+      "max_temperature": 500.0,
+      "cjc_source_code": 10200,
+      "cjc_value_bits_hex": "0000000000000000"
+    },
+    {
+      "physical_suffix": "ai5",
+      "thermocouple_type": "t",
+      "thermocouple_code": 10086,
+      "units": "deg_f",
+      "units_code": 10144,
+      "min_temperature": -50.0,
+      "max_temperature": 500.0,
+      "cjc_source_code": 10200,
+      "cjc_value_bits_hex": "0000000000000000"
+    },
+    {
+      "physical_suffix": "ai6",
+      "thermocouple_type": "b",
+      "thermocouple_code": 10047,
+      "units": "kelvin",
+      "units_code": 10325,
+      "min_temperature": -50.0,
+      "max_temperature": 500.0,
+      "cjc_source_code": 10200,
+      "cjc_value_bits_hex": "0000000000000000"
+    },
+    {
+      "physical_suffix": "ai7",
+      "thermocouple_type": "e",
+      "thermocouple_code": 10055,
+      "units": "deg_r",
+      "units_code": 10145,
+      "min_temperature": -50.0,
+      "max_temperature": 500.0,
+      "cjc_source_code": 10200,
+      "cjc_value_bits_hex": "0000000000000000"
+    },
+    {
+      "physical_suffix": "ai8",
+      "thermocouple_type": "a",
+      "thermocouple_code": 16208,
+      "units": "deg_c",
+      "units_code": 10143,
+      "min_temperature": -50.0,
+      "max_temperature": 500.0,
+      "cjc_source_code": 10200,
+      "cjc_value_bits_hex": "0000000000000000"
+    },
+    {
+      "physical_suffix": "ai9",
+      "thermocouple_type": "c",
+      "thermocouple_code": 16209,
+      "units": "deg_f",
+      "units_code": 10144,
+      "min_temperature": -50.0,
+      "max_temperature": 500.0,
+      "cjc_source_code": 10200,
+      "cjc_value_bits_hex": "0000000000000000"
+    }
+  ],
+  "manual_sample_patterns": [
+    {
+      "name": "twenty_five_channel_c",
+      "bits_hex": "4039000000000000",
+      "ieee754_le_hex": "0000000000003940",
+      "classification": "normal",
+      "sign_bit": false,
+      "finite_decimal": "25.0"
+    },
+    {
+      "name": "twenty_five_channel_f",
+      "bits_hex": "4039000000000000",
+      "ieee754_le_hex": "0000000000003940",
+      "classification": "normal",
+      "sign_bit": false,
+      "finite_decimal": "25.0"
+    },
+    {
+      "name": "negative_zero",
+      "bits_hex": "8000000000000000",
+      "ieee754_le_hex": "0000000000000080",
+      "classification": "zero",
+      "sign_bit": true,
+      "finite_decimal": "-0.0"
+    },
+    {
+      "name": "quiet_nan_payload_a5",
+      "bits_hex": "7ff80000000000a5",
+      "ieee754_le_hex": "a50000000000f87f",
+      "classification": "nan",
+      "sign_bit": false
+    },
+    {
+      "name": "positive_infinity",
+      "bits_hex": "7ff0000000000000",
+      "ieee754_le_hex": "000000000000f07f",
+      "classification": "infinity",
+      "sign_bit": false
+    },
+    {
+      "name": "negative_infinity",
+      "bits_hex": "fff0000000000000",
+      "ieee754_le_hex": "000000000000f0ff",
+      "classification": "infinity",
+      "sign_bit": true
+    },
+    {
+      "name": "minimum_positive_subnormal",
+      "bits_hex": "0000000000000001",
+      "ieee754_le_hex": "0100000000000000",
+      "classification": "subnormal",
+      "sign_bit": false,
+      "finite_decimal": "4.9406564584124654e-324"
+    },
+    {
+      "name": "maximum_finite",
+      "bits_hex": "7fefffffffffffff",
+      "ieee754_le_hex": "ffffffffffffef7f",
+      "classification": "normal",
+      "sign_bit": false,
+      "finite_decimal": "1.7976931348623157e308"
+    },
+    {
+      "name": "positive_zero",
+      "bits_hex": "0000000000000000",
+      "ieee754_le_hex": "0000000000000000",
+      "classification": "zero",
+      "sign_bit": false,
+      "finite_decimal": "0.0"
+    },
+    {
+      "name": "minimum_positive_normal",
+      "bits_hex": "0010000000000000",
+      "ieee754_le_hex": "0000000000001000",
+      "classification": "normal",
+      "sign_bit": false,
+      "finite_decimal": "2.2250738585072014e-308"
+    },
+    {
+      "name": "minimum_negative_subnormal",
+      "bits_hex": "8000000000000001",
+      "ieee754_le_hex": "0100000000000080",
+      "classification": "subnormal",
+      "sign_bit": true,
+      "finite_decimal": "-4.9406564584124654e-324"
+    },
+    {
+      "name": "negative_quiet_nan_payload_45",
+      "bits_hex": "fff8000000000045",
+      "ieee754_le_hex": "450000000000f8ff",
+      "classification": "nan",
+      "sign_bit": true
+    }
+  ],
+  "two_channel_six_scan_sequence": {
+    "shape": [
+      6,
+      2
+    ],
+    "layout": "scan_major",
+    "all_words_le_hex": "000000000000394000000000000039400000000000000080a50000000000f87f000000000000f07f000000000000f0ff0100000000000000ffffffffffffef7f000000000000000000000000000010000100000000000080450000000000f8ff",
+    "no_conversion": "identical 25.0 bits in deg_c and deg_f remain numeric25.0 in each channel; never reinterpret as volts"
+  },
+  "partial_two_channel_one_scan": {
+    "requested_per_channel": 3,
+    "actual_per_channel": 1,
+    "capacity_f64": 6,
+    "status": -200284,
+    "valid_words_le_hex": "00000000000039400000000000003940"
+  },
+  "semantics": {
+    "ranges": "configured min/max in each channel measurement units",
+    "constant_cjc": "configured value in that channel measurement units; no Celsius conversion",
+    "built_in_cjc": "unused ABI +0 dummy is not measured/configured CJC temperature; omit unused value/channel metadata",
+    "external_cjc": "unsupported by this finite profile",
+    "presentation": "driver-scaled finite temperature only; raw F64 retained for every finite/nonfinite/signed-zero value; no volts field",
+    "clock": "actual host native read completion; no physical sampling/CJC/synchronization inference",
+    "private_protocol": 2
+  },
+  "primary": {
+    "ni_python_commit": "1d60b6c53ef11dead0ba6aa9d6e2855351835ad7",
+    "constants_py_sha256": "9d15eb38ccb03769f9e5ad94289a00658ee36b6685709e4f3d49dafb25b4ae57",
+    "constructor_payload_sha256": "e919e6eacdc9aaebf3f8de70fccde914d7122fadb808544dc7cb42ab0e229758",
+    "setter_payload_sha256": "7488f7dc53c794f0179598b14625d370f002043860b85c44afa155e86da7f4ba",
+    "units_payload_sha256": "b9587aac42c5effbee76fc1715473cf1618d480bb73349c7b1ac1203dfdbdba9",
+    "cjc_value_payload_sha256": "521cb99ccc74ca270bd100647970d7fb6843446df12030de9dfeac8b91e89123",
+    "terminal_property_payload_sha256": "72b1eb178fe5219b346c94d2e5852e9c17891a4b8e4434b7ee148fddcc09e51c",
+    "reference_version_from_retained_proof": "26.8.0d20",
+    "verification": "official NI pages and pinned NI-owned constants independently fetched into bounded RAM before this freeze; no SDK files retained"
+  },
+  "qualification": "Independent synthetic fixed-ABI/raw-value oracle only; no installed NI driver, NI-9213 chassis/OS support, physical thermocouple accuracy, continuity, calibration or timing qualification."
+}

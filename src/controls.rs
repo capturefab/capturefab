@@ -322,6 +322,9 @@ pub(crate) fn with_bank<T>(
     bank: &[(String, String)],
     action: impl FnOnce(&mut Camera) -> Result<T>,
 ) -> Result<T> {
+    if camera.is_read_only_monitor() && !bank.is_empty() {
+        return Err(crate::camera::monitor_error());
+    }
     let mut originals = Vec::new();
     let result = (|| {
         for (selector, value) in bank {
@@ -334,17 +337,22 @@ pub(crate) fn with_bank<T>(
         action(camera)
     })();
     let mut restoration = Vec::new();
+    let mut first_restoration = None;
     for (selector, original) in originals.into_iter().rev() {
         if let Err(error) = camera.set(&selector, &text(&original)) {
             restoration.push(format!("{selector}: {error:#}"));
+            first_restoration.get_or_insert(error);
         }
     }
-    anyhow::ensure!(
-        restoration.is_empty(),
-        "could not restore selectors: {}",
-        restoration.join("; ")
-    );
-    result
+    let Some(restoration_error) = first_restoration else {
+        return result;
+    };
+    let context = format!("could not restore selectors: {}", restoration.join("; "));
+    match result {
+        // Cleanup must not replace the original action's typed cause.
+        Err(error) => Err(error.context(context)),
+        Ok(_) => Err(restoration_error.context(context)),
+    }
 }
 
 /// A JSON value as the text a feature write takes.
@@ -1909,6 +1917,10 @@ pub(crate) struct ControlInfo {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct Info {
     pub camera: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub camera_access: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acquisition_control: Option<&'static str>,
     pub kind: &'static str,
     pub vendor: String,
     pub model: String,
@@ -1949,6 +1961,14 @@ pub(crate) struct Info {
 impl Info {
     pub(crate) const FIELDS: &[(&str, &str)] = &[
         ("camera", "string — camera ID"),
+        (
+            "camera_access",
+            "read_only_monitor — explicit GigE monitor connection",
+        ),
+        (
+            "acquisition_control",
+            "external — acquisition belongs to the controlling application",
+        ),
         ("kind", "gige|u3v|webcam|screen|onvif|stream|file|sim"),
         ("vendor", "string"),
         ("model", "string"),
@@ -2119,6 +2139,8 @@ pub(crate) fn info(camera: &mut Camera) -> Info {
     let info = camera.info.clone();
     Info {
         camera: crate::media::redact_url(&info.id),
+        camera_access: camera.is_read_only_monitor().then_some("read_only_monitor"),
+        acquisition_control: camera.is_read_only_monitor().then_some("external"),
         kind: crate::camera::kind(&info),
         vendor: info.vendor,
         model: info.model,
@@ -2248,6 +2270,9 @@ pub(crate) struct FeatureRow {
     #[serde(rename = "type")]
     pub kind: &'static str,
     pub access: &'static str,
+    /// Effective write permission for an explicit monitor; access retains the XML declaration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub writable: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2281,7 +2306,7 @@ impl FeatureList {
         ("camera", "string — camera ID"),
         (
             "features",
-            "[{name,type:int|float|bool|enum|string|command,access:rw|ro|wo,value,unit,min,max,inc,choices,selectors,locked_by,category}] — Beginner features and common controls; every level with --all, a PATTERN or --category; locked_by when another setting locks it now",
+            "[{name,type:int|float|bool|enum|string|command|register,access:rw|ro|wo,writable?:false,value,unit,min,max,inc,choices,selectors,locked_by,category}] — access is the XML declaration; writable:false disables writes in monitor mode. Beginner features and common controls; every level with --all, a PATTERN or --category; locked_by when another setting locks it now",
         ),
         (
             "truncated",
@@ -2297,6 +2322,7 @@ fn normalized_type(kind: &str) -> &'static str {
         "Boolean" => "bool",
         "Enumeration" => "enum",
         "Command" => "command",
+        "Register" => "register",
         _ => "string",
     }
 }
@@ -2360,6 +2386,7 @@ pub(crate) fn features(camera: &mut Camera, filter: &FeatureFilter) -> Result<Fe
             name,
             kind,
             access,
+            writable: camera.is_read_only_monitor().then_some(false),
             value: info.value,
             unit: info.unit,
             min: info.min,
@@ -3296,6 +3323,113 @@ mod tests {
                 Info::FIELDS.iter().any(|(name, _)| name == key),
                 "{key} is undocumented"
             );
+        }
+    }
+    #[test]
+    fn bank_restoration_preserves_the_first_typed_action_or_cleanup_cause() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct Banked {
+            value: u32,
+            fail: Arc<AtomicBool>,
+            restore_kind: ErrorKind,
+        }
+        impl crate::types::RegisterIo for Banked {
+            fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
+                assert_eq!((address, length), (0, 4));
+                Ok(self.value.to_be_bytes().to_vec())
+            }
+            fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
+                assert_eq!((address, data.len()), (0, 4));
+                if self.fail.load(Ordering::Acquire) {
+                    return Err(
+                        Categorized::new(self.restore_kind, "selector restore rejected")
+                            .details(json!({"cause":"restoration"}))
+                            .into(),
+                    );
+                }
+                self.value = u32::from_be_bytes(data.try_into()?);
+                Ok(())
+            }
+        }
+        impl crate::types::Backend for Banked {
+            fn xml(&mut self) -> Result<String> {
+                Ok(concat!(
+                    "<RegisterDescription><Enumeration Name='Selector'><pValue>SelectorReg</pValue>",
+                    "<EnumEntry Name='A'><Value>0</Value></EnumEntry><EnumEntry Name='B'><Value>1</Value></EnumEntry>",
+                    "</Enumeration><IntReg Name='SelectorReg'><Address>0</Address><Length>4</Length>",
+                    "<AccessMode>RW</AccessMode><Endianess>BigEndian</Endianess></IntReg></RegisterDescription>"
+                ).into())
+            }
+            fn start(&mut self, _: usize) -> Result<()> {
+                anyhow::bail!("no acquisition")
+            }
+            fn next_frame(&mut self, _: Duration) -> Result<crate::types::Frame> {
+                anyhow::bail!("no acquisition")
+            }
+            fn stop(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+        for (primary, restore_kind, expected) in [
+            (
+                Some(ErrorKind::Disconnected),
+                ErrorKind::Timeout,
+                ErrorKind::Disconnected,
+            ),
+            (
+                Some(ErrorKind::Usage),
+                ErrorKind::Disconnected,
+                ErrorKind::Usage,
+            ),
+            (None, ErrorKind::Timeout, ErrorKind::Timeout),
+        ] {
+            let fail = Arc::new(AtomicBool::new(false));
+            let mut camera = Camera::from_backend(
+                crate::transport::simulator::info(),
+                Box::new(Banked {
+                    value: 0,
+                    fail: fail.clone(),
+                    restore_kind,
+                }),
+            )
+            .unwrap();
+            let error = with_bank(
+                &mut camera,
+                &[("Selector".into(), "B".into())],
+                |camera| -> Result<u32> {
+                    assert_eq!(camera.get("Selector").unwrap(), "B");
+                    fail.store(true, Ordering::Release);
+                    primary.map_or_else(|| Ok(7), |kind| Err(Categorized::new(kind, "primary action rejected")
+                            .details(json!({"cause":"primary", "controller_ownership": (kind == ErrorKind::Disconnected).then_some("retired")}))
+                            .into()))
+                },
+            )
+            .unwrap_err();
+            let classified = crate::types::classify(&error);
+            assert_eq!(classified.kind, expected);
+            if primary == Some(ErrorKind::Disconnected) {
+                assert!(crate::transport::gige::ownership_retired(&error));
+            }
+            assert_eq!(
+                classified.details.unwrap()["cause"],
+                if primary.is_some() {
+                    "primary"
+                } else {
+                    "restoration"
+                }
+            );
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("could not restore selectors")
+                    && message.contains("selector restore rejected"),
+                "{message}"
+            );
+            if primary.is_some() {
+                assert!(message.contains("primary action rejected"), "{message}");
+            }
         }
     }
 }

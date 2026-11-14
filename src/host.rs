@@ -360,6 +360,48 @@ mod platform {
     }
 }
 
+/// One host-wide clock shared across the coordinator and camera workers.
+/// Its epoch is arbitrary and never serialized as a UTC/device timestamp.
+pub(crate) fn monotonic_ns() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let mut value = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        // SAFETY: clock_gettime initializes this valid timespec on success.
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, value.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        // SAFETY: the successful call initialized the structure.
+        let value = unsafe { value.assume_init() };
+        u64::try_from(value.tv_sec)
+            .ok()?
+            .checked_mul(1_000_000_000)?
+            .checked_add(u64::try_from(value.tv_nsec).ok()?)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Performance::{
+            QueryPerformanceCounter, QueryPerformanceFrequency,
+        };
+        let mut counter = 0;
+        let mut frequency = 0;
+        // SAFETY: counter is a valid writable i64 for the complete call.
+        if unsafe { QueryPerformanceCounter(&raw mut counter) } == 0 {
+            return None;
+        }
+        // SAFETY: frequency is a valid writable i64 for the complete call.
+        if unsafe { QueryPerformanceFrequency(&raw mut frequency) } == 0 {
+            return None;
+        }
+        let ticks = u128::try_from(counter).ok()?;
+        let hz = u128::try_from(frequency).ok()?;
+        u64::try_from(ticks.checked_mul(1_000_000_000)?.checked_div(hz)?).ok()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

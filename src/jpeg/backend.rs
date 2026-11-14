@@ -932,6 +932,7 @@ pub(crate) fn deadline(frame: &Frame) -> Duration {
 )]
 pub(crate) fn color_at_default_quality(view: FrameRef<'_>, quality: i32) -> bool {
     quality == QUALITY
+        && view.frame.pixel_encoding.is_none()
         && crate::frame::convertible(view.pixel_format())
         && !crate::frame::monochrome(view.pixel_format())
 }
@@ -951,6 +952,7 @@ fn gradient(width: u32, height: u32) -> Frame {
         })
         .collect();
     Frame {
+        pixel_encoding: None,
         width,
         height,
         pixel_format: crate::types::RGB8,
@@ -1388,6 +1390,7 @@ mod tests {
             return frame;
         }
         let ramp = Frame {
+            pixel_encoding: None,
             pixel_format: crate::types::MONO8,
             data: (0..96 * 64)
                 .map(|i| u8::try_from((i % 96 + i / 96) * 255 / 160).unwrap())
@@ -1396,6 +1399,7 @@ mod tests {
         };
         match format {
             crate::types::MONO8 | 0x0108_0009 => Frame {
+                pixel_encoding: None,
                 pixel_format: format,
                 ..ramp
             },

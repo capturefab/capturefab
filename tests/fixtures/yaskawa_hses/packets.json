@@ -1,0 +1,98 @@
+{
+  "format_version": 1,
+  "plan_sha256": "5d6ec161720a0295a6a0fd8c1df130cece3245c3be53a68e739236ccae3f393f",
+  "qualification": "Independent packets frozen before reviewing any product decoder. Only status pair is original vendor sample; all others hand reconstructed from documented YRC1000 HW1483358rev12. R word stays raw; string storage never NUL-trimmed.",
+  "packets": {
+    "status_request": {
+      "origin": "unchanged_manufacturer_sample",
+      "description": "Official published status request",
+      "bytes": 32,
+      "sha256": "c83bc67d500cbff01f4c5b6bee33a9dddec1b89d90f8c5190d59fa4ceed4a7ee",
+      "hex": "5945524320000000030100000000000039393939393939397200010000010000"
+    },
+    "status_response": {
+      "origin": "unchanged_manufacturer_sample",
+      "description": "Official published status response",
+      "bytes": 40,
+      "sha256": "d2e65ada3c7662c843477cb19281d86b500be2f677ae38da9a871f2acc976577",
+      "hex": "59455243200008000301010000000080393939393939393981000000000000002200000000000000"
+    },
+    "status_unknown_response": {
+      "origin": "spec_derived_not_device_capture",
+      "description": "Derived status high/unknown-bit response",
+      "bytes": 40,
+      "sha256": "b686aac5ea1be56cdf4ab234ca7ca0495511e677e687c68adbde7394024cd073",
+      "hex": "59455243200008000301012a0000008039393939393939398100000000000000dd0000804e000080"
+    },
+    "base_position_request": {
+      "origin": "spec_derived_not_device_capture",
+      "description": "Derived base-position request",
+      "bytes": 32,
+      "sha256": "f01f4b77843e4da4790a56874a0538605dbb91d5d1b08faa56a48c02d160126e",
+      "hex": "59455243200000000301002b0000000039393939393939397500650000010000"
+    },
+    "base_position_response": {
+      "origin": "spec_derived_not_device_capture",
+      "description": "Derived base-position response",
+      "bytes": 84,
+      "sha256": "fe1349cae4314b0ddaab0aae8d37f6bd9a0c3e4b96d39746754387f1c8a61218",
+      "hex": "59455243200034000301012b000000803939393939393939810000000000000010000000341200000300000000000000a50000006079feff90d00300000000006044f2ffd0dd060040771b0007000000f8ffffff"
+    },
+    "byte7_request": {
+      "origin": "spec_derived_not_device_capture",
+      "description": "Derived B7 request",
+      "bytes": 32,
+      "sha256": "011be28a202351365a50a15da0a7d4666532674386ad13e6204426ba319e6460",
+      "hex": "59455243200000000301002c0000000039393939393939397a000700010e0000"
+    },
+    "byte7_response": {
+      "origin": "spec_derived_not_device_capture",
+      "description": "Derived B7 response",
+      "bytes": 33,
+      "sha256": "18dc6e2a672da6bfb31e3add38bb66a3ba9886dc73c2fa869df0ed1582bcfc94",
+      "hex": "59455243200001000301012c0000008039393939393939398e00000000000000a5"
+    },
+    "integer8_response": {
+      "origin": "spec_derived_not_device_capture",
+      "description": "Derived I8 response",
+      "bytes": 34,
+      "sha256": "291f88c3d5908ffd5c5e3730281d6aeb6900aa07d842cb09bcc8afcf4b4266ec",
+      "hex": "59455243200002000301012d0000008039393939393939398e00000000000000c7cf"
+    },
+    "double9_response": {
+      "origin": "spec_derived_not_device_capture",
+      "description": "Derived D9 response",
+      "bytes": 36,
+      "sha256": "b4d848f7a86460dae32eda107f694d68b2d76f47f77d88a5516bb9cf18e2872b",
+      "hex": "59455243200004000301012e0000008039393939393939398e00000000000000eb32a4f8"
+    },
+    "real10_raw_response": {
+      "origin": "spec_derived_not_device_capture",
+      "description": "Derived R10 raw response",
+      "bytes": 36,
+      "sha256": "89a3a440b1b340dbbf6a3cf6892a26751567189989352df5f61aa5bd88d068e9",
+      "hex": "59455243200004000301012f0000008039393939393939398e000000000000000000c03f"
+    },
+    "string32_request": {
+      "origin": "spec_derived_not_device_capture",
+      "description": "Derived S32 request",
+      "bytes": 32,
+      "sha256": "e18ae5f89da12bed30f9b49a6cb19920b578e3e5fc6ada0119673b2fde9e34af",
+      "hex": "5945524320000000030100300000000039393939393939398c000b00010e0000"
+    },
+    "string32_response": {
+      "origin": "spec_derived_not_device_capture",
+      "description": "Derived S32 response",
+      "bytes": 64,
+      "sha256": "0d87c0f5edd382cc45c9d18b3e48c49242639369a9e5209aefd1361b49a715f5",
+      "hex": "5945524320002000030101300000008039393939393939398e00000000000000414200434445464748494a4b4c4d4e4f7172737475767778797a313233343536"
+    },
+    "attribute_error_response": {
+      "origin": "spec_derived_not_device_capture",
+      "description": "Derived remote attribute-error response",
+      "bytes": 32,
+      "sha256": "a9b5f63ae9839e95e99aef7797acda4fc0bacbfdc959dd20b357259dc0cb7954",
+      "hex": "5945524320000000030101310000008039393939393939398e1f010002a00000"
+    }
+  }
+}

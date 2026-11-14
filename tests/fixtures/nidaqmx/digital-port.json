@@ -1,0 +1,411 @@
+{
+ "version": 1,
+ "freeze": "Independent additive scientific/ABI oracle, written before any digital/counter native implementation is authored or read. Literal words and asymmetric arguments are hand-declared; no product encoder/decoder, SDK, compiler, native call or runtime.",
+ "immutable_prior_oracles_sha256": {
+  "abi.json": "1bbc016312c3aab6093483cfa3aeee442e6bc3aaeb74eaa8113641a090329b6b",
+  "current.json": "14f428f82a6cf94704ac47ff2b42d18bf71553435437ae4f0345bf4260779bff",
+  "mixed-ai.json": "d4a74d1e2310b8f16648e296ab95ebffe175559fbe326655ac98dae6d31a9d78",
+  "on-demand.json": "b87122de19d2bdb77f16c0511d1759925b84697ad59e97375197d1b54e81fe89",
+  "rtd.json": "5f83a52d2ce10c71d6e1f7498bb6bd020828365a734fbe235cb7bbcadd2cb6a5",
+  "thermocouple.json": "2a8109877c63aa7448965c0d0ac9ec060355d8dde41e98496b4ff8050ac65cb1",
+  "voltage-scale-null.json": "5764fe41ecab45d8b5795d15dc82f723c566d5ba0af565048224337ed321ba63"
+ },
+ "abi_policy": {
+  "TaskHandle": "pointer-sized opaque owned handle",
+  "return_status": "signed i32; zero success, positive warning, negative failure",
+  "bool32": "u32, including pointer target for reserved",
+  "calling_convention": "fixed NI __CFUNC: C on Linux, system on Windows; no variadic attribute calls",
+  "all_exports_before_create": true
+ },
+ "common_exports": [
+  "DAQmxCreateTask",
+  "DAQmxGetTaskNumChans",
+  "DAQmxGetNthTaskReadChannel",
+  "DAQmxStartTask",
+  "DAQmxStopTask",
+  "DAQmxClearTask",
+  "DAQmxGetErrorString",
+  "DAQmxGetExtendedErrorInfo"
+ ],
+ "excluded_analog_or_clock_exports": [
+  "DAQmxReadAnalogF64",
+  "DAQmxCreateAIVoltageChan",
+  "DAQmxCreateAIThrmcplChan",
+  "DAQmxCreateAICurrentChan",
+  "DAQmxCreateAIRTDChan",
+  "DAQmxSetAITermCfg",
+  "DAQmxCfgSampClkTiming",
+  "DAQmxCfgInputBuffer",
+  "DAQmxSetReadOverWrite",
+  "DAQmxGetReadAvailSampPerChan",
+  "DAQmxGetSampClkRate",
+  "DAQmxSetSampTimingType",
+  "DAQmxGetSampTimingType"
+ ],
+ "positive_timeout_word": {
+  "name": "positive_read_timeout_control",
+  "exact_rational_seconds": "1/8",
+  "decimal_seconds": "0.125",
+  "bits_hex": "3fc0000000000000",
+  "ieee754_le_hex": "000000000000c03f",
+  "rule": "An exactly representable independent positive timeout control. Actual Read receives positive original remaining duration, never this constant as a renewed budget."
+ },
+ "one_scan_status_geometry_controls": [
+  {
+   "status": 0,
+   "actual_per_channel": 0,
+   "result": "Incomplete; no data block"
+  },
+  {
+   "status": 12345,
+   "actual_per_channel": 0,
+   "result": "Incomplete; preserve raw warning and geometry; no data block"
+  },
+  {
+   "status": -200284,
+   "actual_per_channel": 0,
+   "result": "original negative error; no data block"
+  },
+  {
+   "status": 0,
+   "actual_per_channel": -1,
+   "result": "Incomplete; no data block; do not inspect unqualified words"
+  },
+  {
+   "status": 0,
+   "actual_per_channel": 2,
+   "result": "Incomplete; no data block; do not inspect unqualified words"
+  },
+  {
+   "status": -200284,
+   "actual_per_channel": 1,
+   "result": "one complete scan/word and raw status retained before original error/deferred diagnostics"
+  },
+  {
+   "status": 12345,
+   "actual_per_channel": 1,
+   "result": "one complete scan/word plus raw warning; no extra native read from Finish"
+  }
+ ],
+ "software_attempt_frontier_control": {
+  "unit": "host_monotonic_ns",
+  "poll_interval_ns": 10000000,
+  "ready_observed_ns": 1000000000,
+  "ready_advances_frontier": false,
+  "original_deadline_ns": 1500000000,
+  "cutoff_ns": 1600000000,
+  "trace": [
+   {
+    "attempt_start_ns": 1010000000,
+    "next_not_before_ns": 1020000000,
+    "read_observed_ns": 1011000000,
+    "native_read_count_delta": 1
+   },
+   {
+    "attempt_start_ns": null,
+    "request_observed_ns": 1015000000,
+    "next_not_before_ns": 1020000000,
+    "native_read_count_delta": 0
+   },
+   {
+    "attempt_start_ns": 1022000000,
+    "next_not_before_ns": 1032000000,
+    "read_observed_ns": 1037000000,
+    "native_read_count_delta": 1
+   },
+   {
+    "attempt_start_ns": 1038000000,
+    "next_not_before_ns": 1048000000,
+    "read_observed_ns": 1039000000,
+    "native_read_count_delta": 1
+   }
+  ],
+  "semantics": "Each actual attempt owns one pre-FFI host start+interval frontier; early idle repeats frontier without SDK. Slow completion neither adds completion+interval nor triggers catchup bursts. No exact physical C-entry gap, fresh conversion, hardware sampling rate or RT guarantee."
+ },
+ "clock_and_retention_contract": {
+  "completion": "Host monotonic sampled immediately after selected Read returns, before optional diagnostics/encoding/IPC. Preserve original clock for accepted data and exports. No device source_time.",
+  "deadline": "One original operation deadline and cutoff across setup/probes/read/publication. No native calls while early-idle; no Read in Finish; no retry/fallback/reconnect after terminal failure.",
+  "diagnostics": "Publish valid returned data/raw read status first. Deferred optional negative diagnostics precede other NI cleanup calls at Finish; diagnostic hang cannot erase received data or replace first code. Owned Stop/Clear only and cleanup uncertainty explicit."
+ },
+ "legacy_preservation": "All seven prior JSON byte hashes, all five C manual arrays (voltage, thermocouple, current, RTD, mixed eight-word), existing AI homogeneous/mixed rows and both timing modes remain unchanged.",
+ "qualification": "Synthetic ABI/host lifecycle only. No physical NI USB/C-Series/chassis/OS/driver acceptance, routing/electrical/width readback beyond stated getter, simultaneity, missed-transition or real-time guarantee.",
+ "profile": "one fresh owned whole-port digital INPUT task, explicit on_demand only; one separate port per task channel; no individual-line/packed-multiport/output profile",
+ "public_boundary": {
+  "measurement": "digital_port",
+  "private_protocol": 7,
+  "channels": "1..64 individual Device/portN strings, no ranges/lists/line names/MAX aliases",
+  "event": "digital_port_block",
+  "representation": "sdk_u32_digital_port",
+  "word_keys": [
+   "value",
+   "u32_le_hex"
+  ],
+  "word_bytes": 4,
+  "no_masks_or_bit_labels": true
+ },
+ "fixed_abis": [
+  {
+   "name": "DAQmxCreateDIChan",
+   "returns": "i32",
+   "slot_count": 4,
+   "arguments": [
+    "TaskHandle",
+    "const char* physical_port",
+    "const char* assigned_virtual_name",
+    "i32 line_grouping"
+   ]
+  },
+  {
+   "name": "DAQmxReadDigitalU32",
+   "returns": "i32",
+   "slot_count": 8,
+   "arguments": [
+    "TaskHandle",
+    "i32 requested_per_channel",
+    "f64 timeout_seconds",
+    "u32 fill_mode",
+    "u32* zeroed_output",
+    "u32 capacity_in_U32_elements",
+    "i32* actual_per_channel",
+    "u32* reserved"
+   ]
+  },
+  {
+   "name": "DAQmxGetDINumLines",
+   "returns": "i32",
+   "slot_count": 3,
+   "arguments": [
+    "TaskHandle",
+    "const char* assigned_channel",
+    "u32* width"
+   ]
+  }
+ ],
+ "constants": {
+  "ChanForAllLines": 1,
+  "GroupByScanNumber": 1,
+  "ChanPerLine_research_only_excluded": 0
+ },
+ "primary_sources": [
+  {
+   "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__channel__configuration__creation__create__digital__input__channels_1ga3325b4a3660e51e9d6631460bab3ed94.html",
+   "bytes": 13981,
+   "sha256": "e4af2211b912d3d2984836c5aaefc2db0679a4d6efbde742504a22dc2ad7f38d",
+   "prototype": "int32 __CFUNC DAQmxCreateDIChan(TaskHandle taskHandle, const char lines[], const char nameToAssignToLines[], int32 lineGrouping)"
+  },
+  {
+   "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__read__functions_1ga181bfa364ffe16a0cc0d38a0cd6bc85d.html",
+   "bytes": 14196,
+   "sha256": "4bc7ed2f5c69c30565b7313afdc1c0c8b12918748ce537d164de2bf69d361be2",
+   "prototype": "int32 __CFUNC DAQmxReadDigitalU32(TaskHandle taskHandle, int32 numSampsPerChan, float64 timeout, bool32 fillMode, uInt32 readArray[], uInt32 arraySizeInSamps, int32 *sampsPerChanRead, bool32 *reserved)"
+  },
+  {
+   "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__property__manipulation__getter_1ga72833c4121223135bc904f73626141cb.html",
+   "bytes": 6105,
+   "sha256": "3f6c79c7aef270f4cb61900fc493e6d4b1787a823c79b6b987c9db1807eb4ec7",
+   "prototype": "int32 __CFUNC DAQmxGetDINumLines(TaskHandle taskHandle, const char channel[], uInt32 *data)"
+  },
+  {
+   "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__read__functions__advanced_1ga323a4f09ce420b14d37b68c9a9ded308.html",
+   "bytes": 9919,
+   "sha256": "81e809582f18d418f5c61f600d56af534b879cf4f941cab5ca65e7687096b54d",
+   "prototype": "int32 __CFUNC DAQmxGetNthTaskReadChannel(TaskHandle taskHandle, uInt32 index, char buffer[], int32 bufferSize)"
+  },
+  {
+   "url": "https://raw.githubusercontent.com/ni/nidaqmx-python/1d60b6c53ef11dead0ba6aa9d6e2855351835ad7/generated/nidaqmx/constants.py",
+   "bytes": 50365,
+   "sha256": "9d15eb38ccb03769f9e5ad94289a00658ee36b6685709e4f3d49dafb25b4ae57"
+  }
+ ],
+ "constructor_and_identity_controls": [
+  {
+   "channel_index": 0,
+   "requested_physical": "DigitalSuccess/port3",
+   "assigned_virtual_name": "cfdp0000",
+   "line_grouping": 1,
+   "synthetic_driver_width": 1
+  },
+  {
+   "channel_index": 1,
+   "requested_physical": "DigitalSuccess/port1",
+   "assigned_virtual_name": "cfdp0001",
+   "line_grouping": 1,
+   "synthetic_driver_width": 8
+  },
+  {
+   "channel_index": 2,
+   "requested_physical": "DigitalSuccess/port12",
+   "assigned_virtual_name": "cfdp0002",
+   "line_grouping": 1,
+   "synthetic_driver_width": 32
+  }
+ ],
+ "identity_rules": {
+  "task_channels": 3,
+  "nth_index_base": 1,
+  "expected_read_order": [
+   "cfdp0000",
+   "cfdp0001",
+   "cfdp0002"
+  ],
+  "width_query_channels": [
+   "cfdp0000",
+   "cfdp0001",
+   "cfdp0002"
+  ],
+  "width_range_inclusive": [
+   1,
+   32
+  ],
+  "physical_binding": "Exact requested physical bytes go to that constructor; returned virtual read identity/order and observed width are independently checked. Do not label physical request as driver readback.",
+  "max_channels": 64,
+  "last_generated_name_at_max": "cfdp0063"
+ },
+ "read_control": {
+  "selected_export": "DAQmxReadDigitalU32",
+  "requested_per_channel": 1,
+  "fill_mode": 1,
+  "actual_channels": 3,
+  "capacity_elements": 3,
+  "allocation_bytes": 12,
+  "zero_initial_bytes_hex": "000000000000000000000000",
+  "reserved": "NULL",
+  "valid_complete_count": 1,
+  "unsigned_range_inclusive": [
+   0,
+   4294967295
+  ]
+ },
+ "manual_scan_major_patterns": [
+  {
+   "scan_index": 0,
+   "channel_index": 0,
+   "value": 1,
+   "u32_hex": "00000001",
+   "u32_le_hex": "01000000"
+  },
+  {
+   "scan_index": 0,
+   "channel_index": 1,
+   "value": 165,
+   "u32_hex": "000000a5",
+   "u32_le_hex": "a5000000"
+  },
+  {
+   "scan_index": 0,
+   "channel_index": 2,
+   "value": 2147483648,
+   "u32_hex": "80000000",
+   "u32_le_hex": "00000080"
+  },
+  {
+   "scan_index": 1,
+   "channel_index": 0,
+   "value": 0,
+   "u32_hex": "00000000",
+   "u32_le_hex": "00000000"
+  },
+  {
+   "scan_index": 1,
+   "channel_index": 1,
+   "value": 90,
+   "u32_hex": "0000005a",
+   "u32_le_hex": "5a000000"
+  },
+  {
+   "scan_index": 1,
+   "channel_index": 2,
+   "value": 4294967295,
+   "u32_hex": "ffffffff",
+   "u32_le_hex": "ffffffff"
+  },
+  {
+   "scan_index": 2,
+   "channel_index": 0,
+   "value": 1,
+   "u32_hex": "00000001",
+   "u32_le_hex": "01000000"
+  },
+  {
+   "scan_index": 2,
+   "channel_index": 1,
+   "value": 129,
+   "u32_hex": "00000081",
+   "u32_le_hex": "81000000"
+  },
+  {
+   "scan_index": 2,
+   "channel_index": 2,
+   "value": 0,
+   "u32_hex": "00000000",
+   "u32_le_hex": "00000000"
+  },
+  {
+   "scan_index": 3,
+   "channel_index": 0,
+   "value": 1,
+   "u32_hex": "00000001",
+   "u32_le_hex": "01000000"
+  },
+  {
+   "scan_index": 3,
+   "channel_index": 1,
+   "value": 129,
+   "u32_hex": "00000081",
+   "u32_le_hex": "81000000"
+  },
+  {
+   "scan_index": 3,
+   "channel_index": 2,
+   "value": 0,
+   "u32_hex": "00000000",
+   "u32_le_hex": "00000000"
+  }
+ ],
+ "raw_extent_control": {
+  "scan_count": 4,
+  "channels": 3,
+  "word_count": 12,
+  "bytes": 48,
+  "all_words_le_hex": "01000000a500000000000080000000005a000000ffffffff010000008100000000000000010000008100000000000000",
+  "negative_valid_first_scan_le_hex": "01000000a500000000000080",
+  "negative_valid_first_scan_bytes": 12,
+  "repeated_last_two_scans_not_deduplicated": true
+ },
+ "selected_exports": [
+  "DAQmxCreateTask",
+  "DAQmxGetTaskNumChans",
+  "DAQmxGetNthTaskReadChannel",
+  "DAQmxStartTask",
+  "DAQmxStopTask",
+  "DAQmxClearTask",
+  "DAQmxGetErrorString",
+  "DAQmxGetExtendedErrorInfo",
+  "DAQmxCreateDIChan",
+  "DAQmxReadDigitalU32",
+  "DAQmxGetDINumLines"
+ ],
+ "also_absent_unneeded": [
+  "DAQmxReadDigitalLines",
+  "DAQmxCreateCICountEdgesChan",
+  "DAQmxCreateCIFreqChan",
+  "DAQmxReadCounterU32",
+  "DAQmxReadCounterF64",
+  "DAQmxSetCICountEdgesTerm",
+  "DAQmxSetCIFreqTerm"
+ ],
+ "setup_fault_controls": [
+  "count not requested N",
+  "wrong/duplicate/swapped assigned read names",
+  "width0",
+  "width33",
+  "negative GetDINumLines status"
+ ],
+ "semantic_rules": [
+  "Retain all four bytes/full unsigned word unchanged; no masking, signed cast or line-label expansion.",
+  "Unequal synthetic widths are metadata controls, not claims about DigitalSuccess hardware.",
+  "High bit and all-ones controls are on width32; no narrower-width padding assumption.",
+  "Each Read contains at most one complete scan, in validated task read order; repeated states remain.",
+  "DI setup may configure input direction/resources; no DO/write/reset/clock/export/takeover calls and no passive-monitor claim."
+ ]
+}

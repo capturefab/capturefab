@@ -44,6 +44,10 @@ pub(crate) struct CaptureJob {
     pub id: u64,
     pub status: CaptureStatus,
     pub output: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part_format: Option<crate::transport::multipart::GvspPartFormat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part_index: Option<u32>,
     pub count: u32,
     pub captured: u32,
     /// Frames not taken because the encoders' queue was full.
@@ -115,6 +119,9 @@ pub(crate) struct CaptureJob {
     pub last_id: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_ts_ns: Option<u64>,
+    /// The first saved frame's original producer clock, without an inferred unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_device_timestamp: Option<crate::types::DeviceTimestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_ts_ns: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -129,6 +136,8 @@ pub(crate) const MAX_JOB_FILES: usize = 1000;
 /// The shape of a saved frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct JobFrame {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pixel_encoding: Option<crate::types::PixelEncoding>,
     pub width: u32,
     pub height: u32,
     pub pixel_format: u32,

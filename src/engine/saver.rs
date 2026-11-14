@@ -48,6 +48,8 @@ pub(super) struct Save {
     pub(super) plan: crate::naming::Plan,
     pub(super) on_exists: crate::naming::OnExists,
     pub(super) format: String,
+    pub(super) part_format: Option<crate::transport::multipart::GvspPartFormat>,
+    pub(super) part_index: Option<u32>,
     /// JPEG quality, when not the default.
     pub(super) quality: Option<u8>,
     pub(super) sync: crate::storage::SyncMode,
@@ -76,6 +78,7 @@ pub(super) struct SavedShot {
     /// The frame's block ID and the camera's clock when it was taken.
     pub(super) id: u64,
     pub(super) device_ts_ns: Option<u64>,
+    pub(super) device_timestamp: Option<crate::types::DeviceTimestamp>,
     pub(super) wall_ms: u64,
     pub(super) settings: serde_json::Map<String, Value>,
     /// Its measurements and preview, when asked for.
@@ -100,8 +103,8 @@ struct Queue {
 }
 #[derive(Default)]
 struct Waiting {
-    /// Shots by their number, in the order their frames came.
-    shots: VecDeque<(u64, Shot)>,
+    /// Shots in arrival order, with their number and reserved bytes.
+    shots: VecDeque<(u64, usize, Shot)>,
     /// Bytes of the frames waiting and being encoded.
     bytes: usize,
     /// Shots handed over and not reported yet.
@@ -220,9 +223,12 @@ impl Saver {
         if state.bytes == 0 {
             state.capacity = self.capacity.unwrap_or_else(queue_bytes);
         }
-        state.bytes = state.bytes.saturating_add(shot.frame.data.len());
+        let bytes = frame_bytes(&shot.frame, || {
+            shot.saves.iter().any(|save| save.part_format.is_some())
+        });
+        state.bytes = state.bytes.saturating_add(bytes);
         state.held += 1;
-        state.shots.push_back((self.next, shot));
+        state.shots.push_back((self.next, bytes, shot));
         self.next += 1;
         drop(state);
         self.queue.ready.notify_one();
@@ -234,7 +240,7 @@ impl Saver {
         let mut state = self.queue.lock();
         let mut taken = Vec::new();
         let mut emptied = Vec::new();
-        state.shots.retain_mut(|(number, shot)| {
+        state.shots.retain_mut(|(number, bytes, shot)| {
             shot.saves.retain(|save| {
                 if save.job == job {
                     taken.push(save.index);
@@ -242,7 +248,7 @@ impl Saver {
                 save.job != job
             });
             if shot.saves.is_empty() {
-                emptied.push((*number, shot.frame.data.len()));
+                emptied.push((*number, *bytes));
                 return false;
             }
             true
@@ -306,7 +312,7 @@ struct Encoder {
 impl Encoder {
     fn run(self) {
         loop {
-            let (number, shot) = {
+            let (number, bytes, shot) = {
                 let mut state = self.queue.lock();
                 loop {
                     if let Some(next) = state.shots.pop_front() {
@@ -322,7 +328,6 @@ impl Encoder {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
             };
-            let bytes = shot.frame.data.len();
             let results = shot
                 .saves
                 .iter()
@@ -384,18 +389,61 @@ fn report(
     }
 }
 
+/// Budget one projected image and its metadata while jobs encode in sequence.
+pub(super) fn frame_bytes(frame: &Frame, projection: impl FnOnce() -> bool) -> usize {
+    let bytes = frame.buffer_bytes();
+    if let Some(archive) = &frame.multipart
+        && archive.layout.gendc.is_none()
+        && projection()
+    {
+        // A selected part fits within the retained archive and uses its own
+        // exact-length buffer. The projected part table is also bounded here.
+        bytes.saturating_add(archive.buffer_bytes())
+    } else {
+        bytes
+    }
+}
+
 /// Encode and publish one job's file for a shot. Returns the file and its
 /// manifest line, for its turn to be reported.
 fn write(h: &WorkerHandle, shot: &Shot, save: &Save) -> Result<Written> {
-    let meta = still_meta(&shot.frame, shot.wall_ms, &shot.acquisition, &save.context);
-    let bytes = crate::frame::encode_parts(&shot.frame, &save.format, save.quality, Some(&meta))?;
+    if save.part_format.is_none() {
+        crate::frame::validate_encoding(&shot.frame)?;
+    }
+    if save.part_format.is_none()
+        && shot
+            .frame
+            .multipart
+            .as_ref()
+            .is_some_and(|parts| parts.layout.selected_native_part_format().is_some())
+    {
+        return Err(crate::types::Categorized::new(
+            crate::types::ErrorKind::Unsupported,
+            "GVSP multipart block has no ordinary intensity image",
+        )
+        .hint("Pass --part-format with the available scalar format, such as Coord3D_C16 or Mono16.")
+        .into());
+    }
+    let selected = save
+        .part_format
+        .map(|format| {
+            if save.part_index.is_some() {
+                format.project_index(&shot.frame, save.part_index)
+            } else {
+                format.project(&shot.frame)
+            }
+        })
+        .transpose()?;
+    let frame = selected.as_ref().unwrap_or(&shot.frame);
+    let meta = still_meta(frame, shot.wall_ms, &shot.acquisition, &save.context);
+    let bytes = crate::frame::encode_parts(frame, &save.format, save.quality, Some(&meta))?;
     let input = crate::naming::NameInput {
         camera: &save.camera,
         now: save.now,
         index: save.index,
         context: &save.context,
     };
-    let (path, stored) = crate::naming::save_named(
+    let (path, (stored, chunks, multipart)) = crate::naming::save_named(
         &h.names,
         &save.plan,
         &input,
@@ -403,34 +451,55 @@ fn write(h: &WorkerHandle, shot: &Shot, save: &Save) -> Result<Written> {
         save.path.clone(),
         |path| {
             let hash = save.manifest.is_some();
-            crate::storage::save_parts(&bytes.parts(), path, save.sync, save.min_free, hash)
+            crate::naming::check_capture_free(path)?;
+            if let Some(parts) = &frame.multipart {
+                crate::naming::check_multipart_free(path, parts.layout.gendc.is_some())?;
+            }
+            let artifacts =
+                super::chunks::Artifacts::save(path, frame, save.sync, save.min_free, hash)?;
+            let multipart = super::multipart::Artifacts::save(
+                path,
+                frame,
+                &save.source.id,
+                save.sync,
+                save.min_free,
+                hash,
+            )?;
+            let stored =
+                crate::storage::save_parts(&bytes.parts(), path, save.sync, save.min_free, hash)?;
+            if save.format == "raw" {
+                save_sidecar(
+                    path,
+                    frame,
+                    shot.wall_ms,
+                    &shot.acquisition,
+                    save.sync,
+                    save.min_free,
+                    super::ArtifactReferences {
+                        chunks: artifacts.reference(),
+                        multipart: multipart.reference(),
+                    },
+                )?;
+            }
+            Ok((stored, artifacts.commit(), multipart.commit()))
         },
     )
     .with_context(|| format!("save {}", save.path.display()))?;
-    if save.format == "raw" {
-        save_sidecar(
-            &path,
-            &shot.frame,
-            shot.wall_ms,
-            &shot.acquisition,
-            save.sync,
-            save.min_free,
-        )?;
-    }
     let file = image_file(
         &path,
         &stored,
-        &shot.frame,
+        frame,
         bytes.passthrough(),
         shot.wall_ms,
         &save.context,
+        super::ArtifactReferences { chunks, multipart },
     );
     // Measured here, from the frame in memory, beside the file.
     let inspection = save
         .inspect
         .then(|| {
             inspector::measurements(
-                &shot.frame,
+                frame,
                 save.source.kind,
                 &save.source.id,
                 None,
@@ -454,12 +523,14 @@ fn write(h: &WorkerHandle, shot: &Shot, save: &Save) -> Result<Written> {
         shot: SavedShot {
             path: path.to_string_lossy().into_owned(),
             frame: crate::scheduling::JobFrame {
-                width: shot.frame.width,
-                height: shot.frame.height,
-                pixel_format: shot.frame.pixel_format,
+                width: frame.width,
+                height: frame.height,
+                pixel_format: frame.pixel_format,
+                pixel_encoding: frame.pixel_encoding,
             },
-            id: shot.frame.id,
-            device_ts_ns: shot.frame.device_ts_ns,
+            id: frame.id,
+            device_ts_ns: frame.device_ts_ns,
+            device_timestamp: frame.device_timestamp,
             wall_ms: shot.wall_ms,
             settings: shot.acquisition.settings.clone(),
             inspection,

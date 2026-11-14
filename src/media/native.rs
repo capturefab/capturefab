@@ -188,12 +188,17 @@ pub(super) fn read_frame(
     ensure!(read == len, "truncated FFmpeg frame");
     crate::copies::record(crate::copies::Site::PipeRead, len);
     Ok(Frame {
+        pixel_encoding: None,
+        device_timestamp: None,
         id,
         width: described.width,
         height: described.height,
         pixel_format,
         device_ts_ns: None,
         wall_ms: 0,
+        received_monotonic_ns: None,
+        chunks: None,
+        multipart: None,
         data: data.freeze(),
         jpeg: None,
     })

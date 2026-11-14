@@ -1154,7 +1154,7 @@ pub(super) fn apply(
     }
     let mut result = outcome(plan, &c.info, &restored.unavailable);
     if setup.auto.is_some() {
-        let entered = enter_auto(h, camera, auto, forwarder, jobs, None)?;
+        let entered = enter_auto(h, camera, auto, forwarder, jobs, None, None)?;
         result["auto"] = entered["auto"].clone();
     } else {
         refresh(h, camera.as_ref());
@@ -1295,6 +1295,8 @@ mod tests {
             count: 1,
             timeout_ms: 100,
             format: "png".into(),
+            part_format: None,
+            part_index: None,
             first_at_ms: crate::scheduling::now_ms() + 60_000,
             interval_ms: 0,
             on_exists: crate::naming::OnExists::default(),
@@ -1504,6 +1506,7 @@ mod tests {
         let manual = saved(&h, "manual");
         h.request(SessionCommand::Auto {
             continuous: false,
+            part_selection: None,
             job: None,
             max_exposure_us: None,
             region: None,

@@ -598,6 +598,13 @@ impl Backing {
 }
 
 impl FrameBuf {
+    /// Bytes in the backing allocation retained by this buffer, including
+    /// unused vector capacity or the complete shared-memory mapping.
+    pub(crate) fn allocated_bytes(&self) -> usize {
+        match &*self.0 {
+            Backing::Pool(buffer) => buffer.capacity(),
+        }
+    }
     /// The shared memory segment the bytes are at the start of, if they
     /// are in one: what a helper process can read without a copy.
     #[cfg(jpeg_helper)]
@@ -728,6 +735,48 @@ pub(crate) mod tests {
 
     fn pool(budget: Option<u64>) -> FramePool {
         FramePool::new(move || budget)
+    }
+
+    #[test]
+    fn short_buffers_keep_their_backing_allocation_without_copying() {
+        for adopt in [false, true] {
+            let pool = pool(None);
+            let mut buffer = if adopt {
+                let mut received = pool.take_vec(1 << 20);
+                received.truncate(3);
+                pool.adopt(received)
+            } else {
+                let mut assembled = pool.take_empty(1 << 20);
+                assembled.extend_from_slice(&[1, 2, 3]);
+                assembled
+            };
+            buffer.copy_from_slice(&[1, 2, 3]);
+            let (address, allocated) = (buffer.as_ptr(), buffer.capacity());
+            let frame = buffer.freeze();
+            assert_eq!(frame.len(), 3);
+            assert!(allocated >= 1 << 20);
+            assert_eq!(frame.allocated_bytes(), allocated);
+            assert_eq!(frame.as_ptr(), address);
+            let shared = frame.clone();
+            assert_eq!(shared.allocated_bytes(), allocated);
+            assert_eq!(shared.as_ptr(), address);
+            assert_eq!(shared, [1, 2, 3]);
+        }
+        #[cfg(jpeg_helper)]
+        {
+            let pool = pool(None);
+            let mut buffer = pool.take_shared(5000).unwrap();
+            buffer[..3].copy_from_slice(&[4, 5, 6]);
+            buffer.truncate(3);
+            let segment = buffer.segment().unwrap();
+            let (address, allocated) = (segment.as_ptr(), segment.len());
+            let frame = buffer.freeze();
+            assert_eq!(frame.len(), 3);
+            assert!(allocated >= 5000 && allocated.is_multiple_of(shared::page()));
+            assert_eq!(frame.allocated_bytes(), allocated);
+            assert_eq!(frame.as_ptr(), address);
+            assert_eq!(frame, [4, 5, 6]);
+        }
     }
 
     #[test]

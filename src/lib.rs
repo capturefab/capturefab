@@ -36,6 +36,7 @@ pub(crate) mod auto;
 pub(crate) mod camera;
 pub(crate) mod camera_profile;
 pub(crate) mod cli;
+mod config_number;
 pub(crate) mod context;
 pub(crate) mod controls;
 pub(crate) mod copies;
@@ -68,6 +69,7 @@ pub(crate) mod storage;
 mod test_cameras;
 #[cfg(test)]
 mod test_io;
+pub(crate) mod timeseries;
 pub(crate) mod transport;
 pub(crate) mod types;
 pub(crate) mod volumes;
@@ -91,6 +93,39 @@ pub fn run() {
         }
         return;
     }
+    #[cfg(feature = "gentl")]
+    if mode.as_deref() == Some(std::ffi::OsStr::new(transport::gentl::ARG)) {
+        if let Err(error) = transport::gentl::run(std::env::args_os().skip(2)) {
+            eprintln!(
+                "capturefab GenTL helper: {}",
+                scrub::scrub(&format!("{error:#}"))
+            );
+            std::process::exit(1);
+        }
+        return;
+    }
+    #[cfg(feature = "ni-daqmx")]
+    if mode.as_deref() == Some(std::ffi::OsStr::new(timeseries::ni_daqmx::WORKER_ARG)) {
+        if let Err(error) = timeseries::ni_daqmx::run_worker() {
+            eprintln!(
+                "capturefab NI-DAQmx worker: {}",
+                scrub::scrub(&format!("{error:#}"))
+            );
+            std::process::exit(1);
+        }
+        return;
+    }
+    #[cfg(feature = "usb")]
+    if mode.as_deref() == Some(std::ffi::OsStr::new(timeseries::USBTMC_WORKER_ARG)) {
+        if let Err(error) = timeseries::run_usbtmc_worker() {
+            eprintln!(
+                "capturefab USBTMC worker: {}",
+                scrub::scrub(&format!("{error:#}"))
+            );
+            std::process::exit(1);
+        }
+        return;
+    }
     #[cfg(jpeg_helper)]
     if mode.as_deref() == Some(std::ffi::OsStr::new(jpeg::helper::ARG)) {
         if let Err(e) = jpeg::helper::run(std::env::args_os().skip(2)) {
@@ -109,6 +144,16 @@ pub fn run() {
 #[cfg(feature = "testing")]
 #[doc(hidden)]
 pub mod testing {
+    #[cfg(feature = "usb")]
+    pub fn usbtmc_worker_fixture() -> anyhow::Result<()> {
+        crate::timeseries::run_usbtmc_fixture()
+    }
+
+    #[cfg(feature = "usb")]
+    pub fn usbtmc_client_probe(input: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        crate::timeseries::run_usbtmc_probe(input)
+    }
+
     pub mod auto {
         pub use crate::auto::meter;
     }
@@ -132,13 +177,14 @@ pub mod testing {
         pub use crate::jpeg::{Raster, insert_com, software};
     }
     pub mod session {
+        pub use crate::media::timeline::Config as VideoTimelineConfig;
         pub use crate::session::{SessionCommand, SessionHandle};
     }
     pub mod storage {
         pub use crate::storage::{SyncMode, save};
     }
     pub mod types {
-        pub use crate::types::{Frame, MONO8, RGB8};
+        pub use crate::types::{Frame, IdsPixelFormat, MONO8, PixelEncoding, RGB8};
     }
     pub mod framebuf {
         pub use crate::framebuf::pool;

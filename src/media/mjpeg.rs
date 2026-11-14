@@ -276,12 +276,17 @@ pub(super) fn decode(
     };
     crate::copies::record(crate::copies::Site::PipeRead, jpeg.len());
     Ok(Frame {
+        pixel_encoding: None,
+        device_timestamp: None,
         id,
         width: w,
         height: h,
         pixel_format,
         device_ts_ns: None,
         wall_ms: 0,
+        received_monotonic_ns: None,
+        chunks: None,
+        multipart: None,
         data: data.freeze(),
         jpeg: Some(jpeg.into()),
     })

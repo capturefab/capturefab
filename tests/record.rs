@@ -722,14 +722,17 @@ fn a_recording_ends_as_asked_at_its_maximum_size() {
             "{frames} frames: {capped}"
         );
     }
-    // Too small for FFmpeg to finish: cut at a byte, it plays up to its
-    // last complete part, and reports no frame count it cannot vouch for.
+    // Lossless textured frames exceed the cap even when H.264's first
+    // fragment can finalize below it. An actual cut reports no frame count
+    // it cannot vouch for.
     let cut = home.ok(&[
         "record",
         "-c",
-        "sim:0",
+        "sim:microscope",
         "-o",
-        "cut.mp4",
+        "cut.mkv",
+        "--codec",
+        "ffv1",
         "--max-size",
         "16KiB",
         "--for",

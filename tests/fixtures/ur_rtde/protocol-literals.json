@@ -1,0 +1,68 @@
+{
+  "qualification": "Independent hand-authored protocol-v2 byte literals from vendor layout, before any candidate decoder. Spec-derived, not manufacturer captures/emulator output or executed stock proof. No product helpers imported or protocol runtime run.",
+  "wire": "Network byte order; uint16 total length includes three-byte header; uint8 command; no wire checksum.",
+  "handshake": {
+    "request_v2_hex": "0005560002",
+    "accepted_v2_hex": "00045601",
+    "rejected_v2_hex": "00045600",
+    "get_controller_version_hex": "000376",
+    "controller_5_25_0_1234_hex": "001376000000050000001900000000000004D2",
+    "fields": ["timestamp", "robot_mode", "actual_digital_input_bits"],
+    "requested_frequency": 125,
+    "frequency_ieee754_hex": "405F400000000000",
+    "setup_output_hex": "00394F405F40000000000074696D657374616D702C726F626F745F6D6F64652C61637475616C5F6469676974616C5F696E7075745F62697473",
+    "setup_recipe7_types_hex": "00174F07444F55424C452C494E5433322C55494E543634",
+    "negotiated_types": ["DOUBLE", "INT32", "UINT64"],
+    "start_hex": "000353",
+    "start_accepted_hex": "00045301",
+    "pause_hex": "000350",
+    "pause_accepted_hex": "00045001"
+  },
+  "state_cases": [
+    {
+      "frame_hex": "001855073FF8000000000000FFFFFFFFFFFFFFFFFFFFFFFF",
+      "recipe_id": 7,
+      "timestamp": {"ieee754_hex": "3FF8000000000000", "classification": "finite", "value": 1.5, "clock_basis": "controller_uptime_seconds"},
+      "robot_mode": -1,
+      "actual_digital_input_bits": 18446744073709551615
+    },
+    {
+      "frame_hex": "001855078000000000000000800000000020000000000001",
+      "recipe_id": 7,
+      "timestamp": {"ieee754_hex": "8000000000000000", "classification": "finite", "negative_zero": true},
+      "robot_mode": -2147483648,
+      "actual_digital_input_bits": 9007199254740993
+    },
+    {
+      "frame_hex": "001855077FF8000000000001000000000000000000000000",
+      "recipe_id": 7,
+      "timestamp": {"ieee754_hex": "7FF8000000000001", "classification": "nan", "numeric_value_absent": true},
+      "robot_mode": 0,
+      "actual_digital_input_bits": 0
+    }
+  ],
+  "bool_recipe8": {
+    "declared_type": "BOOL",
+    "false_hex": "0005550800",
+    "true_noncanonical_hex": "00055508FF",
+    "expected_true_raw": 255,
+    "expected_true": true,
+    "rule": "Manufacturer BOOL defines zero false and everything else true; do not reject FF or discard its raw byte."
+  },
+  "vector6d_recipe9": {
+    "header_recipe_hex": "00345509",
+    "word_hex": ["0000000000000000", "3FF0000000000000", "BFF0000000000000", "3FE0000000000000", "4000000000000000", "8000000000000000"],
+    "expected_finite_values": [0.0, 1.0, -1.0, 0.5, 2.0, -0.0],
+    "last_word_is_negative_zero": true,
+    "total_bytes": 52,
+    "qualification": "This is a synthetic field-layout recipe, not a claim that a named robot output emits these values or has inferred units."
+  },
+  "text_v2": {
+    "warning_hex": "000E4D0462757379045254444502",
+    "message_ascii": "busy", "message_bytes": 4,
+    "source_ascii": "RTDE", "source_bytes": 4,
+    "level_raw": 2,
+    "classification": "warning"
+  },
+  "not_qualified": ["No physical model or software identity is inferred from these version literals.", "No actual delivered frequency, missing-packet count or UTC/source_time is inferred.", "No input setup/data, robot program/motion/control or controller-setting packet is authorized by this plan."]
+}

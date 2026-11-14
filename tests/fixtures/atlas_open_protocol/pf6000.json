@@ -1,0 +1,2459 @@
+{
+  "schema": 1,
+  "kind": "independent_manufacturer_literal_oracle",
+  "profile": "pf6000_v2_8",
+  "authorship": {
+    "origin": "manual manufacturer table transcription and independently chosen asymmetric values before decoder/transport authorship",
+    "product_imports": false,
+    "device_capture": false,
+    "hardware_qualification": false,
+    "new_decoder_authored_before_freeze": false,
+    "accepted_contract": {
+      "sha256": "0dd975a626f8dcbb16880fb7eb5b5bc0fe5911b25731a9d3e958b82ae9819b8c",
+      "bytes": 7722
+    },
+    "before_authoring_receipt_sha256": "047fbb70436e0b7f10452fd6e3d0e0239e953d108d0abd7ed83b660a0490b207"
+  },
+  "sources": [
+    {
+      "document": "9836 4415 01",
+      "edition": "2.8.0",
+      "original_author": "Atlas Copco Industrial Technique AB",
+      "url": "https://s3.amazonaws.com/co.tulip.cdn/OpenProtocolSpecification_R280.pdf",
+      "host_is_mirror": true,
+      "bytes": 3896488,
+      "sha256": "8d3a8ff94d6952979e1ed6fe06c82957aa6da357f40ddd915c832d152a53660e",
+      "roles": "header Table1; static data rules; startup Tables11-15; result Tables76-77; sections5.8.1-4; keepalive5.28.1",
+      "custody": "credible manufacturer-authored copy, not vendor-byte authentication"
+    },
+    {
+      "document": "9836 4415 01",
+      "edition": "2.16.0",
+      "original_author": "Atlas Copco Industrial Technique AB",
+      "url": "https://asutp.org/Atlas_Copco/OpenProtocol_Specification_R_2.16.0.pdf",
+      "host_is_mirror": true,
+      "bytes": 1872460,
+      "sha256": "5aa4a7ac004d67c0f53295ed178c39352d3b7f4ed80f09163fd6e56c44d0b36d",
+      "roles": "corroborating fixed layouts, corrected sender wording, later enum evolution only"
+    },
+    {
+      "document": "PF6000 appendix",
+      "edition": "2.8 revision2; valid from2.8.14",
+      "original_author": "Atlas Copco Tools and Assembly Systems",
+      "url": "https://servaid.atlascopco.com/AssertWeb/en-US/AtlasCopco/Document/10268853/GetFile",
+      "host_is_mirror": false,
+      "bytes": 1003068,
+      "sha256": "4d7d9eef9b98fb57ba2f4b1a5566f193808056535a52bd0bb2ea8edc04a8809c",
+      "roles": "MID revision support, unavailable whole spans, global/nonconsecutive IDs and Pset menu-index semantics"
+    },
+    {
+      "document": "9836 4415 01 rendered older headers",
+      "edition": "2.5",
+      "url": "https://www.scribd.com/document/495555891/OpenProtocol-Specification-9836-4415-01-2-5-1",
+      "host_is_mirror": true,
+      "response_kind": "HTML rendered manufacturer document, not original PDF byte pin",
+      "bytes": 1383674,
+      "sha256": "795a9d9a83b1491f9bc1b202f92ed5d7b6a2edf9d642935d4fda0295eed885f0",
+      "roles": "individual0001/0060/0061/0062/0063/9999 header tables; ASCII0/1 flag"
+    },
+    {
+      "document": "9836 4415 01 rendered older headers",
+      "edition": "2.6",
+      "url": "https://www.scribd.com/document/439292650/OpenProtocol-Specification-1-pdf",
+      "host_is_mirror": true,
+      "response_kind": "HTML rendered manufacturer document, not original PDF byte pin",
+      "bytes": 1388704,
+      "sha256": "c1bcffecf219afa2afb411a6d4c8800fb69d4625ff3e2ae27c7e6527e642d2fb",
+      "roles": "independent rendered corroboration of older individual-header tables"
+    }
+  ],
+  "framing": {
+    "header_bytes": 20,
+    "declared_length_excludes_terminal_nul": true,
+    "declared_min": 20,
+    "declared_max": 419,
+    "terminal_byte_hex": "00",
+    "body_byte_range_inclusive": [
+      32,
+      127
+    ],
+    "no_source_time": true,
+    "startup_revision": 5,
+    "result_revision": 3,
+    "initial_control_revision_aliases": [
+      "   ",
+      "000",
+      "001"
+    ],
+    "result_no_ack_byte_hex": "30",
+    "control_no_ack_byte": "opaque static-domain byte",
+    "incoming_default_address_pairs": [
+      "  ",
+      "01"
+    ],
+    "incoming_disabled_sequence": [
+      "  ",
+      "00"
+    ],
+    "incoming_disabled_parts": [
+      " ",
+      "0"
+    ],
+    "canonical_outbound_n_a_byte_hex": "20"
+  },
+  "startup_slots": [
+    {
+      "id": "01",
+      "role": "cell_id",
+      "id_bytes_1based": [
+        21,
+        22
+      ],
+      "value_bytes_1based": [
+        23,
+        26
+      ],
+      "value_width": 4,
+      "model_supported": false,
+      "unavailable_whole_span_opaque": true
+    },
+    {
+      "id": "02",
+      "role": "channel_id",
+      "id_bytes_1based": [
+        27,
+        28
+      ],
+      "value_bytes_1based": [
+        29,
+        30
+      ],
+      "value_width": 2,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "03",
+      "role": "controller_name",
+      "id_bytes_1based": [
+        31,
+        32
+      ],
+      "value_bytes_1based": [
+        33,
+        57
+      ],
+      "value_width": 25,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "04",
+      "role": "supplier_code",
+      "id_bytes_1based": [
+        58,
+        59
+      ],
+      "value_bytes_1based": [
+        60,
+        62
+      ],
+      "value_width": 3,
+      "model_supported": false,
+      "unavailable_whole_span_opaque": true
+    },
+    {
+      "id": "05",
+      "role": "implemented_protocol_version",
+      "id_bytes_1based": [
+        63,
+        64
+      ],
+      "value_bytes_1based": [
+        65,
+        83
+      ],
+      "value_width": 19,
+      "model_supported": false,
+      "unavailable_whole_span_opaque": true
+    },
+    {
+      "id": "06",
+      "role": "controller_software",
+      "id_bytes_1based": [
+        84,
+        85
+      ],
+      "value_bytes_1based": [
+        86,
+        104
+      ],
+      "value_width": 19,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "07",
+      "role": "tool_software",
+      "id_bytes_1based": [
+        105,
+        106
+      ],
+      "value_bytes_1based": [
+        107,
+        125
+      ],
+      "value_width": 19,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "08",
+      "role": "rbu_type",
+      "id_bytes_1based": [
+        126,
+        127
+      ],
+      "value_bytes_1based": [
+        128,
+        151
+      ],
+      "value_width": 24,
+      "model_supported": false,
+      "unavailable_whole_span_opaque": true
+    },
+    {
+      "id": "09",
+      "role": "controller_serial",
+      "id_bytes_1based": [
+        152,
+        153
+      ],
+      "value_bytes_1based": [
+        154,
+        163
+      ],
+      "value_width": 10,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "10",
+      "role": "system_type_code",
+      "id_bytes_1based": [
+        164,
+        165
+      ],
+      "value_bytes_1based": [
+        166,
+        168
+      ],
+      "value_width": 3,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "11",
+      "role": "system_subtype",
+      "id_bytes_1based": [
+        169,
+        170
+      ],
+      "value_bytes_1based": [
+        171,
+        173
+      ],
+      "value_width": 3,
+      "model_supported": false,
+      "unavailable_whole_span_opaque": true
+    }
+  ],
+  "result_slots": [
+    {
+      "id": "01",
+      "role": "cell_id",
+      "id_bytes_1based": [
+        21,
+        22
+      ],
+      "value_bytes_1based": [
+        23,
+        26
+      ],
+      "value_width": 4,
+      "model_supported": false,
+      "unavailable_whole_span_opaque": true
+    },
+    {
+      "id": "02",
+      "role": "channel_id",
+      "id_bytes_1based": [
+        27,
+        28
+      ],
+      "value_bytes_1based": [
+        29,
+        30
+      ],
+      "value_width": 2,
+      "model_supported": false,
+      "unavailable_whole_span_opaque": true
+    },
+    {
+      "id": "03",
+      "role": "controller_name",
+      "id_bytes_1based": [
+        31,
+        32
+      ],
+      "value_bytes_1based": [
+        33,
+        57
+      ],
+      "value_width": 25,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "04",
+      "role": "identifier",
+      "id_bytes_1based": [
+        58,
+        59
+      ],
+      "value_bytes_1based": [
+        60,
+        84
+      ],
+      "value_width": 25,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "05",
+      "role": "job_id",
+      "id_bytes_1based": [
+        85,
+        86
+      ],
+      "value_bytes_1based": [
+        87,
+        90
+      ],
+      "value_width": 4,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "06",
+      "role": "pset_menu_index",
+      "id_bytes_1based": [
+        91,
+        92
+      ],
+      "value_bytes_1based": [
+        93,
+        95
+      ],
+      "value_width": 3,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "07",
+      "role": "strategy_code",
+      "id_bytes_1based": [
+        96,
+        97
+      ],
+      "value_bytes_1based": [
+        98,
+        99
+      ],
+      "value_width": 2,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "08",
+      "role": "strategy_options",
+      "id_bytes_1based": [
+        100,
+        101
+      ],
+      "value_bytes_1based": [
+        102,
+        106
+      ],
+      "value_width": 5,
+      "model_supported": false,
+      "unavailable_whole_span_opaque": true
+    },
+    {
+      "id": "09",
+      "role": "batch_size",
+      "id_bytes_1based": [
+        107,
+        108
+      ],
+      "value_bytes_1based": [
+        109,
+        112
+      ],
+      "value_width": 4,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "10",
+      "role": "batch_count",
+      "id_bytes_1based": [
+        113,
+        114
+      ],
+      "value_bytes_1based": [
+        115,
+        118
+      ],
+      "value_width": 4,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "11",
+      "role": "tightening_status_code",
+      "id_bytes_1based": [
+        119,
+        120
+      ],
+      "value_bytes_1based": [
+        121,
+        121
+      ],
+      "value_width": 1,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "12",
+      "role": "batch_status_code",
+      "id_bytes_1based": [
+        122,
+        123
+      ],
+      "value_bytes_1based": [
+        124,
+        124
+      ],
+      "value_width": 1,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "13",
+      "role": "torque_status_code",
+      "id_bytes_1based": [
+        125,
+        126
+      ],
+      "value_bytes_1based": [
+        127,
+        127
+      ],
+      "value_width": 1,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "14",
+      "role": "angle_status_code",
+      "id_bytes_1based": [
+        128,
+        129
+      ],
+      "value_bytes_1based": [
+        130,
+        130
+      ],
+      "value_width": 1,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "15",
+      "role": "rundown_status_code",
+      "id_bytes_1based": [
+        131,
+        132
+      ],
+      "value_bytes_1based": [
+        133,
+        133
+      ],
+      "value_width": 1,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "16",
+      "role": "current_monitor_status",
+      "id_bytes_1based": [
+        134,
+        135
+      ],
+      "value_bytes_1based": [
+        136,
+        136
+      ],
+      "value_width": 1,
+      "model_supported": false,
+      "unavailable_whole_span_opaque": true
+    },
+    {
+      "id": "17",
+      "role": "selftap_status_code",
+      "id_bytes_1based": [
+        137,
+        138
+      ],
+      "value_bytes_1based": [
+        139,
+        139
+      ],
+      "value_width": 1,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "18",
+      "role": "prevail_monitor_status",
+      "id_bytes_1based": [
+        140,
+        141
+      ],
+      "value_bytes_1based": [
+        142,
+        142
+      ],
+      "value_width": 1,
+      "model_supported": false,
+      "unavailable_whole_span_opaque": true
+    },
+    {
+      "id": "19",
+      "role": "prevail_compensate_status",
+      "id_bytes_1based": [
+        143,
+        144
+      ],
+      "value_bytes_1based": [
+        145,
+        145
+      ],
+      "value_width": 1,
+      "model_supported": false,
+      "unavailable_whole_span_opaque": true
+    },
+    {
+      "id": "20",
+      "role": "tightening_error_status",
+      "id_bytes_1based": [
+        146,
+        147
+      ],
+      "value_bytes_1based": [
+        148,
+        157
+      ],
+      "value_width": 10,
+      "model_supported": false,
+      "unavailable_whole_span_opaque": true
+    },
+    {
+      "id": "21",
+      "role": "torque_min_raw",
+      "id_bytes_1based": [
+        158,
+        159
+      ],
+      "value_bytes_1based": [
+        160,
+        165
+      ],
+      "value_width": 6,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "22",
+      "role": "torque_max_raw",
+      "id_bytes_1based": [
+        166,
+        167
+      ],
+      "value_bytes_1based": [
+        168,
+        173
+      ],
+      "value_width": 6,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "23",
+      "role": "torque_target_raw",
+      "id_bytes_1based": [
+        174,
+        175
+      ],
+      "value_bytes_1based": [
+        176,
+        181
+      ],
+      "value_width": 6,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "24",
+      "role": "torque_result_raw",
+      "id_bytes_1based": [
+        182,
+        183
+      ],
+      "value_bytes_1based": [
+        184,
+        189
+      ],
+      "value_width": 6,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "25",
+      "role": "angle_min_deg",
+      "id_bytes_1based": [
+        190,
+        191
+      ],
+      "value_bytes_1based": [
+        192,
+        196
+      ],
+      "value_width": 5,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "26",
+      "role": "angle_max_deg",
+      "id_bytes_1based": [
+        197,
+        198
+      ],
+      "value_bytes_1based": [
+        199,
+        203
+      ],
+      "value_width": 5,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "27",
+      "role": "angle_target_deg",
+      "id_bytes_1based": [
+        204,
+        205
+      ],
+      "value_bytes_1based": [
+        206,
+        210
+      ],
+      "value_width": 5,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "28",
+      "role": "angle_result_deg",
+      "id_bytes_1based": [
+        211,
+        212
+      ],
+      "value_bytes_1based": [
+        213,
+        217
+      ],
+      "value_width": 5,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "29",
+      "role": "rundown_angle_min_deg",
+      "id_bytes_1based": [
+        218,
+        219
+      ],
+      "value_bytes_1based": [
+        220,
+        224
+      ],
+      "value_width": 5,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "30",
+      "role": "rundown_angle_max_deg",
+      "id_bytes_1based": [
+        225,
+        226
+      ],
+      "value_bytes_1based": [
+        227,
+        231
+      ],
+      "value_width": 5,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "31",
+      "role": "rundown_angle_result",
+      "id_bytes_1based": [
+        232,
+        233
+      ],
+      "value_bytes_1based": [
+        234,
+        238
+      ],
+      "value_width": 5,
+      "model_supported": false,
+      "unavailable_whole_span_opaque": true
+    },
+    {
+      "id": "32",
+      "role": "current_monitor_min",
+      "id_bytes_1based": [
+        239,
+        240
+      ],
+      "value_bytes_1based": [
+        241,
+        243
+      ],
+      "value_width": 3,
+      "model_supported": false,
+      "unavailable_whole_span_opaque": true
+    },
+    {
+      "id": "33",
+      "role": "current_monitor_max",
+      "id_bytes_1based": [
+        244,
+        245
+      ],
+      "value_bytes_1based": [
+        246,
+        248
+      ],
+      "value_width": 3,
+      "model_supported": false,
+      "unavailable_whole_span_opaque": true
+    },
+    {
+      "id": "34",
+      "role": "current_monitor_value",
+      "id_bytes_1based": [
+        249,
+        250
+      ],
+      "value_bytes_1based": [
+        251,
+        253
+      ],
+      "value_width": 3,
+      "model_supported": false,
+      "unavailable_whole_span_opaque": true
+    },
+    {
+      "id": "35",
+      "role": "selftap_min_raw",
+      "id_bytes_1based": [
+        254,
+        255
+      ],
+      "value_bytes_1based": [
+        256,
+        261
+      ],
+      "value_width": 6,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "36",
+      "role": "selftap_max_raw",
+      "id_bytes_1based": [
+        262,
+        263
+      ],
+      "value_bytes_1based": [
+        264,
+        269
+      ],
+      "value_width": 6,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "37",
+      "role": "selftap_result",
+      "id_bytes_1based": [
+        270,
+        271
+      ],
+      "value_bytes_1based": [
+        272,
+        277
+      ],
+      "value_width": 6,
+      "model_supported": false,
+      "unavailable_whole_span_opaque": true
+    },
+    {
+      "id": "38",
+      "role": "prevail_monitor_min",
+      "id_bytes_1based": [
+        278,
+        279
+      ],
+      "value_bytes_1based": [
+        280,
+        285
+      ],
+      "value_width": 6,
+      "model_supported": false,
+      "unavailable_whole_span_opaque": true
+    },
+    {
+      "id": "39",
+      "role": "prevail_monitor_max",
+      "id_bytes_1based": [
+        286,
+        287
+      ],
+      "value_bytes_1based": [
+        288,
+        293
+      ],
+      "value_width": 6,
+      "model_supported": false,
+      "unavailable_whole_span_opaque": true
+    },
+    {
+      "id": "40",
+      "role": "prevail_torque",
+      "id_bytes_1based": [
+        294,
+        295
+      ],
+      "value_bytes_1based": [
+        296,
+        301
+      ],
+      "value_width": 6,
+      "model_supported": false,
+      "unavailable_whole_span_opaque": true
+    },
+    {
+      "id": "41",
+      "role": "tightening_id",
+      "id_bytes_1based": [
+        302,
+        303
+      ],
+      "value_bytes_1based": [
+        304,
+        313
+      ],
+      "value_width": 10,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "42",
+      "role": "job_sequence_number",
+      "id_bytes_1based": [
+        314,
+        315
+      ],
+      "value_bytes_1based": [
+        316,
+        320
+      ],
+      "value_width": 5,
+      "model_supported": false,
+      "unavailable_whole_span_opaque": true
+    },
+    {
+      "id": "43",
+      "role": "sync_tightening_id",
+      "id_bytes_1based": [
+        321,
+        322
+      ],
+      "value_bytes_1based": [
+        323,
+        327
+      ],
+      "value_width": 5,
+      "model_supported": false,
+      "unavailable_whole_span_opaque": true
+    },
+    {
+      "id": "44",
+      "role": "tool_serial",
+      "id_bytes_1based": [
+        328,
+        329
+      ],
+      "value_bytes_1based": [
+        330,
+        343
+      ],
+      "value_width": 14,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "45",
+      "role": "tightening_time_local",
+      "id_bytes_1based": [
+        344,
+        345
+      ],
+      "value_bytes_1based": [
+        346,
+        364
+      ],
+      "value_width": 19,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "46",
+      "role": "pset_change_time_local",
+      "id_bytes_1based": [
+        365,
+        366
+      ],
+      "value_bytes_1based": [
+        367,
+        385
+      ],
+      "value_width": 19,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "47",
+      "role": "pset_name",
+      "id_bytes_1based": [
+        386,
+        387
+      ],
+      "value_bytes_1based": [
+        388,
+        412
+      ],
+      "value_width": 25,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "48",
+      "role": "torque_unit_code",
+      "id_bytes_1based": [
+        413,
+        414
+      ],
+      "value_bytes_1based": [
+        415,
+        415
+      ],
+      "value_width": 1,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    },
+    {
+      "id": "49",
+      "role": "result_type_code",
+      "id_bytes_1based": [
+        416,
+        417
+      ],
+      "value_bytes_1based": [
+        418,
+        419
+      ],
+      "value_width": 2,
+      "model_supported": true,
+      "unavailable_whole_span_opaque": false
+    }
+  ],
+  "known_torque_units": {
+    "1": "Nm",
+    "2": "lbf.ft",
+    "3": "lbf.in",
+    "4": "kpm",
+    "5": "kgf.cm",
+    "6": "ozf.in",
+    "7": "percent",
+    "8": "Ncm"
+  },
+  "scientific_decimal_controls": [
+    {
+      "field": "torque_min_raw",
+      "raw_integer": 1237,
+      "producer_scale": 100,
+      "exact_decimal": "12.37",
+      "reduced_fraction": [
+        1237,
+        100
+      ],
+      "host_unit_conversion": false
+    },
+    {
+      "field": "torque_max_raw",
+      "raw_integer": 78931,
+      "producer_scale": 100,
+      "exact_decimal": "789.31",
+      "reduced_fraction": [
+        78931,
+        100
+      ],
+      "host_unit_conversion": false
+    },
+    {
+      "field": "torque_target_raw",
+      "raw_integer": 34567,
+      "producer_scale": 100,
+      "exact_decimal": "345.67",
+      "reduced_fraction": [
+        34567,
+        100
+      ],
+      "host_unit_conversion": false
+    },
+    {
+      "field": "torque_result_raw",
+      "raw_integer": 23459,
+      "producer_scale": 100,
+      "exact_decimal": "234.59",
+      "reduced_fraction": [
+        23459,
+        100
+      ],
+      "host_unit_conversion": false
+    },
+    {
+      "field": "selftap_min_raw",
+      "raw_integer": 2471,
+      "producer_scale": 100,
+      "exact_decimal": "24.71",
+      "reduced_fraction": [
+        2471,
+        100
+      ],
+      "host_unit_conversion": false
+    },
+    {
+      "field": "selftap_max_raw",
+      "raw_integer": 65439,
+      "producer_scale": 100,
+      "exact_decimal": "654.39",
+      "reduced_fraction": [
+        65439,
+        100
+      ],
+      "host_unit_conversion": false
+    }
+  ],
+  "outbound_frames": [
+    {
+      "name": "startup_request",
+      "wire_hex": "303032303030303130303520202020202020202000",
+      "wire_bytes": 21,
+      "mid": "0001",
+      "revision": 5,
+      "declared_bytes": 20,
+      "no_ack_byte_hex": "20",
+      "n_a_suffix_hex": "2020202020202020"
+    },
+    {
+      "name": "subscribe_result",
+      "wire_hex": "303032303030363030303330202020202020202000",
+      "wire_bytes": 21,
+      "mid": "0060",
+      "revision": 3,
+      "declared_bytes": 20,
+      "no_ack_byte_hex": "30",
+      "n_a_suffix_hex": "2020202020202020"
+    },
+    {
+      "name": "result_ack",
+      "wire_hex": "303032303030363230303120202020202020202000",
+      "wire_bytes": 21,
+      "mid": "0062",
+      "revision": 1,
+      "declared_bytes": 20,
+      "no_ack_byte_hex": "20",
+      "n_a_suffix_hex": "2020202020202020"
+    },
+    {
+      "name": "keepalive",
+      "wire_hex": "303032303939393930303120202020202020202000",
+      "wire_bytes": 21,
+      "mid": "9999",
+      "revision": 1,
+      "declared_bytes": 20,
+      "no_ack_byte_hex": "20",
+      "n_a_suffix_hex": "2020202020202020"
+    },
+    {
+      "name": "unsubscribe",
+      "wire_hex": "303032303030363330303120202020202020202000",
+      "wire_bytes": 21,
+      "mid": "0063",
+      "revision": 1,
+      "declared_bytes": 20,
+      "no_ack_byte_hex": "20",
+      "n_a_suffix_hex": "2020202020202020"
+    }
+  ],
+  "valid_startups": [
+    {
+      "name": "startup_005",
+      "wire_hex": "30313733303030323030352020202020202020202020202020203032303730335046362d43454c4c2d414c504841202020202020202020202020202020202020202020202020202020202020202020202020203036322e382e31342d4354524c2d373331202020203037544f4f4c2d322e382e31342d3532392020202020202020202020202020202020202020202020202020202020203039504636413137423239433130303033202020202000",
+      "wire_bytes": 174,
+      "declared_bytes": 173,
+      "expected_controller": {
+        "channel_id": 7,
+        "controller_name": "PF6-CELL-ALPHA",
+        "controller_software": "2.8.14-CTRL-731",
+        "tool_software": "TOOL-2.8.14-529",
+        "controller_serial": "PF6A17B29C",
+        "system_type_code": 3,
+        "system_type_raw": "003",
+        "raw_hex": "30313733303030323030352020202020202020202020202020203032303730335046362d43454c4c2d414c504841202020202020202020202020202020202020202020202020202020202020202020202020203036322e382e31342d4354524c2d373331202020203037544f4f4c2d322e382e31342d3532392020202020202020202020202020202020202020202020202020202020203039504636413137423239433130303033202020202000"
+      }
+    },
+    {
+      "name": "startup_005_opaque_ascii",
+      "wire_hex": "3031373330303032303035202020202020202020783031213f7f3032303730335046362d43454c4c2d414c5048412020202020202020202020783034213f783035213f7e696d706c656d656e7465645f70726f3036322e382e31342d4354524c2d373331202020203037544f4f4c2d322e382e31342d35323920202020783038213f7e7262755f74797065783038213f7e7262755f74793039504636413137423239433130303033783131213f00",
+      "wire_bytes": 174,
+      "declared_bytes": 173,
+      "expected_controller": {
+        "channel_id": 7,
+        "controller_name": "PF6-CELL-ALPHA",
+        "controller_software": "2.8.14-CTRL-731",
+        "tool_software": "TOOL-2.8.14-529",
+        "controller_serial": "PF6A17B29C",
+        "system_type_code": 3,
+        "system_type_raw": "003",
+        "raw_hex": "3031373330303032303035202020202020202020783031213f7f3032303730335046362d43454c4c2d414c5048412020202020202020202020783034213f783035213f7e696d706c656d656e7465645f70726f3036322e382e31342d4354524c2d373331202020203037544f4f4c2d322e382e31342d35323920202020783038213f7e7262755f74797065783038213f7e7262755f74793039504636413137423239433130303033783131213f00"
+      }
+    },
+    {
+      "name": "startup_blank_channel",
+      "wire_hex": "30313733303030323030352020202020202020202020202020203032202030335046362d43454c4c2d414c504841202020202020202020202020202020202020202020202020202020202020202020202020203036322e382e31342d4354524c2d373331202020203037544f4f4c2d322e382e31342d3532392020202020202020202020202020202020202020202020202020202020203039504636413137423239433130303033202020202000",
+      "wire_bytes": 174,
+      "declared_bytes": 173,
+      "expected_controller": {
+        "controller_name": "PF6-CELL-ALPHA",
+        "controller_software": "2.8.14-CTRL-731",
+        "tool_software": "TOOL-2.8.14-529",
+        "controller_serial": "PF6A17B29C",
+        "system_type_code": 3,
+        "system_type_raw": "003",
+        "raw_hex": "30313733303030323030352020202020202020202020202020203032202030335046362d43454c4c2d414c504841202020202020202020202020202020202020202020202020202020202020202020202020203036322e382e31342d4354524c2d373331202020203037544f4f4c2d322e382e31342d3532392020202020202020202020202020202020202020202020202020202020203039504636413137423239433130303033202020202000",
+        "unavailable_fields": [
+          "channel_id"
+        ]
+      }
+    }
+  ],
+  "valid_results": [
+    {
+      "name": "result_003",
+      "wire_hex": "30343139303036313030333020202020202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+      "wire_bytes": 420,
+      "declared_bytes": 419,
+      "expected_value": {
+        "kind": "atlas_open_protocol_result",
+        "profile": "pf6000_v2_8",
+        "startup_revision": 5,
+        "result_revision": 3,
+        "ack_policy": "jsonl_checkpoint_before_send",
+        "raw_hex": "30343139303036313030333020202020202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+        "controller": {
+          "channel_id": 7,
+          "controller_name": "PF6-CELL-ALPHA",
+          "controller_software": "2.8.14-CTRL-731",
+          "tool_software": "TOOL-2.8.14-529",
+          "controller_serial": "PF6A17B29C",
+          "system_type_code": 3,
+          "system_type_raw": "003",
+          "raw_hex": "30313733303030323030352020202020202020202020202020203032303730335046362d43454c4c2d414c504841202020202020202020202020202020202020202020202020202020202020202020202020203036322e382e31342d4354524c2d373331202020203037544f4f4c2d322e382e31342d3532392020202020202020202020202020202020202020202020202020202020203039504636413137423239433130303033202020202000"
+        },
+        "result": {
+          "controller_name": "PF6-RESULT-DELTA",
+          "identifier": "VIN-ALPHA 17/BRAVO",
+          "job_id": 237,
+          "pset_menu_index": 59,
+          "strategy_code": 37,
+          "batch_size": 137,
+          "batch_count": 42,
+          "tightening_status_code": 1,
+          "batch_status_code": 2,
+          "torque_status_code": 0,
+          "angle_status_code": 2,
+          "rundown_status_code": 7,
+          "selftap_status_code": 4,
+          "torque_min_raw": 1237,
+          "torque_max_raw": 78931,
+          "torque_target_raw": 34567,
+          "torque_result_raw": 23459,
+          "angle_min_deg": 123,
+          "angle_max_deg": 98765,
+          "angle_target_deg": 5432,
+          "angle_result_deg": 2347,
+          "rundown_angle_min_deg": 17,
+          "rundown_angle_max_deg": 54321,
+          "selftap_min_raw": 2471,
+          "selftap_max_raw": 65439,
+          "tightening_id": 98765,
+          "tightening_id_raw": "0000098765",
+          "tool_serial": "TOOL73A9B2C5D8",
+          "tightening_time_local": "2026-11-12:14:37:59",
+          "pset_change_time_local": "2026-10-03:09:26:41",
+          "pset_name": "PSET-OMEGA/059",
+          "torque_unit_code": 1,
+          "result_type_code": 7,
+          "torque_scale": 100,
+          "torque_unit": "Nm"
+        },
+        "unavailable_fields": [],
+        "unsupported_fields": [
+          "01",
+          "02",
+          "08",
+          "16",
+          "18",
+          "19",
+          "20",
+          "31",
+          "32",
+          "33",
+          "34",
+          "37",
+          "38",
+          "39",
+          "40",
+          "42",
+          "43"
+        ]
+      },
+      "startup_frame": "startup_005"
+    },
+    {
+      "name": "result_003_opaque_ascii",
+      "wire_hex": "3034313930303631303033302020202020202020783031213f7f7830322130335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f20202020202020303530323337303630353930373337783038213f7e73303930313337313030303432313131313232313330313432313537783136313734783138783139783230213f7e7469676874653231303031323337323230373839333132333033343536373234303233343539323530303132333236393837363532373035343332323830323334373239303030313733303534333231783331213f7e72783332213f783333213f783334213f33353030323437313336303635343339783337213f7e7365783338213f7e7072783339213f7e7072783430213f7e7072343130303030303938373635783432213f7e6a783433213f7e733434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+      "wire_bytes": 420,
+      "declared_bytes": 419,
+      "expected_value": {
+        "kind": "atlas_open_protocol_result",
+        "profile": "pf6000_v2_8",
+        "startup_revision": 5,
+        "result_revision": 3,
+        "ack_policy": "jsonl_checkpoint_before_send",
+        "raw_hex": "3034313930303631303033302020202020202020783031213f7f7830322130335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f20202020202020303530323337303630353930373337783038213f7e73303930313337313030303432313131313232313330313432313537783136313734783138783139783230213f7e7469676874653231303031323337323230373839333132333033343536373234303233343539323530303132333236393837363532373035343332323830323334373239303030313733303534333231783331213f7e72783332213f783333213f783334213f33353030323437313336303635343339783337213f7e7365783338213f7e7072783339213f7e7072783430213f7e7072343130303030303938373635783432213f7e6a783433213f7e733434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+        "controller": {
+          "channel_id": 7,
+          "controller_name": "PF6-CELL-ALPHA",
+          "controller_software": "2.8.14-CTRL-731",
+          "tool_software": "TOOL-2.8.14-529",
+          "controller_serial": "PF6A17B29C",
+          "system_type_code": 3,
+          "system_type_raw": "003",
+          "raw_hex": "3031373330303032303035202020202020202020783031213f7f3032303730335046362d43454c4c2d414c5048412020202020202020202020783034213f783035213f7e696d706c656d656e7465645f70726f3036322e382e31342d4354524c2d373331202020203037544f4f4c2d322e382e31342d35323920202020783038213f7e7262755f74797065783038213f7e7262755f74793039504636413137423239433130303033783131213f00"
+        },
+        "result": {
+          "controller_name": "PF6-RESULT-DELTA",
+          "identifier": "VIN-ALPHA 17/BRAVO",
+          "job_id": 237,
+          "pset_menu_index": 59,
+          "strategy_code": 37,
+          "batch_size": 137,
+          "batch_count": 42,
+          "tightening_status_code": 1,
+          "batch_status_code": 2,
+          "torque_status_code": 0,
+          "angle_status_code": 2,
+          "rundown_status_code": 7,
+          "selftap_status_code": 4,
+          "torque_min_raw": 1237,
+          "torque_max_raw": 78931,
+          "torque_target_raw": 34567,
+          "torque_result_raw": 23459,
+          "angle_min_deg": 123,
+          "angle_max_deg": 98765,
+          "angle_target_deg": 5432,
+          "angle_result_deg": 2347,
+          "rundown_angle_min_deg": 17,
+          "rundown_angle_max_deg": 54321,
+          "selftap_min_raw": 2471,
+          "selftap_max_raw": 65439,
+          "tightening_id": 98765,
+          "tightening_id_raw": "0000098765",
+          "tool_serial": "TOOL73A9B2C5D8",
+          "tightening_time_local": "2026-11-12:14:37:59",
+          "pset_change_time_local": "2026-10-03:09:26:41",
+          "pset_name": "PSET-OMEGA/059",
+          "torque_unit_code": 1,
+          "result_type_code": 7,
+          "torque_scale": 100,
+          "torque_unit": "Nm"
+        },
+        "unavailable_fields": [],
+        "unsupported_fields": [
+          "01",
+          "02",
+          "08",
+          "16",
+          "18",
+          "19",
+          "20",
+          "31",
+          "32",
+          "33",
+          "34",
+          "37",
+          "38",
+          "39",
+          "40",
+          "42",
+          "43"
+        ]
+      },
+      "startup_frame": "startup_005_opaque_ascii"
+    },
+    {
+      "name": "result_percent",
+      "wire_hex": "30343139303036313030333020202020202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438373439303700",
+      "wire_bytes": 420,
+      "declared_bytes": 419,
+      "expected_value": {
+        "kind": "atlas_open_protocol_result",
+        "profile": "pf6000_v2_8",
+        "startup_revision": 5,
+        "result_revision": 3,
+        "ack_policy": "jsonl_checkpoint_before_send",
+        "raw_hex": "30343139303036313030333020202020202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438373439303700",
+        "controller": {
+          "channel_id": 7,
+          "controller_name": "PF6-CELL-ALPHA",
+          "controller_software": "2.8.14-CTRL-731",
+          "tool_software": "TOOL-2.8.14-529",
+          "controller_serial": "PF6A17B29C",
+          "system_type_code": 3,
+          "system_type_raw": "003",
+          "raw_hex": "30313733303030323030352020202020202020202020202020203032303730335046362d43454c4c2d414c504841202020202020202020202020202020202020202020202020202020202020202020202020203036322e382e31342d4354524c2d373331202020203037544f4f4c2d322e382e31342d3532392020202020202020202020202020202020202020202020202020202020203039504636413137423239433130303033202020202000"
+        },
+        "result": {
+          "controller_name": "PF6-RESULT-DELTA",
+          "identifier": "VIN-ALPHA 17/BRAVO",
+          "job_id": 237,
+          "pset_menu_index": 59,
+          "strategy_code": 37,
+          "batch_size": 137,
+          "batch_count": 42,
+          "tightening_status_code": 1,
+          "batch_status_code": 2,
+          "torque_status_code": 0,
+          "angle_status_code": 2,
+          "rundown_status_code": 7,
+          "selftap_status_code": 4,
+          "torque_min_raw": 1237,
+          "torque_max_raw": 78931,
+          "torque_target_raw": 34567,
+          "torque_result_raw": 23459,
+          "angle_min_deg": 123,
+          "angle_max_deg": 98765,
+          "angle_target_deg": 5432,
+          "angle_result_deg": 2347,
+          "rundown_angle_min_deg": 17,
+          "rundown_angle_max_deg": 54321,
+          "selftap_min_raw": 2471,
+          "selftap_max_raw": 65439,
+          "tightening_id": 98765,
+          "tightening_id_raw": "0000098765",
+          "tool_serial": "TOOL73A9B2C5D8",
+          "tightening_time_local": "2026-11-12:14:37:59",
+          "pset_change_time_local": "2026-10-03:09:26:41",
+          "pset_name": "PSET-OMEGA/059",
+          "torque_unit_code": 7,
+          "result_type_code": 7,
+          "torque_scale": 100,
+          "torque_unit": "percent"
+        },
+        "unavailable_fields": [],
+        "unsupported_fields": [
+          "01",
+          "02",
+          "08",
+          "16",
+          "18",
+          "19",
+          "20",
+          "31",
+          "32",
+          "33",
+          "34",
+          "37",
+          "38",
+          "39",
+          "40",
+          "42",
+          "43"
+        ]
+      },
+      "startup_frame": "startup_005"
+    },
+    {
+      "name": "result_unknown_unit_and_type",
+      "wire_hex": "30343139303036313030333020202020202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438393439393700",
+      "wire_bytes": 420,
+      "declared_bytes": 419,
+      "expected_value": {
+        "kind": "atlas_open_protocol_result",
+        "profile": "pf6000_v2_8",
+        "startup_revision": 5,
+        "result_revision": 3,
+        "ack_policy": "jsonl_checkpoint_before_send",
+        "raw_hex": "30343139303036313030333020202020202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438393439393700",
+        "controller": {
+          "channel_id": 7,
+          "controller_name": "PF6-CELL-ALPHA",
+          "controller_software": "2.8.14-CTRL-731",
+          "tool_software": "TOOL-2.8.14-529",
+          "controller_serial": "PF6A17B29C",
+          "system_type_code": 3,
+          "system_type_raw": "003",
+          "raw_hex": "30313733303030323030352020202020202020202020202020203032303730335046362d43454c4c2d414c504841202020202020202020202020202020202020202020202020202020202020202020202020203036322e382e31342d4354524c2d373331202020203037544f4f4c2d322e382e31342d3532392020202020202020202020202020202020202020202020202020202020203039504636413137423239433130303033202020202000"
+        },
+        "result": {
+          "controller_name": "PF6-RESULT-DELTA",
+          "identifier": "VIN-ALPHA 17/BRAVO",
+          "job_id": 237,
+          "pset_menu_index": 59,
+          "strategy_code": 37,
+          "batch_size": 137,
+          "batch_count": 42,
+          "tightening_status_code": 1,
+          "batch_status_code": 2,
+          "torque_status_code": 0,
+          "angle_status_code": 2,
+          "rundown_status_code": 7,
+          "selftap_status_code": 4,
+          "torque_min_raw": 1237,
+          "torque_max_raw": 78931,
+          "torque_target_raw": 34567,
+          "torque_result_raw": 23459,
+          "angle_min_deg": 123,
+          "angle_max_deg": 98765,
+          "angle_target_deg": 5432,
+          "angle_result_deg": 2347,
+          "rundown_angle_min_deg": 17,
+          "rundown_angle_max_deg": 54321,
+          "selftap_min_raw": 2471,
+          "selftap_max_raw": 65439,
+          "tightening_id": 98765,
+          "tightening_id_raw": "0000098765",
+          "tool_serial": "TOOL73A9B2C5D8",
+          "tightening_time_local": "2026-11-12:14:37:59",
+          "pset_change_time_local": "2026-10-03:09:26:41",
+          "pset_name": "PSET-OMEGA/059",
+          "torque_unit_code": 9,
+          "result_type_code": 97,
+          "torque_scale": 100
+        },
+        "unavailable_fields": [],
+        "unsupported_fields": [
+          "01",
+          "02",
+          "08",
+          "16",
+          "18",
+          "19",
+          "20",
+          "31",
+          "32",
+          "33",
+          "34",
+          "37",
+          "38",
+          "39",
+          "40",
+          "42",
+          "43"
+        ]
+      },
+      "startup_frame": "startup_005"
+    },
+    {
+      "name": "result_blank_supported_numeric",
+      "wire_hex": "30343139303036313030333020202020202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035202020203036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732342020202020203235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034312020202020202020202020202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438203439303700",
+      "wire_bytes": 420,
+      "declared_bytes": 419,
+      "expected_value": {
+        "kind": "atlas_open_protocol_result",
+        "profile": "pf6000_v2_8",
+        "startup_revision": 5,
+        "result_revision": 3,
+        "ack_policy": "jsonl_checkpoint_before_send",
+        "raw_hex": "30343139303036313030333020202020202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035202020203036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732342020202020203235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034312020202020202020202020202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438203439303700",
+        "controller": {
+          "channel_id": 7,
+          "controller_name": "PF6-CELL-ALPHA",
+          "controller_software": "2.8.14-CTRL-731",
+          "tool_software": "TOOL-2.8.14-529",
+          "controller_serial": "PF6A17B29C",
+          "system_type_code": 3,
+          "system_type_raw": "003",
+          "raw_hex": "30313733303030323030352020202020202020202020202020203032303730335046362d43454c4c2d414c504841202020202020202020202020202020202020202020202020202020202020202020202020203036322e382e31342d4354524c2d373331202020203037544f4f4c2d322e382e31342d3532392020202020202020202020202020202020202020202020202020202020203039504636413137423239433130303033202020202000"
+        },
+        "result": {
+          "controller_name": "PF6-RESULT-DELTA",
+          "identifier": "VIN-ALPHA 17/BRAVO",
+          "pset_menu_index": 59,
+          "strategy_code": 37,
+          "batch_size": 137,
+          "batch_count": 42,
+          "tightening_status_code": 1,
+          "batch_status_code": 2,
+          "torque_status_code": 0,
+          "angle_status_code": 2,
+          "rundown_status_code": 7,
+          "selftap_status_code": 4,
+          "torque_min_raw": 1237,
+          "torque_max_raw": 78931,
+          "torque_target_raw": 34567,
+          "angle_min_deg": 123,
+          "angle_max_deg": 98765,
+          "angle_target_deg": 5432,
+          "angle_result_deg": 2347,
+          "rundown_angle_min_deg": 17,
+          "rundown_angle_max_deg": 54321,
+          "selftap_min_raw": 2471,
+          "selftap_max_raw": 65439,
+          "tool_serial": "TOOL73A9B2C5D8",
+          "tightening_time_local": "2026-11-12:14:37:59",
+          "pset_change_time_local": "2026-10-03:09:26:41",
+          "pset_name": "PSET-OMEGA/059",
+          "result_type_code": 7,
+          "torque_scale": 100
+        },
+        "unavailable_fields": [
+          "job_id",
+          "torque_result_raw",
+          "tightening_id",
+          "torque_unit_code"
+        ],
+        "unsupported_fields": [
+          "01",
+          "02",
+          "08",
+          "16",
+          "18",
+          "19",
+          "20",
+          "31",
+          "32",
+          "33",
+          "34",
+          "37",
+          "38",
+          "39",
+          "40",
+          "42",
+          "43"
+        ]
+      },
+      "startup_frame": "startup_005"
+    },
+    {
+      "name": "result_text_is_not_datetime_parsed",
+      "wire_hex": "303431393030363130303330202020202020202020202020202020202020303320204c454144494e472d4e414d452020202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c3733413942324335443834352e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e3436202020202020202020202020202020202020203437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+      "wire_bytes": 420,
+      "declared_bytes": 419,
+      "expected_value": {
+        "kind": "atlas_open_protocol_result",
+        "profile": "pf6000_v2_8",
+        "startup_revision": 5,
+        "result_revision": 3,
+        "ack_policy": "jsonl_checkpoint_before_send",
+        "raw_hex": "303431393030363130303330202020202020202020202020202020202020303320204c454144494e472d4e414d452020202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c3733413942324335443834352e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e3436202020202020202020202020202020202020203437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+        "controller": {
+          "channel_id": 7,
+          "controller_name": "PF6-CELL-ALPHA",
+          "controller_software": "2.8.14-CTRL-731",
+          "tool_software": "TOOL-2.8.14-529",
+          "controller_serial": "PF6A17B29C",
+          "system_type_code": 3,
+          "system_type_raw": "003",
+          "raw_hex": "30313733303030323030352020202020202020202020202020203032303730335046362d43454c4c2d414c504841202020202020202020202020202020202020202020202020202020202020202020202020203036322e382e31342d4354524c2d373331202020203037544f4f4c2d322e382e31342d3532392020202020202020202020202020202020202020202020202020202020203039504636413137423239433130303033202020202000"
+        },
+        "result": {
+          "controller_name": "  LEADING-NAME",
+          "identifier": "VIN-ALPHA 17/BRAVO",
+          "job_id": 237,
+          "pset_menu_index": 59,
+          "strategy_code": 37,
+          "batch_size": 137,
+          "batch_count": 42,
+          "tightening_status_code": 1,
+          "batch_status_code": 2,
+          "torque_status_code": 0,
+          "angle_status_code": 2,
+          "rundown_status_code": 7,
+          "selftap_status_code": 4,
+          "torque_min_raw": 1237,
+          "torque_max_raw": 78931,
+          "torque_target_raw": 34567,
+          "torque_result_raw": 23459,
+          "angle_min_deg": 123,
+          "angle_max_deg": 98765,
+          "angle_target_deg": 5432,
+          "angle_result_deg": 2347,
+          "rundown_angle_min_deg": 17,
+          "rundown_angle_max_deg": 54321,
+          "selftap_min_raw": 2471,
+          "selftap_max_raw": 65439,
+          "tightening_id": 98765,
+          "tightening_id_raw": "0000098765",
+          "tool_serial": "TOOL73A9B2C5D8",
+          "tightening_time_local": "...................",
+          "pset_change_time_local": "",
+          "pset_name": "PSET-OMEGA/059",
+          "torque_unit_code": 1,
+          "result_type_code": 7,
+          "torque_scale": 100,
+          "torque_unit": "Nm"
+        },
+        "unavailable_fields": [],
+        "unsupported_fields": [
+          "01",
+          "02",
+          "08",
+          "16",
+          "18",
+          "19",
+          "20",
+          "31",
+          "32",
+          "33",
+          "34",
+          "37",
+          "38",
+          "39",
+          "40",
+          "42",
+          "43"
+        ]
+      },
+      "startup_frame": "startup_005"
+    },
+    {
+      "name": "result_maximum_native_id",
+      "wire_hex": "30343139303036313030333020202020202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313432393439363732393520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+      "wire_bytes": 420,
+      "declared_bytes": 419,
+      "expected_value": {
+        "kind": "atlas_open_protocol_result",
+        "profile": "pf6000_v2_8",
+        "startup_revision": 5,
+        "result_revision": 3,
+        "ack_policy": "jsonl_checkpoint_before_send",
+        "raw_hex": "30343139303036313030333020202020202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313432393439363732393520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+        "controller": {
+          "channel_id": 7,
+          "controller_name": "PF6-CELL-ALPHA",
+          "controller_software": "2.8.14-CTRL-731",
+          "tool_software": "TOOL-2.8.14-529",
+          "controller_serial": "PF6A17B29C",
+          "system_type_code": 3,
+          "system_type_raw": "003",
+          "raw_hex": "30313733303030323030352020202020202020202020202020203032303730335046362d43454c4c2d414c504841202020202020202020202020202020202020202020202020202020202020202020202020203036322e382e31342d4354524c2d373331202020203037544f4f4c2d322e382e31342d3532392020202020202020202020202020202020202020202020202020202020203039504636413137423239433130303033202020202000"
+        },
+        "result": {
+          "controller_name": "PF6-RESULT-DELTA",
+          "identifier": "VIN-ALPHA 17/BRAVO",
+          "job_id": 237,
+          "pset_menu_index": 59,
+          "strategy_code": 37,
+          "batch_size": 137,
+          "batch_count": 42,
+          "tightening_status_code": 1,
+          "batch_status_code": 2,
+          "torque_status_code": 0,
+          "angle_status_code": 2,
+          "rundown_status_code": 7,
+          "selftap_status_code": 4,
+          "torque_min_raw": 1237,
+          "torque_max_raw": 78931,
+          "torque_target_raw": 34567,
+          "torque_result_raw": 23459,
+          "angle_min_deg": 123,
+          "angle_max_deg": 98765,
+          "angle_target_deg": 5432,
+          "angle_result_deg": 2347,
+          "rundown_angle_min_deg": 17,
+          "rundown_angle_max_deg": 54321,
+          "selftap_min_raw": 2471,
+          "selftap_max_raw": 65439,
+          "tightening_id": 4294967295,
+          "tightening_id_raw": "4294967295",
+          "tool_serial": "TOOL73A9B2C5D8",
+          "tightening_time_local": "2026-11-12:14:37:59",
+          "pset_change_time_local": "2026-10-03:09:26:41",
+          "pset_name": "PSET-OMEGA/059",
+          "torque_unit_code": 1,
+          "result_type_code": 7,
+          "torque_scale": 100,
+          "torque_unit": "Nm"
+        },
+        "unavailable_fields": [],
+        "unsupported_fields": [
+          "01",
+          "02",
+          "08",
+          "16",
+          "18",
+          "19",
+          "20",
+          "31",
+          "32",
+          "33",
+          "34",
+          "37",
+          "38",
+          "39",
+          "40",
+          "42",
+          "43"
+        ]
+      },
+      "startup_frame": "startup_005"
+    },
+    {
+      "name": "result_explicit_default_address_zero_disabled_fields",
+      "wire_hex": "30343139303036313030333030313031303030302020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+      "wire_bytes": 420,
+      "declared_bytes": 419,
+      "expected_value": {
+        "kind": "atlas_open_protocol_result",
+        "profile": "pf6000_v2_8",
+        "startup_revision": 5,
+        "result_revision": 3,
+        "ack_policy": "jsonl_checkpoint_before_send",
+        "raw_hex": "30343139303036313030333030313031303030302020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+        "controller": {
+          "channel_id": 7,
+          "controller_name": "PF6-CELL-ALPHA",
+          "controller_software": "2.8.14-CTRL-731",
+          "tool_software": "TOOL-2.8.14-529",
+          "controller_serial": "PF6A17B29C",
+          "system_type_code": 3,
+          "system_type_raw": "003",
+          "raw_hex": "30313733303030323030352020202020202020202020202020203032303730335046362d43454c4c2d414c504841202020202020202020202020202020202020202020202020202020202020202020202020203036322e382e31342d4354524c2d373331202020203037544f4f4c2d322e382e31342d3532392020202020202020202020202020202020202020202020202020202020203039504636413137423239433130303033202020202000"
+        },
+        "result": {
+          "controller_name": "PF6-RESULT-DELTA",
+          "identifier": "VIN-ALPHA 17/BRAVO",
+          "job_id": 237,
+          "pset_menu_index": 59,
+          "strategy_code": 37,
+          "batch_size": 137,
+          "batch_count": 42,
+          "tightening_status_code": 1,
+          "batch_status_code": 2,
+          "torque_status_code": 0,
+          "angle_status_code": 2,
+          "rundown_status_code": 7,
+          "selftap_status_code": 4,
+          "torque_min_raw": 1237,
+          "torque_max_raw": 78931,
+          "torque_target_raw": 34567,
+          "torque_result_raw": 23459,
+          "angle_min_deg": 123,
+          "angle_max_deg": 98765,
+          "angle_target_deg": 5432,
+          "angle_result_deg": 2347,
+          "rundown_angle_min_deg": 17,
+          "rundown_angle_max_deg": 54321,
+          "selftap_min_raw": 2471,
+          "selftap_max_raw": 65439,
+          "tightening_id": 98765,
+          "tightening_id_raw": "0000098765",
+          "tool_serial": "TOOL73A9B2C5D8",
+          "tightening_time_local": "2026-11-12:14:37:59",
+          "pset_change_time_local": "2026-10-03:09:26:41",
+          "pset_name": "PSET-OMEGA/059",
+          "torque_unit_code": 1,
+          "result_type_code": 7,
+          "torque_scale": 100,
+          "torque_unit": "Nm"
+        },
+        "unavailable_fields": [],
+        "unsupported_fields": [
+          "01",
+          "02",
+          "08",
+          "16",
+          "18",
+          "19",
+          "20",
+          "31",
+          "32",
+          "33",
+          "34",
+          "37",
+          "38",
+          "39",
+          "40",
+          "42",
+          "43"
+        ]
+      },
+      "startup_frame": "startup_005"
+    }
+  ],
+  "control_frames": [
+    {
+      "name": "accepted_subscribe_one",
+      "wire_hex": "30303234303030353030312020202020202020203030363000",
+      "wire_bytes": 25,
+      "declared_bytes": 24,
+      "expected": {
+        "mid": "0005",
+        "revision": 1,
+        "accepted_mid": "0060"
+      }
+    },
+    {
+      "name": "accepted_unsubscribe_one",
+      "wire_hex": "30303234303030353030312020202020202020203030363300",
+      "wire_bytes": 25,
+      "declared_bytes": 24,
+      "expected": {
+        "mid": "0005",
+        "revision": 1,
+        "accepted_mid": "0063"
+      }
+    },
+    {
+      "name": "error_duplicate_subscription_one",
+      "wire_hex": "303032363030303430303120202020202020202030303630303900",
+      "wire_bytes": 27,
+      "declared_bytes": 26,
+      "expected": {
+        "mid": "0004",
+        "revision": 1,
+        "failed_mid": "0060",
+        "error_code": 9,
+        "error_code_raw": "09"
+      }
+    },
+    {
+      "name": "error_unknown_native_one",
+      "wire_hex": "303032363030303430303120202020202020202030303630393900",
+      "wire_bytes": 27,
+      "declared_bytes": 26,
+      "expected": {
+        "mid": "0004",
+        "revision": 1,
+        "failed_mid": "0060",
+        "error_code": 99,
+        "error_code_raw": "99"
+      }
+    },
+    {
+      "name": "keepalive_reply_one",
+      "wire_hex": "303032303939393930303120202020202020202000",
+      "wire_bytes": 21,
+      "declared_bytes": 20,
+      "expected": {
+        "mid": "9999",
+        "revision": 1
+      }
+    },
+    {
+      "name": "accepted_subscribe_zero_alias",
+      "wire_hex": "30303234303030353030302020202020202020203030363000",
+      "wire_bytes": 25,
+      "declared_bytes": 24,
+      "expected": {
+        "mid": "0005",
+        "revision": 1,
+        "accepted_mid": "0060"
+      }
+    },
+    {
+      "name": "accepted_unsubscribe_zero_alias",
+      "wire_hex": "30303234303030353030302020202020202020203030363300",
+      "wire_bytes": 25,
+      "declared_bytes": 24,
+      "expected": {
+        "mid": "0005",
+        "revision": 1,
+        "accepted_mid": "0063"
+      }
+    },
+    {
+      "name": "error_duplicate_subscription_zero_alias",
+      "wire_hex": "303032363030303430303020202020202020202030303630303900",
+      "wire_bytes": 27,
+      "declared_bytes": 26,
+      "expected": {
+        "mid": "0004",
+        "revision": 1,
+        "failed_mid": "0060",
+        "error_code": 9,
+        "error_code_raw": "09"
+      }
+    },
+    {
+      "name": "error_unknown_native_zero_alias",
+      "wire_hex": "303032363030303430303020202020202020202030303630393900",
+      "wire_bytes": 27,
+      "declared_bytes": 26,
+      "expected": {
+        "mid": "0004",
+        "revision": 1,
+        "failed_mid": "0060",
+        "error_code": 99,
+        "error_code_raw": "99"
+      }
+    },
+    {
+      "name": "keepalive_reply_zero_alias",
+      "wire_hex": "303032303939393930303020202020202020202000",
+      "wire_bytes": 21,
+      "declared_bytes": 20,
+      "expected": {
+        "mid": "9999",
+        "revision": 1
+      }
+    },
+    {
+      "name": "accepted_subscribe_blank_alias",
+      "wire_hex": "30303234303030352020202020202020202020203030363000",
+      "wire_bytes": 25,
+      "declared_bytes": 24,
+      "expected": {
+        "mid": "0005",
+        "revision": 1,
+        "accepted_mid": "0060"
+      }
+    },
+    {
+      "name": "accepted_unsubscribe_blank_alias",
+      "wire_hex": "30303234303030352020202020202020202020203030363300",
+      "wire_bytes": 25,
+      "declared_bytes": 24,
+      "expected": {
+        "mid": "0005",
+        "revision": 1,
+        "accepted_mid": "0063"
+      }
+    },
+    {
+      "name": "error_duplicate_subscription_blank_alias",
+      "wire_hex": "303032363030303420202020202020202020202030303630303900",
+      "wire_bytes": 27,
+      "declared_bytes": 26,
+      "expected": {
+        "mid": "0004",
+        "revision": 1,
+        "failed_mid": "0060",
+        "error_code": 9,
+        "error_code_raw": "09"
+      }
+    },
+    {
+      "name": "error_unknown_native_blank_alias",
+      "wire_hex": "303032363030303420202020202020202020202030303630393900",
+      "wire_bytes": 27,
+      "declared_bytes": 26,
+      "expected": {
+        "mid": "0004",
+        "revision": 1,
+        "failed_mid": "0060",
+        "error_code": 99,
+        "error_code_raw": "99"
+      }
+    },
+    {
+      "name": "keepalive_reply_blank_alias",
+      "wire_hex": "303032303939393920202020202020202020202000",
+      "wire_bytes": 21,
+      "declared_bytes": 20,
+      "expected": {
+        "mid": "9999",
+        "revision": 1
+      }
+    },
+    {
+      "name": "control_n_a_byte_is_opaque_del",
+      "wire_hex": "30303234303030353030317f20202020202020203030363000",
+      "wire_bytes": 25,
+      "declared_bytes": 24,
+      "expected": {
+        "mid": "0005",
+        "revision": 1,
+        "accepted_mid": "0060"
+      }
+    },
+    {
+      "name": "control_explicit_default_address_zero_disabled_fields",
+      "wire_hex": "30303234303030353030312030313031303030303030363000",
+      "wire_bytes": 25,
+      "declared_bytes": 24,
+      "expected": {
+        "mid": "0005",
+        "revision": 1,
+        "accepted_mid": "0060"
+      }
+    }
+  ],
+  "malformed_frames": [
+    {
+      "name": "length_non_decimal",
+      "wire_hex": "30347839303036313030333020202020202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+      "wire_bytes": 420,
+      "expected_failure": "header_length_not_decimal"
+    },
+    {
+      "name": "declared_below_header",
+      "wire_hex": "303031393030303130303520202020202020202000",
+      "wire_bytes": 21,
+      "expected_failure": "declared_length_below_20"
+    },
+    {
+      "name": "declared_above_profile_max",
+      "wire_hex": "30343230303036313030333020202020202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+      "wire_bytes": 420,
+      "expected_failure": "declared_length_above_419"
+    },
+    {
+      "name": "result_wrong_declared_extent",
+      "wire_hex": "30343138303036313030333020202020202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+      "wire_bytes": 420,
+      "expected_failure": "mid_revision_extent_mismatch"
+    },
+    {
+      "name": "result_missing_final_nul",
+      "wire_hex": "30343139303036313030333020202020202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f303539202020202020202020202034383134393037",
+      "wire_bytes": 419,
+      "expected_failure": "incomplete_frame"
+    },
+    {
+      "name": "result_final_byte_not_nul",
+      "wire_hex": "30343139303036313030333020202020202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303758",
+      "wire_bytes": 420,
+      "expected_failure": "terminal_not_nul"
+    },
+    {
+      "name": "result_embedded_nul",
+      "wire_hex": "30343139303036313030333020202020202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303400494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+      "wire_bytes": 420,
+      "expected_failure": "embedded_nul"
+    },
+    {
+      "name": "result_c0_in_opaque_span",
+      "wire_hex": "303431393030363130303330202020202020202078301f213f7f7830322130335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f20202020202020303530323337303630353930373337783038213f7e73303930313337313030303432313131313232313330313432313537783136313734783138783139783230213f7e7469676874653231303031323337323230373839333132333033343536373234303233343539323530303132333236393837363532373035343332323830323334373239303030313733303534333231783331213f7e72783332213f783333213f783334213f33353030323437313336303635343339783337213f7e7365783338213f7e7072783339213f7e7072783430213f7e7072343130303030303938373635783432213f7e6a783433213f7e733434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+      "wire_bytes": 420,
+      "expected_failure": "byte_below_static_text_domain"
+    },
+    {
+      "name": "result_non_ascii_opaque_span",
+      "wire_hex": "3034313930303631303033302020202020202020783080213f7f7830322130335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f20202020202020303530323337303630353930373337783038213f7e73303930313337313030303432313131313232313330313432313537783136313734783138783139783230213f7e7469676874653231303031323337323230373839333132333033343536373234303233343539323530303132333236393837363532373035343332323830323334373239303030313733303534333231783331213f7e72783332213f783333213f783334213f33353030323437313336303635343339783337213f7e7365783338213f7e7072783339213f7e7072783430213f7e7072343130303030303938373635783432213f7e6a783433213f7e733434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+      "wire_bytes": 420,
+      "expected_failure": "byte_above_static_text_domain"
+    },
+    {
+      "name": "result_no_ack_one",
+      "wire_hex": "30343139303036313030333120202020202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+      "wire_bytes": 420,
+      "expected_failure": "reliable_event_requires_ascii_zero"
+    },
+    {
+      "name": "result_no_ack_blank",
+      "wire_hex": "30343139303036313030332020202020202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+      "wire_bytes": 420,
+      "expected_failure": "reliable_event_requires_ascii_zero"
+    },
+    {
+      "name": "result_wrong_revision",
+      "wire_hex": "30343139303036313030313020202020202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+      "wire_bytes": 420,
+      "expected_failure": "result_revision_must_be_003"
+    },
+    {
+      "name": "startup_wrong_revision",
+      "wire_hex": "30313733303030323030342020202020202020202020202020203032303730335046362d43454c4c2d414c504841202020202020202020202020202020202020202020202020202020202020202020202020203036322e382e31342d4354524c2d373331202020203037544f4f4c2d322e382e31342d3532392020202020202020202020202020202020202020202020202020202020203039504636413137423239433130303033202020202000",
+      "wire_bytes": 174,
+      "expected_failure": "startup_revision_must_be_005"
+    },
+    {
+      "name": "startup_wrong_model",
+      "wire_hex": "30313733303030323030352020202020202020202020202020203032303730335046362d43454c4c2d414c504841202020202020202020202020202020202020202020202020202020202020202020202020203036322e382e31342d4354524c2d373331202020203037544f4f4c2d322e382e31342d3532392020202020202020202020202020202020202020202020202020202020203039504636413137423239433130303031202020202000",
+      "wire_bytes": 174,
+      "expected_failure": "model_system_type_must_be_003"
+    },
+    {
+      "name": "startup_blank_model",
+      "wire_hex": "30313733303030323030352020202020202020202020202020203032303730335046362d43454c4c2d414c504841202020202020202020202020202020202020202020202020202020202020202020202020203036322e382e31342d4354524c2d373331202020203037544f4f4c2d322e382e31342d3532392020202020202020202020202020202020202020202020202020202020203039504636413137423239433130202020202020202000",
+      "wire_bytes": 174,
+      "expected_failure": "model_system_type_must_be_003"
+    },
+    {
+      "name": "startup_bad_supported_id",
+      "wire_hex": "30313733303030323030352020202020202020202020202020203032303730335046362d43454c4c2d414c504841202020202020202020202020202020202020202020202020202020202020202020202020203939322e382e31342d4354524c2d373331202020203037544f4f4c2d322e382e31342d3532392020202020202020202020202020202020202020202020202020202020203039504636413137423239433130303033202020202000",
+      "wire_bytes": 174,
+      "expected_failure": "supported_parameter_id_mismatch"
+    },
+    {
+      "name": "result_bad_supported_id",
+      "wire_hex": "30343139303036313030333020202020202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363739393032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+      "wire_bytes": 420,
+      "expected_failure": "supported_parameter_id_mismatch"
+    },
+    {
+      "name": "result_non_decimal_supported_numeric",
+      "wire_hex": "30343139303036313030333020202020202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343031783335393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+      "wire_bytes": 420,
+      "expected_failure": "supported_numeric_not_decimal"
+    },
+    {
+      "name": "result_partial_blank_numeric",
+      "wire_hex": "30343139303036313030333020202020202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343031203335393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+      "wire_bytes": 420,
+      "expected_failure": "supported_numeric_not_decimal"
+    },
+    {
+      "name": "result_signed_numeric",
+      "wire_hex": "30343139303036313030333020202020202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732342d32333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+      "wire_bytes": 420,
+      "expected_failure": "supported_numeric_not_unsigned_decimal"
+    },
+    {
+      "name": "native_id_overflow",
+      "wire_hex": "30343139303036313030333020202020202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313432393439363732393620202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+      "wire_bytes": 420,
+      "expected_failure": "tightening_id_above_u32_max"
+    },
+    {
+      "name": "result_non_default_station",
+      "wire_hex": "30343139303036313030333030322020202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+      "wire_bytes": 420,
+      "expected_failure": "unsupported_station"
+    },
+    {
+      "name": "result_non_default_spindle",
+      "wire_hex": "30343139303036313030333020203032202020202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+      "wire_bytes": 420,
+      "expected_failure": "unsupported_spindle"
+    },
+    {
+      "name": "result_link_sequence",
+      "wire_hex": "30343139303036313030333020202020303120202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+      "wire_bytes": 420,
+      "expected_failure": "link_sequence_not_supported"
+    },
+    {
+      "name": "result_link_part_count",
+      "wire_hex": "30343139303036313030333020202020202031202020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+      "wire_bytes": 420,
+      "expected_failure": "linked_message_not_supported"
+    },
+    {
+      "name": "result_link_part_number",
+      "wire_hex": "30343139303036313030333020202020202020312020202020202020202030335046362d524553554c542d44454c5441202020202020202020303456494e2d414c5048412031372f425241564f202020202020203035303233373036303539303733372020202020202030393031333731303030343231313131323231333031343231353720202031373420202020202020202020202020202020202032313030313233373232303738393331323330333435363732343032333435393235303031323332363938373635323730353433323238303233343732393030303137333035343332312020202020202020202020202020202020202020202033353030323437313336303635343339202020202020202020202020202020202020202020202020202020202020202034313030303030393837363520202020202020202020202020203434544f4f4c373341394232433544383435323032362d31312d31323a31343a33373a35393436323032362d31302d30333a30393a32363a34313437505345542d4f4d4547412f30353920202020202020202020203438313439303700",
+      "wire_bytes": 420,
+      "expected_failure": "linked_message_not_supported"
+    },
+    {
+      "name": "control_revision_two",
+      "wire_hex": "30303234303030353030322020202020202020203030363000",
+      "wire_bytes": 25,
+      "expected_failure": "control_revision_not_initial_alias"
+    },
+    {
+      "name": "unsupported_mid_0064",
+      "wire_hex": "303032303030363430303120202020202020202000",
+      "wire_bytes": 21,
+      "expected_failure": "mid_not_in_profile"
+    },
+    {
+      "name": "result_truncated_after_header",
+      "wire_hex": "3034313930303631303033302020202020202020",
+      "wire_bytes": 20,
+      "expected_failure": "incomplete_frame"
+    }
+  ],
+  "stream_controls": [
+    {
+      "name": "fragmented_result",
+      "frame": "result_003",
+      "segment_lengths": [
+        1,
+        2,
+        1,
+        7,
+        9,
+        13,
+        37,
+        101,
+        248,
+        1
+      ],
+      "expected_complete_frames": 1,
+      "expected_frame_bytes": 420,
+      "observation_clock": "capture_after_terminal_nul_before_parse",
+      "read_credit": "never_request_beyond_current_frame_remaining"
+    },
+    {
+      "name": "coalesced_subscribe_result_keepalive",
+      "frame_order": [
+        "accepted_subscribe_one",
+        "result_003",
+        "keepalive_reply_one"
+      ],
+      "expected_frame_boundaries": [
+        25,
+        445,
+        466
+      ],
+      "read_credit": "do_not_prefetch_into_next_frame"
+    },
+    {
+      "name": "duplicate_native_id",
+      "frame_order": [
+        "result_003",
+        "result_003"
+      ],
+      "expected_result_rows": 2,
+      "expected_checkpoint_receipts": 2,
+      "expected_result_ack_frames": 2,
+      "infer_result_loss": false,
+      "deduplicate": false
+    },
+    {
+      "name": "unsupported_spans_are_opaque",
+      "startup": "startup_005_opaque_ascii",
+      "result": "result_003_opaque_ascii",
+      "same_qualified_values_as": [
+        "startup_005",
+        "result_003"
+      ],
+      "raw_bytes_must_differ": true
+    },
+    {
+      "name": "wrong_accepted_mid",
+      "pending_mid": "0060",
+      "received_control": "accepted_unsubscribe_one",
+      "expected_failure": "wrong_control_correlation",
+      "send_result_ack": false
+    },
+    {
+      "name": "native_error_preserved",
+      "pending_mid": "0060",
+      "received_control": "error_duplicate_subscription_one",
+      "expected_failed_mid": "0060",
+      "expected_error_code_raw": "09",
+      "continue_sequence": false
+    },
+    {
+      "name": "unsolicited_keepalive",
+      "pending_keepalive": false,
+      "received_control": "keepalive_reply_one",
+      "expected_failure": "unsolicited_control_reply"
+    },
+    {
+      "name": "housekeeping_cap",
+      "pending_keepalive": true,
+      "repeat_control": "keepalive_reply_one",
+      "repeat_count": 65,
+      "housekeeping_limit": 64,
+      "expected_failure": "bounded_housekeeping_limit",
+      "renew_deadline": false
+    }
+  ],
+  "lifecycle_controls": [
+    {
+      "name": "event_then_matching_commit",
+      "steps": [
+        "read_complete_result",
+        "capture_original_clock",
+        "parse_supported_fields",
+        "emit_single_batch",
+        "wait_matching_jsonl_checkpoint_receipt",
+        "send_result_ack_with_original_deadline"
+      ],
+      "expected_result_ack_frames": 1,
+      "row_claims_ack_success": false
+    },
+    {
+      "name": "no_early_ack",
+      "steps": [
+        "read_complete_result",
+        "emit_single_batch",
+        "writer_still_pending"
+      ],
+      "expected_result_ack_frames": 0,
+      "next_result_read_allowed": false
+    },
+    {
+      "name": "stale_receipt",
+      "steps": [
+        "read_complete_result",
+        "emit_single_batch",
+        "receive_other_batch_receipt"
+      ],
+      "expected_failure": "stale_checkpoint_receipt",
+      "expected_result_ack_frames": 0
+    },
+    {
+      "name": "failed_write_or_sync",
+      "steps": [
+        "read_complete_result",
+        "emit_single_batch",
+        "writer_or_sync_fails"
+      ],
+      "expected_result_ack_frames": 0,
+      "preserve_previous_complete_rows": true,
+      "close_owned_socket": true
+    },
+    {
+      "name": "receipt_after_deadline",
+      "original_deadline_ns": 1000,
+      "frame_complete_ns": 900,
+      "receipt_ns": 1000,
+      "expected_result_ack_frames": 0,
+      "renew_deadline": false
+    },
+    {
+      "name": "ack_write_fails_after_checkpoint",
+      "steps": [
+        "read_complete_result",
+        "writer_checkpoint_succeeds",
+        "result_ack_socket_write_fails"
+      ],
+      "saved_event_retained": true,
+      "row_claims_ack_success": false,
+      "reconnect": false
+    },
+    {
+      "name": "keepalive_interleaves_event",
+      "original_deadline_ns": 1000,
+      "keepalive_sent_ns": 700,
+      "frame_complete_ns": 850,
+      "receipt_ns": 900,
+      "keepalive_reply_ns": 950,
+      "expected_original_clock_ns": 850,
+      "response_deadline_remains_ns": 1000,
+      "renew_deadline": false
+    },
+    {
+      "name": "empty_initial_timeout_is_idle",
+      "frame_bytes_received": 0,
+      "pending_control": false,
+      "expected_idle": true,
+      "send_result_ack": false
+    },
+    {
+      "name": "partial_initial_timeout_fails",
+      "frame_prefix_bytes": 17,
+      "expected_failure": "incomplete_frame",
+      "expected_idle": false,
+      "reconnect": false
+    },
+    {
+      "name": "pending_keepalive_timeout_fails",
+      "frame_bytes_received": 0,
+      "pending_control": true,
+      "expected_idle": false,
+      "reconnect": false
+    },
+    {
+      "name": "cutoff_during_frame",
+      "original_deadline_ns": 1200,
+      "acquisition_cutoff_ns": 1000,
+      "frame_complete_ns": 1000,
+      "publish_event": false,
+      "send_result_ack": false
+    },
+    {
+      "name": "healthy_finish",
+      "steps": [
+        "send_unsubscribe_001",
+        "match_0005_0063",
+        "close_owned_socket"
+      ],
+      "send_0003": false,
+      "read_history": false
+    },
+    {
+      "name": "shutdown_result_interleave",
+      "steps": [
+        "send_unsubscribe_001",
+        "read_complete_result",
+        "capture_original_clock",
+        "retain_raw_and_clock_in_error_details",
+        "close_owned_socket"
+      ],
+      "publish_after_cutoff": false,
+      "send_result_ack": false
+    },
+    {
+      "name": "ambiguous_session_finish",
+      "steps": [
+        "pending_uncommitted_event_or_source_error",
+        "close_owned_socket"
+      ],
+      "send_unsubscribe": false,
+      "send_result_ack": false
+    },
+    {
+      "name": "original_clock_survives_checkpoint",
+      "frame_complete_ns": 123456789,
+      "checkpoint_ns": 123457800,
+      "ack_write_complete_ns": 123458900,
+      "expected_observed_ns": 123456789,
+      "source_time_present": false
+    }
+  ],
+  "limitations": [
+    "Synthetic independently authored wire/control oracle; no observed physical controller, firmware, tool, socket or process execution.",
+    "No chain-of-custody authentication is inferred from a mirror URL or copyright cover.",
+    "No host unit conversion, source timestamp, exactly-once delivery, hardware passivity or power-loss durability guarantee.",
+    "Unsupported whole spans remain opaque even if their ID positions are not decimal.",
+    "The root accepted contract, not generic Open Protocol completeness, fixes this first application-ACK profile."
+  ]
+}

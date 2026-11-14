@@ -13,6 +13,9 @@ pub(super) const CONTRACT_VERSION: u32 = 1;
 /// `camera_write`, `file_write` (outside the camera), or disruptive (may stop
 /// streams, hold cameras or run arbitrary camera commands).
 const EFFECTS: &[(&str, &str)] = &[
+    ("data record", "disruptive"),
+    ("data export", "file_write"),
+    ("data protocols", "read"),
     ("list", "read"),
     ("info", "read"),
     ("features", "read"),
@@ -45,6 +48,8 @@ const EFFECTS: &[(&str, &str)] = &[
     ("login rm", "file_write"),
     ("onvif resolve", "read"),
     ("network", "read"),
+    ("network force-ip", "disruptive"),
+    ("network action", "disruptive"),
     ("doctor", "read"),
     ("schema", "read"),
     ("shell", "disruptive"),
@@ -92,6 +97,9 @@ const PRESET_DOCUMENT: &[(&str, &str)] = &[
 /// Result fields of the commands that have a typed contract.
 fn fields(command: &str) -> Option<&'static [(&'static str, &'static str)]> {
     Some(match command {
+        "data record" => super::data::RECORD_FIELDS,
+        "data export" => super::data::EXPORT_FIELDS,
+        "data protocols" => super::data::PROTOCOL_FIELDS,
         "list" => super::camera::ListResult::FIELDS,
         "info" => crate::controls::Info::FIELDS,
         "features" => crate::controls::FeatureList::FIELDS,
@@ -182,6 +190,8 @@ fn fields(command: &str) -> Option<&'static [(&'static str, &'static str)]> {
         ],
         "onvif resolve" => super::onvif::FIELDS,
         "network" => super::network::FIELDS,
+        "network force-ip" => super::network::FORCE_IP_FIELDS,
+        "network action" => super::network::ACTION_FIELDS,
         "doctor" => super::doctor::DOCTOR_FIELDS,
         "licenses" => super::doctor::LICENSES_FIELDS,
         "debug xml" => &[
@@ -189,8 +199,19 @@ fn fields(command: &str) -> Option<&'static [(&'static str, &'static str)]> {
             ("path", "string — with -o"),
             ("bytes", "int — with -o"),
         ],
-        "debug read" => &[("address", "int"), ("hex", "string — the bytes read")],
-        "debug write" => &[("address", "int"), ("written", "int — bytes")],
+        "debug read" => &[
+            ("address", "int"),
+            ("hex", "string — exact raw bytes"),
+            ("feature", "string — named form only"),
+            ("bank", "[{selector,value}] — named form only"),
+            ("bytes", "int — declared length, named form only"),
+        ],
+        "debug write" => &[
+            ("address", "int"),
+            ("written", "int — bytes"),
+            ("feature", "string — named form only"),
+            ("bank", "[{selector,value}] — named form only"),
+        ],
         "completions" => &[
             ("shell", "string — with --json"),
             (
@@ -263,6 +284,7 @@ fn errors(command: &str) -> &'static [&'static str] {
             "timeout",
         ],
         "exec" => &[
+            "unsupported",
             "feature_not_found",
             "not_writable",
             "feature_locked",
@@ -391,6 +413,30 @@ fn errors(command: &str) -> &'static [&'static str] {
             "timeout",
         ],
         "network" => &["invalid_duration", "camera_not_found", "unavailable"],
+        "network force-ip" => &[
+            "usage",
+            "invalid_duration",
+            "camera_not_found",
+            "camera_ambiguous",
+            "camera_busy",
+            "permission_denied",
+            "unsupported",
+            "incomplete",
+            "unavailable",
+            "timeout",
+        ],
+        "network action" => &[
+            "usage",
+            "invalid_duration",
+            "permission_denied",
+            "unsupported",
+            "incomplete",
+            "camera_ambiguous",
+            "failed",
+            "unavailable",
+            "timeout",
+            "interrupted",
+        ],
         _ => CAMERA,
     }
 }
@@ -558,21 +604,21 @@ fn overview() -> Value {
         "commands": commands,
         "effect_with": widened,
         "conventions": {
-            "json": "`--json` or `CAPTUREFAB_JSON=1` usually writes one result line to stdout. A failure returns `error` with `code`, `message` and optional `hint` and `details`",
-            "globals": "Put global options before or after the command",
-            "camera": "Use `-c CAM` or `CAPTUREFAB_CAMERA`. By default, use the session's only camera or the only camera discovered. Discovery for this default excludes simulators and screens",
-            "routing": "Use `--session NAME` to choose a session. Otherwise, commands reuse a matching session. Most camera commands keep the camera open in `auto` for 60s after use. `--keep 0` can reuse a session. Use `--no-session` to bypass sessions",
-            "jobs": "`capture` and `record` normally wait for the job. `--background` returns a job to follow with `jobs wait ID`",
-            "streams": "`watch --json` and `shell --json` emit NDJSON. With `capture --json -o -`, image bytes go to stdout and JSON goes to stderr. `--progress` sends JSON progress to stderr",
-            "results": "Keys use `snake_case`, with units in names such as `exposure_us`. Timestamps use RFC 3339 UTC. Missing fields are omitted",
-            "credentials": "Capturefab redacts credentials in camera URLs",
-            "describe": "Run `capturefab schema COMMAND` for arguments, result fields and errors"
+            "json": "`--json` or `CAPTUREFAB_JSON=1`: usually one stdout result; failures return `error.{code,message,hint?,details?}`",
+            "globals": "Global options work before or after the command",
+            "camera": "`-c CAM` or `CAPTUREFAB_CAMERA`; else the session's only camera, then the only discovered camera (excluding simulators/screens)",
+            "routing": "`--session NAME`, else matching session; warm `auto` lasts 60s. `--keep 0` reuses; `--no-session` bypasses. `network force-ip` and `network action` run locally, ignore ambient sessions, reject explicit sessions.",
+            "jobs": "`capture` and `record` wait by default. `--background` returns a job for `jobs wait ID`",
+            "streams": "`watch --json` and `shell --json` emit NDJSON. `capture --json -o -` writes image bytes to stdout, JSON to stderr. `--progress` emits JSON progress to stderr",
+            "results": "Keys: `snake_case`, units as in `exposure_us`. Timestamps: RFC 3339 UTC. Missing fields are omitted",
+            "credentials": "Camera URL credentials are redacted",
+            "describe": "`capturefab schema COMMAND` shows arguments, results and errors"
         },
         "grammars": {
-            "selector": "Camera ID from `list`, serial, IPv4, stream URL such as `rtsp://HOST/PATH`, `onvif://HOST`, file path, `sim:N[?drop=0..0.5&line0=every:DUR]` or `sim:replay:PATH`",
+            "selector": "ID/serial/IPv4/URL/file; sim:N[?drop=0..0.5&line0=every:DUR]; sim:replay:PATH; gige-monitor://IP?interface=IP&mac=12HEX",
             "name": "Use `Feature`, `Feature[Selector=Value,…]` or `Feature[Value]` for one selector. Controls include `exposure`, `gain`, `fps`, `roi`, `format`, `trigger`, `auto_exposure` and `auto_wb`",
-            "duration": "Add a unit, as in `250ms`, `1.5s` or `1h30m`. Use `0` where allowed. Some waits accept `none` for an unlimited wait",
-            "template": "Capture names accept `{camera}`, `{serial}`, `{seq}`, `{seq:N}`, `{frame}`, `{time}`, `{date}`, `{datetime}`, `{tag:KEY}` and `{ext}`"
+            "duration": "Units: `250ms`, `1.5s`, `1h30m`. Use `0` where allowed; some waits accept `none` (unlimited).",
+            "template": "Names accept `{camera}`, `{serial}`, `{seq}`, `{seq:N}`, `{frame}`, `{time}`, `{date}`, `{datetime}`, `{tag:KEY}` and `{ext}`"
         },
         "exit_codes": exit_codes,
         "errors": errors,
@@ -623,6 +669,18 @@ fn command(name: &str) -> Result<Value> {
                 .map(|(field, meaning)| ((*field).to_owned(), json!(meaning)))
                 .collect::<Map<_, _>>(),
         );
+    }
+    if name == "set"
+        && let Some(result) = value["result"].as_object_mut()
+    {
+        for (field, meaning) in super::camera::ACTION_KEY_FIELDS {
+            if *field != "camera" {
+                result.insert(
+                    (*field).to_owned(),
+                    json!(format!("{meaning} — with --write-only")),
+                );
+            }
+        }
     }
     Ok(value)
 }
@@ -789,6 +847,12 @@ mod tests {
             .unwrap();
         assert_eq!(dry_run["type"], "flag");
         assert!(set["result"]["changed"].is_string());
+        assert_eq!(
+            set["result"]["feature"],
+            "ActionDeviceKey — with --write-only"
+        );
+        assert!(set["result"]["write_completed"].is_string());
+        assert!(set["result"]["readback"].is_string());
     }
 
     #[test]

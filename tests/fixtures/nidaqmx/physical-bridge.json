@@ -1,0 +1,1041 @@
+{
+ "version": 1,
+ "freeze": "Independent additive scientific/ABI oracle frozen before new resistive/physical-bridge native or C implementation is authored or read. Literal IEEE words and ordered controls are manually declared; no product encoder/decoder, SDK, compiler/native or device runtime.",
+ "accepted_contract_sha256": "39a7c956e7660e36fdcdf8cffeab404ca031fed72fd10f45a9612ed87843e81b",
+ "baseline_source": {
+  "sha256": "983482df0c81dcb22c6d62ce6712f3eba11debd989b0cd22432921ced12518fc",
+  "files": 866
+ },
+ "immutable_prior_oracles_sha256": {
+  "abi.json": "1bbc016312c3aab6093483cfa3aeee442e6bc3aaeb74eaa8113641a090329b6b",
+  "thermocouple.json": "2a8109877c63aa7448965c0d0ac9ec060355d8dde41e98496b4ff8050ac65cb1",
+  "current.json": "14f428f82a6cf94704ac47ff2b42d18bf71553435437ae4f0345bf4260779bff",
+  "voltage-scale-null.json": "5764fe41ecab45d8b5795d15dc82f723c566d5ba0af565048224337ed321ba63",
+  "on-demand.json": "b87122de19d2bdb77f16c0511d1759925b84697ad59e97375197d1b54e81fe89",
+  "rtd.json": "5f83a52d2ce10c71d6e1f7498bb6bd020828365a734fbe235cb7bbcadd2cb6a5",
+  "mixed-ai.json": "d4a74d1e2310b8f16648e296ab95ebffe175559fbe326655ac98dae6d31a9d78",
+  "digital-port.json": "78475d5d3a4dc0e02405b57887dfd9f3bfd3e7659b31613edde6aea674af9434",
+  "counter-input.json": "a056640e872e599b54413e18e7824ac114a6fe99b248693838b09b7a51a44d93",
+  "engineering-ai.json": "889cba7a8fef9408df7dba6af195dda402df094387d39ee14a54f4eaa44797fb",
+  "counter-time-position.json": "1a3e1be6f66ff03ea3f41c776ca057339d5cc1ce3c985e38d935b13a8c21e63d"
+ },
+ "immutable_eleven_c_word_arrays_text_sha256": {
+  "words": "d33dae464ecceaadc4899b09d31bf09af0546a822db79612680d2132caaa4d92",
+  "tc_words": "d42057e167b20a607f173cd2902ca57185b7633ea67f3894364e4d0757014496",
+  "current_words": "83d49b770ec0813b9f2a11b36e30e92303b4e8c3109f801e487465a9a8f464c2",
+  "rtd_words": "a0621fdea511efa372a8a5675070b773700cfd6f6b3325ebf1eada76ecc9a966",
+  "mixed_words": "67d1533c2be4a430a11f19b6cc9fd3cadcc4dd56db14b9d1f03cd7fdb49aed99",
+  "engineering_words": "99c57d35c6d5dbb611e3271058b1164a505348f97bfe1268dafd899c8a621d36",
+  "engineering_mixed_words": "2993a8e268c34fc9fb21983ae37213bac9f23e573d81326185f72f60ba954602",
+  "engineering_counter_words": "41ade0ec88361c9cb8f5c75b253cba165dbdd9f10e3a3e40b94d390521e16d79",
+  "digital_words": "be6f5d896eabb2a6a053cde8f4dcc05f03d10d8d2ad81c49a8a48f6b7f5d5489",
+  "count_words": "89f06a5474da075b2dc5c0fc0ebeaf88c03aa1ecab3543e0b2f6355c84bb72f3",
+  "frequency_words": "8d8263d3c909d65d9d0ea5080d7b2d911664b3cc5b175eb39f0190ddf7df690d"
+ },
+ "abi_policy": {
+  "returns": "signed i32 status",
+  "TaskHandle": "pointer-sized opaque owned handle",
+  "calling_convention": "fixed NI __CFUNC; C Linux/system Windows",
+  "all_selected_exports_before_CreateTask": true,
+  "no_variadic_attributes_or_transmuted_signatures": true,
+  "scale_pointer": "NULL for ordinary scaled-tail units; thermistor constructors have no scale slot"
+ },
+ "common_exports": {
+  "on_demand": [
+   "DAQmxCreateTask",
+   "DAQmxGetTaskNumChans",
+   "DAQmxGetNthTaskReadChannel",
+   "DAQmxStartTask",
+   "DAQmxStopTask",
+   "DAQmxClearTask",
+   "DAQmxGetErrorString",
+   "DAQmxGetExtendedErrorInfo",
+   "DAQmxReadAnalogF64"
+  ],
+  "continuous": [
+   "DAQmxCreateTask",
+   "DAQmxGetTaskNumChans",
+   "DAQmxGetNthTaskReadChannel",
+   "DAQmxStartTask",
+   "DAQmxStopTask",
+   "DAQmxClearTask",
+   "DAQmxGetErrorString",
+   "DAQmxGetExtendedErrorInfo",
+   "DAQmxReadAnalogF64",
+   "DAQmxCfgSampClkTiming",
+   "DAQmxCfgInputBuffer",
+   "DAQmxSetReadOverWrite",
+   "DAQmxGetReadAvailSampPerChan",
+   "DAQmxGetSampClkRate"
+  ]
+ },
+ "read_abi": {
+  "name": "DAQmxReadAnalogF64",
+  "slot_count": 8,
+  "arguments": [
+   "H",
+   "i32 requested_per_channel",
+   "f64 timeout_seconds",
+   "u32 fill_mode",
+   "f64* zeroed_output",
+   "u32 capacity_f64_elements",
+   "i32* actual_per_channel",
+   "u32* reserved"
+  ],
+  "fill_mode": 1,
+  "reserved": "NULL",
+  "continuous": "positive bounded request times validated actual_channels, capacity<=4096, zero timeout; current idle semantics unchanged",
+  "on_demand": "request1, exact actual_channels capacity, positive original remaining timeout; no clocked5 exports",
+  "output_allocation": "zeroed exact F64 element capacity, not bytes or renewed budget"
+ },
+ "private_protocol": 9,
+ "scientific_rules": [
+  "Preserve SDK-exposed IEEE/sign/NaN payload in canonical8-byte LE words and numeric family key only when finite.",
+  "No host engineering/unit/coefficient/calibration interpolation, clipping, coordinate sorting/relinking, range enforcement on returned words or sensor fitting.",
+  "No device source_time, physical synchronization/freshness or hard native-entry cadence guarantee. Preserve old rows.",
+  "One original deadline/cutoff and worker pre-FFI host frontier; immediate post-native clock precedes optional diagnostics/encoding.",
+  "Negative qualified complete first scan is retained before original status/deferred diagnostics; owned Stop/Clear only, no Read in Finish.",
+  "All scientific settings/calibration/excitation/coupling are exact requests, not observed/performed calibration, physical-off or readback."
+ ],
+ "status_controls": [
+  {
+   "status": 0,
+   "actual_per_channel": 0,
+   "timing_scope": "on_demand",
+   "result": "Incomplete/no block"
+  },
+  {
+   "status": 12345,
+   "actual_per_channel": 0,
+   "timing_scope": "on_demand",
+   "result": "Incomplete with original warning/geometry/no block"
+  },
+  {
+   "status": -200284,
+   "actual_per_channel": 0,
+   "result": "original negative/no block"
+  },
+  {
+   "status": 0,
+   "actual_per_channel": -1,
+   "result": "Incomplete/no fabricated data"
+  },
+  {
+   "status": 0,
+   "actual_per_channel": "requested+1",
+   "result": "Incomplete/no fabricated data"
+  },
+  {
+   "status": -200284,
+   "actual_per_channel": 1,
+   "result": "complete first scan then original error; optional diagnostic may hang without losing data"
+  }
+ ],
+ "metadata": {
+  "measurement": "selected family",
+  "settings_provenance": "requested_not_read_back",
+  "channels": "actual validated read names, original order",
+  "channel_measurements": "zero-based channel_index, actual physical and exact typed requests/units",
+  "coupling_explicit": "coupling_request plus coupling_provenance:explicit_request_not_read_back",
+  "coupling_omitted": "no setter/getter/request; coupling_provenance:driver_default_unqueried",
+  "no_inferred_terminal_fields": true
+ },
+ "qualification": [
+  "Synthetic finite host ABI/data-preservation contract only; no actual module/driver/OS or sensor calibration qualification.",
+  "None, GND and Stop/Clear do not establish physical-off or sensor-zero. Persistent/coerced excitation/device restrictions remain native.",
+  "No TEDS, null/shunt calibration, saved task, reset, output, fallback or SDK/header/archive retained."
+ ],
+ "constants_primary": {
+  "url": "https://raw.githubusercontent.com/ni/nidaqmx-python/1d60b6c53ef11dead0ba6aa9d6e2855351835ad7/generated/nidaqmx/constants.py",
+  "bytes": 50365,
+  "sha256": "9d15eb38ccb03769f9e5ad94289a00658ee36b6685709e4f3d49dafb25b4ae57"
+ },
+ "profiles": [
+  "force_bridge",
+  "pressure_bridge",
+  "torque_bridge"
+ ],
+ "primary_sources": [
+  {
+   "name": "force",
+   "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__channel__configuration__creation__create__analog__input__channels_1ga2e610b43e3c00dac59d46de4c609b2ad.html",
+   "bytes": 34436,
+   "sha256": "c52fa44aca579cd4f51cc974e89e194b85f7b906022c886bae70ca7753663b31",
+   "prototype": "int32 __CFUNC DAQmxCreateAIForceBridgeTwoPointLinChan(TaskHandle taskHandle, const char physicalChannel[], const char nameToAssignToChannel[], float64 minVal, float64 maxVal, int32 units, int32 bridgeConfig, int32 voltageExcitSource, float64 voltageExcitVal, float64 nominalBridgeResistance, float64 firstElectricalVal, float64 secondElectricalVal, int32 electricalUnits, float64 firstPhysicalVal, float64 secondPhysicalVal, int32 physicalUnits, const char customScaleName[])"
+  },
+  {
+   "name": "pressure",
+   "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__channel__configuration__creation__create__analog__input__channels_1ga58a8c28527b09fa4182a2fab25fbfe57.html",
+   "bytes": 34634,
+   "sha256": "1dd8016803a5ac111c9b8660b8273606f6df3148330ac5e06d6046d3353ab9e1",
+   "prototype": "int32 __CFUNC DAQmxCreateAIPressureBridgeTwoPointLinChan(TaskHandle taskHandle, const char physicalChannel[], const char nameToAssignToChannel[], float64 minVal, float64 maxVal, int32 units, int32 bridgeConfig, int32 voltageExcitSource, float64 voltageExcitVal, float64 nominalBridgeResistance, float64 firstElectricalVal, float64 secondElectricalVal, int32 electricalUnits, float64 firstPhysicalVal, float64 secondPhysicalVal, int32 physicalUnits, const char customScaleName[])"
+  },
+  {
+   "name": "torque",
+   "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__channel__configuration__creation__create__analog__input__channels_1gac0648326f7b53707894030813e538950.html",
+   "bytes": 35501,
+   "sha256": "43a7bf4d34b27b059f4b2c8a8d1d3962fbae8e0941fc0e5a743d3e7c1d893d94",
+   "prototype": "int32 __CFUNC DAQmxCreateAITorqueBridgeTwoPointLinChan(TaskHandle taskHandle, const char physicalChannel[], const char nameToAssignToChannel[], float64 minVal, float64 maxVal, int32 units, int32 bridgeConfig, int32 voltageExcitSource, float64 voltageExcitVal, float64 nominalBridgeResistance, float64 firstElectricalVal, float64 secondElectricalVal, int32 electricalUnits, float64 firstPhysicalVal, float64 secondPhysicalVal, int32 physicalUnits, const char customScaleName[])"
+  }
+ ],
+ "fixed_abis": [
+  {
+   "name": "DAQmxCreateAIForceBridgeTwoPointLinChan",
+   "returns": "i32",
+   "slot_count": 17,
+   "arguments": [
+    "H",
+    "const char* physical",
+    "const char* empty_virtual",
+    "f64 min",
+    "f64 max",
+    "i32 output_units",
+    "i32 bridge_config",
+    "i32 voltage_source",
+    "f64 volts",
+    "f64 nominal_bridge_ohms",
+    "f64 first_electrical",
+    "f64 second_electrical",
+    "i32 electrical_units",
+    "f64 first_physical",
+    "f64 second_physical",
+    "i32 physical_units",
+    "const char* scale"
+   ]
+  },
+  {
+   "name": "DAQmxCreateAIPressureBridgeTwoPointLinChan",
+   "returns": "i32",
+   "slot_count": 17,
+   "arguments": [
+    "H",
+    "const char* physical",
+    "const char* empty_virtual",
+    "f64 min",
+    "f64 max",
+    "i32 output_units",
+    "i32 bridge_config",
+    "i32 voltage_source",
+    "f64 volts",
+    "f64 nominal_bridge_ohms",
+    "f64 first_electrical",
+    "f64 second_electrical",
+    "i32 electrical_units",
+    "f64 first_physical",
+    "f64 second_physical",
+    "i32 physical_units",
+    "const char* scale"
+   ]
+  },
+  {
+   "name": "DAQmxCreateAITorqueBridgeTwoPointLinChan",
+   "returns": "i32",
+   "slot_count": 17,
+   "arguments": [
+    "H",
+    "const char* physical",
+    "const char* empty_virtual",
+    "f64 min",
+    "f64 max",
+    "i32 output_units",
+    "i32 bridge_config",
+    "i32 voltage_source",
+    "f64 volts",
+    "f64 nominal_bridge_ohms",
+    "f64 first_electrical",
+    "f64 second_electrical",
+    "i32 electrical_units",
+    "f64 first_physical",
+    "f64 second_physical",
+    "i32 physical_units",
+    "const char* scale"
+   ]
+  },
+  {
+   "name": "DAQmxSetAICoupling",
+   "returns": "i32",
+   "slot_count": 3,
+   "arguments": [
+    "H",
+    "const char* requested_physical",
+    "i32 coupling"
+   ]
+  }
+ ],
+ "manual_argument_words": [
+  {
+   "name": "force_min_a",
+   "exact_rational": "-64",
+   "bits_hex": "c050000000000000",
+   "ieee754_le_hex": "00000000000050c0"
+  },
+  {
+   "name": "force_max_a",
+   "exact_rational": "1024",
+   "bits_hex": "4090000000000000",
+   "ieee754_le_hex": "0000000000009040"
+  },
+  {
+   "name": "volts_a",
+   "exact_rational": "5/2",
+   "bits_hex": "4004000000000000",
+   "ieee754_le_hex": "0000000000000440"
+  },
+  {
+   "name": "bridge_ohms_a",
+   "exact_rational": "350",
+   "bits_hex": "4075e00000000000",
+   "ieee754_le_hex": "0000000000e07540"
+  },
+  {
+   "name": "force_e1",
+   "exact_rational": "-1/1024",
+   "bits_hex": "bf50000000000000",
+   "ieee754_le_hex": "00000000000050bf"
+  },
+  {
+   "name": "force_e2",
+   "exact_rational": "3/512",
+   "bits_hex": "3f78000000000000",
+   "ieee754_le_hex": "000000000000783f"
+  },
+  {
+   "name": "force_p1_a",
+   "exact_rational": "-4",
+   "bits_hex": "c010000000000000",
+   "ieee754_le_hex": "00000000000010c0"
+  },
+  {
+   "name": "force_p2_a",
+   "exact_rational": "128",
+   "bits_hex": "4060000000000000",
+   "ieee754_le_hex": "0000000000006040"
+  },
+  {
+   "name": "force_min_b",
+   "exact_rational": "-128",
+   "bits_hex": "c060000000000000",
+   "ieee754_le_hex": "00000000000060c0"
+  },
+  {
+   "name": "force_max_b",
+   "exact_rational": "512",
+   "bits_hex": "4080000000000000",
+   "ieee754_le_hex": "0000000000008040"
+  },
+  {
+   "name": "volts_b",
+   "exact_rational": "5",
+   "bits_hex": "4014000000000000",
+   "ieee754_le_hex": "0000000000001440"
+  },
+  {
+   "name": "bridge_ohms_b",
+   "exact_rational": "1000",
+   "bits_hex": "408f400000000000",
+   "ieee754_le_hex": "0000000000408f40"
+  },
+  {
+   "name": "force_p1_b",
+   "exact_rational": "64",
+   "bits_hex": "4050000000000000",
+   "ieee754_le_hex": "0000000000005040"
+  },
+  {
+   "name": "force_p2_b",
+   "exact_rational": "-32",
+   "bits_hex": "c040000000000000",
+   "ieee754_le_hex": "00000000000040c0"
+  },
+  {
+   "name": "pressure_min_a",
+   "exact_rational": "-131072",
+   "bits_hex": "c100000000000000",
+   "ieee754_le_hex": "00000000000000c1"
+  },
+  {
+   "name": "pressure_max_a",
+   "exact_rational": "524288",
+   "bits_hex": "4120000000000000",
+   "ieee754_le_hex": "0000000000002041"
+  },
+  {
+   "name": "pressure_e1_a",
+   "exact_rational": "-1/2048",
+   "bits_hex": "bf40000000000000",
+   "ieee754_le_hex": "00000000000040bf"
+  },
+  {
+   "name": "pressure_e2_a",
+   "exact_rational": "1/256",
+   "bits_hex": "3f70000000000000",
+   "ieee754_le_hex": "000000000000703f"
+  },
+  {
+   "name": "pressure_p1_a",
+   "exact_rational": "-1/2",
+   "bits_hex": "bfe0000000000000",
+   "ieee754_le_hex": "000000000000e0bf"
+  },
+  {
+   "name": "pressure_p2_a",
+   "exact_rational": "3",
+   "bits_hex": "4008000000000000",
+   "ieee754_le_hex": "0000000000000840"
+  },
+  {
+   "name": "pressure_min_b",
+   "exact_rational": "-1/8",
+   "bits_hex": "bfc0000000000000",
+   "ieee754_le_hex": "000000000000c0bf"
+  },
+  {
+   "name": "pressure_max_b",
+   "exact_rational": "64",
+   "bits_hex": "4050000000000000",
+   "ieee754_le_hex": "0000000000005040"
+  },
+  {
+   "name": "volts_c",
+   "exact_rational": "5/4",
+   "bits_hex": "3ff4000000000000",
+   "ieee754_le_hex": "000000000000f43f"
+  },
+  {
+   "name": "zero",
+   "exact_rational": "0",
+   "bits_hex": "0000000000000000",
+   "ieee754_le_hex": "0000000000000000"
+  },
+  {
+   "name": "negative_zero",
+   "exact_rational": "0",
+   "bits_hex": "8000000000000000",
+   "ieee754_le_hex": "0000000000000080"
+  },
+  {
+   "name": "pressure_e2_b",
+   "exact_rational": "1/512",
+   "bits_hex": "3f60000000000000",
+   "ieee754_le_hex": "000000000000603f"
+  },
+  {
+   "name": "pressure_p1_b",
+   "exact_rational": "16",
+   "bits_hex": "4030000000000000",
+   "ieee754_le_hex": "0000000000003040"
+  },
+  {
+   "name": "pressure_p2_b",
+   "exact_rational": "2048",
+   "bits_hex": "40a0000000000000",
+   "ieee754_le_hex": "000000000000a040"
+  },
+  {
+   "name": "torque_min_a",
+   "exact_rational": "-8",
+   "bits_hex": "c020000000000000",
+   "ieee754_le_hex": "00000000000020c0"
+  },
+  {
+   "name": "torque_max_a",
+   "exact_rational": "64",
+   "bits_hex": "4050000000000000",
+   "ieee754_le_hex": "0000000000005040"
+  },
+  {
+   "name": "bridge_ohms_c",
+   "exact_rational": "120",
+   "bits_hex": "405e000000000000",
+   "ieee754_le_hex": "0000000000005e40"
+  },
+  {
+   "name": "torque_e1_a",
+   "exact_rational": "-1/4096",
+   "bits_hex": "bf30000000000000",
+   "ieee754_le_hex": "00000000000030bf"
+  },
+  {
+   "name": "torque_e2_a",
+   "exact_rational": "3/1024",
+   "bits_hex": "3f68000000000000",
+   "ieee754_le_hex": "000000000000683f"
+  },
+  {
+   "name": "torque_p1_a",
+   "exact_rational": "-16",
+   "bits_hex": "c030000000000000",
+   "ieee754_le_hex": "00000000000030c0"
+  },
+  {
+   "name": "torque_p2_a",
+   "exact_rational": "512",
+   "bits_hex": "4080000000000000",
+   "ieee754_le_hex": "0000000000008040"
+  },
+  {
+   "name": "torque_min_b",
+   "exact_rational": "-16",
+   "bits_hex": "c030000000000000",
+   "ieee754_le_hex": "00000000000030c0"
+  },
+  {
+   "name": "torque_max_b",
+   "exact_rational": "64",
+   "bits_hex": "4050000000000000",
+   "ieee754_le_hex": "0000000000005040"
+  },
+  {
+   "name": "torque_e1_b",
+   "exact_rational": "-3/2048",
+   "bits_hex": "bf58000000000000",
+   "ieee754_le_hex": "00000000000058bf"
+  },
+  {
+   "name": "torque_e2_b",
+   "exact_rational": "1/1024",
+   "bits_hex": "3f50000000000000",
+   "ieee754_le_hex": "000000000000503f"
+  },
+  {
+   "name": "torque_p1_b",
+   "exact_rational": "3/2",
+   "bits_hex": "3ff8000000000000",
+   "ieee754_le_hex": "000000000000f83f"
+  },
+  {
+   "name": "torque_p2_b",
+   "exact_rational": "-7/4",
+   "bits_hex": "bffc000000000000",
+   "ieee754_le_hex": "000000000000fcbf"
+  }
+ ],
+ "constants": {
+  "newtons": 15875,
+  "pounds": 15876,
+  "kilogram_force": 15877,
+  "pascals": 10081,
+  "psi": 15879,
+  "bar": 15880,
+  "newton_meters": 15881,
+  "inch_ounces": 15882,
+  "inch_pounds": 15883,
+  "foot_pounds": 15884,
+  "volts_per_volt": 15896,
+  "millivolts_per_volt": 15897,
+  "full_bridge": 10182,
+  "half_bridge": 10187,
+  "quarter_bridge": 10270,
+  "internal": 10200,
+  "external": 10167,
+  "none": 10230,
+  "ac": 10045,
+  "dc": 10050,
+  "ground": 10066
+ },
+ "ordered_constructor_pairs": {
+  "force_bridge": [
+   {
+    "case": "force_a",
+    "physical": "ForceSuccess/ai0",
+    "virtual_name": "",
+    "min_word": "force_min_a",
+    "max_word": "force_max_a",
+    "output_units": "newtons",
+    "output_units_code": 15875,
+    "bridge_config": "full_bridge",
+    "bridge_code": 10182,
+    "excitation_source": "internal",
+    "excitation_code": 10200,
+    "volts_word": "volts_a",
+    "nominal_bridge_ohms_word": "bridge_ohms_a",
+    "calibration": {
+     "electrical_units": "volts_per_volt",
+     "electrical_units_code": 15896,
+     "physical_units": "pounds",
+     "physical_units_code": 15876,
+     "first": {
+      "electrical_word": "force_e1",
+      "physical_word": "force_p1_a"
+     },
+     "second": {
+      "electrical_word": "force_e2",
+      "physical_word": "force_p2_a"
+     }
+    },
+    "custom_scale": "NULL",
+    "coupling": "dc",
+    "coupling_code": 10050
+   },
+   {
+    "case": "force_b",
+    "physical": "ForceSuccess/ai1",
+    "virtual_name": "",
+    "min_word": "force_min_b",
+    "max_word": "force_max_b",
+    "output_units": "kilogram_force",
+    "output_units_code": 15877,
+    "bridge_config": "half_bridge",
+    "bridge_code": 10187,
+    "excitation_source": "external",
+    "excitation_code": 10167,
+    "volts_word": "volts_b",
+    "nominal_bridge_ohms_word": "bridge_ohms_b",
+    "calibration": {
+     "electrical_units": "millivolts_per_volt",
+     "electrical_units_code": 15897,
+     "physical_units": "newtons",
+     "physical_units_code": 15875,
+     "first": {
+      "electrical_word": "force_e1",
+      "physical_word": "force_p1_b"
+     },
+     "second": {
+      "electrical_word": "force_e2",
+      "physical_word": "force_p2_b"
+     }
+    },
+    "custom_scale": "NULL",
+    "coupling": "omitted"
+   }
+  ],
+  "pressure_bridge": [
+   {
+    "case": "pressure_a",
+    "physical": "PressureSuccess/ai0",
+    "virtual_name": "",
+    "min_word": "pressure_min_a",
+    "max_word": "pressure_max_a",
+    "output_units": "pascals",
+    "output_units_code": 10081,
+    "bridge_config": "half_bridge",
+    "bridge_code": 10187,
+    "excitation_source": "external",
+    "excitation_code": 10167,
+    "volts_word": "volts_b",
+    "nominal_bridge_ohms_word": "bridge_ohms_b",
+    "calibration": {
+     "electrical_units": "millivolts_per_volt",
+     "electrical_units_code": 15897,
+     "physical_units": "bar",
+     "physical_units_code": 15880,
+     "first": {
+      "electrical_word": "pressure_e1_a",
+      "physical_word": "pressure_p1_a"
+     },
+     "second": {
+      "electrical_word": "pressure_e2_a",
+      "physical_word": "pressure_p2_a"
+     }
+    },
+    "custom_scale": "NULL",
+    "coupling": "ground",
+    "coupling_code": 10066
+   },
+   {
+    "case": "pressure_b",
+    "physical": "PressureSuccess/ai1",
+    "virtual_name": "",
+    "min_word": "pressure_min_b",
+    "max_word": "pressure_max_b",
+    "output_units": "psi",
+    "output_units_code": 15879,
+    "bridge_config": "full_bridge",
+    "bridge_code": 10182,
+    "excitation_source": "internal",
+    "excitation_code": 10200,
+    "volts_word": "volts_c",
+    "nominal_bridge_ohms_word": "bridge_ohms_a",
+    "calibration": {
+     "electrical_units": "volts_per_volt",
+     "electrical_units_code": 15896,
+     "physical_units": "pascals",
+     "physical_units_code": 10081,
+     "first": {
+      "electrical_word": "zero",
+      "physical_word": "pressure_p1_b"
+     },
+     "second": {
+      "electrical_word": "pressure_e2_b",
+      "physical_word": "pressure_p2_b"
+     }
+    },
+    "custom_scale": "NULL",
+    "coupling": "ac",
+    "coupling_code": 10045
+   }
+  ],
+  "torque_bridge": [
+   {
+    "case": "torque_a",
+    "physical": "TorqueSuccess/ai0",
+    "virtual_name": "",
+    "min_word": "torque_min_a",
+    "max_word": "torque_max_a",
+    "output_units": "newton_meters",
+    "output_units_code": 15881,
+    "bridge_config": "quarter_bridge",
+    "bridge_code": 10270,
+    "excitation_source": "internal",
+    "excitation_code": 10200,
+    "volts_word": "volts_c",
+    "nominal_bridge_ohms_word": "bridge_ohms_c",
+    "calibration": {
+     "electrical_units": "volts_per_volt",
+     "electrical_units_code": 15896,
+     "physical_units": "inch_ounces",
+     "physical_units_code": 15882,
+     "first": {
+      "electrical_word": "torque_e1_a",
+      "physical_word": "torque_p1_a"
+     },
+     "second": {
+      "electrical_word": "torque_e2_a",
+      "physical_word": "torque_p2_a"
+     }
+    },
+    "custom_scale": "NULL",
+    "coupling": "omitted"
+   },
+   {
+    "case": "torque_b",
+    "physical": "TorqueSuccess/ai1",
+    "virtual_name": "",
+    "min_word": "torque_min_b",
+    "max_word": "torque_max_b",
+    "output_units": "foot_pounds",
+    "output_units_code": 15884,
+    "bridge_config": "full_bridge",
+    "bridge_code": 10182,
+    "excitation_source": "external",
+    "excitation_code": 10167,
+    "volts_word": "volts_a",
+    "nominal_bridge_ohms_word": "bridge_ohms_a",
+    "calibration": {
+     "electrical_units": "millivolts_per_volt",
+     "electrical_units_code": 15897,
+     "physical_units": "newton_meters",
+     "physical_units_code": 15881,
+     "first": {
+      "electrical_word": "torque_e1_b",
+      "physical_word": "torque_p1_b"
+     },
+     "second": {
+      "electrical_word": "torque_e2_b",
+      "physical_word": "torque_p2_b"
+     }
+    },
+    "custom_scale": "NULL",
+    "coupling": "dc",
+    "coupling_code": 10050
+   }
+  ]
+ },
+ "short_enum_cycles": {
+  "force": [
+   {
+    "base": "force_a",
+    "units": "newtons",
+    "code": 15875,
+    "bridge": "full_bridge",
+    "bridge_code": 10182,
+    "physical_units": "pounds",
+    "physical_code": 15876
+   },
+   {
+    "base": "force_b",
+    "units": "kilogram_force",
+    "code": 15877,
+    "bridge": "half_bridge",
+    "bridge_code": 10187,
+    "physical_units": "newtons",
+    "physical_code": 15875
+   },
+   {
+    "base": "force_a",
+    "units": "pounds",
+    "code": 15876,
+    "bridge": "quarter_bridge",
+    "bridge_code": 10270,
+    "physical_units": "kilogram_force",
+    "physical_code": 15877
+   }
+  ],
+  "pressure": [
+   {
+    "base": "pressure_a",
+    "units": "pascals",
+    "code": 10081,
+    "bridge": "half_bridge",
+    "bridge_code": 10187,
+    "physical_units": "bar",
+    "physical_code": 15880
+   },
+   {
+    "base": "pressure_b",
+    "units": "psi",
+    "code": 15879,
+    "bridge": "full_bridge",
+    "bridge_code": 10182,
+    "physical_units": "pascals",
+    "physical_code": 10081
+   },
+   {
+    "base": "pressure_a",
+    "units": "bar",
+    "code": 15880,
+    "bridge": "quarter_bridge",
+    "bridge_code": 10270,
+    "physical_units": "psi",
+    "physical_code": 15879
+   }
+  ],
+  "torque": [
+   {
+    "base": "torque_a",
+    "units": "newton_meters",
+    "code": 15881,
+    "bridge": "quarter_bridge",
+    "bridge_code": 10270,
+    "physical_units": "inch_ounces",
+    "physical_code": 15882
+   },
+   {
+    "base": "torque_b",
+    "units": "foot_pounds",
+    "code": 15884,
+    "bridge": "full_bridge",
+    "bridge_code": 10182,
+    "physical_units": "newton_meters",
+    "physical_code": 15881
+   },
+   {
+    "base": "torque_a",
+    "units": "inch_ounces",
+    "code": 15882,
+    "bridge": "half_bridge",
+    "bridge_code": 10187,
+    "physical_units": "inch_pounds",
+    "physical_code": 15883
+   },
+   {
+    "base": "torque_b",
+    "units": "inch_pounds",
+    "code": 15883,
+    "bridge": "quarter_bridge",
+    "bridge_code": 10270,
+    "physical_units": "foot_pounds",
+    "physical_code": 15884
+   }
+  ],
+  "rule": "one bounded cycle per quantity, no Cartesian grid; output and calibration physical-unit slots remain different"
+ },
+ "supplemental_exact_request_controls": [
+  {
+   "base": "force_a",
+   "operation": "swap both complete coordinate pairs",
+   "result": "descending electrical and physical requests; associations preserved, no independent sorting/relinking"
+  },
+  {
+   "base": "force_b",
+   "operation": "unchanged ascending E/descending P",
+   "result": "negative slope request admitted, no host interpolation"
+  },
+  {
+   "base": "pressure_a",
+   "operation": "second physical_word=pressure_p1_a",
+   "result": "equal physical requests admitted unchanged; native acceptance not promised and any original rejection remains original"
+  },
+  {
+   "base": "torque_a",
+   "excitation_source": "none",
+   "excitation_code": 10230,
+   "volts_word": "negative_zero",
+   "result": "exact None/negativezero amount, no physical-off/ignored claim"
+  },
+  {
+   "base": "force_a",
+   "excitation_source": "none",
+   "excitation_code": 10230,
+   "volts_word": "volts_c",
+   "result": "nonzero None amount passed exactly; no universal ignored/accepted/off claim"
+  },
+  {
+   "base": "pressure_a",
+   "excitation_source": "none",
+   "excitation_code": 10230,
+   "volts_word": "zero",
+   "result": "positive zero None amount passed exactly; no physical-off claim"
+  }
+ ],
+ "admission": {
+  "all_numbers": "finite/bit-exact; min<max; positive nominal unloaded bridge ohms; no universal sign/material bound",
+  "electrical_coordinates": "must differ numerically; +0/-0 coincidence rejected before effects",
+  "physical_coordinates": "may be equal/descending or imply negative slope; original native rejection preserved",
+  "unit_domains": "family-specific output/physical calibration enum; V/V or mV/V separately; cross-family units rejected",
+  "exact_pair_binding": "firstE maps firstP; secondE maps secondP; ABI floats group E1/E2 then integerEunits then P1/P2 then integerPunits",
+  "coupling": "optional missing-only; all explicit source/value/units remain requested metadata",
+  "no_driver_acceptance_guarantee": true
+ },
+ "metadata_extension": {
+  "calibration_provenance": "declared_two_point_linear_request",
+  "location": "per channel beside original nested calibration",
+  "meaning": "declared operator mapping, not observed/performed sensor calibration",
+  "independent_units": [
+   "returned quantity/min-max",
+   "calibration electrical",
+   "calibration physical"
+  ]
+ },
+ "manual_native_patterns": [
+  {
+   "ordinal": 0,
+   "bits_hex": "3f90000000000000",
+   "ieee754_le_hex": "000000000000903f",
+   "classification": "finite",
+   "sign_bit": 0,
+   "exact_rational": "1/64",
+   "finite_decimal": "0.015625"
+  },
+  {
+   "ordinal": 1,
+   "bits_hex": "3f90000000000000",
+   "ieee754_le_hex": "000000000000903f",
+   "classification": "finite",
+   "sign_bit": 0,
+   "exact_rational": "1/64",
+   "finite_decimal": "0.015625"
+  },
+  {
+   "ordinal": 2,
+   "bits_hex": "0000000000000000",
+   "ieee754_le_hex": "0000000000000000",
+   "classification": "zero",
+   "sign_bit": 0,
+   "exact_rational": "0",
+   "finite_decimal": "0.0"
+  },
+  {
+   "ordinal": 3,
+   "bits_hex": "8000000000000000",
+   "ieee754_le_hex": "0000000000000080",
+   "classification": "zero",
+   "sign_bit": 1,
+   "exact_rational": "0",
+   "finite_decimal": "-0.0"
+  },
+  {
+   "ordinal": 4,
+   "bits_hex": "7ff0000000000000",
+   "ieee754_le_hex": "000000000000f07f",
+   "classification": "infinity",
+   "sign_bit": 0
+  },
+  {
+   "ordinal": 5,
+   "bits_hex": "fff0000000000000",
+   "ieee754_le_hex": "000000000000f0ff",
+   "classification": "infinity",
+   "sign_bit": 1
+  },
+  {
+   "ordinal": 6,
+   "bits_hex": "7ff80000000000a5",
+   "ieee754_le_hex": "a50000000000f87f",
+   "classification": "nan",
+   "sign_bit": 0,
+   "fraction_hex": "80000000000a5"
+  },
+  {
+   "ordinal": 7,
+   "bits_hex": "c004000000000000",
+   "ieee754_le_hex": "00000000000004c0",
+   "classification": "finite",
+   "sign_bit": 1,
+   "exact_rational": "-5/2",
+   "finite_decimal": "-2.5"
+  },
+  {
+   "ordinal": 8,
+   "bits_hex": "4039000000000000",
+   "ieee754_le_hex": "0000000000003940",
+   "classification": "finite",
+   "sign_bit": 0,
+   "exact_rational": "25",
+   "finite_decimal": "25.0"
+  },
+  {
+   "ordinal": 9,
+   "bits_hex": "4060000000000000",
+   "ieee754_le_hex": "0000000000006040",
+   "classification": "finite",
+   "sign_bit": 0,
+   "exact_rational": "128",
+   "finite_decimal": "128.0"
+  },
+  {
+   "ordinal": 10,
+   "bits_hex": "0000000000000001",
+   "ieee754_le_hex": "0100000000000000",
+   "classification": "finite",
+   "sign_bit": 0,
+   "exact_rational": "1/2^1074",
+   "finite_decimal": "5e-324",
+   "decimal_status": "shortest round-trip rendering, not exact decimal rational"
+  },
+  {
+   "ordinal": 11,
+   "bits_hex": "fff8000000000045",
+   "ieee754_le_hex": "450000000000f8ff",
+   "classification": "nan",
+   "sign_bit": 1,
+   "fraction_hex": "8000000000045"
+  }
+ ],
+ "raw_extent": {
+  "shape": [
+   6,
+   2
+  ],
+  "words": 12,
+  "bytes": 96,
+  "all_words_le_hex": "000000000000903f000000000000903f00000000000000000000000000000080000000000000f07f000000000000f0ffa50000000000f87f00000000000004c0000000000000394000000000000060400100000000000000450000000000f8ff",
+  "negative_one_scan_le_hex": "000000000000903f000000000000903f",
+  "negative_one_scan_bytes": 16,
+  "control": "identical first words under different returned/calibration/electrical units stay identical; no host interpolation/unit/excitation math or clipping"
+ },
+ "public_rows": [
+  {
+   "measurement": "force_bridge",
+   "event": "force_bridge_block",
+   "representation": "driver_scaled_f64_force_bridge",
+   "finite_key": "force",
+   "units": "requested family output enum"
+  },
+  {
+   "measurement": "pressure_bridge",
+   "event": "pressure_bridge_block",
+   "representation": "driver_scaled_f64_pressure_bridge",
+   "finite_key": "pressure",
+   "units": "requested family output enum"
+  },
+  {
+   "measurement": "torque_bridge",
+   "event": "torque_bridge_block",
+   "representation": "driver_scaled_f64_torque_bridge",
+   "finite_key": "torque",
+   "units": "requested family output enum"
+  }
+ ],
+ "mixed_control_reference": {
+  "oracle": "resistive-ai.json",
+  "field": "mixed_thirteen_channel_control",
+  "shape": [
+   2,
+   13
+  ],
+  "bytes": 208,
+  "negative_prefix_bytes": 104,
+  "rule": "same one owned task with all thirteen constructors before read; no separate physical-bridge acquisition/reordering"
+ }
+}

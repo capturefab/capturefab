@@ -1625,7 +1625,7 @@
       "len": 4,
       "measure": [
         {"kind":"area_scan","region":[0,0,4,1],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.6745,"pixels":4},"exposure":{"channels":{"blue":0.4294,"green":0.4725,"red":0.5078},"highlights":0.0,"histogram16":[0,0,0,0,1,0,0,1,1,1,0,0,0,0,0,0],"mean":0.4765,"p01":0.2506,"p50":0.4844,"p99":0.6244,"shadows":0.0},"focus":null,"notes":["focus not measured: frame is too small to measure sharpness"]}},
-        {"kind":"area_scan","region":[1,0,3,3],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.6745,"pixels":3},"exposure":{"channels":{"blue":0.4974,"green":0.6804,"red":0.4085},"highlights":0.0,"histogram16":[0,0,0,0,0,0,0,0,1,1,1,0,0,0,0,0],"mean":0.6026,"p01":0.5161,"p50":0.6172,"p99":0.6714,"shadows":0.0},"focus":null,"notes":["focus not measured: frame is too small to measure sharpness"]}},
+        {"kind":"area_scan","region":[1,0,3,3],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.6745,"pixels":3},"exposure":{"channels":{"blue":0.4974,"green":0.4085,"red":0.6804},"highlights":0.0,"histogram16":[0,0,0,0,1,0,0,1,0,0,1,0,0,0,0,0],"mean":0.4706,"p01":0.2505,"p50":0.4766,"p99":0.6714,"shadows":0.0},"focus":null,"notes":["focus not measured: frame is too small to measure sharpness"]}},
         {"kind":"area_scan","region":[3,0,5,5],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.149,"pixels":1},"exposure":{"channels":{"blue":0.1471,"green":0.1471,"red":0.1471},"highlights":0.0,"histogram16":[0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0],"mean":0.149,"p01":0.1408,"p50":0.1484,"p99":0.1561,"shadows":0.0},"focus":null,"notes":["focus not measured: frame is too small to measure sharpness","dark: mean brightness 0.15 is below 0.25"]}},
         {"kind":"area_scan","region":[3,1,2,2],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.149,"pixels":1},"exposure":{"channels":{"blue":0.1471,"green":0.1471,"red":0.1471},"highlights":0.0,"histogram16":[0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0],"mean":0.149,"p01":0.1408,"p50":0.1484,"p99":0.1561,"shadows":0.0},"focus":null,"notes":["focus not measured: frame is too small to measure sharpness","dark: mean brightness 0.15 is below 0.25"]}}
       ],
@@ -1976,16 +1976,16 @@
       "generator": {"kind":"noise"},
       "height": 17,
       "inspect": [
-        {"region":null,"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.996,"pixels":561},"exposure":{"channels":null,"highlights":0.0089,"histogram16":[34,24,31,37,41,34,34,40,44,35,43,26,29,38,46,25],"mean":0.5071,"p01":0.0088,"p50":0.5066,"p99":0.9875,"shadows":0.0089},"focus":{"brenner":10195.8145,"laplacian":108729.9297,"tenengrad":117621.5234,"variance":40.2677},"image":null,"notes":["highlights clipped: 0.9 % of the image at full scale","shadows crushed: 0.9 % of the image at black"],"region":{"height":17,"normalized":[0.0,0.0,1.0,1.0],"width":33,"x":0,"y":0}}},
-        {"region":[0.1,0.2,0.35,0.5],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.9825,"pixels":108},"exposure":{"channels":null,"highlights":0.0,"histogram16":[8,4,1,4,6,6,8,7,13,6,8,5,7,9,10,6],"mean":0.5481,"p01":0.0056,"p50":0.5391,"p99":0.9681,"shadows":0.0185},"focus":{"brenner":9873.0459,"laplacian":104970.4609,"tenengrad":123938.1875,"variance":35.6091},"image":null,"notes":["shadows crushed: 1.8 % of the image at black"],"region":{"height":9,"normalized":[0.0909,0.1765,0.3636,0.5294],"width":12,"x":3,"y":3}}},
-        {"region":[0.5,0.5,0.5,0.5],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.9807,"pixels":128},"exposure":{"channels":null,"highlights":0.0,"histogram16":[8,6,9,5,8,6,12,9,8,9,14,8,9,5,9,3],"mean":0.4997,"p01":0.01,"p50":0.5156,"p99":0.9644,"shadows":0.0},"focus":{"brenner":8835.0146,"laplacian":98752.1484,"tenengrad":87028.0781,"variance":36.8956},"image":null,"notes":[],"region":{"height":8,"normalized":[0.5152,0.5294,0.4848,0.4706],"width":16,"x":17,"y":9}}}
+        {"region":null,"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"image":null,"notes":["Coord3D_C16 contains measurement samples. Exposure and focus require an intensity image."],"region":{"height":17,"normalized":[0.0,0.0,1.0,1.0],"width":33,"x":0,"y":0}}},
+        {"region":[0.1,0.2,0.35,0.5],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"image":null,"notes":["Coord3D_C16 contains measurement samples. Exposure and focus require an intensity image."],"region":{"height":9,"normalized":[0.0909,0.1765,0.3636,0.5294],"width":12,"x":3,"y":3}}},
+        {"region":[0.5,0.5,0.5,0.5],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"image":null,"notes":["Coord3D_C16 contains measurement samples. Exposure and focus require an intensity image."],"region":{"height":8,"normalized":[0.5152,0.5294,0.4848,0.4706],"width":16,"x":17,"y":9}}}
       ],
       "len": 1122,
       "measure": [
-        {"kind":"area_scan","region":[0,0,33,17],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.996,"pixels":561},"exposure":{"channels":null,"highlights":0.0089,"histogram16":[34,24,31,37,41,34,34,40,44,35,43,26,29,38,46,25],"mean":0.5071,"p01":0.0088,"p50":0.5066,"p99":0.9875,"shadows":0.0089},"focus":{"brenner":10195.8145,"laplacian":108729.9297,"tenengrad":117621.5234,"variance":40.2677},"notes":["highlights clipped: 0.9 % of the image at full scale","shadows crushed: 0.9 % of the image at black"]}},
-        {"kind":"area_scan","region":[8,5,17,11],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.9929,"pixels":187},"exposure":{"channels":null,"highlights":0.0053,"histogram16":[12,9,13,14,13,10,11,12,17,12,13,11,9,12,13,6],"mean":0.4874,"p01":0.0097,"p50":0.4922,"p99":0.9776,"shadows":0.0107},"focus":{"brenner":10100.3125,"laplacian":98089.8906,"tenengrad":123284.8672,"variance":40.1774},"notes":["highlights clipped: 0.5 % of the image at full scale","shadows crushed: 1.1 % of the image at black"]}},
-        {"kind":"area_scan","region":[32,16,5,5],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.9495,"pixels":1},"exposure":{"channels":null,"highlights":0.0,"histogram16":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],"mean":0.9529,"p01":0.9377,"p50":0.9453,"p99":0.953,"shadows":0.0},"focus":{"brenner":2097.0,"laplacian":0.0,"tenengrad":77402.0,"variance":0.0},"notes":["bright: mean brightness 0.95 is above 0.65"]}},
-        {"kind":"area_scan","region":[3,1,2,2],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.8848,"pixels":4},"exposure":{"channels":null,"highlights":0.0,"histogram16":[0,1,0,1,0,0,0,0,0,0,0,0,1,0,1,0],"mean":0.5049,"p01":0.11,"p50":0.25,"p99":0.89,"shadows":0.0},"focus":{"brenner":6701.75,"laplacian":95776.25,"tenengrad":144232.0,"variance":57.3879},"notes":[]}}
+        {"kind":"area_scan","region":[0,0,33,17],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"notes":["Coord3D_C16 contains measurement samples. Exposure and focus require an intensity image."]}},
+        {"kind":"area_scan","region":[8,5,17,11],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"notes":["Coord3D_C16 contains measurement samples. Exposure and focus require an intensity image."]}},
+        {"kind":"area_scan","region":[32,16,5,5],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"notes":["Coord3D_C16 contains measurement samples. Exposure and focus require an intensity image."]}},
+        {"kind":"area_scan","region":[3,1,2,2],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"notes":["Coord3D_C16 contains measurement samples. Exposure and focus require an intensity image."]}}
       ],
       "name": "Coord3D_C16-noise-33x17",
       "pixel_format": 17825976,
@@ -2036,16 +2036,16 @@
       "generator": {"kind":"noise"},
       "height": 17,
       "inspect": [
-        {"region":null,"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.996,"pixels":561},"exposure":{"channels":null,"highlights":0.0089,"histogram16":[34,24,31,37,41,34,34,40,44,35,43,26,29,38,46,25],"mean":0.5071,"p01":0.0088,"p50":0.5066,"p99":0.9875,"shadows":0.0089},"focus":{"brenner":10195.8145,"laplacian":108729.9297,"tenengrad":117621.5234,"variance":40.2677},"image":null,"notes":["highlights clipped: 0.9 % of the image at full scale","shadows crushed: 0.9 % of the image at black"],"region":{"height":17,"normalized":[0.0,0.0,1.0,1.0],"width":33,"x":0,"y":0}}},
-        {"region":[0.1,0.2,0.35,0.5],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.9825,"pixels":108},"exposure":{"channels":null,"highlights":0.0,"histogram16":[8,4,1,4,6,6,8,7,13,6,8,5,7,9,10,6],"mean":0.5481,"p01":0.0056,"p50":0.5391,"p99":0.9681,"shadows":0.0185},"focus":{"brenner":9873.0459,"laplacian":104970.4609,"tenengrad":123938.1875,"variance":35.6091},"image":null,"notes":["shadows crushed: 1.8 % of the image at black"],"region":{"height":9,"normalized":[0.0909,0.1765,0.3636,0.5294],"width":12,"x":3,"y":3}}},
-        {"region":[0.5,0.5,0.5,0.5],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.9807,"pixels":128},"exposure":{"channels":null,"highlights":0.0,"histogram16":[8,6,9,5,8,6,12,9,8,9,14,8,9,5,9,3],"mean":0.4997,"p01":0.01,"p50":0.5156,"p99":0.9644,"shadows":0.0},"focus":{"brenner":8835.0146,"laplacian":98752.1484,"tenengrad":87028.0781,"variance":36.8956},"image":null,"notes":[],"region":{"height":8,"normalized":[0.5152,0.5294,0.4848,0.4706],"width":16,"x":17,"y":9}}}
+        {"region":null,"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"image":null,"notes":["Confidence16 contains measurement samples. Exposure and focus require an intensity image."],"region":{"height":17,"normalized":[0.0,0.0,1.0,1.0],"width":33,"x":0,"y":0}}},
+        {"region":[0.1,0.2,0.35,0.5],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"image":null,"notes":["Confidence16 contains measurement samples. Exposure and focus require an intensity image."],"region":{"height":9,"normalized":[0.0909,0.1765,0.3636,0.5294],"width":12,"x":3,"y":3}}},
+        {"region":[0.5,0.5,0.5,0.5],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"image":null,"notes":["Confidence16 contains measurement samples. Exposure and focus require an intensity image."],"region":{"height":8,"normalized":[0.5152,0.5294,0.4848,0.4706],"width":16,"x":17,"y":9}}}
       ],
       "len": 1122,
       "measure": [
-        {"kind":"area_scan","region":[0,0,33,17],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.996,"pixels":561},"exposure":{"channels":null,"highlights":0.0089,"histogram16":[34,24,31,37,41,34,34,40,44,35,43,26,29,38,46,25],"mean":0.5071,"p01":0.0088,"p50":0.5066,"p99":0.9875,"shadows":0.0089},"focus":{"brenner":10195.8145,"laplacian":108729.9297,"tenengrad":117621.5234,"variance":40.2677},"notes":["highlights clipped: 0.9 % of the image at full scale","shadows crushed: 0.9 % of the image at black"]}},
-        {"kind":"area_scan","region":[8,5,17,11],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.9929,"pixels":187},"exposure":{"channels":null,"highlights":0.0053,"histogram16":[12,9,13,14,13,10,11,12,17,12,13,11,9,12,13,6],"mean":0.4874,"p01":0.0097,"p50":0.4922,"p99":0.9776,"shadows":0.0107},"focus":{"brenner":10100.3125,"laplacian":98089.8906,"tenengrad":123284.8672,"variance":40.1774},"notes":["highlights clipped: 0.5 % of the image at full scale","shadows crushed: 1.1 % of the image at black"]}},
-        {"kind":"area_scan","region":[32,16,5,5],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.9495,"pixels":1},"exposure":{"channels":null,"highlights":0.0,"histogram16":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],"mean":0.9529,"p01":0.9377,"p50":0.9453,"p99":0.953,"shadows":0.0},"focus":{"brenner":2097.0,"laplacian":0.0,"tenengrad":77402.0,"variance":0.0},"notes":["bright: mean brightness 0.95 is above 0.65"]}},
-        {"kind":"area_scan","region":[3,1,2,2],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.8848,"pixels":4},"exposure":{"channels":null,"highlights":0.0,"histogram16":[0,1,0,1,0,0,0,0,0,0,0,0,1,0,1,0],"mean":0.5049,"p01":0.11,"p50":0.25,"p99":0.89,"shadows":0.0},"focus":{"brenner":6701.75,"laplacian":95776.25,"tenengrad":144232.0,"variance":57.3879},"notes":[]}}
+        {"kind":"area_scan","region":[0,0,33,17],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"notes":["Confidence16 contains measurement samples. Exposure and focus require an intensity image."]}},
+        {"kind":"area_scan","region":[8,5,17,11],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"notes":["Confidence16 contains measurement samples. Exposure and focus require an intensity image."]}},
+        {"kind":"area_scan","region":[32,16,5,5],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"notes":["Confidence16 contains measurement samples. Exposure and focus require an intensity image."]}},
+        {"kind":"area_scan","region":[3,1,2,2],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"notes":["Confidence16 contains measurement samples. Exposure and focus require an intensity image."]}}
       ],
       "name": "Confidence16-noise-33x17",
       "pixel_format": 17825991,
@@ -2816,6 +2816,39 @@
     },
     {
       "conversions": {
+        "gray8": {"fnv1a64":"25dc3957f2c1dcd4","len":96},
+        "jpeg": {"error":"coordinate and confidence maps require a lossless still format"},
+        "png": {"fnv1a64":"1d6ad4ee3078df58","len":281},
+        "png_bit_depth": [16,null],
+        "raw": {"fnv1a64":"787c8516cfbc22e9","len":120},
+        "rgb": {"fnv1a64":"221e9caad3d525ce","len":288},
+        "rgba": {"fnv1a64":"11b1a5de54f9785e","len":384},
+        "sample_bits": 10
+      },
+      "fnv1a64": "787c8516cfbc22e9",
+      "generator": {
+        "hex": "852b4a30388d206f7d47be5bfa27682488a665be4dbbf1115baafa828d34cc41258aea03d0a6908e3841cff14aaf8aaa4b2678a9ab8e823b99e691d81d2961ed065c7b532988584db62d32b50aecb1ae76b684773df182d2fd5b133d5ac67e80e546532703236a7608e4caf1ca7095ce432cfc574facd9a5",
+        "kind": "bytes"
+      },
+      "height": 8,
+      "inspect": [
+        {"region":null,"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"image":null,"notes":["Coord3D_C10p contains measurement samples. Exposure and focus require an intensity image."],"region":{"height":8,"normalized":[0.0,0.0,1.0,1.0],"width":12,"x":0,"y":0}}},
+        {"region":[0.1,0.2,0.35,0.5],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"image":null,"notes":["Coord3D_C10p contains measurement samples. Exposure and focus require an intensity image."],"region":{"height":4,"normalized":[0.0833,0.25,0.3333,0.5],"width":4,"x":1,"y":2}}},
+        {"region":[0.5,0.5,0.5,0.5],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"image":null,"notes":["Coord3D_C10p contains measurement samples. Exposure and focus require an intensity image."],"region":{"height":4,"normalized":[0.5,0.5,0.5,0.5],"width":6,"x":6,"y":4}}}
+      ],
+      "len": 120,
+      "measure": [
+        {"kind":"area_scan","region":[0,0,12,8],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"notes":["Coord3D_C10p contains measurement samples. Exposure and focus require an intensity image."]}},
+        {"kind":"area_scan","region":[3,2,7,7],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"notes":["Coord3D_C10p contains measurement samples. Exposure and focus require an intensity image."]}},
+        {"kind":"area_scan","region":[11,7,5,5],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"notes":["Coord3D_C10p contains measurement samples. Exposure and focus require an intensity image."]}},
+        {"kind":"area_scan","region":[3,1,2,2],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"notes":["Coord3D_C10p contains measurement samples. Exposure and focus require an intensity image."]}}
+      ],
+      "name": "Coord3D_C10p-layout-12x8",
+      "pixel_format": 17432791,
+      "width": 12
+    },
+    {
+      "conversions": {
         "gray8": {"fnv1a64":"b790e5001ec727f7","len":96},
         "jpeg": {"fnv1a64":"1e1bc8c43a4dff80","len":436},
         "png": {"fnv1a64":"2660a84fd16b5f04","len":281},
@@ -3307,6 +3340,39 @@
       ],
       "name": "BayerRG12p-layout-12x8",
       "pixel_format": 17563737,
+      "width": 12
+    },
+    {
+      "conversions": {
+        "gray8": {"fnv1a64":"e517091a2b15c625","len":96},
+        "jpeg": {"error":"coordinate and confidence maps require a lossless still format"},
+        "png": {"fnv1a64":"c913891f6bae6f21","len":281},
+        "png_bit_depth": [16,null],
+        "raw": {"fnv1a64":"bd61d88ed69f5011","len":144},
+        "rgb": {"fnv1a64":"a022f9a7128b8349","len":288},
+        "rgba": {"fnv1a64":"b930fba3b5bdb173","len":384},
+        "sample_bits": 12
+      },
+      "fnv1a64": "bd61d88ed69f5011",
+      "generator": {
+        "hex": "4b26254f5a5755c5608ba8f1acf7251f0b0a90f214308f063ff941ed00028ad9e396ea60186baeec91192be584ab137f412066d77cce8fe09945ec53e9c6fe371be3f5ff546964cd1817d4ed648d65b696533fe193ba9762eae7d08bd7fd23261fbaf8d691bbab7a4d440a2ae7ff13225d77d625f3871f5ede25139a50802b16312da53faafd36621442fe449e8bfefc",
+        "kind": "bytes"
+      },
+      "height": 8,
+      "inspect": [
+        {"region":null,"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"image":null,"notes":["Coord3D_C12p contains measurement samples. Exposure and focus require an intensity image."],"region":{"height":8,"normalized":[0.0,0.0,1.0,1.0],"width":12,"x":0,"y":0}}},
+        {"region":[0.1,0.2,0.35,0.5],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"image":null,"notes":["Coord3D_C12p contains measurement samples. Exposure and focus require an intensity image."],"region":{"height":4,"normalized":[0.0833,0.25,0.3333,0.5],"width":4,"x":1,"y":2}}},
+        {"region":[0.5,0.5,0.5,0.5],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"image":null,"notes":["Coord3D_C12p contains measurement samples. Exposure and focus require an intensity image."],"region":{"height":4,"normalized":[0.5,0.5,0.5,0.5],"width":6,"x":6,"y":4}}}
+      ],
+      "len": 144,
+      "measure": [
+        {"kind":"area_scan","region":[0,0,12,8],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"notes":["Coord3D_C12p contains measurement samples. Exposure and focus require an intensity image."]}},
+        {"kind":"area_scan","region":[3,2,7,7],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"notes":["Coord3D_C12p contains measurement samples. Exposure and focus require an intensity image."]}},
+        {"kind":"area_scan","region":[11,7,5,5],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"notes":["Coord3D_C12p contains measurement samples. Exposure and focus require an intensity image."]}},
+        {"kind":"area_scan","region":[3,1,2,2],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"notes":["Coord3D_C12p contains measurement samples. Exposure and focus require an intensity image."]}}
+      ],
+      "name": "Coord3D_C12p-layout-12x8",
+      "pixel_format": 17563866,
       "width": 12
     },
     {
@@ -4020,16 +4086,16 @@
       },
       "height": 8,
       "inspect": [
-        {"region":null,"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.9978,"pixels":96},"exposure":{"channels":null,"highlights":0.0104,"histogram16":[2,4,10,4,10,6,9,8,5,4,5,5,7,7,7,3],"mean":0.5005,"p01":0.0306,"p50":0.4688,"p99":0.985,"shadows":0.0},"focus":{"brenner":9587.333,"laplacian":103830.1328,"tenengrad":126115.0313,"variance":39.392},"image":null,"notes":["highlights clipped: 1.0 % of the image at full scale"],"region":{"height":8,"normalized":[0.0,0.0,1.0,1.0],"width":12,"x":0,"y":0}}},
-        {"region":[0.1,0.2,0.35,0.5],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.9978,"pixels":16},"exposure":{"channels":null,"highlights":0.0625,"histogram16":[0,1,3,0,1,0,2,1,0,0,2,1,1,0,3,1],"mean":0.5461,"p01":0.065,"p50":0.4844,"p99":0.9975,"shadows":0.0},"focus":{"brenner":12851.0,"laplacian":111926.4375,"tenengrad":158680.0,"variance":45.0893},"image":null,"notes":["highlights clipped: 6.2 % of the image at full scale"],"region":{"height":4,"normalized":[0.0833,0.25,0.3333,0.5],"width":4,"x":1,"y":2}}},
-        {"region":[0.5,0.5,0.5,0.5],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.9151,"pixels":24},"exposure":{"channels":null,"highlights":0.0,"histogram16":[1,0,4,2,3,1,3,1,2,1,0,1,4,0,1,0],"mean":0.4304,"p01":0.0194,"p50":0.3906,"p99":0.9181,"shadows":0.0},"focus":{"brenner":8012.3999,"laplacian":99363.4453,"tenengrad":108396.2656,"variance":39.4192},"image":null,"notes":[],"region":{"height":4,"normalized":[0.5,0.5,0.5,0.5],"width":6,"x":6,"y":4}}}
+        {"region":null,"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"image":null,"notes":["Coord3D_C16 contains measurement samples. Exposure and focus require an intensity image."],"region":{"height":8,"normalized":[0.0,0.0,1.0,1.0],"width":12,"x":0,"y":0}}},
+        {"region":[0.1,0.2,0.35,0.5],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"image":null,"notes":["Coord3D_C16 contains measurement samples. Exposure and focus require an intensity image."],"region":{"height":4,"normalized":[0.0833,0.25,0.3333,0.5],"width":4,"x":1,"y":2}}},
+        {"region":[0.5,0.5,0.5,0.5],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"image":null,"notes":["Coord3D_C16 contains measurement samples. Exposure and focus require an intensity image."],"region":{"height":4,"normalized":[0.5,0.5,0.5,0.5],"width":6,"x":6,"y":4}}}
       ],
       "len": 192,
       "measure": [
-        {"kind":"area_scan","region":[0,0,12,8],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.9978,"pixels":96},"exposure":{"channels":null,"highlights":0.0104,"histogram16":[2,4,10,4,10,6,9,8,5,4,5,5,7,7,7,3],"mean":0.5005,"p01":0.0306,"p50":0.4688,"p99":0.985,"shadows":0.0},"focus":{"brenner":9587.333,"laplacian":103830.1328,"tenengrad":126115.0313,"variance":39.392},"notes":["highlights clipped: 1.0 % of the image at full scale"]}},
-        {"kind":"area_scan","region":[3,2,7,7],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.943,"pixels":42},"exposure":{"channels":null,"highlights":0.0,"histogram16":[2,0,5,1,5,1,4,5,2,2,2,3,2,3,4,1],"mean":0.5078,"p01":0.0222,"p50":0.474,"p99":0.9466,"shadows":0.0},"focus":{"brenner":8186.9712,"laplacian":104563.1641,"tenengrad":124948.9141,"variance":36.1278},"notes":[]}},
-        {"kind":"area_scan","region":[11,7,5,5],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.7691,"pixels":1},"exposure":{"channels":null,"highlights":0.0,"histogram16":[0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0],"mean":0.7686,"p01":0.7658,"p50":0.7734,"p99":0.7811,"shadows":0.0},"focus":{"brenner":16062.5,"laplacian":0.0,"tenengrad":178868.0,"variance":0.0},"notes":["bright: mean brightness 0.77 is above 0.65"]}},
-        {"kind":"area_scan","region":[3,1,2,2],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.8582,"pixels":4},"exposure":{"channels":null,"highlights":0.0,"histogram16":[0,0,1,0,1,0,0,0,0,0,0,1,0,1,0,0],"mean":0.5098,"p01":0.1412,"p50":0.3125,"p99":0.8588,"shadows":0.0},"focus":{"brenner":5608.5,"laplacian":267058.25,"tenengrad":54782.5,"variance":43.6731},"notes":[]}}
+        {"kind":"area_scan","region":[0,0,12,8],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"notes":["Coord3D_C16 contains measurement samples. Exposure and focus require an intensity image."]}},
+        {"kind":"area_scan","region":[3,2,7,7],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"notes":["Coord3D_C16 contains measurement samples. Exposure and focus require an intensity image."]}},
+        {"kind":"area_scan","region":[11,7,5,5],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"notes":["Coord3D_C16 contains measurement samples. Exposure and focus require an intensity image."]}},
+        {"kind":"area_scan","region":[3,1,2,2],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"notes":["Coord3D_C16 contains measurement samples. Exposure and focus require an intensity image."]}}
       ],
       "name": "Coord3D_C16-layout-12x8",
       "pixel_format": 17825976,
@@ -4053,16 +4119,16 @@
       },
       "height": 8,
       "inspect": [
-        {"region":null,"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.998,"pixels":96},"exposure":{"channels":null,"highlights":0.0208,"histogram16":[8,5,6,2,7,2,10,8,5,7,6,7,8,5,3,7],"mean":0.5024,"p01":0.015,"p50":0.5,"p99":0.9925,"shadows":0.0104},"focus":{"brenner":10320.0166,"laplacian":87364.0859,"tenengrad":163212.0625,"variance":38.1837},"image":null,"notes":["highlights clipped: 2.1 % of the image at full scale","shadows crushed: 1.0 % of the image at black"],"region":{"height":8,"normalized":[0.0,0.0,1.0,1.0],"width":12,"x":0,"y":0}}},
-        {"region":[0.1,0.2,0.35,0.5],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.9646,"pixels":16},"exposure":{"channels":null,"highlights":0.0,"histogram16":[1,1,3,0,0,1,2,1,0,1,1,0,1,2,1,1],"mean":0.4875,"p01":0.0181,"p50":0.3906,"p99":0.9663,"shadows":0.0},"focus":{"brenner":11840.4063,"laplacian":65645.4063,"tenengrad":192373.875,"variance":50.1918},"image":null,"notes":[],"region":{"height":4,"normalized":[0.0833,0.25,0.3333,0.5],"width":4,"x":1,"y":2}}},
-        {"region":[0.5,0.5,0.5,0.5],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.998,"pixels":24},"exposure":{"channels":null,"highlights":0.0417,"histogram16":[3,3,1,0,3,0,4,1,1,1,2,1,1,0,2,1],"mean":0.4208,"p01":0.0175,"p50":0.3854,"p99":0.9963,"shadows":0.0},"focus":{"brenner":11528.4336,"laplacian":109752.625,"tenengrad":192971.4688,"variance":50.2666},"image":null,"notes":["highlights clipped: 4.2 % of the image at full scale"],"region":{"height":4,"normalized":[0.5,0.5,0.5,0.5],"width":6,"x":6,"y":4}}}
+        {"region":null,"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"image":null,"notes":["Confidence16 contains measurement samples. Exposure and focus require an intensity image."],"region":{"height":8,"normalized":[0.0,0.0,1.0,1.0],"width":12,"x":0,"y":0}}},
+        {"region":[0.1,0.2,0.35,0.5],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"image":null,"notes":["Confidence16 contains measurement samples. Exposure and focus require an intensity image."],"region":{"height":4,"normalized":[0.0833,0.25,0.3333,0.5],"width":4,"x":1,"y":2}}},
+        {"region":[0.5,0.5,0.5,0.5],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"image":null,"notes":["Confidence16 contains measurement samples. Exposure and focus require an intensity image."],"region":{"height":4,"normalized":[0.5,0.5,0.5,0.5],"width":6,"x":6,"y":4}}}
       ],
       "len": 192,
       "measure": [
-        {"kind":"area_scan","region":[0,0,12,8],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.998,"pixels":96},"exposure":{"channels":null,"highlights":0.0208,"histogram16":[8,5,6,2,7,2,10,8,5,7,6,7,8,5,3,7],"mean":0.5024,"p01":0.015,"p50":0.5,"p99":0.9925,"shadows":0.0104},"focus":{"brenner":10320.0166,"laplacian":87364.0859,"tenengrad":163212.0625,"variance":38.1837},"notes":["highlights clipped: 2.1 % of the image at full scale","shadows crushed: 1.0 % of the image at black"]}},
-        {"kind":"area_scan","region":[3,2,7,7],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.998,"pixels":42},"exposure":{"channels":null,"highlights":0.0476,"histogram16":[4,2,4,0,4,0,3,3,2,4,4,3,3,1,1,4],"mean":0.4978,"p01":0.0178,"p50":0.5234,"p99":0.9967,"shadows":0.0},"focus":{"brenner":9635.4004,"laplacian":88285.0781,"tenengrad":178468.5781,"variance":41.4027},"notes":["highlights clipped: 4.8 % of the image at full scale"]}},
-        {"kind":"area_scan","region":[11,7,5,5],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.9137,"pixels":1},"exposure":{"channels":null,"highlights":0.0,"histogram16":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0],"mean":0.9137,"p01":0.9064,"p50":0.9141,"p99":0.9217,"shadows":0.0},"focus":{"brenner":19592.5,"laplacian":0.0,"tenengrad":55060.0,"variance":0.0},"notes":["bright: mean brightness 0.91 is above 0.65"]}},
-        {"kind":"area_scan","region":[3,1,2,2],"result":{"auto_meter":null,"clipping":{"high_px":0,"low_px":0,"max":0.85,"pixels":4},"exposure":{"channels":null,"highlights":0.0,"histogram16":[0,0,1,1,0,0,0,0,0,1,0,0,0,1,0,0],"mean":0.4686,"p01":0.1725,"p50":0.2344,"p99":0.8588,"shadows":0.0},"focus":{"brenner":3078.375,"laplacian":69009.1875,"tenengrad":104856.5,"variance":42.8891},"notes":[]}}
+        {"kind":"area_scan","region":[0,0,12,8],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"notes":["Confidence16 contains measurement samples. Exposure and focus require an intensity image."]}},
+        {"kind":"area_scan","region":[3,2,7,7],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"notes":["Confidence16 contains measurement samples. Exposure and focus require an intensity image."]}},
+        {"kind":"area_scan","region":[11,7,5,5],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"notes":["Confidence16 contains measurement samples. Exposure and focus require an intensity image."]}},
+        {"kind":"area_scan","region":[3,1,2,2],"result":{"auto_meter":null,"clipping":null,"exposure":null,"focus":null,"notes":["Confidence16 contains measurement samples. Exposure and focus require an intensity image."]}}
       ],
       "name": "Confidence16-layout-12x8",
       "pixel_format": 17825991,
@@ -4764,6 +4830,72 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"f3dd472502f21f59","len":759},
+        "png": {"fnv1a64":"942dfb9ec5b7db9c","len":364},
+        "png_bit_depth": [8,null],
+        "raw": {"fnv1a64":"87a1ac6a5b7102d6","len":192},
+        "rgb": {"fnv1a64":"1b3a4100047cf7de","len":288},
+        "rgba": {"fnv1a64":"bbb3db5e748bbd32","len":384},
+        "sample_bits": 8
+      },
+      "fnv1a64": "87a1ac6a5b7102d6",
+      "generator": {
+        "hex": "7d904d7bb0007df0800d1df2c8e2e80ff811c9725d0ca4f83c435860024033b111c4a957db4e54071c46487422a895bc322ed184fc92e3f7686393e044f1906b3fdd23dee35b2bd016e25b27fa515fdbd1702608378b2c3beb658e9934da5c9090e210d0d50b145ab26ab73924769f5aa8cf66893e6a5a1cad4eb84c75c753765f1c6788340735d6acf2aef67d9dd59159ab9cb514dabacd4b4863c566db1b5a90f1c3c280927fb1f679780e66d28b2008a36d837e7fdcf4d4dfafa29363fb5c",
+        "kind": "bytes"
+      },
+      "height": 8,
+      "inspect": [
+        {"region":null,"result":{"auto_meter":{"mean":0.5038,"p99":0.9882},"clipping":{"high_px":0,"low_px":0,"max":0.9882,"pixels":96},"exposure":{"channels":{"blue":0.4806,"green":0.5289,"red":0.4773},"highlights":0.0,"histogram16":[0,1,8,6,5,5,9,12,10,8,8,9,4,9,2,0],"mean":0.5122,"p01":0.0931,"p50":0.5078,"p99":0.8912,"shadows":0.0},"focus":{"brenner":4902.125,"laplacian":45621.3594,"tenengrad":78817.1328,"variance":20.492},"image":null,"notes":[],"region":{"height":8,"normalized":[0.0,0.0,1.0,1.0],"width":12,"x":0,"y":0}}},
+        {"region":[0.1,0.2,0.35,0.5],"result":{"auto_meter":{"mean":0.5265,"p99":0.9882},"clipping":{"high_px":0,"low_px":0,"max":0.9882,"pixels":16},"exposure":{"channels":{"blue":0.4431,"green":0.4676,"red":0.7255},"highlights":0.0,"histogram16":[0,0,1,1,0,2,2,3,1,0,2,1,1,1,1,0],"mean":0.5184,"p01":0.1744,"p50":0.4531,"p99":0.9038,"shadows":0.0},"focus":{"brenner":6940.5313,"laplacian":55473.2148,"tenengrad":82993.0,"variance":21.2564},"image":null,"notes":[],"region":{"height":4,"normalized":[0.0833,0.25,0.3333,0.5],"width":4,"x":1,"y":2}}},
+        {"region":[0.5,0.5,0.5,0.5],"result":{"auto_meter":{"mean":0.5679,"p99":0.9843},"clipping":{"high_px":0,"low_px":0,"max":0.9843,"pixels":24},"exposure":{"channels":{"blue":0.5641,"green":0.6052,"red":0.4948},"highlights":0.0,"histogram16":[0,1,1,0,0,2,2,2,3,2,2,3,1,4,1,0],"mean":0.577,"p01":0.0663,"p50":0.5781,"p99":0.8869,"shadows":0.0},"focus":{"brenner":5375.2002,"laplacian":53299.9727,"tenengrad":104990.3984,"variance":20.7455},"image":null,"notes":[],"region":{"height":4,"normalized":[0.5,0.5,0.5,0.5],"width":6,"x":6,"y":4}}}
+      ],
+      "len": 192,
+      "measure": [
+        {"kind":"area_scan","region":[0,0,12,8],"result":{"auto_meter":{"mean":0.5038,"p99":0.9882},"clipping":{"high_px":0,"low_px":0,"max":0.9882,"pixels":96},"exposure":{"channels":{"blue":0.4806,"green":0.5289,"red":0.4773},"highlights":0.0,"histogram16":[0,1,8,6,5,5,9,12,10,8,8,9,4,9,2,0],"mean":0.5122,"p01":0.0931,"p50":0.5078,"p99":0.8912,"shadows":0.0},"focus":{"brenner":4902.125,"laplacian":45621.3594,"tenengrad":78817.1328,"variance":20.492},"notes":[]}},
+        {"kind":"area_scan","region":[3,2,7,7],"result":{"auto_meter":{"mean":0.5261,"p99":0.9686},"clipping":{"high_px":0,"low_px":0,"max":0.9686,"pixels":42},"exposure":{"channels":{"blue":0.466,"green":0.5825,"red":0.4709},"highlights":0.0,"histogram16":[0,1,3,0,3,1,6,5,4,0,4,6,3,4,2,0],"mean":0.5487,"p01":0.0847,"p50":0.5104,"p99":0.8873,"shadows":0.0},"focus":{"brenner":5310.7002,"laplacian":48813.4609,"tenengrad":83284.3984,"variance":22.1097},"notes":[]}},
+        {"kind":"area_scan","region":[11,7,5,5],"result":{"auto_meter":{"mean":0.5167,"p99":0.9843},"clipping":{"high_px":0,"low_px":0,"max":0.9843,"pixels":1},"exposure":{"channels":{"blue":0.9784,"green":0.3667,"red":0.3667},"highlights":0.0,"histogram16":[0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0],"mean":0.4039,"p01":0.3908,"p50":0.3984,"p99":0.4061,"shadows":0.0},"focus":{"brenner":793.0,"laplacian":0.0,"tenengrad":49978.0,"variance":0.0},"notes":[]}},
+        {"kind":"area_scan","region":[3,1,2,2],"result":{"auto_meter":{"mean":0.548,"p99":0.9686},"clipping":{"high_px":0,"low_px":0,"max":0.9686,"pixels":4},"exposure":{"channels":{"blue":0.5392,"green":0.7039,"red":0.2412},"highlights":0.0,"histogram16":[0,0,0,0,0,0,1,0,1,1,0,0,0,1,0,0],"mean":0.5922,"p01":0.4225,"p50":0.5313,"p99":0.8431,"shadows":0.0},"focus":{"brenner":3550.5,"laplacian":56038.5,"tenengrad":55937.5,"variance":13.8461},"notes":[]}}
+      ],
+      "name": "BiColorRGBG8-layout-12x8",
+      "pixel_format": 34603173,
+      "width": 12
+    },
+    {
+      "conversions": {
+        "gray8": null,
+        "jpeg": {"fnv1a64":"d4639fbcb576193a","len":769},
+        "png": {"fnv1a64":"b6cfbb772557a57b","len":364},
+        "png_bit_depth": [8,null],
+        "raw": {"fnv1a64":"3997851c1936574b","len":192},
+        "rgb": {"fnv1a64":"3a7d9438d7cbb2d1","len":288},
+        "rgba": {"fnv1a64":"c17c281ebd891f55","len":384},
+        "sample_bits": 8
+      },
+      "fnv1a64": "3997851c1936574b",
+      "generator": {
+        "hex": "1e930a327bf33ef48f421cf84b6823404fe66df0e65dc52e290ef9b1f9a7a7d2c19774c9030bcfddb9d91ee5b7428cdcd35870477ceda0a0dc4ed194e458ec6e795d75c2171a4232da1cb219910611dd58c6a362ee4478253d90ee7374a1dc08464bbde0d680b11488ee5708937f575f24f9f30bbf497f59525dc297bc4d88b2e6023b156680889ff9652bfcefc5382df67636db1585435e57776e7480601b4e1553e805ddd9bed02796e726355276f22d4a3cdaf00a290941f60a45c11702e5",
+        "kind": "bytes"
+      },
+      "height": 8,
+      "inspect": [
+        {"region":null,"result":{"auto_meter":{"mean":0.4967,"p99":0.9882},"clipping":{"high_px":0,"low_px":0,"max":0.9882,"pixels":96},"exposure":{"channels":{"blue":0.5458,"green":0.4794,"red":0.4833},"highlights":0.0,"histogram16":[0,1,9,7,10,7,12,9,2,6,9,10,9,5,0,0],"mean":0.483,"p01":0.1088,"p50":0.4438,"p99":0.8444,"shadows":0.0},"focus":{"brenner":6110.9751,"laplacian":62025.8594,"tenengrad":66474.5703,"variance":22.5348},"image":null,"notes":[],"region":{"height":8,"normalized":[0.0,0.0,1.0,1.0],"width":12,"x":0,"y":0}}},
+        {"region":[0.1,0.2,0.35,0.5],"result":{"auto_meter":{"mean":0.5484,"p99":0.9333},"clipping":{"high_px":0,"low_px":0,"max":0.9333,"pixels":16},"exposure":{"channels":{"blue":0.6618,"green":0.4941,"red":0.55},"highlights":0.0,"histogram16":[0,0,2,0,2,1,2,0,0,2,4,0,1,2,0,0],"mean":0.515,"p01":0.1275,"p50":0.5781,"p99":0.8569,"shadows":0.0},"focus":{"brenner":7044.5313,"laplacian":92452.7188,"tenengrad":77548.25,"variance":25.5719},"image":null,"notes":[],"region":{"height":4,"normalized":[0.0833,0.25,0.3333,0.5],"width":4,"x":1,"y":2}}},
+        {"region":[0.5,0.5,0.5,0.5],"result":{"auto_meter":{"mean":0.4786,"p99":0.9882},"clipping":{"high_px":0,"low_px":0,"max":0.9882,"pixels":24},"exposure":{"channels":{"blue":0.617,"green":0.4575,"red":0.3824},"highlights":0.0,"histogram16":[0,1,2,3,2,3,3,2,0,1,1,2,2,2,0,0],"mean":0.4518,"p01":0.0975,"p50":0.4141,"p99":0.8556,"shadows":0.0},"focus":{"brenner":7390.2666,"laplacian":65496.9961,"tenengrad":64891.1992,"variance":21.7924},"image":null,"notes":[],"region":{"height":4,"normalized":[0.5,0.5,0.5,0.5],"width":6,"x":6,"y":4}}}
+      ],
+      "len": 192,
+      "measure": [
+        {"kind":"area_scan","region":[0,0,12,8],"result":{"auto_meter":{"mean":0.4967,"p99":0.9882},"clipping":{"high_px":0,"low_px":0,"max":0.9882,"pixels":96},"exposure":{"channels":{"blue":0.5458,"green":0.4794,"red":0.4833},"highlights":0.0,"histogram16":[0,1,9,7,10,7,12,9,2,6,9,10,9,5,0,0],"mean":0.483,"p01":0.1088,"p50":0.4438,"p99":0.8444,"shadows":0.0},"focus":{"brenner":6110.9751,"laplacian":62025.8594,"tenengrad":66474.5703,"variance":22.5348},"notes":[]}},
+        {"kind":"area_scan","region":[3,2,7,7],"result":{"auto_meter":{"mean":0.4706,"p99":0.9882},"clipping":{"high_px":0,"low_px":0,"max":0.9882,"pixels":42},"exposure":{"channels":{"blue":0.5202,"green":0.4485,"red":0.4675},"highlights":0.0,"histogram16":[0,1,4,5,2,4,4,6,2,2,6,2,2,2,0,0],"mean":0.4557,"p01":0.1003,"p50":0.4453,"p99":0.8372,"shadows":0.0},"focus":{"brenner":5667.6143,"laplacian":59539.2891,"tenengrad":53264.0586,"variance":19.6878},"notes":[]}},
+        {"kind":"area_scan","region":[11,7,5,5],"result":{"auto_meter":{"mean":0.6755,"p99":0.898},"clipping":{"high_px":0,"low_px":0,"max":0.898,"pixels":1},"exposure":{"channels":{"blue":0.9,"green":0.9,"red":0.0059},"highlights":0.0,"histogram16":[0,0,0,0,0,0,0,0,0,0,0,1,0,0,0,0],"mean":0.7098,"p01":0.7033,"p50":0.7109,"p99":0.7186,"shadows":0.0},"focus":{"brenner":19616.0,"laplacian":0.0,"tenengrad":157682.0,"variance":0.0},"notes":["bright: mean brightness 0.71 is above 0.65"]}},
+        {"kind":"area_scan","region":[3,1,2,2],"result":{"auto_meter":{"mean":0.6564,"p99":0.8627},"clipping":{"high_px":0,"low_px":0,"max":0.8627,"pixels":4},"exposure":{"channels":{"blue":0.8137,"green":0.5863,"red":0.6412},"highlights":0.0,"histogram16":[0,0,0,0,0,0,1,0,0,1,1,0,1,0,0,0],"mean":0.6127,"p01":0.4069,"p50":0.625,"p99":0.7806,"shadows":0.0},"focus":{"brenner":1920.75,"laplacian":14646.5,"tenengrad":33628.5,"variance":6.6978},"notes":[]}}
+      ],
+      "name": "BiColorBGRG8-layout-12x8",
+      "pixel_format": 34603174,
+      "width": 12
+    },
+    {
+      "conversions": {
+        "gray8": null,
         "jpeg": {"fnv1a64":"cb0628bbfcdba6e2","len":773},
         "png": {"fnv1a64":"7c7a3e8cfea8a53d","len":364},
         "png_bit_depth": [8,null],
@@ -4825,6 +4957,72 @@
       ],
       "name": "YCbCr422_8_YY_CrCb_Semiplanar-layout-12x8",
       "pixel_format": 34603285,
+      "width": 12
+    },
+    {
+      "conversions": {
+        "gray8": null,
+        "jpeg": {"fnv1a64":"a67d0bd646a9706d","len":766},
+        "png": {"fnv1a64":"159955fb3e68bafa","len":364},
+        "png_bit_depth": [8,10],
+        "raw": {"fnv1a64":"f1fbb747c80260a2","len":240},
+        "rgb": {"fnv1a64":"0e585ec2e44db17c","len":288},
+        "rgba": {"fnv1a64":"994d793cea73778e","len":384},
+        "sample_bits": 10
+      },
+      "fnv1a64": "f1fbb747c80260a2",
+      "generator": {
+        "hex": "929da74e439b2bdb6c68f4445202c75abea5e77e493d2318039c04e4828d90c00498a57ab58f308446b1106b29501a8f2ca86895d3d5538b0c230aa892fc2ee9430747f02a459661c33387d34968365d44cde03fd009820a946cd03f4e024fb7467cb06263ef469f7ffc8f808fd6ff0670fe46fb65ade4e4d4225783bf18df588e8bf2b5dcafc1ed2f2051c02a85c3268e6efe6fe1ea03a8b2b7e961f37d160e7e06323ddd65e37198f242f9ab297dbf930b42ade7c7e657fb2679d96ce9f0376930f747f2befdfb5c763a61f9be9681587a3436554d7b1c57cb4c5ff5ca1f889549a1aec29d0e5130bb3ff412b3bb5f",
+        "kind": "bytes"
+      },
+      "height": 8,
+      "inspect": [
+        {"region":null,"result":{"auto_meter":{"mean":0.5251,"p99":1.0},"clipping":{"high_px":1,"low_px":0,"max":1.0,"pixels":96},"exposure":{"channels":{"blue":0.5025,"green":0.5196,"red":0.5582},"highlights":0.0313,"histogram16":[0,2,5,8,8,6,7,8,13,4,6,10,4,12,3,0],"mean":0.525,"p01":0.0931,"p50":0.5188,"p99":0.9069,"shadows":0.0},"focus":{"brenner":6789.8916,"laplacian":52597.7148,"tenengrad":91902.5313,"variance":25.5103},"image":null,"notes":["highlights clipped: 3.1 % of the image at full scale"],"region":{"height":8,"normalized":[0.0,0.0,1.0,1.0],"width":12,"x":0,"y":0}}},
+        {"region":[0.1,0.2,0.35,0.5],"result":{"auto_meter":{"mean":0.5174,"p99":0.9137},"clipping":{"high_px":0,"low_px":0,"max":0.913,"pixels":16},"exposure":{"channels":{"blue":0.4637,"green":0.4529,"red":0.699},"highlights":0.0,"histogram16":[0,0,0,3,1,2,1,1,2,1,1,2,0,1,1,0],"mean":0.5049,"p01":0.22,"p50":0.5,"p99":0.9038,"shadows":0.0},"focus":{"brenner":6237.5313,"laplacian":49371.7773,"tenengrad":79039.25,"variance":21.2356},"image":null,"notes":[],"region":{"height":4,"normalized":[0.0833,0.25,0.3333,0.5],"width":4,"x":1,"y":2}}},
+        {"region":[0.5,0.5,0.5,0.5],"result":{"auto_meter":{"mean":0.5633,"p99":1.0},"clipping":{"high_px":1,"low_px":0,"max":1.0,"pixels":24},"exposure":{"channels":{"blue":0.5144,"green":0.568,"red":0.6},"highlights":0.0417,"histogram16":[0,1,0,3,1,2,0,1,4,0,3,3,0,4,2,0],"mean":0.5699,"p01":0.0975,"p50":0.5469,"p99":0.9025,"shadows":0.0},"focus":{"brenner":6748.7002,"laplacian":56275.332,"tenengrad":105079.2031,"variance":23.6913},"image":null,"notes":["highlights clipped: 4.2 % of the image at full scale"],"region":{"height":4,"normalized":[0.5,0.5,0.5,0.5],"width":6,"x":6,"y":4}}}
+      ],
+      "len": 240,
+      "measure": [
+        {"kind":"area_scan","region":[0,0,12,8],"result":{"auto_meter":{"mean":0.5251,"p99":1.0},"clipping":{"high_px":1,"low_px":0,"max":1.0,"pixels":96},"exposure":{"channels":{"blue":0.5025,"green":0.5196,"red":0.5582},"highlights":0.0313,"histogram16":[0,2,5,8,8,6,7,8,13,4,6,10,4,12,3,0],"mean":0.525,"p01":0.0931,"p50":0.5188,"p99":0.9069,"shadows":0.0},"focus":{"brenner":6789.8916,"laplacian":52597.7148,"tenengrad":91902.5313,"variance":25.5103},"notes":["highlights clipped: 3.1 % of the image at full scale"]}},
+        {"kind":"area_scan","region":[3,2,7,7],"result":{"auto_meter":{"mean":0.5559,"p99":1.0},"clipping":{"high_px":0,"low_px":0,"max":0.999,"pixels":42},"exposure":{"channels":{"blue":0.5866,"green":0.5224,"red":0.5919},"highlights":0.0476,"histogram16":[0,1,1,4,5,1,3,1,8,1,3,5,1,5,3,0],"mean":0.54,"p01":0.1003,"p50":0.5208,"p99":0.9186,"shadows":0.0},"focus":{"brenner":6069.7144,"laplacian":52460.5195,"tenengrad":90272.4609,"variance":24.3125},"notes":["highlights clipped: 4.8 % of the image at full scale"]}},
+        {"kind":"area_scan","region":[11,7,5,5],"result":{"auto_meter":{"mean":0.5134,"p99":0.9333},"clipping":{"high_px":0,"low_px":0,"max":0.9335,"pixels":1},"exposure":{"channels":{"blue":0.9314,"green":0.3667,"red":0.3667},"highlights":0.0,"histogram16":[0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0],"mean":0.4118,"p01":0.4064,"p50":0.4141,"p99":0.4217,"shadows":0.0},"focus":{"brenner":8845.0,"laplacian":0.0,"tenengrad":94970.0,"variance":0.0},"notes":[]}},
+        {"kind":"area_scan","region":[3,1,2,2],"result":{"auto_meter":{"mean":0.3982,"p99":0.7569},"clipping":{"high_px":0,"low_px":0,"max":0.7586,"pixels":4},"exposure":{"channels":{"blue":0.7118,"green":0.2608,"red":0.3588},"highlights":0.0,"histogram16":[0,0,1,0,1,1,0,1,0,0,0,0,0,0,0,0],"mean":0.3127,"p01":0.1412,"p50":0.2969,"p99":0.4994,"shadows":0.0},"focus":{"brenner":5762.125,"laplacian":6636.1875,"tenengrad":89480.0,"variance":12.5702},"notes":[]}}
+      ],
+      "name": "BiColorRGBG10p-layout-12x8",
+      "pixel_format": 34865320,
+      "width": 12
+    },
+    {
+      "conversions": {
+        "gray8": null,
+        "jpeg": {"fnv1a64":"7ea9a9479103f41b","len":762},
+        "png": {"fnv1a64":"9ff8b3ab6c40e4e7","len":364},
+        "png_bit_depth": [8,10],
+        "raw": {"fnv1a64":"4990cdb94aa092f9","len":240},
+        "rgb": {"fnv1a64":"461a5999d7560192","len":288},
+        "rgba": {"fnv1a64":"86f51a6c0af727c2","len":384},
+        "sample_bits": 10
+      },
+      "fnv1a64": "4990cdb94aa092f9",
+      "generator": {
+        "hex": "d09f254859b8726d46533e795b26f9a4015ad2e5c1d5a981e4f800d1a25453b7d5e398109728d559123405dd0b5346bb605bf2e59f7fa4086c5a9b515f73522b6537c5a633c871121fadb2e814f2e78b486fa3950d8ad15b7be28888b1b00ff50b348da5dcc4abdbfeab851048c7520e85d9a2e9fcd4960781f7b018aa449eb1ed146f05e6c41caf5559465e04b365f49766560b194814664e192c44ca3138435386bd0523e4e422ae7849c7ed31cfb518a78d4c484b20b11cf6cd6ee9b22ec1d0a2b534aa5e47c0593b2d77a7f25f27f6f8ca6e0d5d0455234b11abdcad9cccd86efab8b53d10932ff75721c1f34e29",
+        "kind": "bytes"
+      },
+      "height": 8,
+      "inspect": [
+        {"region":null,"result":{"auto_meter":{"mean":0.497,"p99":0.9961},"clipping":{"high_px":0,"low_px":0,"max":0.9961,"pixels":96},"exposure":{"channels":{"blue":0.5191,"green":0.4899,"red":0.4915},"highlights":0.0313,"histogram16":[0,4,6,9,5,13,7,4,6,11,12,5,5,5,3,1],"mean":0.4897,"p01":0.1131,"p50":0.4844,"p99":0.9381,"shadows":0.0},"focus":{"brenner":7390.0752,"laplacian":58512.5156,"tenengrad":83803.7031,"variance":24.9444},"image":null,"notes":["highlights clipped: 3.1 % of the image at full scale"],"region":{"height":8,"normalized":[0.0,0.0,1.0,1.0],"width":12,"x":0,"y":0}}},
+        {"region":[0.1,0.2,0.35,0.5],"result":{"auto_meter":{"mean":0.5042,"p99":0.9922},"clipping":{"high_px":0,"low_px":0,"max":0.9902,"pixels":16},"exposure":{"channels":{"blue":0.5461,"green":0.4314,"red":0.6157},"highlights":0.0,"histogram16":[0,0,0,3,2,1,1,3,1,2,0,0,1,1,1,0],"mean":0.4743,"p01":0.2213,"p50":0.4453,"p99":0.8881,"shadows":0.0},"focus":{"brenner":6031.3438,"laplacian":42867.1836,"tenengrad":89659.5,"variance":22.6774},"image":null,"notes":[],"region":{"height":4,"normalized":[0.0833,0.25,0.3333,0.5],"width":4,"x":1,"y":2}}},
+        {"region":[0.5,0.5,0.5,0.5],"result":{"auto_meter":{"mean":0.5614,"p99":0.9882},"clipping":{"high_px":0,"low_px":0,"max":0.9873,"pixels":24},"exposure":{"channels":{"blue":0.5922,"green":0.5444,"red":0.5686},"highlights":0.0,"histogram16":[0,0,1,0,3,2,3,2,1,3,2,2,2,1,1,1],"mean":0.5503,"p01":0.1756,"p50":0.5313,"p99":0.9494,"shadows":0.0},"focus":{"brenner":5023.6333,"laplacian":26601.5996,"tenengrad":97496.9297,"variance":13.3908},"image":null,"notes":[],"region":{"height":4,"normalized":[0.5,0.5,0.5,0.5],"width":6,"x":6,"y":4}}}
+      ],
+      "len": 240,
+      "measure": [
+        {"kind":"area_scan","region":[0,0,12,8],"result":{"auto_meter":{"mean":0.497,"p99":0.9961},"clipping":{"high_px":0,"low_px":0,"max":0.9961,"pixels":96},"exposure":{"channels":{"blue":0.5191,"green":0.4899,"red":0.4915},"highlights":0.0313,"histogram16":[0,4,6,9,5,13,7,4,6,11,12,5,5,5,3,1],"mean":0.4897,"p01":0.1131,"p50":0.4844,"p99":0.9381,"shadows":0.0},"focus":{"brenner":7390.0752,"laplacian":58512.5156,"tenengrad":83803.7031,"variance":24.9444},"notes":["highlights clipped: 3.1 % of the image at full scale"]}},
+        {"kind":"area_scan","region":[3,2,7,7],"result":{"auto_meter":{"mean":0.5258,"p99":0.9961},"clipping":{"high_px":0,"low_px":0,"max":0.9961,"pixels":42},"exposure":{"channels":{"blue":0.5392,"green":0.5377,"red":0.4884},"highlights":0.0238,"histogram16":[0,2,3,3,0,3,4,2,4,5,6,2,4,2,2,0],"mean":0.5257,"p01":0.1127,"p50":0.5625,"p99":0.9309,"shadows":0.0},"focus":{"brenner":7861.5571,"laplacian":61038.7305,"tenengrad":100444.3438,"variance":27.0103},"notes":["highlights clipped: 2.4 % of the image at full scale"]}},
+        {"kind":"area_scan","region":[11,7,5,5],"result":{"auto_meter":{"mean":0.1794,"p99":0.2353},"clipping":{"high_px":0,"low_px":0,"max":0.2336,"pixels":1},"exposure":{"channels":{"blue":0.1627,"green":0.1627,"red":0.2255},"highlights":0.0,"histogram16":[0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0],"mean":0.1725,"p01":0.172,"p50":0.1797,"p99":0.1873,"shadows":0.0},"focus":{"brenner":2226.5,"laplacian":0.0,"tenengrad":35786.0,"variance":0.0},"notes":["dark: mean brightness 0.17 is below 0.25"]}},
+        {"kind":"area_scan","region":[3,1,2,2],"result":{"auto_meter":{"mean":0.5209,"p99":0.9412},"clipping":{"high_px":0,"low_px":0,"max":0.9423,"pixels":4},"exposure":{"channels":{"blue":0.3196,"green":0.602,"red":0.5706},"highlights":0.0,"histogram16":[0,0,0,0,1,1,0,0,0,0,0,0,1,0,1,0],"mean":0.5716,"p01":0.2975,"p50":0.3281,"p99":0.89,"shadows":0.0},"focus":{"brenner":5574.875,"laplacian":42798.1875,"tenengrad":80315.5,"variance":27.6026},"notes":[]}}
+      ],
+      "name": "BiColorBGRG10p-layout-12x8",
+      "pixel_format": 34865322,
       "width": 12
     },
     {
@@ -5094,6 +5292,72 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"541998f60be2b009","len":759},
+        "png": {"fnv1a64":"52b006f57f80b6f9","len":364},
+        "png_bit_depth": [8,12],
+        "raw": {"fnv1a64":"c2245f96c761a3d0","len":288},
+        "rgb": {"fnv1a64":"67ff33d39f175ac4","len":288},
+        "rgba": {"fnv1a64":"1b7e31f1803d4d78","len":384},
+        "sample_bits": 12
+      },
+      "fnv1a64": "c2245f96c761a3d0",
+      "generator": {
+        "hex": "d0913de6eb924744660aca6efbb594860192f498e742efb113f8c6bce1027bf0d4bec5990f64bf2d5f386c99d4bbe7971449515cee8a2afae6c26a522315f129033fb63fab367e1ded1dbc7bc6ee59010f991827bd929755b91bad18443fc751b1177c313443d4aa3ae1c3b5f64e700d386f2720842ef217381886e46994bcc23b14cb195561d02b47c79c78588b219b5e3102065edd22359b6b35c979aae17b20c309ba7cb2a974043eb420a86fb2ba33be1ac9276034a209887a00bcaeca69952ab85003a3a53b7e977e6f1a8a1be34e77c22fcff0827d618651e6fd2d553efa927fc9f27e4e200c98a541b140992689eb065781279d5b4567f97c858163278fd26728856d83715e44657a8d0d723142c550443318a333dde5fd8b5949b5cb",
+        "kind": "bytes"
+      },
+      "height": 8,
+      "inspect": [
+        {"region":null,"result":{"auto_meter":{"mean":0.5031,"p99":0.9843},"clipping":{"high_px":0,"low_px":0,"max":0.9851,"pixels":96},"exposure":{"channels":{"blue":0.5444,"green":0.4913,"red":0.4837},"highlights":0.0,"histogram16":[0,3,4,7,3,12,10,6,15,10,7,8,6,4,0,1],"mean":0.4917,"p01":0.0775,"p50":0.5094,"p99":0.9537,"shadows":0.0},"focus":{"brenner":5700.4165,"laplacian":48243.6563,"tenengrad":84597.8359,"variance":21.4085},"image":null,"notes":[],"region":{"height":8,"normalized":[0.0,0.0,1.0,1.0],"width":12,"x":0,"y":0}}},
+        {"region":[0.1,0.2,0.35,0.5],"result":{"auto_meter":{"mean":0.4621,"p99":0.9333},"clipping":{"high_px":0,"low_px":0,"max":0.9328,"pixels":16},"exposure":{"channels":{"blue":0.4853,"green":0.5529,"red":0.2549},"highlights":0.0,"histogram16":[0,1,2,0,0,1,3,2,1,1,0,4,1,0,0,0],"mean":0.4836,"p01":0.0963,"p50":0.4922,"p99":0.7944,"shadows":0.0},"focus":{"brenner":6627.5313,"laplacian":53808.8086,"tenengrad":105621.0,"variance":23.7501},"image":null,"notes":[],"region":{"height":4,"normalized":[0.0833,0.25,0.3333,0.5],"width":4,"x":1,"y":2}}},
+        {"region":[0.5,0.5,0.5,0.5],"result":{"auto_meter":{"mean":0.5215,"p99":0.9843},"clipping":{"high_px":0,"low_px":0,"max":0.9851,"pixels":24},"exposure":{"channels":{"blue":0.5294,"green":0.4516,"red":0.6523},"highlights":0.0,"histogram16":[0,0,0,3,3,2,0,1,6,4,0,2,1,2,0,0],"mean":0.498,"p01":0.1913,"p50":0.526,"p99":0.84,"shadows":0.0},"focus":{"brenner":5539.7998,"laplacian":35145.8477,"tenengrad":69595.6016,"variance":17.2548},"image":null,"notes":[],"region":{"height":4,"normalized":[0.5,0.5,0.5,0.5],"width":6,"x":6,"y":4}}}
+      ],
+      "len": 288,
+      "measure": [
+        {"kind":"area_scan","region":[0,0,12,8],"result":{"auto_meter":{"mean":0.5031,"p99":0.9843},"clipping":{"high_px":0,"low_px":0,"max":0.9851,"pixels":96},"exposure":{"channels":{"blue":0.5444,"green":0.4913,"red":0.4837},"highlights":0.0,"histogram16":[0,3,4,7,3,12,10,6,15,10,7,8,6,4,0,1],"mean":0.4917,"p01":0.0775,"p50":0.5094,"p99":0.9537,"shadows":0.0},"focus":{"brenner":5700.4165,"laplacian":48243.6563,"tenengrad":84597.8359,"variance":21.4085},"notes":[]}},
+        {"kind":"area_scan","region":[3,2,7,7],"result":{"auto_meter":{"mean":0.4754,"p99":0.9725},"clipping":{"high_px":0,"low_px":0,"max":0.9734,"pixels":42},"exposure":{"channels":{"blue":0.5116,"green":0.4462,"red":0.4948},"highlights":0.0,"histogram16":[0,0,4,5,4,2,2,4,8,5,3,2,2,1,0,0],"mean":0.4597,"p01":0.1316,"p50":0.5,"p99":0.8372,"shadows":0.0},"focus":{"brenner":5354.3286,"laplacian":29065.2188,"tenengrad":88345.4844,"variance":19.7311},"notes":[]}},
+        {"kind":"area_scan","region":[11,7,5,5],"result":{"auto_meter":{"mean":0.6795,"p99":0.7961},"clipping":{"high_px":0,"low_px":0,"max":0.7958,"pixels":1},"exposure":{"channels":{"blue":0.3353,"green":0.7902,"red":0.7902},"highlights":0.0,"histogram16":[0,0,0,0,0,0,0,0,0,0,0,0,1,0,0,0],"mean":0.7608,"p01":0.7502,"p50":0.7578,"p99":0.7655,"shadows":0.0},"focus":{"brenner":7154.5,"laplacian":0.0,"tenengrad":20648.0,"variance":0.0},"notes":["bright: mean brightness 0.76 is above 0.65"]}},
+        {"kind":"area_scan","region":[3,1,2,2],"result":{"auto_meter":{"mean":0.4269,"p99":0.5922},"clipping":{"high_px":0,"low_px":0,"max":0.5934,"pixels":4},"exposure":{"channels":{"blue":0.5078,"green":0.4098,"red":0.3667},"highlights":0.0,"histogram16":[0,0,1,0,0,0,1,1,0,1,0,0,0,0,0,0],"mean":0.4098,"p01":0.1725,"p50":0.3906,"p99":0.5775,"shadows":0.0},"focus":{"brenner":4743.875,"laplacian":25246.1875,"tenengrad":49338.5,"variance":14.4524},"notes":[]}}
+      ],
+      "name": "BiColorRGBG12p-layout-12x8",
+      "pixel_format": 35127468,
+      "width": 12
+    },
+    {
+      "conversions": {
+        "gray8": null,
+        "jpeg": {"fnv1a64":"77689e48e761e404","len":762},
+        "png": {"fnv1a64":"ebfc683ddac7df36","len":364},
+        "png_bit_depth": [8,12],
+        "raw": {"fnv1a64":"7c2f822e1c3aa02a","len":288},
+        "rgb": {"fnv1a64":"af9444764a83ad36","len":288},
+        "rgba": {"fnv1a64":"803432152a7536d2","len":384},
+        "sample_bits": 12
+      },
+      "fnv1a64": "7c2f822e1c3aa02a",
+      "generator": {
+        "hex": "9293bfe0f1b11ef24c310053f291aa78be6dc1036faa6528f49cc289c1dbb88705c5f8f32dc35af00bbd792ff6b8bba358bacb2ca220dd7986bbfbabee9a8deb250f3469b2bb996e318389409b7488d7033b5b8d6011c4045695f5afbb8d8713fc5f41f68b6839eebbb6c925315fdd05cd48c3321d5780f46dcd617f7cc8fd2b588b56a96f0a0d693dbe8be676bd87494739aa62a67f35fb67c5f0ec40e6cf360d4386828233ae2732b4bf1eee7700b0b812d52888ecf244ee58ceb739f5149f2cb8fa235b431f007bda697944c6d245e0f53c7797e0fd3415060c12d44ad67ab7b524df85de50e213d4cd9462006c50a2f00fce81c674bb2bfe69c7195210c9799ab735551ae5905bee21996de9b5cba6ba0f65e290760f06c2f39b871bec40",
+        "kind": "bytes"
+      },
+      "height": 8,
+      "inspect": [
+        {"region":null,"result":{"auto_meter":{"mean":0.509,"p99":1.0},"clipping":{"high_px":0,"low_px":0,"max":0.9993,"pixels":96},"exposure":{"channels":{"blue":0.4987,"green":0.5054,"red":0.5248},"highlights":0.0313,"histogram16":[0,2,6,6,5,6,10,9,15,7,10,13,1,3,3,0],"mean":0.5075,"p01":0.1169,"p50":0.5208,"p99":0.9144,"shadows":0.0},"focus":{"brenner":5490.3999,"laplacian":55446.9805,"tenengrad":56560.0352,"variance":17.7725},"image":null,"notes":["highlights clipped: 3.1 % of the image at full scale"],"region":{"height":8,"normalized":[0.0,0.0,1.0,1.0],"width":12,"x":0,"y":0}}},
+        {"region":[0.1,0.2,0.35,0.5],"result":{"auto_meter":{"mean":0.4831,"p99":0.9804},"clipping":{"high_px":0,"low_px":0,"max":0.9795,"pixels":16},"exposure":{"channels":{"blue":0.4578,"green":0.5216,"red":0.4324},"highlights":0.0,"histogram16":[0,0,1,1,0,2,2,2,3,1,0,3,1,0,0,0],"mean":0.4953,"p01":0.1744,"p50":0.5,"p99":0.81,"shadows":0.0},"focus":{"brenner":6515.7188,"laplacian":36530.1211,"tenengrad":97661.25,"variance":17.1023},"image":null,"notes":[],"region":{"height":4,"normalized":[0.0833,0.25,0.3333,0.5],"width":4,"x":1,"y":2}}},
+        {"region":[0.5,0.5,0.5,0.5],"result":{"auto_meter":{"mean":0.4842,"p99":0.9843},"clipping":{"high_px":0,"low_px":0,"max":0.9832,"pixels":24},"exposure":{"channels":{"blue":0.3359,"green":0.4915,"red":0.6144},"highlights":0.0,"histogram16":[0,0,2,0,2,1,2,4,5,1,3,4,0,0,0,0],"mean":0.5047,"p01":0.1288,"p50":0.5234,"p99":0.7481,"shadows":0.0},"focus":{"brenner":3489.7666,"laplacian":46764.9141,"tenengrad":48824.2656,"variance":14.6875},"image":null,"notes":[],"region":{"height":4,"normalized":[0.5,0.5,0.5,0.5],"width":6,"x":6,"y":4}}}
+      ],
+      "len": 288,
+      "measure": [
+        {"kind":"area_scan","region":[0,0,12,8],"result":{"auto_meter":{"mean":0.509,"p99":1.0},"clipping":{"high_px":0,"low_px":0,"max":0.9993,"pixels":96},"exposure":{"channels":{"blue":0.4987,"green":0.5054,"red":0.5248},"highlights":0.0313,"histogram16":[0,2,6,6,5,6,10,9,15,7,10,13,1,3,3,0],"mean":0.5075,"p01":0.1169,"p50":0.5208,"p99":0.9144,"shadows":0.0},"focus":{"brenner":5490.3999,"laplacian":55446.9805,"tenengrad":56560.0352,"variance":17.7725},"notes":["highlights clipped: 3.1 % of the image at full scale"]}},
+        {"kind":"area_scan","region":[3,2,7,7],"result":{"auto_meter":{"mean":0.5368,"p99":1.0},"clipping":{"high_px":0,"low_px":0,"max":0.9993,"pixels":42},"exposure":{"channels":{"blue":0.4985,"green":0.5527,"red":0.5426},"highlights":0.0952,"histogram16":[0,0,1,2,2,2,6,3,8,3,3,7,3,1,1,0],"mean":0.545,"p01":0.1316,"p50":0.543,"p99":0.8841,"shadows":0.0},"focus":{"brenner":4798.1714,"laplacian":55359.5977,"tenengrad":48316.0586,"variance":15.0168},"notes":["highlights clipped: 9.5 % of the image at full scale"]}},
+        {"kind":"area_scan","region":[11,7,5,5],"result":{"auto_meter":{"mean":0.3793,"p99":0.7569},"clipping":{"high_px":0,"low_px":0,"max":0.7568,"pixels":1},"exposure":{"channels":{"blue":0.2569,"green":0.2569,"red":0.7588},"highlights":0.0,"histogram16":[0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0],"mean":0.3569,"p01":0.3439,"p50":0.3516,"p99":0.3592,"shadows":0.0},"focus":{"brenner":613.0,"laplacian":0.0,"tenengrad":7618.0,"variance":0.0},"notes":[]}},
+        {"kind":"area_scan","region":[3,1,2,2],"result":{"auto_meter":{"mean":0.6151,"p99":0.7961},"clipping":{"high_px":0,"low_px":0,"max":0.7958,"pixels":4},"exposure":{"channels":{"blue":0.3667,"green":0.6882,"red":0.7118},"highlights":0.0,"histogram16":[0,0,0,0,0,0,0,0,1,0,1,1,1,0,0,0],"mean":0.6696,"p01":0.5475,"p50":0.6719,"p99":0.7806,"shadows":0.0},"focus":{"brenner":5931.625,"laplacian":4913.1875,"tenengrad":57822.0,"variance":1.1536},"notes":["bright: mean brightness 0.67 is above 0.65"]}}
+      ],
+      "name": "BiColorBGRG12p-layout-12x8",
+      "pixel_format": 35127470,
+      "width": 12
+    },
+    {
+      "conversions": {
+        "gray8": null,
         "jpeg": {"fnv1a64":"2110566aa08b7bd5","len":770},
         "png": {"fnv1a64":"b44059c8c3120e5f","len":364},
         "png_bit_depth": [8,10],
@@ -5254,6 +5518,138 @@
       ],
       "name": "RGB10p32-layout-12x8",
       "pixel_format": 35651613,
+      "width": 12
+    },
+    {
+      "conversions": {
+        "gray8": null,
+        "jpeg": {"fnv1a64":"3671abd0a5d3f51b","len":763},
+        "png": {"fnv1a64":"1783e3dfdf923c5e","len":364},
+        "png_bit_depth": [8,10],
+        "raw": {"fnv1a64":"12649ad00fbbd2f3","len":384},
+        "rgb": {"fnv1a64":"b2b610dda8653e2f","len":288},
+        "rgba": {"fnv1a64":"d2c469a50c321f75","len":384},
+        "sample_bits": 10
+      },
+      "fnv1a64": "12649ad00fbbd2f3",
+      "generator": {
+        "hex": "278386cf3bbb1d69ae5ce2bd00982dee78e9368dc25305ec5a6c2dbfce70407e66b1f16e76962ab5c35e1e316e798be9e16515d394a8529a5226fcac19983f0fefbaa088c32b2fea128445447e88760adf0c1bc9a066d10061f0c341b4b1eb692005fb13faf38eadce98047c9739776098e92797bc548655e2a063039b86b367908a940bb221e6675ea683b3ccea61d4ecc2c5fe9ea74680ea1d20616f4a8118a51256737682f1594238bbcb8b24d0b6edffd6d6812b969d36478ea29b2aa5bf5f97ba7eb83aa6ebbccbf888a235ce90f7ec3b54e128dcd1653c99801ba68557269905616604cc860bf5ed69634ecf435a1f28cc0a730e806f85e89c19e0aa721178195836e88b685d562c211da1e60bee00d75143efd509b98cda1747db2bab0b26aa0d3b0ec0a2ba40ad239e72111c83210efb73d0dafdf4e6e485b00a1558f13aee8cf4656f9a9095b575ad0ed47a3b0d5c8d6a7dfc64d8ede45d6df545fa6e6e3fb24e6a47cf1d6b4c527fcf35ac52f7c7ed622be8c5be613521d5d6579a",
+        "kind": "bytes"
+      },
+      "height": 8,
+      "inspect": [
+        {"region":null,"result":{"auto_meter":{"mean":0.4853,"p99":0.9961},"clipping":{"high_px":0,"low_px":0,"max":0.9961,"pixels":96},"exposure":{"channels":{"blue":0.5127,"green":0.4897,"red":0.449},"highlights":0.0208,"histogram16":[1,5,3,5,10,10,10,8,10,4,10,7,7,5,1,0],"mean":0.4808,"p01":0.0306,"p50":0.457,"p99":0.8756,"shadows":0.0},"focus":{"brenner":6541.2583,"laplacian":66201.8516,"tenengrad":95101.3359,"variance":29.1892},"image":null,"notes":["highlights clipped: 2.1 % of the image at full scale"],"region":{"height":8,"normalized":[0.0,0.0,1.0,1.0],"width":12,"x":0,"y":0}}},
+        {"region":[0.1,0.2,0.35,0.5],"result":{"auto_meter":{"mean":0.3974,"p99":0.9961},"clipping":{"high_px":0,"low_px":0,"max":0.9951,"pixels":16},"exposure":{"channels":{"blue":0.5373,"green":0.3088,"red":0.4304},"highlights":0.0625,"histogram16":[1,2,2,1,3,1,2,0,1,0,1,0,1,0,1,0],"mean":0.35,"p01":0.0181,"p50":0.2813,"p99":0.9038,"shadows":0.0},"focus":{"brenner":9241.8125,"laplacian":76942.0625,"tenengrad":102756.125,"variance":42.0751},"image":null,"notes":["highlights clipped: 6.2 % of the image at full scale"],"region":{"height":4,"normalized":[0.0833,0.25,0.3333,0.5],"width":4,"x":1,"y":2}}},
+        {"region":[0.5,0.5,0.5,0.5],"result":{"auto_meter":{"mean":0.5185,"p99":0.9765},"clipping":{"high_px":0,"low_px":0,"max":0.9756,"pixels":24},"exposure":{"channels":{"blue":0.6092,"green":0.5105,"red":0.4444},"highlights":0.0,"histogram16":[0,0,1,1,2,3,4,0,4,2,3,1,3,0,0,0],"mean":0.5025,"p01":0.16,"p50":0.5391,"p99":0.8088,"shadows":0.0},"focus":{"brenner":5305.2334,"laplacian":57536.7305,"tenengrad":52331.4648,"variance":19.6345},"image":null,"notes":[],"region":{"height":4,"normalized":[0.5,0.5,0.5,0.5],"width":6,"x":6,"y":4}}}
+      ],
+      "len": 384,
+      "measure": [
+        {"kind":"area_scan","region":[0,0,12,8],"result":{"auto_meter":{"mean":0.4853,"p99":0.9961},"clipping":{"high_px":0,"low_px":0,"max":0.9961,"pixels":96},"exposure":{"channels":{"blue":0.5127,"green":0.4897,"red":0.449},"highlights":0.0208,"histogram16":[1,5,3,5,10,10,10,8,10,4,10,7,7,5,1,0],"mean":0.4808,"p01":0.0306,"p50":0.457,"p99":0.8756,"shadows":0.0},"focus":{"brenner":6541.2583,"laplacian":66201.8516,"tenengrad":95101.3359,"variance":29.1892},"notes":["highlights clipped: 2.1 % of the image at full scale"]}},
+        {"kind":"area_scan","region":[3,2,7,7],"result":{"auto_meter":{"mean":0.4802,"p99":0.9843},"clipping":{"high_px":0,"low_px":0,"max":0.9824,"pixels":42},"exposure":{"channels":{"blue":0.4485,"green":0.4981,"red":0.4776},"highlights":0.0,"histogram16":[1,1,3,3,3,3,3,3,5,4,4,3,4,2,0,0],"mean":0.4876,"p01":0.0222,"p50":0.5313,"p99":0.8684,"shadows":0.0},"focus":{"brenner":6941.4429,"laplacian":61087.1289,"tenengrad":97604.7422,"variance":29.7953},"notes":[]}},
+        {"kind":"area_scan","region":[11,7,5,5],"result":{"auto_meter":{"mean":0.6163,"p99":0.7098},"clipping":{"high_px":0,"low_px":0,"max":0.7087,"pixels":1},"exposure":{"channels":{"blue":0.7118,"green":0.5863,"red":0.5863},"highlights":0.0,"histogram16":[0,0,0,0,0,0,0,0,0,1,0,0,0,0,0,0],"mean":0.5922,"p01":0.5783,"p50":0.5859,"p99":0.5936,"shadows":0.0},"focus":{"brenner":5916.5,"laplacian":0.0,"tenengrad":54506.0,"variance":0.0},"notes":[]}},
+        {"kind":"area_scan","region":[3,1,2,2],"result":{"auto_meter":{"mean":0.4286,"p99":0.8118},"clipping":{"high_px":0,"low_px":0,"max":0.8123,"pixels":4},"exposure":{"channels":{"blue":0.2098,"green":0.4686,"red":0.5627},"highlights":0.0,"histogram16":[0,0,0,1,1,0,0,0,0,0,1,1,0,0,0,0],"mean":0.4667,"p01":0.1881,"p50":0.2813,"p99":0.7338,"shadows":0.0},"focus":{"brenner":8354.0,"laplacian":96142.75,"tenengrad":67055.0,"variance":29.7152},"notes":[]}}
+      ],
+      "name": "BiColorRGBG10-layout-12x8",
+      "pixel_format": 35651751,
+      "width": 12
+    },
+    {
+      "conversions": {
+        "gray8": null,
+        "jpeg": {"fnv1a64":"8eb2891e63b6a1f5","len":764},
+        "png": {"fnv1a64":"2ec9ff174b6ab9b3","len":364},
+        "png_bit_depth": [8,10],
+        "raw": {"fnv1a64":"56dce7d09a447e73","len":384},
+        "rgb": {"fnv1a64":"75818c1fc65be970","len":288},
+        "rgba": {"fnv1a64":"94c7a60b17adafe0","len":384},
+        "sample_bits": 10
+      },
+      "fnv1a64": "56dce7d09a447e73",
+      "generator": {
+        "hex": "e98d29bf99f3415bd6c774e1e69a58d5691e9274569920581215f221125a0918d517aab777e531d7665816c2b784d9a5d5c7a0dcdebf855e55282395636751761a3e7ad08079d71439b5d4e97a52a5773252aed006b0cc4659b97682bdef84d930bf2686a2ff3ea15b515b4dad8541785848bed4555c48e992c396dcde20ad964d4e5cb6ba1410ad84f59f8d1d7f7c68e2b8564cd17260fe492ce7d6b50ef094bd2f7ec4c9646cc378065d4df0b8544cf2f39dfe37d541db6771fdc91e9f9c31bdcfcc4316c5cb218142a294ccc3f516fcce3b2a365e69cea5e0b8e033a5915660b60e52dae2aa07335b8005454c478960406fe750e2deebf84720f0f89c6474253c781cf6bd5080f27e3c238d0c91e0faa5f97569fc0aa19036467200a9a01cc689bd1dbb589b12c66b724ce64f03d1b04023db5ade7478ccd70792b684799cd88094b7b786de7ff9f34789b7edf4f264b702c7d7d9d40ff339b72952040f3b8f312560104dcefd9038658a7c2aba38946d6846f7715a3c7f49ae15844f5b56",
+        "kind": "bytes"
+      },
+      "height": 8,
+      "inspect": [
+        {"region":null,"result":{"auto_meter":{"mean":0.4756,"p99":0.9961},"clipping":{"high_px":0,"low_px":0,"max":0.9941,"pixels":96},"exposure":{"channels":{"blue":0.5294,"green":0.4482,"red":0.4783},"highlights":0.0313,"histogram16":[0,2,9,10,10,3,13,9,9,8,4,9,4,5,1,0],"mean":0.4583,"p01":0.0931,"p50":0.4531,"p99":0.8756,"shadows":0.0},"focus":{"brenner":5760.625,"laplacian":60145.9844,"tenengrad":62995.3984,"variance":25.0202},"image":null,"notes":["highlights clipped: 3.1 % of the image at full scale"],"region":{"height":8,"normalized":[0.0,0.0,1.0,1.0],"width":12,"x":0,"y":0}}},
+        {"region":[0.1,0.2,0.35,0.5],"result":{"auto_meter":{"mean":0.4468,"p99":0.9922},"clipping":{"high_px":0,"low_px":0,"max":0.9932,"pixels":16},"exposure":{"channels":{"blue":0.4853,"green":0.3559,"red":0.5902},"highlights":0.125,"histogram16":[0,0,4,1,2,1,3,0,0,1,2,0,1,0,1,0],"mean":0.4123,"p01":0.1275,"p50":0.3594,"p99":0.8881,"shadows":0.0},"focus":{"brenner":6864.875,"laplacian":53549.5625,"tenengrad":77486.0,"variance":32.0288},"image":null,"notes":["highlights clipped: 12.5 % of the image at full scale"],"region":{"height":4,"normalized":[0.0833,0.25,0.3333,0.5],"width":4,"x":1,"y":2}}},
+        {"region":[0.5,0.5,0.5,0.5],"result":{"auto_meter":{"mean":0.4762,"p99":0.9961},"clipping":{"high_px":0,"low_px":0,"max":0.9941,"pixels":24},"exposure":{"channels":{"blue":0.5601,"green":0.4752,"red":0.3954},"highlights":0.0833,"histogram16":[0,0,2,4,2,0,3,3,2,2,2,2,0,1,1,0],"mean":0.4624,"p01":0.16,"p50":0.4688,"p99":0.8869,"shadows":0.0},"focus":{"brenner":4415.1001,"laplacian":84073.4453,"tenengrad":51877.1992,"variance":26.3271},"image":null,"notes":["highlights clipped: 8.3 % of the image at full scale"],"region":{"height":4,"normalized":[0.5,0.5,0.5,0.5],"width":6,"x":6,"y":4}}}
+      ],
+      "len": 384,
+      "measure": [
+        {"kind":"area_scan","region":[0,0,12,8],"result":{"auto_meter":{"mean":0.4756,"p99":0.9961},"clipping":{"high_px":0,"low_px":0,"max":0.9941,"pixels":96},"exposure":{"channels":{"blue":0.5294,"green":0.4482,"red":0.4783},"highlights":0.0313,"histogram16":[0,2,9,10,10,3,13,9,9,8,4,9,4,5,1,0],"mean":0.4583,"p01":0.0931,"p50":0.4531,"p99":0.8756,"shadows":0.0},"focus":{"brenner":5760.625,"laplacian":60145.9844,"tenengrad":62995.3984,"variance":25.0202},"notes":["highlights clipped: 3.1 % of the image at full scale"]}},
+        {"kind":"area_scan","region":[3,2,7,7],"result":{"auto_meter":{"mean":0.436,"p99":0.9882},"clipping":{"high_px":0,"low_px":0,"max":0.9873,"pixels":42},"exposure":{"channels":{"blue":0.5019,"green":0.4249,"red":0.3921},"highlights":0.0,"histogram16":[0,2,6,7,3,1,4,0,5,6,0,5,1,2,0,0],"mean":0.4218,"p01":0.0847,"p50":0.3984,"p99":0.8561,"shadows":0.0},"focus":{"brenner":6136.2573,"laplacian":71335.5938,"tenengrad":59579.7148,"variance":31.6184},"notes":[]}},
+        {"kind":"area_scan","region":[11,7,5,5],"result":{"auto_meter":{"mean":0.662,"p99":0.8784},"clipping":{"high_px":0,"low_px":0,"max":0.8798,"pixels":1},"exposure":{"channels":{"blue":0.5863,"green":0.5863,"red":0.8843},"highlights":0.0,"histogram16":[0,0,0,0,0,0,0,0,0,0,1,0,0,0,0,0],"mean":0.6471,"p01":0.6408,"p50":0.6484,"p99":0.6561,"shadows":0.0},"focus":{"brenner":1164.5,"laplacian":0.0,"tenengrad":6938.0,"variance":0.0},"notes":[]}},
+        {"kind":"area_scan","region":[3,1,2,2],"result":{"auto_meter":{"mean":0.3534,"p99":0.8471},"clipping":{"high_px":0,"low_px":0,"max":0.8475,"pixels":4},"exposure":{"channels":{"blue":0.3039,"green":0.2373,"red":0.6333},"highlights":0.0,"histogram16":[0,0,1,1,1,0,0,0,0,0,1,0,0,0,0,0],"mean":0.3225,"p01":0.1256,"p50":0.2344,"p99":0.64,"shadows":0.0},"focus":{"brenner":3101.375,"laplacian":40797.6875,"tenengrad":52564.0,"variance":29.0904},"notes":[]}}
+      ],
+      "name": "BiColorBGRG10-layout-12x8",
+      "pixel_format": 35651753,
+      "width": 12
+    },
+    {
+      "conversions": {
+        "gray8": null,
+        "jpeg": {"fnv1a64":"ee447485cd56ca26","len":766},
+        "png": {"fnv1a64":"f6558bbeb45cebab","len":364},
+        "png_bit_depth": [8,12],
+        "raw": {"fnv1a64":"e5711883b7c7e021","len":384},
+        "rgb": {"fnv1a64":"6e474e765f17700e","len":288},
+        "rgba": {"fnv1a64":"9b99973c038bc466","len":384},
+        "sample_bits": 12
+      },
+      "fnv1a64": "e5711883b7c7e021",
+      "generator": {
+        "hex": "ab8fabb983d018edfcfcbedcefbe662bd6e1a7efde71aac1f571f6143283ca6f046c97dd5542d40a32dd03749587859199343aac921572dd3551b26caee82db43c0ef88699f43067e52be1d227c874a13ef0ed7adb339f17b6372e35425dc49b7df71b411dd4d3e5da0651dd6a94ec70ad6f5ac6cc253a0ac7167147cb7cec7f2ed1c106807fcdeffe8c88133349dabafbb0fe2829d07730b58222f38c42ded990aff1fc37e56b904e8c5673b6a0e646795f521f9859873d80a1497e9bc442c7045d8e304e25711a840fb582928f3cb0524cc5726e4e1687d160e5141ac212122d915544ad42b4c52c17e8d0960cb2ff4b5b667e5003370b96deb04b644f179ad374a80126ca3661f7d478c06de8561a1edaa654b874df9d4b114862defbf9979988810128e06092274841291121509e7e29a58ff61acb69d8ba684b6f9e90aa90b61942b8482b329480527f0f44e9972892bb881e64f5320120e48a93f84f4c9ed57d581f4ab4130dd531c10e158c345b52d16c12a8448c0268985cf0bbd834",
+        "kind": "bytes"
+      },
+      "height": 8,
+      "inspect": [
+        {"region":null,"result":{"auto_meter":{"mean":0.4687,"p99":0.9961},"clipping":{"high_px":0,"low_px":0,"max":0.9954,"pixels":96},"exposure":{"channels":{"blue":0.4306,"green":0.4886,"red":0.4665},"highlights":0.0104,"histogram16":[1,2,11,7,6,10,9,4,6,5,12,8,10,4,1,0],"mean":0.4782,"p01":0.0463,"p50":0.4688,"p99":0.9069,"shadows":0.0},"focus":{"brenner":7345.1665,"laplacian":66036.5313,"tenengrad":93326.0703,"variance":29.0872},"image":null,"notes":["highlights clipped: 1.0 % of the image at full scale"],"region":{"height":8,"normalized":[0.0,0.0,1.0,1.0],"width":12,"x":0,"y":0}}},
+        {"region":[0.1,0.2,0.35,0.5],"result":{"auto_meter":{"mean":0.4817,"p99":0.9804},"clipping":{"high_px":0,"low_px":0,"max":0.98,"pixels":16},"exposure":{"channels":{"blue":0.4471,"green":0.4029,"red":0.6725},"highlights":0.0,"histogram16":[1,0,1,2,1,3,0,0,1,1,1,3,2,0,0,0],"mean":0.4627,"p01":0.0494,"p50":0.375,"p99":0.7944,"shadows":0.0},"focus":{"brenner":10116.25,"laplacian":63555.7344,"tenengrad":109138.125,"variance":30.1852},"image":null,"notes":[],"region":{"height":4,"normalized":[0.0833,0.25,0.3333,0.5],"width":4,"x":1,"y":2}}},
+        {"region":[0.5,0.5,0.5,0.5],"result":{"auto_meter":{"mean":0.4177,"p99":0.9804},"clipping":{"high_px":0,"low_px":0,"max":0.9812,"pixels":24},"exposure":{"channels":{"blue":0.4797,"green":0.4451,"red":0.3007},"highlights":0.0,"histogram16":[0,2,4,3,1,2,3,0,0,1,3,4,0,1,0,0],"mean":0.4152,"p01":0.1113,"p50":0.375,"p99":0.8556,"shadows":0.0},"focus":{"brenner":7657.0669,"laplacian":85485.5547,"tenengrad":61614.1328,"variance":36.6244},"image":null,"notes":[],"region":{"height":4,"normalized":[0.5,0.5,0.5,0.5],"width":6,"x":6,"y":4}}}
+      ],
+      "len": 384,
+      "measure": [
+        {"kind":"area_scan","region":[0,0,12,8],"result":{"auto_meter":{"mean":0.4687,"p99":0.9961},"clipping":{"high_px":0,"low_px":0,"max":0.9954,"pixels":96},"exposure":{"channels":{"blue":0.4306,"green":0.4886,"red":0.4665},"highlights":0.0104,"histogram16":[1,2,11,7,6,10,9,4,6,5,12,8,10,4,1,0],"mean":0.4782,"p01":0.0463,"p50":0.4688,"p99":0.9069,"shadows":0.0},"focus":{"brenner":7345.1665,"laplacian":66036.5313,"tenengrad":93326.0703,"variance":29.0872},"notes":["highlights clipped: 1.0 % of the image at full scale"]}},
+        {"kind":"area_scan","region":[3,2,7,7],"result":{"auto_meter":{"mean":0.4878,"p99":0.9961},"clipping":{"high_px":0,"low_px":0,"max":0.9954,"pixels":42},"exposure":{"channels":{"blue":0.5153,"green":0.4709,"red":0.494},"highlights":0.0238,"histogram16":[0,1,3,6,5,3,1,4,1,4,5,1,4,3,1,0],"mean":0.4771,"p01":0.1159,"p50":0.4688,"p99":0.9153,"shadows":0.0},"focus":{"brenner":6560.043,"laplacian":72737.8359,"tenengrad":89536.9141,"variance":31.5359},"notes":["highlights clipped: 2.4 % of the image at full scale"]}},
+        {"kind":"area_scan","region":[11,7,5,5],"result":{"auto_meter":{"mean":0.4137,"p99":0.7451},"clipping":{"high_px":0,"low_px":0,"max":0.7463,"pixels":1},"exposure":{"channels":{"blue":0.7431,"green":0.3039,"red":0.3039},"highlights":0.0,"histogram16":[0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0],"mean":0.3333,"p01":0.3283,"p50":0.3359,"p99":0.3436,"shadows":0.0},"focus":{"brenner":11474.5,"laplacian":0.0,"tenengrad":67898.0,"variance":0.0},"notes":[]}},
+        {"kind":"area_scan","region":[3,1,2,2],"result":{"auto_meter":{"mean":0.48,"p99":0.9804},"clipping":{"high_px":0,"low_px":0,"max":0.98,"pixels":4},"exposure":{"channels":{"blue":0.4059,"green":0.2843,"red":0.9314},"highlights":0.0,"histogram16":[0,0,0,0,1,0,1,0,2,0,0,0,0,0,0,0],"mean":0.4304,"p01":0.2506,"p50":0.4219,"p99":0.5463,"shadows":0.0},"focus":{"brenner":5494.125,"laplacian":16987.1875,"tenengrad":45759.5,"variance":11.5281},"notes":[]}}
+      ],
+      "name": "BiColorRGBG12-layout-12x8",
+      "pixel_format": 35651755,
+      "width": 12
+    },
+    {
+      "conversions": {
+        "gray8": null,
+        "jpeg": {"fnv1a64":"e65bb8205741899c","len":765},
+        "png": {"fnv1a64":"34b14a10025ec16e","len":364},
+        "png_bit_depth": [8,12],
+        "raw": {"fnv1a64":"552cec6943770e6c","len":384},
+        "rgb": {"fnv1a64":"53fa23a47b79deb3","len":288},
+        "rgba": {"fnv1a64":"9fa5147f1019bbb7","len":384},
+        "sample_bits": 12
+      },
+      "fnv1a64": "552cec6943770e6c",
+      "generator": {
+        "hex": "6d892db3ad94b8087682880fcdeed6af33330addddb812569b1dc7a7131ca8ecaf35a87f66480f8aa52d0cdfdde3f313b417784094af122443689ebf8055f21e79053cae0333d4eaeb2755eaee2266b585bc58740ce82572de5e7051f899779b2d67c3ee6760b8d97851f8d440bf856d5f9a1568e0f79d5b2df159b0e563e3e1dc83138cb0faec833fd3275e75519947679c7ef63c3cc512ac7b41ea0173c0a3294aa8b372b6b0314f4d9afcef211e6e2f2aad6420cef6c542b89b942dbbef89a971a7090742efdf697f4f8c861392c79d50df3bcad21d29c5e4618f80104cc0c05a989678d950d105b95b4f63b4b5601de7b9b8519985bb281ec6504e6ca9b7d2e166cc0704808ac3eea4cf94dc538ad0d637a57228b353a7f6abbd449372197bee734a7455d01e911481f1f0be103c08841df46d13243bdf3d8cd80cb50f7b80f60a894c5cef25ca338ae41db271f300b43f29b8b8f1371e13b5f6b02398347c4d7ff4112678200a9e670d67cee345bfba7ddd4f989cafce52abe3ee1be0df",
+        "kind": "bytes"
+      },
+      "height": 8,
+      "inspect": [
+        {"region":null,"result":{"auto_meter":{"mean":0.5092,"p99":0.9961},"clipping":{"high_px":0,"low_px":0,"max":0.9961,"pixels":96},"exposure":{"channels":{"blue":0.5038,"green":0.5337,"red":0.4657},"highlights":0.0208,"histogram16":[1,1,3,6,9,10,7,9,11,6,8,7,8,7,3,0],"mean":0.5153,"p01":0.0619,"p50":0.5156,"p99":0.9069,"shadows":0.0},"focus":{"brenner":5692.25,"laplacian":61443.0664,"tenengrad":70901.2344,"variance":22.3044},"image":null,"notes":["highlights clipped: 2.1 % of the image at full scale"],"region":{"height":8,"normalized":[0.0,0.0,1.0,1.0],"width":12,"x":0,"y":0}}},
+        {"region":[0.1,0.2,0.35,0.5],"result":{"auto_meter":{"mean":0.5235,"p99":0.9961},"clipping":{"high_px":0,"low_px":0,"max":0.9961,"pixels":16},"exposure":{"channels":{"blue":0.55,"green":0.5363,"red":0.4775},"highlights":0.0625,"histogram16":[0,0,0,2,1,2,1,1,1,3,1,2,1,1,0,0],"mean":0.5203,"p01":0.2356,"p50":0.5469,"p99":0.8413,"shadows":0.0},"focus":{"brenner":5609.5,"laplacian":44608.8594,"tenengrad":66502.625,"variance":16.7229},"image":null,"notes":["highlights clipped: 6.2 % of the image at full scale"],"region":{"height":4,"normalized":[0.0833,0.25,0.3333,0.5],"width":4,"x":1,"y":2}}},
+        {"region":[0.5,0.5,0.5,0.5],"result":{"auto_meter":{"mean":0.5233,"p99":0.9922},"clipping":{"high_px":0,"low_px":0,"max":0.9924,"pixels":24},"exposure":{"channels":{"blue":0.5144,"green":0.5418,"red":0.498},"highlights":0.0417,"histogram16":[1,0,1,2,2,1,2,2,3,1,1,2,1,3,2,0],"mean":0.5284,"p01":0.0506,"p50":0.5078,"p99":0.9338,"shadows":0.0},"focus":{"brenner":5722.2334,"laplacian":64927.7148,"tenengrad":59388.3984,"variance":25.3743},"image":null,"notes":["highlights clipped: 4.2 % of the image at full scale"],"region":{"height":4,"normalized":[0.5,0.5,0.5,0.5],"width":6,"x":6,"y":4}}}
+      ],
+      "len": 384,
+      "measure": [
+        {"kind":"area_scan","region":[0,0,12,8],"result":{"auto_meter":{"mean":0.5092,"p99":0.9961},"clipping":{"high_px":0,"low_px":0,"max":0.9961,"pixels":96},"exposure":{"channels":{"blue":0.5038,"green":0.5337,"red":0.4657},"highlights":0.0208,"histogram16":[1,1,3,6,9,10,7,9,11,6,8,7,8,7,3,0],"mean":0.5153,"p01":0.0619,"p50":0.5156,"p99":0.9069,"shadows":0.0},"focus":{"brenner":5692.25,"laplacian":61443.0664,"tenengrad":70901.2344,"variance":22.3044},"notes":["highlights clipped: 2.1 % of the image at full scale"]}},
+        {"kind":"area_scan","region":[3,2,7,7],"result":{"auto_meter":{"mean":0.4948,"p99":0.9765},"clipping":{"high_px":0,"low_px":0,"max":0.9778,"pixels":42},"exposure":{"channels":{"blue":0.5179,"green":0.4993,"red":0.4645},"highlights":0.0,"histogram16":[1,1,2,2,3,5,3,4,5,3,5,2,3,2,1,0],"mean":0.491,"p01":0.0534,"p50":0.5,"p99":0.8841,"shadows":0.0},"focus":{"brenner":5877.0571,"laplacian":63299.6719,"tenengrad":72158.6875,"variance":22.461},"notes":[]}},
+        {"kind":"area_scan","region":[11,7,5,5],"result":{"auto_meter":{"mean":0.9308,"p99":0.9922},"clipping":{"high_px":0,"low_px":0,"max":0.9924,"pixels":1},"exposure":{"channels":{"blue":0.9941,"green":0.9941,"red":0.7431},"highlights":1.0,"histogram16":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1],"mean":0.9412,"p01":0.9377,"p50":0.9453,"p99":0.953,"shadows":0.0},"focus":{"brenner":7560.5,"laplacian":0.0,"tenengrad":5290.0,"variance":0.0},"notes":["highlights clipped: 100.0 % of the image at full scale","bright: mean brightness 0.94 is above 0.65"]}},
+        {"kind":"area_scan","region":[3,1,2,2],"result":{"auto_meter":{"mean":0.6828,"p99":0.9529},"clipping":{"high_px":0,"low_px":0,"max":0.9534,"pixels":4},"exposure":{"channels":{"blue":0.4922,"green":0.7941,"red":0.6569},"highlights":0.0,"histogram16":[0,0,0,0,0,0,0,0,0,1,0,1,1,1,0,0],"mean":0.7402,"p01":0.5944,"p50":0.7344,"p99":0.8588,"shadows":0.0},"focus":{"brenner":5461.0,"laplacian":29344.75,"tenengrad":139384.0,"variance":3.5847},"notes":["bright: mean brightness 0.74 is above 0.65"]}}
+      ],
+      "name": "BiColorBGRG12-layout-12x8",
+      "pixel_format": 35651757,
       "width": 12
     },
     {

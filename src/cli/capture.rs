@@ -68,6 +68,12 @@ pub(crate) struct CaptureArgs {
     /// Image format when -o has no extension: png (default; 16-bit for Mono10..Mono16), jpg or raw (the exact bytes, with NAME.json beside)
     #[arg(short = 'f', long, value_enum)]
     pub format: Option<Format>,
+    /// Save a native GVSP or `GenTL` part as a local still with every component in the companion (XYZ requires RAW)
+    #[arg(long, value_enum)]
+    pub part_format: Option<crate::transport::multipart::GvspPartFormat>,
+    /// Exact zero-based table ordinal; requires --part-format and never implies a component name
+    #[arg(long, requires = "part_format", value_parser = clap::value_parser!(u32).range(0..32))]
+    pub part_index: Option<u32>,
     /// JPEG quality, 1..100 (default 90; without it, a Motion JPEG source's own JPEG is stored as it is)
     #[arg(long, value_name = "1-100", value_parser = clap::value_parser!(u8).range(1..=100))]
     pub quality: Option<u8>,
@@ -89,9 +95,9 @@ pub(crate) struct CaptureArgs {
     /// Frames to let pass after the first one exposed after the last settings change, 0..10
     #[arg(long, default_value_t = 0, value_name = "N", value_parser = clap::value_parser!(u32).range(0..=10))]
     pub fresh: u32,
-    /// How long a camera that sets its own exposure (a webcam, or ExposureAuto=Continuous; a network stream is already running) may take to settle after it starts; 0 takes frames at once
-    #[arg(long, default_value = "2s", value_name = "DUR", value_parser = super::args::duration)]
-    pub warmup: Duration,
+    /// Exposure settling limit (default 2s; none for read-only monitors); 0 takes frames at once
+    #[arg(long, value_name = "DUR", value_parser = super::args::duration)]
+    pub warmup: Option<Duration>,
     /// When a file name without {seq} exists: fail, or number (-0001, -0002, ...)
     #[arg(long, value_enum, default_value_t = crate::naming::OnExists::Fail)]
     pub on_exists: crate::naming::OnExists,
@@ -126,6 +132,7 @@ struct Plan {
     /// 0: the camera's default.
     timeout_ms: u64,
     warmup_ms: u64,
+    requested_warmup_ms: Option<u64>,
     settings: Vec<Assignment>,
     context: crate::context::Context,
     /// Absolute, as the caller meant it.
@@ -154,6 +161,26 @@ impl Plan {
             ),
         };
         let format = format(&output, args.format)?;
+        crate::transport::multipart::GvspPartFormat::validate_index(
+            args.part_index,
+            args.part_format,
+        )
+        .map_err(super::input)?;
+        if args.auto
+            && let Some(format) = args.part_format
+        {
+            crate::transport::multipart::PartSelection {
+                format,
+                index: args.part_index,
+            }
+            .validate()
+            .map_err(super::input)?;
+        }
+        if let Some(selection) = args.part_format {
+            selection
+                .validate_output(&output, format)
+                .map_err(super::input)?;
+        }
         let count = match (args.count, args.every, args.duration) {
             (_, None, Some(_)) => {
                 return Err(
@@ -208,7 +235,10 @@ impl Plan {
             Some(Wait::Forever) => crate::scheduling::MAX_DURATION_MS,
             None => 0,
         };
-        if args.warmup > Duration::from_millis(crate::session::MAX_WARMUP_MS) {
+        if args
+            .warmup
+            .is_some_and(|warmup| warmup > Duration::from_millis(crate::session::MAX_WARMUP_MS))
+        {
             return Err(Usage("--warmup is at most 60s".into()).into());
         }
         let manifest = match args.manifest.as_deref() {
@@ -242,7 +272,10 @@ impl Plan {
             interval_ms: args.every.map_or(0, millis),
             first_at_ms,
             timeout_ms,
-            warmup_ms: millis(args.warmup),
+            warmup_ms: args
+                .warmup
+                .map_or(crate::session::DEFAULT_WARMUP_MS, millis),
+            requested_warmup_ms: args.warmup.map(millis),
             settings,
             context,
             manifest,
@@ -271,6 +304,8 @@ impl Plan {
             count: self.count,
             timeout_ms: self.timeout_ms,
             format: self.format.into(),
+            part_format: args.part_format,
+            part_index: args.part_index,
             first_at_ms: first_at_ms
                 .or(self.first_at_ms)
                 .unwrap_or_else(crate::scheduling::now_ms),
@@ -283,7 +318,7 @@ impl Plan {
             utc_offset_s: Some(crate::naming::local_offset()),
             quality,
             fresh: args.fresh,
-            warmup_ms: Some(self.warmup_ms),
+            warmup_ms: self.requested_warmup_ms,
             inspect: args.inspect,
             job: None,
             lease: !args.background,
@@ -342,6 +377,13 @@ pub(super) fn run(global: &Global, args: &CaptureArgs) -> Result<Option<Report>>
         super::output::document_to_stderr();
     }
     let plan = Plan::new(args)?;
+    if let Some(format) = args.part_format {
+        for camera in &args.cameras.cameras {
+            format
+                .validate_binding(args.part_index, camera)
+                .map_err(super::input)?;
+        }
+    }
     if args.quality.is_some() && plan.format != "jpeg" {
         return Err(Usage("--quality is for JPEG; use a .jpg name or -f jpg".into()).into());
     }
@@ -467,9 +509,27 @@ fn combine(results: Vec<Result<Value>>, cameras: &[Option<&str>]) -> Result<Valu
                 });
                 if let Some(details) = &classified.details {
                     saved(details, &mut files, &mut truncated);
-                    for key in ["files", "truncated", "job"] {
+                    for key in [
+                        "files",
+                        "truncated",
+                        "multipart",
+                        "multipart_truncated",
+                        "job",
+                    ] {
                         if let Some(value) = details.get(key) {
                             entry[key] = value.clone();
+                        }
+                    }
+                    if details["image_selectors"].is_array() {
+                        for key in [
+                            "parts",
+                            "byte_order",
+                            "image_selectors",
+                            "image_selectors_truncated",
+                        ] {
+                            if let Some(value) = details.get(key) {
+                                entry["error"]["details"][key] = value.clone();
+                            }
                         }
                     }
                 }
@@ -532,7 +592,15 @@ fn prepare(client: &Client, args: &CaptureArgs, plan: &Plan) -> Result<()> {
         super::auto::settle(
             client,
             Duration::from_secs(5),
-            &crate::cli::auto::Limits::default(),
+            &crate::cli::auto::Limits {
+                part_selection: args.part_format.map(|format| {
+                    crate::transport::multipart::PartSelection {
+                        format,
+                        index: args.part_index,
+                    }
+                }),
+                ..Default::default()
+            },
         )?;
     }
     if signals::interrupted() {
@@ -629,7 +697,9 @@ fn gige_camera(client: &Client) -> Option<crate::types::CameraInfo> {
     let status = client.status().ok()?;
     serde_json::from_value::<crate::types::CameraInfo>(status["info"].clone())
         .ok()
-        .filter(|info| info.transport == crate::types::Transport::GigE)
+        .filter(|info| {
+            info.transport == crate::types::Transport::GigE && !info.id.starts_with("gige-monitor:")
+        })
 }
 
 /// Capture from one of several cameras together: connected, set, paced to
@@ -664,7 +734,7 @@ fn shoot_together(
             sleep_until(first_at.saturating_sub(ARM_AHEAD_MS + plan.warmup_ms))?;
         }
         let arm = client.call(SessionCommand::Arm {
-            warmup_ms: Some(plan.warmup_ms),
+            warmup_ms: plan.requested_warmup_ms,
             bytes_per_second: share.as_ref().map(|share| share.bytes_per_second),
         })?;
         Ok((client, arm))
@@ -831,6 +901,7 @@ fn saved(job: &Value, detail: &Value) -> Value {
             value[key] = detail[key].clone();
         }
     }
+    multipart_refs(&mut value, detail);
     value["job"] = job.clone();
     value
 }
@@ -895,19 +966,36 @@ fn result(job: &Value, detail: &Value, format: &str) -> Value {
     let pixel_format = frame["pixel_format"]
         .as_u64()
         .and_then(|format| u32::try_from(format).ok());
+    let pixel_encoding = serde_json::from_value::<Option<crate::types::PixelEncoding>>(
+        frame["pixel_encoding"].clone(),
+    )
+    .ok()
+    .flatten();
     let mut value = json!({
         "camera": job["camera"],
         "files": files,
         "count": count,
         "width": frame["width"],
         "height": frame["height"],
-        "pixel_format": pixel_format.map(crate::inspect::pixel_format_label),
+        "pixel_format": pixel_format.map(|code| crate::inspect::pixel_format_label_with_encoding(code, pixel_encoding)),
+        "pixel_encoding": pixel_encoding,
         "settings": crate::engine::saved::settings(&detail["settings"]),
         "time": first.map(rfc3339),
         "device_ts_ns": detail["first_ts_ns"],
+        "device_timestamp": detail["first_device_timestamp"],
     });
     if let Some(pixel_format) = pixel_format {
-        depth(&mut value, pixel_format, format);
+        let (bits, source) =
+            crate::frame::bit_depth_with_encoding(pixel_format, pixel_encoding, format);
+        value["bit_depth"] = json!(bits);
+        if let Some(source) = source {
+            value["source_bits"] = json!(source);
+        }
+    }
+    for key in ["part_format", "part_index"] {
+        if let Some(selection) = detail.get(key) {
+            value[key] = selection.clone();
+        }
     }
     integrity(&mut value, detail, count);
     if let Some(truncated) = detail["truncated"].as_u64() {
@@ -917,16 +1005,16 @@ fn result(job: &Value, detail: &Value, format: &str) -> Value {
         value["passthrough"] = json!(true);
     }
     freshness(&mut value, detail);
+    multipart_refs(&mut value, detail);
     crate::types::without_nulls(value)
 }
 
-/// The bit depth of the files, and the frames' own when the files keep
-/// fewer bits, so a loss of precision is never silent.
-fn depth(value: &mut Value, pixel_format: u32, format: &str) {
-    let (bit_depth, source_bits) = crate::frame::bit_depth(pixel_format, format);
-    value["bit_depth"] = json!(bit_depth);
-    if let Some(bits) = source_bits {
-        value["source_bits"] = json!(bits);
+/// Small per-image archive references from the coordinator's bounded saved catalog.
+fn multipart_refs(value: &mut Value, detail: &Value) {
+    for key in ["multipart", "multipart_truncated"] {
+        if let Some(reference) = detail.get(key) {
+            value[key] = reference.clone();
+        }
     }
 }
 
@@ -1001,6 +1089,18 @@ fn dry_run(client: &Client, args: &CaptureArgs, plan: &Plan) -> Result<Value> {
         "format": crate::naming::format_extension(plan.format),
         "count": plan.count,
     });
+    if let Some(part_format) = args.part_format {
+        let transport = serde_json::from_value(camera["info"]["transport"].clone())?;
+        crate::transport::multipart::GvspPartFormat::validate_transport(transport)?;
+        value["part_format"] = json!(part_format);
+        part_format.validate_binding(
+            args.part_index,
+            camera["info"]["id"].as_str().context("camera ID missing")?,
+        )?;
+        if let Some(index) = args.part_index {
+            value["part_index"] = json!(index);
+        }
+    }
     if plan.interval_ms > 0 {
         value["every_s"] = json!(plan.interval_ms as f64 / 1000.0);
     }
@@ -1090,7 +1190,7 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
         context: plan.context.clone(),
         quality: args.quality,
         fresh: args.fresh,
-        warmup_ms: Some(plan.warmup_ms),
+        warmup_ms: plan.requested_warmup_ms,
         stdout,
     };
     let copied = if client.session().is_some() {
@@ -1165,6 +1265,11 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
     let pixel_format = meta["pixel_format"]
         .as_u64()
         .and_then(|format| u32::try_from(format).ok());
+    let pixel_encoding = serde_json::from_value::<Option<crate::types::PixelEncoding>>(
+        meta["pixel_encoding"].clone(),
+    )
+    .ok()
+    .flatten();
     let camera = client.status()?;
     let mut value = crate::types::without_nulls(json!({
         "camera": crate::media::redact_url(camera["info"]["id"].as_str().unwrap_or_default()),
@@ -1173,12 +1278,14 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
         "count": 1,
         "width": meta["width"],
         "height": meta["height"],
-        "pixel_format": pixel_format.map(crate::inspect::pixel_format_label),
-        "bit_depth": pixel_format.map(|format| crate::frame::bit_depth(format, plan.format).0),
-        "source_bits": pixel_format.and_then(|format| crate::frame::bit_depth(format, plan.format).1),
+        "pixel_format": pixel_format.map(|code| crate::inspect::pixel_format_label_with_encoding(code, pixel_encoding)),
+        "pixel_encoding": pixel_encoding,
+        "bit_depth": pixel_format.map(|format| crate::frame::bit_depth_with_encoding(format, pixel_encoding, plan.format).0),
+        "source_bits": pixel_format.and_then(|format| crate::frame::bit_depth_with_encoding(format, pixel_encoding, plan.format).1),
         "settings": crate::engine::saved::settings(&meta["settings"]),
         "time": meta["wall_ms"].as_u64().map(rfc3339),
         "device_ts_ns": meta["device_ts_ns"],
+        "device_timestamp": meta["device_timestamp"],
         "frames": reply["frames"],
         "dropped": reply["dropped"],
         "incomplete": reply["incomplete"],
@@ -1280,9 +1387,21 @@ pub(super) const FIELDS: &[(&str, &str)] = &[
     ),
     ("count", "int — frames saved"),
     ("truncated", "int — files saved but not listed"),
+    (
+        "multipart",
+        "{image_path:{format_version,storage,path,metadata_path,bytes,sha256?,selected,count,part_format?}} — retained component archive references for local multipart or GenDC stills, bounded to the listed files and 64 KiB. Complete part metadata is in each companion JSON",
+    ),
+    (
+        "multipart_truncated",
+        "int — multipart archive references omitted from this bounded summary; each saved image still has its local archive and metadata",
+    ),
     ("width", "int"),
     ("height", "int"),
-    ("pixel_format", "string — the camera's PFNC format"),
+    ("pixel_format", "string — the camera's format name"),
+    (
+        "pixel_encoding",
+        "{namespace:ids,name:Mono10g40IDS|Mono12g24IDS|BayerRG10g40IDS|BayerRG12g24IDS|BayerGR10g40IDS|BayerGR12g24IDS|BayerGB10g40IDS|BayerGB12g24IDS|BayerBG10g40IDS|BayerBG12g24IDS,code,gentl_namespace?} — explicit qualified IDS byte layout and original source code; absent for ordinary PFNC formats",
+    ),
     (
         "bit_depth",
         "int — bits per sample in the files: 16 for PNG of Mono10..Mono16 (samples at the top bits, sBIT says how many count), every bit for raw, else 8",
@@ -1298,7 +1417,11 @@ pub(super) const FIELDS: &[(&str, &str)] = &[
     ("time", "string — RFC 3339 time of the first frame"),
     (
         "device_ts_ns",
-        "int — the camera's clock when the first frame was taken (GigE, U3V, sim); never a date",
+        "int — the camera's clock in nanoseconds when the first frame was taken, where supplied by the transport; never a date",
+    ),
+    (
+        "device_timestamp",
+        "{ticks,frequency_hz?} — original producer clock ticks for the first frame, with its reported frequency when known; exact unsigned integers, no inferred unit or date",
     ),
     (
         "frames",
@@ -1364,7 +1487,7 @@ pub(super) const FIELDS: &[(&str, &str)] = &[
     ),
     (
         "cameras",
-        "[{camera,files,count,truncated?,width,height,pixel_format,bit_depth,source_bits?,settings,time,device_ts_ns?,frames,dropped,incomplete?,resent?,duration_s?,fps?,first_id?,last_id?,gaps?,consecutive?,after_change?,warmup_ms?,settled?,bandwidth_mbps?,warnings?,inspect?,dry_run?,output?,format?,every_s?,first_at?,ends_at?,auto?}] — with -c repeated: one result per camera; in error details, a failed camera's {camera,error,files?,truncated?,job?}",
+        "[{camera,files,count,truncated?,multipart?,multipart_truncated?,width,height,pixel_format,pixel_encoding?,bit_depth,source_bits?,settings,time,device_ts_ns?,device_timestamp?,frames,dropped,incomplete?,resent?,duration_s?,fps?,first_id?,last_id?,gaps?,consecutive?,after_change?,warmup_ms?,settled?,bandwidth_mbps?,warnings?,inspect?,dry_run?,output?,format?,part_format?,part_index?,every_s?,first_at?,ends_at?,auto?}] — with -c repeated: one result per camera; in error details, a failed camera's {camera,error,files?,truncated?,multipart?,multipart_truncated?,job?}",
     ),
     (
         "job",
@@ -1382,6 +1505,14 @@ pub(super) const FIELDS: &[(&str, &str)] = &[
         ),
     ),
     ("dry_run", "true — with --dry-run; nothing was captured"),
+    (
+        "part_format",
+        "requested exact native GVSP or GenTL part PFNC name; also present in --dry-run",
+    ),
+    (
+        "part_index",
+        "int0..31 — requested exact multipart table ordinal; requires part_format and never implies a component name",
+    ),
     ("format", "png|jpg|raw — with --dry-run"),
     ("every_s", "float — with --dry-run, for a time lapse"),
     ("first_at", "string — with --dry-run and --at/--in"),
@@ -1419,6 +1550,103 @@ mod tests {
         );
         assert!(wrapped.get("gaps").is_none());
         assert!(wrapped.get("consecutive").is_none());
+    }
+
+    #[test]
+    fn selected_auto_refuses_maps_before_any_client_or_settings_and_keeps_ordinary_multi_camera_requests()
+     {
+        use clap::Parser as _;
+        for format in [
+            "Coord3D_C16",
+            "Confidence8",
+            "Mono16",
+            "Mono8",
+            "RGB8",
+            "YCbCr411_8",
+        ] {
+            let cli = crate::cli::Cli::try_parse_from([
+                "capturefab",
+                "capture",
+                "-c",
+                "gentl:unopened",
+                "-c",
+                "sim:1",
+                "-o",
+                "{camera}.raw",
+                "--auto",
+                "--part-format",
+                format,
+                "--part-index",
+                "1",
+                "--set",
+                "exposure=1000",
+            ])
+            .unwrap();
+            let Some(crate::cli::Command::Capture(args)) = cli.command else {
+                panic!("capture");
+            };
+            let result = Plan::new(&args);
+            if matches!(format, "Mono8" | "RGB8" | "YCbCr411_8") {
+                let plan = result.unwrap();
+                assert_eq!(args.cameras.cameras.len(), 2);
+                assert!(args.auto);
+                assert_eq!(plan.settings.len(), 1);
+            } else {
+                let Err(error) = result else {
+                    panic!("map auto")
+                };
+                assert!(error.to_string().contains("ordinary"));
+            }
+        }
+    }
+
+    #[test]
+    fn part_indices_are_carried_through_the_shared_burst_and_multi_camera_request() {
+        use clap::Parser as _;
+        let cli = crate::cli::Cli::try_parse_from([
+            "capturefab",
+            "capture",
+            "-c",
+            "sim:0",
+            "-c",
+            "sim:1",
+            "-o",
+            "{camera}-{frame}.raw",
+            "-n",
+            "2",
+            "--every",
+            "100ms",
+            "--part-format",
+            "RGB8",
+            "--part-index",
+            "1",
+        ])
+        .unwrap();
+        let Some(crate::cli::Command::Capture(args)) = cli.command else {
+            panic!("capture");
+        };
+        assert_eq!(args.cameras.cameras.len(), 2);
+        let plan = Plan::new(&args).unwrap();
+        let command = plan.request(&args, None, Some(0));
+        command.validate().unwrap();
+        let value = serde_json::to_value(command).unwrap();
+        assert_eq!(value["part_format"], "RGB8");
+        assert_eq!(value["part_index"], 1);
+        assert_eq!(value["count"], 2);
+        assert_eq!(value["interval_ms"], 100);
+        for index in ["32", "-1", "0.5"] {
+            crate::cli::Cli::try_parse_from([
+                "capturefab",
+                "capture",
+                "--part-format",
+                "Mono8",
+                "--part-index",
+                index,
+            ])
+            .unwrap_err();
+        }
+        crate::cli::Cli::try_parse_from(["capturefab", "capture", "--part-index", "1"])
+            .unwrap_err();
     }
 
     #[test]
@@ -1475,8 +1703,13 @@ mod tests {
 
     #[test]
     fn combined_error_counts_saturate_without_losing_saved_files() {
-        let error = Categorized::new(ErrorKind::OperationFailed, "first camera failed")
-            .details(json!({"files": ["/first.png"], "truncated": u64::MAX}));
+        let error =
+            Categorized::new(ErrorKind::OperationFailed, "first camera failed").details(json!({
+                "files": ["/first.png"], "truncated": u64::MAX,
+                "multipart": {"/first.png":{"path":"/first.png.multipart.raw"}},
+                "image_selectors":[{"part":1,"camera":"gentl:replacement"}],
+                "parts":[{"index":1}],
+            }));
         let result = combine(
             vec![
                 Err(error.into()),
@@ -1491,6 +1724,18 @@ mod tests {
         let details = classified.details.unwrap();
         assert_eq!(details["truncated"], u64::MAX);
         assert_eq!(details["files"], json!(["/first.png", "/second.png"]));
+        assert_eq!(
+            details["cameras"][0]["multipart"]["/first.png"]["path"],
+            "/first.png.multipart.raw"
+        );
+        assert_eq!(
+            details["cameras"][0]["error"]["details"]["image_selectors"][0]["camera"],
+            "gentl:replacement"
+        );
+        assert_eq!(
+            details["cameras"][0]["error"]["details"]["parts"][0]["index"],
+            1
+        );
     }
 
     #[test]

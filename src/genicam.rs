@@ -14,6 +14,11 @@ use std::{
     collections::{BTreeMap, BTreeSet},
 };
 
+mod action;
+mod chunks;
+pub(crate) use action::ActionDeviceKeyTarget;
+pub(crate) use chunks::ChunkContext;
+
 const MAX_XML: usize = 32 * 1024 * 1024;
 const MAX_DEPTH: usize = 64;
 const MAX_FORMULA_DEPTH: usize = 128;
@@ -21,7 +26,7 @@ const MAX_FORMULA_DEPTH: usize = 128;
 const EXACT_INTEGER_LIMIT: f64 = 9_007_199_254_740_992.0;
 
 /// Node kinds that are features a person reads, writes or executes.
-const FEATURE_KINDS: [&str; 14] = [
+const FEATURE_KINDS: [&str; 15] = [
     "Integer",
     "Float",
     "Boolean",
@@ -32,6 +37,7 @@ const FEATURE_KINDS: [&str; 14] = [
     "MaskedIntReg",
     "FloatReg",
     "StringReg",
+    "Register",
     "IntSwissKnife",
     "SwissKnife",
     "IntConverter",
@@ -142,9 +148,74 @@ impl Node {
 #[derive(Debug, Clone)]
 pub(crate) struct NodeMap {
     nodes: BTreeMap<String, Node>,
+    chunk_plan: chunks::Plan,
 }
 
 impl NodeMap {
+    /// A finite write-only integer target, resolved without device I/O.
+    pub(crate) fn action_device_key_target(&self) -> Result<ActionDeviceKeyTarget> {
+        action::target(self)
+    }
+    /// Write the preflighted exact key without reading or checkpointing it.
+    pub(crate) fn write_action_device_key(
+        &self,
+        io: &mut dyn RegisterIo,
+        target: &ActionDeviceKeyTarget,
+        key: u32,
+    ) -> Result<()> {
+        action::write(self, io, target, key)
+    }
+    /// Known vendor byte layouts require both real identity and static XML declarations.
+    pub(crate) fn pixel_encodings(&self, vendor: &str) -> Vec<crate::types::PixelEncoding> {
+        use crate::types::{IdsPixelFormat, LucidPixelFormat};
+        let declared = |name: &str, code: u32| self.declares_pixel_format(name, code);
+        if LucidPixelFormat::vendor_matches(vendor) {
+            return LucidPixelFormat::ALL
+                .into_iter()
+                .filter(|format| declared(format.name(), format.code()))
+                .map(|format| format.encoding(None))
+                .collect();
+        }
+        if !IdsPixelFormat::vendor_matches(vendor) {
+            return Vec::new();
+        }
+        IdsPixelFormat::ALL
+            .into_iter()
+            .filter(|format| declared(format.name(), format.code()))
+            .map(|format| format.encoding(None))
+            .collect()
+    }
+    /// Whether `PixelFormat` statically declares `name` with exactly `code`.
+    fn declares_pixel_format(&self, symbol_name: &str, code: u32) -> bool {
+        let Some(node) = self
+            .nodes
+            .get("PixelFormat")
+            .filter(|node| node.kind == "Enumeration")
+        else {
+            return false;
+        };
+        let Some(entry) = Self::enum_entries(node).into_iter().find_map(|name| {
+            let entry = self.nodes.get(name)?;
+            if entry.kind != "EnumEntry" {
+                return None;
+            }
+            let symbol = entry
+                .prop("Symbolic")
+                .unwrap_or_else(|| name.strip_prefix("PixelFormat_").unwrap_or(name));
+            (symbol == symbol_name).then_some(entry)
+        }) else {
+            return false;
+        };
+        if entry.prop("pValue").is_some() {
+            return false;
+        }
+        entry
+            .prop("Value")
+            .and_then(|value| literal(value).ok())
+            .and_then(|value| value.as_u64())
+            == Some(u64::from(code))
+    }
+
     pub(crate) fn parse(xml: &str) -> Result<Self> {
         ensure!(xml.len() <= MAX_XML, "GenICam XML exceeds 32 MiB limit");
         let doc =
@@ -268,7 +339,12 @@ impl NodeMap {
             nodes.insert(stored_name, node);
         }
         ensure!(!nodes.is_empty(), "GenICam XML has no named nodes");
-        Ok(Self { nodes })
+        let mut map = Self {
+            nodes,
+            chunk_plan: chunks::Plan::default(),
+        };
+        map.chunk_plan = chunks::Plan::new(&map);
+        Ok(map)
     }
     pub(crate) fn has(&self, name: &str) -> bool {
         self.nodes.contains_key(name)
@@ -1023,6 +1099,7 @@ impl NodeMap {
                     | "MaskedIntReg"
                     | "FloatReg"
                     | "StringReg"
+                    | "Register"
             ),
             "unsupported writable node type {}",
             n.kind
@@ -1034,7 +1111,7 @@ impl NodeMap {
             n.host_value()
                 || matches!(
                     n.kind.as_str(),
-                    "IntReg" | "MaskedIntReg" | "FloatReg" | "StringReg"
+                    "IntReg" | "MaskedIntReg" | "FloatReg" | "StringReg" | "Register"
                 ),
             "{name} has no writable register"
         );
@@ -1044,16 +1121,22 @@ impl NodeMap {
         self.get_inner(io, name, 0)
     }
     fn get_inner(&self, io: &mut dyn RegisterIo, name: &str, depth: usize) -> Result<Value> {
-        self.access(io, name, false, depth)?;
         let n = self.node(name, depth)?;
+        if n.kind == "Register" {
+            self.available(io, n, depth)?;
+            let (_, length) = self.register(io, n, depth)?;
+            // Metadata only: ordinary get/features never transfer a buffer.
+            return Ok(json!({"kind":"register", "length_bytes":length}));
+        }
+        self.access(io, name, false, depth)?;
         match n.kind.as_str() {
             "IntReg" | "MaskedIntReg" => {
-                let (addr, len) = self.register(io, n, depth)?;
+                let (target, len) = self.read_register(io, n, depth)?;
                 ensure!(
                     matches!(len, 1 | 2 | 4 | 8),
                     "integer register length {len} is unsupported"
                 );
-                let bytes = io.read_memory(addr, len)?;
+                let bytes = target.read(io, len)?;
                 ensure!(bytes.len() == len, "short register read");
                 let mut raw = decode_integer(&bytes, n.big_endian());
                 let bits = if n.kind == "MaskedIntReg" {
@@ -1075,8 +1158,8 @@ impl NodeMap {
                 }
             }
             "FloatReg" => {
-                let (addr, len) = self.register(io, n, depth)?;
-                let b = io.read_memory(addr, len)?;
+                let (target, len) = self.read_register(io, n, depth)?;
+                let b = target.read(io, len)?;
                 ensure!(b.len() == len, "short float register read");
                 let v = match len {
                     4 => {
@@ -1110,8 +1193,8 @@ impl NodeMap {
                 Ok(json!(v))
             }
             "StringReg" => {
-                let (addr, len) = self.register(io, n, depth)?;
-                let b = io.read_memory(addr, len)?;
+                let (target, len) = self.read_register(io, n, depth)?;
+                let b = target.read(io, len)?;
                 ensure!(b.len() == len, "short string register read");
                 Ok(json!(
                     std::str::from_utf8(b.split(|b| *b == 0).next().unwrap_or(&[]))
@@ -1342,6 +1425,32 @@ impl NodeMap {
             n.prop(key).map(literal).transpose()
         }
     }
+    /// Resolve one live opaque Register after bank selection, without reading its body.
+    pub(crate) fn raw_register_layout(
+        &self,
+        io: &mut dyn RegisterIo,
+        name: &str,
+        write: bool,
+    ) -> Result<(u64, usize)> {
+        let node = self.node(name, 0)?;
+        if node.kind != "Register" {
+            return Err(Categorized::error(
+                ErrorKind::Unsupported,
+                format!("{name} is not an opaque Register feature"),
+            ));
+        }
+        self.access(io, name, write, 0)?;
+        let (address, length) = self.register(io, node, 0)?;
+        if length > 65536 {
+            return Err(Categorized::new(
+                ErrorKind::Unsupported,
+                "named register transfer exceeds the 64 KiB limit",
+            )
+            .details(json!({"feature":name,"bytes":length,"limit_bytes":65536}))
+            .into());
+        }
+        Ok((address, length))
+    }
     fn register(&self, io: &mut dyn RegisterIo, n: &Node, depth: usize) -> Result<(u64, usize)> {
         if let Some(port) = n.prop("pPort") {
             let port = self.node(port, depth + 1)?;
@@ -1354,6 +1463,14 @@ impl NodeMap {
                 "chunk and event ports are not supported for live register access"
             );
         }
+        self.register_layout(io, n, depth)
+    }
+    fn register_layout(
+        &self,
+        io: &mut dyn RegisterIo,
+        n: &Node,
+        depth: usize,
+    ) -> Result<(u64, usize)> {
         let length = if let Some(p) = n.prop("pLength") {
             exact_integer(&self.numeric_value(io, p, depth + 1)?)?
         } else {
@@ -2063,6 +2180,12 @@ fn input_value(name: &str, kind: &str, text: &str) -> Result<Value> {
             })
         }
         "Command" => Err(Usage(format!("use exec for command {name}")).into()),
+        "Register" => Err(Categorized::new(
+            ErrorKind::Unsupported,
+            format!("{name} is an opaque byte register, not a scalar setting"),
+        )
+        .hint("use debug read or debug write with --feature for explicit hexadecimal bytes")
+        .into()),
         _ if integer_kind(kind) => integer_literal(text)
             .map_err(|error| Usage(format!("{name} requires an exact integer: {error:#}")).into()),
         _ => literal(text)
@@ -2311,7 +2434,7 @@ fn literal(s: &str) -> Result<Value> {
     Ok(json!(n))
 }
 /// Decode a raw XML file or an in-memory ZIP, without writing device-provided paths.
-#[cfg(any(feature = "usb", test))]
+#[cfg(any(feature = "usb", feature = "gentl", test))]
 pub(crate) fn decode_xml(data: &[u8]) -> Result<String> {
     use std::io::{Cursor, Read as _};
     ensure!(data.len() <= MAX_XML, "GenICam file exceeds 32 MiB limit");
@@ -2938,6 +3061,100 @@ mod tests {
             "<RegisterDescription>{body}</RegisterDescription>"
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn opaque_register_descriptors_never_read_bodies_or_enter_configuration() {
+        struct NoBody;
+        impl RegisterIo for NoBody {
+            fn read_memory(&mut self, _: u64, _: usize) -> Result<Vec<u8>> {
+                anyhow::bail!("unexpected buffer read")
+            }
+            fn write_memory(&mut self, _: u64, _: &[u8]) -> Result<()> {
+                anyhow::bail!("unexpected buffer write")
+            }
+        }
+        let m = map(
+            "<Register Name='Large'><Address>0xA1000</Address><Length>1048576</Length><AccessMode>RW</AccessMode></Register><Register Name='WriteOnly'><Address>0x2000</Address><Length>8192</Length><AccessMode>WO</AccessMode></Register>",
+        );
+        let mut io = NoBody;
+        assert!(m.feature_names().contains(&"Large"));
+        assert_eq!(
+            m.get(&mut io, "Large").unwrap(),
+            json!({"kind":"register","length_bytes":1_048_576})
+        );
+        assert_eq!(
+            m.get(&mut io, "WriteOnly").unwrap(),
+            json!({"kind":"register","length_bytes":8192})
+        );
+        assert!(!m.is_configuration_value(&mut io, "Large"));
+        assert!(!m.is_configuration_value(&mut io, "WriteOnly"));
+        assert!(m.feature(&mut io, "Large").unwrap().writable);
+        assert_eq!(
+            crate::types::classify(&m.set(&mut io, "Large", "00").unwrap_err()).kind,
+            ErrorKind::Unsupported
+        );
+        assert_eq!(
+            crate::types::classify(&m.raw_register_layout(&mut io, "Large", false).unwrap_err())
+                .kind,
+            ErrorKind::Unsupported
+        );
+        assert!(
+            format!(
+                "{:#}",
+                m.raw_register_layout(&mut io, "WriteOnly", false)
+                    .unwrap_err()
+            )
+            .contains("write-only")
+        );
+    }
+    #[test]
+    fn explicit_raw_register_layout_rejects_access_ports_lengths_and_overflow() {
+        let mut io = Memory::default();
+        for (body, write, message) in [
+            (
+                "<Register Name='R'><Address>0</Address><Length>8</Length><AccessMode>RO</AccessMode></Register>",
+                true,
+                "read-only",
+            ),
+            (
+                "<Register Name='R'><Address>0</Address><Length>8</Length><pIsLocked>Locked</pIsLocked></Register><Integer Name='Locked'><Value>1</Value></Integer>",
+                true,
+                "locked",
+            ),
+            (
+                "<Register Name='R'><Address>0</Address><Length>8</Length><pPort>P</pPort></Register><Port Name='P'><ChunkID>1</ChunkID></Port>",
+                false,
+                "chunk and event",
+            ),
+            (
+                "<Register Name='R'><Address>0</Address><Length>8</Length><pPort>P</pPort></Register><Port Name='P'><EventID>1</EventID></Port>",
+                false,
+                "chunk and event",
+            ),
+            (
+                "<Register Name='R'><Address>0</Address><Length>0</Length></Register>",
+                false,
+                "length",
+            ),
+            (
+                "<Register Name='R'><Address>18446744073709551615</Address><Length>2</Length></Register>",
+                false,
+                "overflow",
+            ),
+        ] {
+            let error = map(body)
+                .raw_register_layout(&mut io, "R", write)
+                .unwrap_err();
+            assert!(format!("{error:#}").contains(message), "{error:#}");
+        }
+        assert_eq!(
+            map("<Register Name='R'><Address>16</Address><Length>65536</Length></Register>")
+                .raw_register_layout(&mut io, "R", false)
+                .unwrap(),
+            (16, 65536)
+        );
+        assert!(io.bytes.is_empty());
     }
     #[test]
     fn scoped_enumeration_entries_and_grouped_features() {
@@ -4385,6 +4602,331 @@ mod tests {
         assert_eq!(
             basler().get(&mut io, "BalanceRatioSelector").unwrap(),
             "Red"
+        );
+    }
+}
+
+#[cfg(test)]
+mod external_vendor_audit {
+    use super::NodeMap;
+
+    #[test]
+    #[ignore = "run scripts/test-camera-xml.py to fetch pinned captured descriptions"]
+    fn captured_descriptions() {
+        let directory = std::env::var("CAPTUREFAB_VENDOR_XML_DIR").unwrap();
+        let count: usize = std::env::var("CAPTUREFAB_VENDOR_XML_COUNT")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut paths = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(paths.len(), count);
+        for path in paths {
+            let xml = std::fs::read_to_string(&path).unwrap();
+            let map = NodeMap::parse(&xml)
+                .unwrap_or_else(|error| panic!("{}: {error:#}", path.display()));
+            assert_eq!(map.unresolved(), None, "{}", path.display());
+            for feature in [
+                "Width",
+                "Height",
+                "PixelFormat",
+                "PayloadSize",
+                "AcquisitionStart",
+                "AcquisitionStop",
+            ] {
+                assert!(map.has(feature), "{} has no {feature}", path.display());
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "run scripts/test-camera-xml.py to fetch pinned captured descriptions"]
+    fn captured_chunk_layouts_decode_with_frozen_registers() {
+        use crate::{
+            transport::chunks::{ByteOrder, ChunkData},
+            types::RegisterIo,
+        };
+        use std::time::Duration;
+        struct Device {
+            reads: usize,
+        }
+        impl RegisterIo for Device {
+            fn read_memory(&mut self, _: u64, length: usize) -> anyhow::Result<Vec<u8>> {
+                self.reads += 1;
+                Ok(vec![255; length])
+            }
+            fn write_memory(&mut self, _: u64, _: &[u8]) -> anyhow::Result<()> {
+                anyhow::bail!("external XML validation never writes to a device")
+            }
+        }
+        let directory =
+            std::path::PathBuf::from(std::env::var("CAPTUREFAB_VENDOR_XML_DIR").unwrap());
+        for (file, counter, counter_id, timestamp_id) in [
+            (
+                "Basler_acA1600_20gm.xml",
+                "ChunkFramecounter",
+                0x8c0f_1cd8_u32,
+                0xc916_13db_u32,
+            ),
+            (
+                "PGR_BlackflyS_13Y3M.xml",
+                "ChunkFrameID",
+                0x0504_0003,
+                0x0508_000e,
+            ),
+        ] {
+            let xml = std::fs::read_to_string(directory.join(file)).unwrap();
+            let map = NodeMap::parse(&xml).unwrap();
+            let mut device = Device { reads: 0 };
+            let context = map.prepare_chunk_context(&mut device, Duration::from_secs(1));
+            let reads = device.reads;
+            assert!(reads <= 32);
+            let counter_bytes = if counter == "ChunkFramecounter" {
+                u32::MAX.to_le_bytes().to_vec()
+            } else {
+                u64::MAX.to_le_bytes().to_vec()
+            };
+            let mut payload = vec![0, 0];
+            for (id, bytes) in [
+                (counter_id, counter_bytes),
+                (timestamp_id, u64::MAX.to_le_bytes().to_vec()),
+            ] {
+                payload.extend_from_slice(&bytes);
+                payload.extend_from_slice(&id.to_be_bytes());
+                payload.extend_from_slice(&u32::try_from(bytes.len()).unwrap().to_be_bytes());
+            }
+            let mut chunks = ChunkData::parse(&payload, 2, 2, ByteOrder::Big, 0).unwrap();
+            chunks.payload = payload.into();
+            let values = map.chunk_values(&chunks, &context);
+            assert_eq!(
+                values["values"]["ChunkTimestamp"],
+                u64::MAX,
+                "{file}: {values}"
+            );
+            assert_eq!(
+                values["values"][counter],
+                if counter == "ChunkFramecounter" {
+                    u64::from(u32::MAX)
+                } else {
+                    u64::MAX
+                },
+                "{file}: {values}"
+            );
+            assert_eq!(device.reads, reads);
+        }
+    }
+}
+
+#[cfg(test)]
+mod lucid_encoding_tests {
+    use super::NodeMap;
+    use crate::types::{LucidPixelFormat, PixelEncoding};
+
+    /// LUCID Arena `PFNC.h`/`ArenaCDefs.h`: `LUCID_Coord3D_ABCY16 0x82400403` (custom bit 31,
+    /// 64 bits per pixel). The signed sibling `Coord3D_ABCY16s` is 0x82400400.
+    const XML: &str = r#"<RegisterDescription><Enumeration Name="PixelFormat"><EnumEntry Name="PixelFormat_Coord3D_ABCY16"><Symbolic>Coord3D_ABCY16</Symbolic><Value>0x82400403</Value></EnumEntry><EnumEntry Name="PixelFormat_Coord3D_ABC16"><Value>0x023000b9</Value></EnumEntry><Value>0x82400403</Value></Enumeration></RegisterDescription>"#;
+
+    #[test]
+    fn lucid_abcy16_requires_identity_and_exact_static_declaration() {
+        let nodes = NodeMap::parse(XML).unwrap();
+        assert_eq!(
+            nodes.pixel_encodings("Lucid Vision Labs"),
+            [LucidPixelFormat::Coord3dAbcy16.encoding(None)]
+        );
+        assert_eq!(
+            nodes.pixel_encodings("LUCID VISION LABS "),
+            [LucidPixelFormat::Coord3dAbcy16.encoding(None)]
+        );
+        for vendor in [
+            "Other Manufacturer",
+            "IDS Imaging Development Systems GmbH",
+            "Lucid",
+        ] {
+            assert_eq!(
+                nodes.pixel_encodings(vendor),
+                [] as [PixelEncoding; 0],
+                "{vendor}"
+            );
+        }
+        for changed in [
+            // Signed sibling and LUCID's SaveDefs.h discrepancy are not the unsigned layout.
+            XML.replace(
+                "0x82400403</Value></EnumEntry>",
+                "0x82400400</Value></EnumEntry>",
+            ),
+            XML.replace(
+                "<Symbolic>Coord3D_ABCY16</Symbolic>",
+                "<Symbolic>Coord3D_ABCY16s</Symbolic>",
+            ),
+            // Same ID field, different size (LUCID ABCY8 reuses 0x0403).
+            XML.replace(
+                "0x82400403</Value></EnumEntry>",
+                "0x82200403</Value></EnumEntry>",
+            ),
+            XML.replace(
+                "<Value>0x82400403</Value></EnumEntry>",
+                "<pValue>Code</pValue></EnumEntry>",
+            )
+            .replace(
+                "</RegisterDescription>",
+                "<Integer Name=\"Code\"><Value>0x82400403</Value></Integer></RegisterDescription>",
+            ),
+        ] {
+            assert_eq!(
+                NodeMap::parse(&changed)
+                    .unwrap()
+                    .pixel_encodings("Lucid Vision Labs"),
+                [] as [PixelEncoding; 0]
+            );
+        }
+    }
+
+    #[test]
+    fn lucid_descriptor_binds_the_full_code_and_namespace() {
+        let encoding = LucidPixelFormat::Coord3dAbcy16.encoding(None);
+        assert_eq!(
+            encoding.lucid(0x8240_0403).ok(),
+            Some(LucidPixelFormat::Coord3dAbcy16)
+        );
+        for code in [0x8240_0400, 0x8220_0403, 0x0240_0403, 0x0230_00b9] {
+            encoding.lucid(code).unwrap_err();
+            encoding.check(code).unwrap_err();
+        }
+        encoding.ids(0x8240_0403).unwrap_err();
+        assert_eq!(encoding.row_bytes(0x8240_0403, 3), Some(24));
+        for namespace in [1, 1000] {
+            encoding
+                .with_namespace(Some(namespace))
+                .check(0x8240_0403)
+                .unwrap();
+        }
+        for namespace in [0, 2, 4, 1001] {
+            encoding
+                .with_namespace(Some(namespace))
+                .check(0x8240_0403)
+                .unwrap_err();
+        }
+        let json = serde_json::to_value(encoding).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"namespace":"lucid","name":"Coord3D_ABCY16","code":0x8240_0403_u32})
+        );
+        assert_eq!(
+            serde_json::from_value::<PixelEncoding>(json).unwrap(),
+            encoding
+        );
+    }
+}
+
+#[cfg(test)]
+mod ids_encoding_tests {
+    use super::*;
+    use crate::types::{IdsPixelFormat, PixelEncoding};
+
+    #[test]
+    fn ids_encoding_requires_literal_named_entries_and_manufacturer_identity() {
+        let xml = r#"<RegisterDescription><Enumeration Name="PixelFormat"><EnumEntry Name="Mono10g40IDS"><Value>0x4000000f</Value></EnumEntry><EnumEntry Name="Mono12g24IDS"><Value>0x4000001f</Value></EnumEntry><Value>0x4000000f</Value></Enumeration></RegisterDescription>"#;
+        let nodes = NodeMap::parse(xml).unwrap();
+        assert_eq!(
+            nodes.pixel_encodings("Other Manufacturer"),
+            [] as [PixelEncoding; 0]
+        );
+        assert_eq!(
+            nodes.pixel_encodings("IDS Imaging Development Systems GmbH"),
+            [
+                IdsPixelFormat::Mono10g40.encoding(None),
+                IdsPixelFormat::Mono12g24.encoding(None)
+            ]
+        );
+        for changed in [
+            xml.replace("<EnumEntry Name=\"Mono10g40IDS\">","<EnumEntry Name=\"Mono10g40IDS\"><Symbolic>WrongName</Symbolic>")
+                .replace("<EnumEntry Name=\"Mono12g24IDS\">","<EnumEntry Name=\"Mono12g24IDS\"><Symbolic>WrongName12</Symbolic>"),
+            xml.replace("Mono10g40IDS","WrongName").replace("Mono12g24IDS","WrongName12"),
+            xml.replace("0x4000000f","0x40000010").replace("0x4000001f","0x40000020"),
+            xml.replace("<Value>0x4000000f</Value>","<pValue>Code10</pValue>")
+                .replace("<Value>0x4000001f</Value>","<pValue>Code12</pValue>")
+                .replace("</RegisterDescription>","<Integer Name=\"Code10\"><Value>0x4000000f</Value></Integer><Integer Name=\"Code12\"><Value>0x4000001f</Value></Integer></RegisterDescription>"),
+        ] {
+            assert_eq!(NodeMap::parse(&changed).unwrap().pixel_encodings("IDS Imaging Development Systems GmbH"), [] as [PixelEncoding; 0]);
+        }
+    }
+    #[test]
+    fn ids_bayer_qualification_is_finite_literal_and_respects_symbolic_precedence() {
+        for format in IdsPixelFormat::ALL
+            .into_iter()
+            .filter(|format| !format.is_monochrome())
+        {
+            let name = format.name();
+            let code = format.code();
+            let xml = format!(
+                r#"<RegisterDescription><Enumeration Name="PixelFormat"><EnumEntry Name="PixelFormat_{name}"><Symbolic>{name}</Symbolic><Value>{code}</Value></EnumEntry><Value>{code}</Value></Enumeration></RegisterDescription>"#
+            );
+            let nodes = NodeMap::parse(&xml).unwrap();
+            assert_eq!(
+                nodes.pixel_encodings("IDS Imaging Development Systems GmbH"),
+                [format.encoding(None)]
+            );
+            assert_eq!(
+                nodes.pixel_encodings("Other Manufacturer"),
+                [] as [PixelEncoding; 0]
+            );
+            // Nested entries inherit their literal Name as Symbolic. A prefixed
+            // nested Name therefore needs an explicit unprefixed Symbolic.
+            let without_symbolic = xml.replace(&format!("<Symbolic>{name}</Symbolic>"), "");
+            assert_eq!(
+                NodeMap::parse(&without_symbolic)
+                    .unwrap()
+                    .pixel_encodings("IDS Imaging Development Systems GmbH"),
+                [] as [PixelEncoding; 0]
+            );
+            // The prefix fallback is for a top-level referenced EnumEntry whose
+            // Symbolic is absent, not for the parser's injected nested Symbolic.
+            let referenced = format!(
+                r#"<RegisterDescription><Enumeration Name="PixelFormat"><pEnumEntry>PixelFormat_{name}</pEnumEntry><Value>{code}</Value></Enumeration><EnumEntry Name="PixelFormat_{name}"><Value>{code}</Value></EnumEntry></RegisterDescription>"#
+            );
+            assert_eq!(
+                NodeMap::parse(&referenced)
+                    .unwrap()
+                    .pixel_encodings("IDS Imaging Development Systems GmbH"),
+                [format.encoding(None)]
+            );
+            for changed in [
+                xml.replace(
+                    &format!("<Value>{code}</Value>"),
+                    &format!("<Value>{}</Value>", code + 1),
+                ),
+                xml.replace(
+                    &format!("<Value>{code}</Value>"),
+                    "<pValue>Dynamic</pValue>",
+                ),
+                xml.replace(
+                    &format!("<Symbolic>{name}</Symbolic>"),
+                    "<Symbolic>OtherLayout</Symbolic>",
+                ),
+            ] {
+                assert_eq!(
+                    NodeMap::parse(&changed)
+                        .unwrap()
+                        .pixel_encodings("IDS Imaging Development Systems GmbH"),
+                    [] as [PixelEncoding; 0]
+                );
+            }
+        }
+        let xml = r#"<RegisterDescription><Enumeration Name="PixelFormat"><EnumEntry Name="Mono10g40IDS"><Value>0x4000000f</Value></EnumEntry><EnumEntry Name="Mono12g24IDS"><Value>0x4000001f</Value></EnumEntry><EnumEntry Name="BayerRG10g40IDS"><Value>0x40000001</Value></EnumEntry><EnumEntry Name="BayerRG12g24IDS"><Value>0x40000011</Value></EnumEntry><Value>0x40000001</Value></Enumeration></RegisterDescription>"#;
+        assert_eq!(
+            NodeMap::parse(xml)
+                .unwrap()
+                .pixel_encodings("IDS Imaging Development Systems GmbH"),
+            [
+                IdsPixelFormat::Mono10g40,
+                IdsPixelFormat::Mono12g24,
+                IdsPixelFormat::BayerRg10g40,
+                IdsPixelFormat::BayerRg12g24
+            ]
+            .map(|format| format.encoding(None))
         );
     }
 }

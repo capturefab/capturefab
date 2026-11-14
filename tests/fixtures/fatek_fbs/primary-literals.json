@@ -1,0 +1,111 @@
+{
+  "scope": "Independent hand literals before any product decoder. Actual official manual-character/hex-row evidence is separated from corrected or spec-derived vectors. No device captures, native/SDK execution, or runtime oracle claim.",
+  "manual": {
+    "url": "https://file.fatek.com/en/PLC/Document/Manual_2_en/Appendix1.pdf",
+    "bytes": 345918,
+    "sha256": "f0fc92cb3015c44373b2df9ed735eda8c36bcfdf7f99e8d69083d6f1e0a37018",
+    "printed_appendix": 1,
+    "qualification": "Actual direct official PDF/render verified; older mirror numbered the protocol Appendix2. These editions are not claimed byte-equivalent."
+  },
+  "published_command46": {
+    "printed_page": "Appendix1-12",
+    "qualification": "Both character diagram and underlying hex-byte row agree. Hand transcription of complete published request/reply, not a physical captured exchange.",
+    "request_hex": "02303134363033523030303132373503",
+    "request_ascii_body": "014603R00012",
+    "request_bytes": 16,
+    "request_additive_sum_before_mask": 629,
+    "request_checksum_ascii": "75",
+    "reply_hex": "023031343630313041353746433430303031383903",
+    "reply_ascii_body": "0146010A57FC40001",
+    "reply_bytes": 21,
+    "reply_additive_sum_before_mask": 905,
+    "reply_checksum_ascii": "89",
+    "expected_u16": [4261, 32708, 1]
+  },
+  "corrected_command44": {
+    "printed_page": "Appendix1-10",
+    "qualification": "Character labels4E/1E and additive rule agree, but the printed underlying E hex cells say44H(D). Corrected/spec-derived positive; not unchanged vendor hex bytes.",
+    "request_hex": "023031343430365830303530344503",
+    "request_ascii_body": "014406X0050",
+    "request_bytes": 15,
+    "request_additive_sum_before_mask": 590,
+    "request_checksum_ascii": "4E",
+    "reply_hex": "023031343430303130313130314503",
+    "reply_ascii_body": "01440010110",
+    "reply_bytes": 15,
+    "reply_additive_sum_before_mask": 542,
+    "reply_checksum_ascii": "1E",
+    "expected_bool": [false, true, false, true, true, false],
+    "unchanged_bad_printed_hex_row_request": "023031343430365830303530344403",
+    "unchanged_bad_printed_hex_row_reply": "023031343430303130313130314403"
+  },
+  "spec_derived_u32_endpoints": {
+    "qualification": "Not a vendor sample. Explicit DR00012/count02 native32 read; native hex values retained without underlying word-order or floating interpretation.",
+    "request_hex": "0230313436303244523030303132423803",
+    "request_ascii_body": "014602DR00012",
+    "request_bytes": 17,
+    "request_additive_sum_before_mask": 696,
+    "request_checksum_ascii": "B8",
+    "reply_hex": "02303134363046464646464646463830303030303030423503",
+    "reply_bytes": 25,
+    "reply_additive_sum_before_mask": 1205,
+    "reply_checksum_ascii": "B5",
+    "expected_u32": [4294967295, 2147483648],
+    "explicit_twos_complement_i32": [-1, -2147483648]
+  },
+  "spec_derived_error": {
+    "qualification": "Appendix1-2/3 says a nonzero error replaces all data. This is a constructed illegal-address response, not a vendor literal/capture.",
+    "reply_hex": "023031343641304503",
+    "reply_bytes": 9,
+    "error_ascii": "A",
+    "additive_sum_before_mask": 270,
+    "checksum_ascii": "0E"
+  },
+  "spec_derived_maxima": [
+    {
+      "command": "44",
+      "request_ascii": "\u0002014400X000043\u0003",
+      "count": 256,
+      "count_field_ascii": "00",
+      "reply_prefix_hex": "023031343430",
+      "reply_repeated_hex": "30",
+      "reply_repeat_count": 256,
+      "reply_suffix_hex": "464203",
+      "reply_bytes": 265,
+      "reply_additive_sum_before_mask": 12539,
+      "reply_checksum_ascii": "FB",
+      "expected_repeated_bool": false
+    },
+    {
+      "command": "46",
+      "native_bits": 16,
+      "request_ascii": "\u0002014640R0000073\u0003",
+      "count": 64,
+      "count_field_ascii": "40",
+      "reply_prefix_hex": "023031343630",
+      "reply_repeated_hex": "46",
+      "reply_repeat_count": 256,
+      "reply_suffix_hex": "464403",
+      "reply_bytes": 265,
+      "reply_additive_sum_before_mask": 18173,
+      "reply_checksum_ascii": "FD",
+      "expected_repeated_u16": 65535
+    },
+    {
+      "command": "46",
+      "native_bits": 32,
+      "request_ascii": "\u0002014620DR00000B5\u0003",
+      "count": 32,
+      "count_field_ascii": "20",
+      "reply_prefix_hex": "023031343630",
+      "reply_repeated_hex": "46",
+      "reply_repeat_count": 256,
+      "reply_suffix_hex": "464403",
+      "reply_bytes": 265,
+      "reply_additive_sum_before_mask": 18173,
+      "reply_checksum_ascii": "FD",
+      "expected_repeated_u32": 4294967295
+    }
+  ],
+  "limit_qualification": "265B bounds only the selected44/46 success replies; general FATEK data field is0..500ASCII. No global256B cap. Reply carries no address/count echo orTID, so request correlation cannot prove freshness or snapshots."
+}

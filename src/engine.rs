@@ -27,16 +27,27 @@ use std::{
 #[cfg(test)]
 use crate::session::LogEntry;
 use crate::session::{SessionCommand, WorkerSnapshot};
+mod action_key;
+mod chunks;
 mod emulated;
 pub(crate) mod events;
 mod history;
 pub(crate) mod inspector;
 mod lock;
+mod pinned;
+
+/// Strict advisory reservation for an explicit cold native network mutation.
+pub(crate) fn reserve_network_camera(id: &str) -> Result<lock::CameraLock> {
+    lock::reserve_network(id)
+}
+mod multipart;
 mod network_defaults;
 #[cfg(test)]
 mod network_tests;
+pub(crate) mod retirement;
 pub(crate) mod saved;
 mod saver;
+mod settings_change;
 use events::Events;
 use history::process;
 #[cfg(test)]
@@ -201,6 +212,8 @@ pub(crate) struct WorkerHandle {
     logins: crate::logins::Logins,
     /// The session this worker serves, which its camera lock names.
     session: Arc<str>,
+    /// The immutable first terminal cause of this exact worker binding.
+    retired: Arc<Mutex<Option<Value>>>,
     /// The lock of the camera it holds open.
     lock: Arc<Mutex<Option<lock::CameraLock>>>,
     /// Whether settings it emulates for its camera are kept for the next
@@ -293,6 +306,7 @@ impl WorkerHandle {
             names: Arc::default(),
             logins,
             session: session.into(),
+            retired: Arc::default(),
             lock: Arc::default(),
             keeps_settings: false,
             forward_baseline: Arc::default(),
@@ -569,13 +583,22 @@ fn timeout(ms: u64) -> Result<Duration> {
 /// Never a walk of every feature, which on `GigE` is hundreds of round trips:
 /// commands read what they need.
 fn refresh(h: &WorkerHandle, camera: Option<&Camera>) {
+    let retired = h
+        .retired
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some();
     let mut s = h
         .state
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     s.connected = camera.map(|c| c.info.clone());
     s.streaming = camera.is_some_and(Camera::is_streaming);
-    s.transport = camera.and_then(Camera::stats);
+    if let Some(camera) = camera {
+        s.transport = camera.stats();
+    } else if !retired {
+        s.transport = None;
+    }
 }
 fn release_auto(
     h: &WorkerHandle,
@@ -1026,10 +1049,14 @@ fn end_forward(
                 h.push_saved(
                     job,
                     saved::SavedFile {
+                        received_monotonic_ns: None,
+                        device_timestamp: None,
                         wall_ms: file.started_ms,
                         path: file.path,
                         bytes: file.bytes,
                         sha256: None,
+                        chunks: file.chunks,
+                        multipart: None,
                         context,
                         item: saved::SavedItem::Recording,
                     },
@@ -1052,8 +1079,20 @@ fn end_forward(
         let finished =
             summary.get("recording").is_some() && summary["recording"]["truncated"] != true;
         summary["finalized"] = json!(stopped.is_ok() && (!local || finished));
+        // The pipe writer can report an early fallback before FFmpeg's
+        // stderr arrives. Finalization collected that diagnostic; keep it
+        // beside the first cause without replacing its type or details.
+        let completed_error = cause.and_then(|primary| {
+            stopped
+                .as_ref()
+                .err()
+                .map(|completed| Forwarder::completed_error(primary, completed))
+        });
         let (status, error) = match (cause, &stopped) {
-            (Some(cause), _) => (ended.status(), Some(cause)),
+            (Some(cause), _) => (
+                ended.status(),
+                Some(completed_error.as_ref().unwrap_or(cause)),
+            ),
             (None, Err(error)) => (JobStatus::Failed, Some(error)),
             (None, Ok(_)) => (ended.status(), None),
         };
@@ -1219,6 +1258,7 @@ pub(crate) const ACQUISITION_FEATURES: &[&str] = &[
 /// scheduled shots at most once a second, with what auto exposure wrote since.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Acquisition {
+    transport: Option<crate::types::Transport>,
     vendor: String,
     model: String,
     pub(super) settings: serde_json::Map<String, Value>,
@@ -1250,6 +1290,7 @@ fn acquisition(c: &mut Camera) -> Acquisition {
         settings.insert(name.into(), value);
     }
     Acquisition {
+        transport: Some(c.info.transport),
         vendor: bounded(&c.info.vendor, 128),
         model: bounded(&c.info.model, 128),
         settings,
@@ -1305,10 +1346,29 @@ fn still_meta(
         "wall_ms": wall_ms,
         "width": frame.width,
         "height": frame.height,
-        "pixel_format": crate::frame::pixel_format_name(frame.pixel_format),
+        "pixel_format": crate::frame::frame_format_name(frame),
     });
-    if let Some(bits) = crate::frame::sample_bits(frame.pixel_format) {
+    if let Some(encoding) = frame.pixel_encoding {
+        meta["pixel_encoding"] = json!(encoding);
+    }
+    if let Some(chunks) = &frame.chunks {
+        meta["chunks"] = crate::types::without_nulls(
+            json!({"layout_id": chunks.layout_id,"count":chunks.entries.len(),"payload_bytes":chunks.payload_bytes,"descriptor_error":chunks.descriptor_error}),
+        );
+    }
+    if let Some(parts) = &frame.multipart {
+        meta["multipart"] = crate::types::without_nulls(
+            json!({"storage":parts.layout.storage(), "selected":parts.layout.selected, "count":parts.layout.parts.len(), "payload_bytes":parts.layout.payload_bytes, "byte_order":parts.layout.byte_order}),
+        );
+    }
+    if frame.multipart.is_some() && crate::frame::is_measurement_format(frame.pixel_format) {
+        meta["pfnc_code"] = json!(frame.pixel_format);
+    }
+    if let Some(bits) = crate::frame::frame_sample_bits(frame) {
         meta["bits"] = json!(bits);
+    }
+    if let Some(timestamp) = frame.device_timestamp {
+        meta["device_timestamp"] = json!(timestamp);
     }
     if let Some(device_ts_ns) = frame.device_ts_ns {
         meta["device_ts_ns"] = json!(device_ts_ns);
@@ -1325,6 +1385,12 @@ fn still_meta(
     meta
 }
 
+#[derive(Clone, Copy)]
+struct ArtifactReferences<T> {
+    chunks: Option<T>,
+    multipart: Option<T>,
+}
+
 /// Save `NAME.json` beside the raw file `path`: what reading its bytes back
 /// needs, as they carry nothing but the samples. When it cannot be saved,
 /// the raw file goes too: nothing reported it yet.
@@ -1335,22 +1401,80 @@ fn save_sidecar(
     acquisition: &Acquisition,
     sync: crate::storage::SyncMode,
     min_free: Option<u64>,
+    references: ArtifactReferences<&Value>,
 ) -> Result<()> {
+    crate::frame::validate_encoding(frame)?;
     let sidecar = crate::naming::sidecar(path);
     // A planar layout's rows are its planes', which say where each starts.
     let planes = crate::frame::planes(frame.pixel_format, frame.width, frame.height);
+    let normalized_coordinates = frame.multipart.is_some()
+        || acquisition.transport == Some(crate::types::Transport::GigE)
+        || (matches!(
+            frame.pixel_format,
+            crate::frame::COORD3D_AC16 | crate::frame::COORD3D_ABC16
+        ) && acquisition.transport == Some(crate::types::Transport::GenTl));
+    let sample_layout = match frame.pixel_format {
+        crate::frame::COORD3D_AC16 => Some(("uint16", &["A", "C"][..])),
+        crate::frame::COORD3D_ABC16 => Some(("uint16", &["A", "B", "C"][..])),
+        crate::frame::COORD3D_ABC32F => Some(("float32", &["A", "B", "C"][..])),
+        _ => None,
+    }
+    .filter(|_| {
+        normalized_coordinates
+            && crate::frame::frame_len(frame.pixel_format, frame.width, frame.height)
+                == Some(frame.data.len())
+    })
+    .map(|(sample_type, components)| {
+        json!({
+            "sample_type": sample_type,
+            "organization": "interleaved",
+            "components": components,
+            "byte_order": "little",
+        })
+    })
+    .or_else(|| {
+        // Qualified at ingress with little-endian evidence on both transports.
+        crate::frame::frame_lucid(frame)
+            .filter(|lucid| {
+                usize::try_from(frame.width)
+                    .ok()
+                    .and_then(|width| width.checked_mul(lucid.layout().0))
+                    .and_then(|row| row.checked_mul(usize::try_from(frame.height).ok()?))
+                    == Some(frame.data.len())
+            })
+            .map(|lucid| {
+                json!({"sample_type":"uint16", "organization":"interleaved",
+                "components":lucid.layout().1, "byte_order":"little",
+                "component_roles":{"A":"coordinate","B":"coordinate","C":"coordinate","Y":"intensity"},
+                "coordinate_codes":"unscaled; Scan3d scale and offset are not applied"})
+            })
+    })
+    .or_else(|| {
+        crate::frame::frame_encoding(frame).map(|ids| {
+            let (group_pixels, group_bytes) = ids.group();
+            json!({"sample_type":"unsigned", "significant_bits":ids.bits(),
+            "organization":if ids.is_monochrome() {"grouped_monochrome"} else {"grouped_bayer"},
+            "color_filter":ids.color_filter(),
+            "group_pixels":group_pixels, "group_bytes":group_bytes})
+        })
+    });
     let document = crate::types::without_nulls(json!({
-        "pixel_format": crate::inspect::pixel_format_label(frame.pixel_format),
-        "pfnc_code": frame.pixel_format,
+        "pixel_format": crate::inspect::frame_pixel_format_label(frame),
+        "pfnc_code": frame.pixel_encoding.is_none().then_some(frame.pixel_format),
+        "pixel_encoding": frame.pixel_encoding,
+        "sample_layout": sample_layout,
         "width": frame.width,
         "height": frame.height,
         "row_bytes": planes
             .is_none()
-            .then(|| crate::frame::row_bytes(frame.width, frame.pixel_format)),
+            .then(|| crate::frame::frame_row_bytes(frame)),
         "planes": planes,
         "bytes": frame.data.len(),
+        "chunks": references.chunks,
+        "multipart": references.multipart,
         "frame_id": (frame.id > 0).then_some(frame.id),
         "device_ts_ns": frame.device_ts_ns,
+        "device_timestamp": frame.device_timestamp,
         "time": crate::scheduling::rfc3339(wall_ms),
         "settings": saved::settings(&Value::Object(acquisition.settings.clone())),
     }));
@@ -1371,12 +1495,17 @@ fn image_file(
     passthrough: bool,
     wall_ms: u64,
     context: &crate::context::Context,
+    references: ArtifactReferences<Value>,
 ) -> saved::SavedFile {
     saved::SavedFile {
+        received_monotonic_ns: frame.received_monotonic_ns,
+        device_timestamp: frame.device_timestamp.map(Box::new),
         wall_ms,
         path: absolute_path(path),
         bytes: stored.bytes,
         sha256: stored.sha256.clone(),
+        chunks: references.chunks,
+        multipart: references.multipart.map(Box::new),
         context: context.clone(),
         item: saved::SavedItem::Capture {
             frame_id: frame.id,
@@ -1384,6 +1513,7 @@ fn image_file(
             width: frame.width,
             height: frame.height,
             pixel_format: frame.pixel_format,
+            pixel_encoding: frame.pixel_encoding,
             passthrough,
         },
     }
@@ -1398,11 +1528,35 @@ fn enter_auto(
     forwarder: Option<&(Forwarder, f64)>,
     jobs: &[Scheduled],
     job: Option<u64>,
+    part_selection: Option<crate::transport::multipart::PartSelection>,
 ) -> Result<Value> {
     let c = camera_mut(camera)?;
+    if let Some(selection) = part_selection {
+        selection.validate()?;
+        selection
+            .format
+            .validate_binding(selection.index, &c.info.id)?;
+        crate::transport::multipart::GvspPartFormat::validate_transport(c.info.transport)?;
+    }
+    if auto
+        .as_ref()
+        .is_some_and(|controller| controller.part_selection() != part_selection)
+    {
+        let previous = auto.take().context("existing auto controller")?;
+        let released = previous.release(c, false);
+        end_auto_job(h, JobStatus::Done);
+        h.state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .auto = None;
+        released?;
+    }
     let entered = auto.is_none();
     if entered {
-        let mut controller = AutoController::enter(c)?;
+        let mut controller = match part_selection {
+            Some(selection) => AutoController::enter_selected(c, selection)?,
+            None => AutoController::enter(c)?,
+        };
         controller.set_forward_fps(forwarder.map(|(_, fps)| *fps))?;
         *auto = Some(controller);
     }
@@ -1507,13 +1661,40 @@ fn process_plain(
         next_job,
         scheduled_stream,
     } = state;
+    let observed_forward = matches!(&command, WorkerCommand::ForwardObservedUntil { .. });
+    let first_arm_deadline_ns = match &command {
+        WorkerCommand::SessionUntil { deadline_ns, .. }
+        | WorkerCommand::ForwardObservedUntil { deadline_ns, .. } => Some(*deadline_ns),
+        _ => None,
+    };
     let command = match command {
+        WorkerCommand::WriteActionDeviceKeyUntil { key, deadline_ns } => {
+            return action_key::write(h, camera, auto, key, deadline_ns);
+        }
+        WorkerCommand::CheckConnection => {
+            return Ok(json!({"connected":camera_mut(camera)?.info}));
+        }
         WorkerCommand::OptimizeNetwork { bytes_per_second } => {
             return optimize_network(h, camera, forwarder.as_ref(), auto, jobs, bytes_per_second);
+        }
+        WorkerCommand::SessionUntil {
+            command,
+            deadline_ns,
+        }
+        | WorkerCommand::ForwardObservedUntil {
+            command,
+            deadline_ns,
+        } => {
+            pinned::check(h, deadline_ns)?;
+            command
         }
         WorkerCommand::Session(command) => command,
     };
     match command {
+        SessionCommand::WriteActionDeviceKey { .. } => Err(crate::types::Usage(
+            "action key requires an admitted absolute expiry".into(),
+        )
+        .into()),
         SessionCommand::Frame { .. } => {
             anyhow::bail!("frame requests are taken up by the camera thread's loop")
         }
@@ -1547,6 +1728,7 @@ fn process_plain(
             warmup_ms,
             job,
             copy,
+            timeline,
             ..
         } => {
             ensure!(
@@ -1563,6 +1745,7 @@ fn process_plain(
                 bitrate,
                 max_file_bytes,
                 min_free,
+                timeline,
             };
             config.validate()?;
             let named = crate::media::is_recording(&output)
@@ -1601,12 +1784,32 @@ fn process_plain(
                 (None, None) => Forwarder::new(config)?,
             };
             let f_path = f.recording_path().map(|p| absolute_path(&p));
+            let ownership = if observed_forward {
+                let number = job.filter(|number| *number > 0).ok_or_else(|| {
+                    crate::types::Usage("observed Forward needs an assigned job".into())
+                })?;
+                let index = f
+                    .owned_timeline_path()
+                    .context("observed Forward did not create an index")?;
+                Some((
+                    number,
+                    absolute_path(index),
+                    f_path
+                        .clone()
+                        .context("observed Forward has no local recording path")?,
+                ))
+            } else {
+                None
+            };
             let c = camera_mut(camera)?;
             // A file's frames wait for the encoder: it records every one.
             if c.frames_wait() {
                 f.wait_for_writer();
             }
             let was_streaming = c.is_streaming();
+            if let Some(deadline_ns) = first_arm_deadline_ns {
+                pinned::check(h, deadline_ns)?;
+            }
             c.start()?;
             // A camera this started streams only while something needs its
             // frames: once the recording ends, the jobs' stream lets it go,
@@ -1623,12 +1826,15 @@ fn process_plain(
             } else {
                 warm_up(h, c, auto, warmup_ms)?
             };
+            if observed_forward && let Some(a) = auto.as_mut() {
+                a.set_forward_fps(Some(fps))?;
+            }
             *forwarder = Some((f, fps));
             *h.forward_baseline
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) =
                 Some(Baseline::with(h, c.stats()));
-            if let Some(a) = auto.as_mut() {
+            if !observed_forward && let Some(a) = auto.as_mut() {
                 a.set_forward_fps(Some(fps))?;
             }
             refresh(h, camera.as_ref());
@@ -1677,6 +1883,14 @@ fn process_plain(
                         context,
                     });
             }
+            if let Some((job, index_path, output_path)) = ownership {
+                h.events.emit(Output::IndexOwned {
+                    job,
+                    forwarding_id,
+                    index_path,
+                    output_path,
+                });
+            }
             Ok(value)
         }
         SessionCommand::Connect {
@@ -1692,11 +1906,19 @@ fn process_plain(
                 ));
             }
             let duration = timeout(timeout_ms)?;
+            let monitor = crate::transport::gige::monitor::is_selector(&selector);
+            let selector = if monitor {
+                crate::transport::gige::monitor::MonitorSpec::parse(&selector)?.canonical()
+            } else {
+                selector
+            };
             // Each worker opens one camera, so it has discovered nothing yet.
             // A selector that says what it opens never waits for discovery;
             // a serial, name or model is looked up.
             let mut known = Vec::new();
-            if !selector.starts_with("sim:")
+            if !monitor
+                && !selector.starts_with("sim:")
+                && !selector.starts_with("gentl:")
                 && !crate::media::is_source(&selector)
                 && !crate::onvif::is_source(&selector)
                 && !crate::camera::needs_no_discovery(&selector)
@@ -1780,7 +2002,7 @@ fn process_plain(
             }
             // A device camera is locked to this worker before it opens, so
             // a second owner learns who holds it.
-            let (opened, lock) = if crate::onvif::is_source(&selector) {
+            let (opened, lock) = if monitor || crate::onvif::is_source(&selector) {
                 let opened = Camera::open_with_login(&selector, &known, duration, login.as_ref())?;
                 (opened, None)
             } else {
@@ -1800,7 +2022,8 @@ fn process_plain(
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = lock;
             // The settings an earlier worker emulated for this camera, as a
             // real camera keeps its own.
-            if h.keeps_settings
+            if !monitor
+                && h.keeps_settings
                 && let Some(c) = camera.as_mut()
                 && let Some(saved) = emulated::load(&c.info.id)
                 && let Err(error) = c.restore_settings(&saved)
@@ -1944,6 +2167,29 @@ fn process_plain(
             )?)?)
         }
         SessionCommand::Xml => Ok(json!({"xml":camera_mut(camera)?.xml()})),
+        SessionCommand::ReadRegister { name, timeout_ms } => {
+            if !name.bank.is_empty()
+                && let Some(a) = auto.as_mut()
+            {
+                a.invalidate();
+            }
+            camera_mut(camera)?.read_register_feature(&name, Duration::from_millis(timeout_ms))
+        }
+        SessionCommand::WriteRegister {
+            name,
+            hex,
+            timeout_ms,
+        } => {
+            if let Some(a) = auto.as_mut() {
+                a.invalidate();
+            }
+            let bytes = crate::types::decode_hex(&hex, 65536)?;
+            camera_mut(camera)?.write_register_feature(
+                &name,
+                &bytes,
+                Duration::from_millis(timeout_ms),
+            )
+        }
         SessionCommand::ReadMemory { address, length } => {
             ensure!(
                 (1..=65536).contains(&length),
@@ -1970,6 +2216,8 @@ fn process_plain(
             count,
             timeout_ms,
             format,
+            part_format,
+            part_index,
             first_at_ms,
             interval_ms,
             on_exists,
@@ -1997,13 +2245,32 @@ fn process_plain(
                 "capture schedule queue is full (32 active jobs)"
             );
             crate::scheduling::validate_schedule(first_at_ms, interval_ms, count)?;
+            if let Some(selection) = part_format {
+                let c = camera_mut(camera)?;
+                crate::transport::multipart::GvspPartFormat::validate_index(
+                    part_index,
+                    Some(selection),
+                )?;
+                crate::transport::multipart::GvspPartFormat::validate_transport(c.info.transport)?;
+                selection.validate_binding(part_index, &c.info.id)?;
+            }
+            let info = &camera_mut(camera)?.info;
             if let Some(manifest) = &manifest {
-                check_manifest(&output, count, &format, Path::new(manifest))?;
+                check_manifest(
+                    &output,
+                    count,
+                    &format,
+                    Path::new(manifest),
+                    if info.transport == crate::types::Transport::GenTl && part_format.is_none() {
+                        Some(crate::transport::multipart::PartTypeNamespace::GenDc)
+                    } else {
+                        part_format.map(|_| crate::transport::multipart::PartTypeNamespace::Gvsp)
+                    },
+                )?;
             }
             let manifest = manifest
                 .map(|path| saved::Manifest::open(Path::new(&path)).map(Arc::new))
                 .transpose()?;
-            let info = &camera_mut(camera)?.info;
             let label = crate::naming::camera_name(info);
             let source = Source {
                 id: info.id.as_str().into(),
@@ -2027,6 +2294,8 @@ fn process_plain(
                 id,
                 status: CaptureStatus::Pending,
                 output: output.clone(),
+                part_format,
+                part_index,
                 count,
                 captured: 0,
                 skipped: 0,
@@ -2049,15 +2318,21 @@ fn process_plain(
                 settled: None,
                 ..Default::default()
             };
+            if part_format.is_some() {
+                camera_mut(camera)?.enable_multipart_projection()?;
+            }
             jobs.push(Scheduled {
                 info: info.clone(),
                 plan: crate::naming::Plan::new(&output, count, &format),
+                first_arm_deadline_ns,
                 timeout_ms,
                 wait: Duration::ZERO,
                 fresh,
                 warmup_ms,
                 inspect,
                 format,
+                part_format,
+                part_index,
                 sync,
                 min_free,
                 manifest,
@@ -2088,9 +2363,18 @@ fn process_plain(
             job,
             region,
             max_exposure_us,
+            part_selection,
             ..
         } => {
-            let entered = enter_auto(h, camera, auto, forwarder.as_ref(), jobs, job)?;
+            let entered = enter_auto(
+                h,
+                camera,
+                auto,
+                forwarder.as_ref(),
+                jobs,
+                job,
+                part_selection,
+            )?;
             if let (Some(controller), Some(c)) = (auto.as_mut(), camera.as_mut()) {
                 controller.set_limits(c, region, max_exposure_us)?;
             }
@@ -2223,13 +2507,28 @@ fn process_plain(
                 };
                 let status = auto.as_ref().map(|a| a.status().clone());
                 let settings = acquisition(c);
+                crate::frame::validate_encoding(&frame)?;
                 let mut metadata = serde_json::to_value(&frame)?;
                 metadata["pixel_format_name"] =
-                    json!(crate::inspect::pixel_format_label(frame.pixel_format));
+                    json!(crate::inspect::frame_pixel_format_label(&frame));
                 metadata["bytes"] = json!(frame.data.len());
                 if !settings.settings.is_empty() {
                     metadata["settings"] = Value::Object(settings.settings);
                 }
+                ensure!(
+                    frame.multipart.is_none(),
+                    crate::types::Categorized::error(
+                        crate::types::ErrorKind::Unsupported,
+                        "multipart components require a local still capture path for all companion data"
+                    )
+                );
+                ensure!(
+                    frame.chunks.is_none(),
+                    crate::types::Categorized::error(
+                        crate::types::ErrorKind::Unsupported,
+                        "camera chunk payloads require a local capture path for companion artifacts",
+                    )
+                );
                 let image = crate::frame::encode_parts(&frame, &format, quality, None)?;
                 h.write_stdout(stdout.as_deref(), &image)?;
                 metadata["file_bytes"] = json!(image.len());
@@ -2293,6 +2592,9 @@ struct Source {
 struct Scheduled {
     info: crate::scheduling::CaptureJob,
     plan: crate::naming::Plan,
+    // Pinned source admission only: cleared after its first frame request.
+    // Later per-frame waits retain the existing schedule semantics.
+    first_arm_deadline_ns: Option<u64>,
     /// The frame wait asked for; 0 for the camera's default.
     timeout_ms: u64,
     /// The frame wait of the frame being requested.
@@ -2304,6 +2606,8 @@ struct Scheduled {
     /// Inspect its last frame.
     inspect: bool,
     format: String,
+    part_format: Option<crate::transport::multipart::GvspPartFormat>,
+    part_index: Option<u32>,
     sync: crate::storage::SyncMode,
     /// The client's own free-space floor.
     min_free: Option<u64>,
@@ -2499,6 +2803,8 @@ impl Scheduled {
             plan: self.plan.clone(),
             on_exists: self.on_exists,
             format: self.format.clone(),
+            part_format: self.part_format,
+            part_index: self.part_index,
             quality: self.quality,
             sync: self.sync,
             min_free: self.min_free,
@@ -2738,6 +3044,20 @@ fn cancel_jobs(jobs: &mut [Scheduled], status: CaptureStatus) {
         j.deadline = None;
     }
 }
+/// Acquisition stopped while these jobs still needed frames. Keep its actual
+/// cause rather than replacing it later with a frame-wait timeout. Jobs whose
+/// frames are already with the saver can still finish, and future jobs can
+/// start a new acquisition after the camera's settings have changed.
+fn fail_acquiring_jobs(jobs: &mut [Scheduled], error: &anyhow::Error) {
+    for job in jobs
+        .iter_mut()
+        .filter(|job| job.info.status == CaptureStatus::Running && job.wants())
+    {
+        job.info.end(CaptureStatus::Failed, Some(error));
+        job.deadline = None;
+        job.warm = None;
+    }
+}
 /// Finished jobs whose file lists are kept; older ones keep their counts
 /// and last file, so every status stays small.
 const LISTED_FINISHED_JOBS: usize = 8;
@@ -2848,6 +3168,9 @@ fn tick_jobs(
                 job.baseline = Some(Baseline::with(h, camera.as_ref().and_then(Camera::stats)));
             }
             let result = (|| -> Result<bool> {
+                if let Some(deadline_ns) = job.first_arm_deadline_ns {
+                    pinned::check(h, deadline_ns)?;
+                }
                 let c = camera_mut(camera)?;
                 let stopped = !c.is_streaming();
                 if stopped {
@@ -2881,7 +3204,11 @@ fn tick_jobs(
                 } else {
                     Some(job.allocate(&h.names, None)?)
                 };
+                if let Some(deadline_ns) = job.first_arm_deadline_ns {
+                    pinned::check(h, deadline_ns)?;
+                }
                 c.request_frame()?;
+                job.first_arm_deadline_ns = None;
                 job.trigger = c.software_triggered().then(|| TriggerWait {
                     lost: losses(c),
                     retries: 0,
@@ -3184,6 +3511,7 @@ fn finish(h: &WorkerHandle, job: &mut Scheduled, index: u32, result: Result<save
                 info.first_ms = Some(shot.wall_ms);
                 info.first_id = Some(shot.id);
                 info.first_ts_ns = shot.device_ts_ns;
+                info.first_device_timestamp = shot.device_timestamp;
                 info.settings = shot.settings;
             }
             info.last_ms = Some(shot.wall_ms);
@@ -3391,6 +3719,12 @@ fn warm_up(
     auto: &mut Option<AutoController>,
     limit_ms: Option<u64>,
 ) -> Result<Option<Warmup>> {
+    if c.is_read_only_monitor() {
+        if limit_ms.is_some_and(|ms| ms > 0) {
+            return Err(crate::session::monitor::unsupported());
+        }
+        return Ok(None);
+    }
     let limit = Duration::from_millis(limit_ms.unwrap_or(crate::session::DEFAULT_WARMUP_MS));
     // A triggered camera sends nothing to meter between triggers.
     if limit.is_zero()
@@ -3409,7 +3743,13 @@ fn warm_up(
             break false;
         };
         h.count_frame(&frame);
-        // A frame that cannot be measured cannot say it is unsettled.
+        // Exposure warm-up requires an intensity signal.
+        if crate::frame::selection_required(&frame)
+            || crate::frame::is_measurement_frame(&frame)
+            || crate::frame::is_unclassified_mono16(&frame)
+        {
+            return Ok(None);
+        }
         let Ok(exposure) = crate::frame::exposure(&frame) else {
             break true;
         };
@@ -3443,15 +3783,28 @@ pub(crate) fn unsettled_warning(warmup_ms: u64) -> String {
 /// Frame `index`'s name under an output whose names are known in advance.
 /// A folder's names depend on the camera and the time, so they never are:
 /// its frames are in the folder.
-/// Refuse a manifest that is one of the capture's own files, or a raw
-/// file's sidecar: opened first, it would take that name.
-fn check_manifest(output: &str, count: u32, format: &str, manifest: &Path) -> Result<()> {
+/// Reserve static image and companion names before opening the manifest.
+fn check_manifest(
+    output: &str,
+    count: u32,
+    format: &str,
+    manifest: &Path,
+    companion: Option<crate::transport::multipart::PartTypeNamespace>,
+) -> Result<()> {
     if !crate::naming::Plan::new(output, count, format).is_static() {
         return Ok(());
     }
     for index in 0..count {
         let path = output_path(output, count, index, format);
-        if manifest == path || (format == "raw" && manifest == crate::naming::sidecar(&path)) {
+        let container_collision = companion.is_some_and(|namespace| {
+            let gendc = namespace == crate::transport::multipart::PartTypeNamespace::GenDc;
+            let container = crate::naming::multipart_payload(&path, gendc);
+            manifest == container || manifest == crate::naming::sidecar(&container)
+        });
+        if manifest == path
+            || (format == "raw" && manifest == crate::naming::sidecar(&path))
+            || container_collision
+        {
             return Err(crate::types::Categorized::new(
                 crate::types::ErrorKind::Usage,
                 format!(
@@ -3667,8 +4020,34 @@ fn worker(h: &WorkerHandle) {
     let mut inspector = inspector::Inspector::default();
     // The emulated settings last kept for the next worker.
     let mut kept: Option<Value> = None;
+    // Every entry point observes the same sticky non-I/O transport state.
+    // The gate also catches failures consumed by auto, settings and inspections.
+    macro_rules! check_retirement {
+        ($observed:expr) => {{
+            let retired = retirement::check(
+                h,
+                CommandState {
+                    camera: &mut camera,
+                    forwarder: &mut forwarder,
+                    auto: &mut auto,
+                    jobs: &mut jobs,
+                    next_job: &mut next_job,
+                    scheduled_stream: &mut scheduled_stream,
+                },
+                &mut inspector,
+                $observed,
+            );
+            if retired {
+                settings.invalidate();
+                reconnecting = false;
+                auto_moving = false;
+            }
+            retired
+        }};
+    }
     while !h.quitting.load(Ordering::Acquire) {
         h.beat();
+        check_retirement!(None);
         let receiving = camera.as_ref().is_some_and(Camera::is_streaming);
         let wait = if receiving {
             Duration::ZERO
@@ -3677,14 +4056,67 @@ fn worker(h: &WorkerHandle) {
         };
         if let Some(e) = h.next_request(wait) {
             h.beat();
+            // Ownership may have expired while waiting for this request.
+            check_retirement!(None);
             if let Some(id) = e.id {
                 h.events.emit(Output::Started {
                     id,
                     budget_ms: e.command.budget_ms(),
                 });
             }
+            if let Some(error) = retirement::admission(h, &e.command) {
+                *h.running
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                (e.reply)(Err(error));
+                // Rejecting old queued work must not starve completed owned saves.
+                if saved(h, &mut jobs, &saver) {
+                    jobs_changed(h, camera.as_ref(), &mut jobs);
+                }
+                h.beat();
+                continue;
+            }
+            if let WorkerCommand::WriteActionDeviceKeyUntil { deadline_ns, .. } = &e.command
+                && let Err(error) = action_key::check(h, *deadline_ns)
+            {
+                *h.running
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                (e.reply)(Err(error));
+                h.beat();
+                continue;
+            }
+            if let WorkerCommand::SessionUntil { deadline_ns, .. }
+            | WorkerCommand::ForwardObservedUntil { deadline_ns, .. } = &e.command
+                && let Err(error) = pinned::check(h, *deadline_ns)
+            {
+                *h.running
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                (e.reply)(Err(error));
+                // An expired source admission must not starve owned results.
+                if saved(h, &mut jobs, &saver) {
+                    jobs_changed(h, camera.as_ref(), &mut jobs);
+                }
+                h.beat();
+                continue;
+            }
+            if camera.as_ref().is_some_and(Camera::is_read_only_monitor)
+                && let Err(error) = crate::session::monitor::validate_worker(&e.command)
+            {
+                *h.running
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                (e.reply)(Err(error));
+                if saved(h, &mut jobs, &saver) {
+                    jobs_changed(h, camera.as_ref(), &mut jobs);
+                }
+                h.beat();
+                continue;
+            }
             if let Some(request) = inspector::Request::of(&e.command) {
                 inspector.begin(h, &mut camera, &mut auto, e, request, &mut scheduled_stream);
+                check_retirement!(None);
                 *h.running
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
@@ -3695,22 +4127,13 @@ fn worker(h: &WorkerHandle) {
                 settle_saves(h, &mut saver, &mut jobs);
                 keep_settings(h, &mut camera, &mut kept);
             }
-            let changes = e.command.changes_settings();
-            if changes || matches!(e.command.session(), Some(SessionCommand::SetValues { .. })) {
-                end_linger(
-                    &mut camera,
-                    &mut scheduled_stream,
-                    &jobs,
-                    forwarder.is_some(),
-                );
-            }
-            // Whether the frames in flight before the change were sent
-            // without a software trigger.
-            let was_software = changes
-                && camera
-                    .as_mut()
-                    .is_some_and(|c| c.is_streaming() && c.software_triggered());
-            let connects = matches!(e.command.session(), Some(SessionCommand::Connect { .. }));
+            let camera_effects = settings_change::Effects::of(&e.command);
+            let was_software = camera_effects.before(
+                &mut camera,
+                &mut scheduled_stream,
+                &jobs,
+                forwarder.is_some(),
+            );
             let result = process(
                 h,
                 CommandState {
@@ -3723,19 +4146,14 @@ fn worker(h: &WorkerHandle) {
                 },
                 e.command,
             );
+            check_retirement!(result.as_ref().err());
             *h.running
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             if let Err(err) = &result {
                 h.log("error", format!("{err:#}"));
             }
-            // Even a change that failed and was put back wrote the camera.
-            if changes && let Some(c) = camera.as_mut() {
-                settings_changed(c, was_software);
-                keep_settings(h, &mut camera, &mut kept);
-            } else if connects {
-                kept = camera.as_mut().and_then(Camera::emulated_settings);
-            }
+            camera_effects.after(h, &mut camera, &mut kept, was_software);
             (e.reply)(result);
             h.beat();
             // Any command can connect, reconnect or change a feature.
@@ -3778,8 +4196,10 @@ fn worker(h: &WorkerHandle) {
         {
             publish_auto(h, controller);
         }
+        check_retirement!(None);
         sync_stream(h, camera.as_ref());
         sync_forwarding_progress(h, forwarder.as_ref(), &mut progress_sampler, Instant::now());
+        let mut acquisition_error = None;
         if let Some(c) = camera.as_mut().filter(|c| c.is_streaming()) {
             let asked = Instant::now();
             match c.next_frame(Duration::from_millis(100)) {
@@ -3794,7 +4214,11 @@ fn worker(h: &WorkerHandle) {
                         controller.observe(&frame, Instant::now());
                     }
                     let settled = auto.as_ref().is_none_or(AutoController::converged);
-                    let room = saver.has_room(frame.data.len());
+                    let room = saver.has_room(saver::frame_bytes(&frame, || {
+                        jobs.iter().any(|job| {
+                            job.info.active() && job.deadline.is_some() && job.part_format.is_some()
+                        })
+                    }));
                     // Auto exposure moved the camera until now: read what it
                     // left once, for the shots to come.
                     if settled && std::mem::take(&mut auto_moving) {
@@ -3877,6 +4301,9 @@ fn worker(h: &WorkerHandle) {
                         }
                         refresh(h, camera.as_ref());
                     }
+                    None if crate::transport::gige::ownership_retired(&e) => {
+                        acquisition_error = Some(e);
+                    }
                     None if timed_out(&e) => {
                         // A source that fails fast must not turn this loop
                         // into a spin.
@@ -3885,27 +4312,25 @@ fn worker(h: &WorkerHandle) {
                         }
                     }
                     None => {
+                        let unsupported =
+                            crate::types::classify(&e).kind == crate::types::ErrorKind::Unsupported;
                         consecutive_errors += 1;
                         h.counters.dropped.fetch_add(1, Ordering::Relaxed);
                         if consecutive_errors == 1 {
                             h.log("warn", format!("{e:#}"));
                         }
-                        if consecutive_errors >= 10 {
+                        if unsupported || consecutive_errors >= 10 {
                             let _ = c.stop();
-                            h.log(
-                                "error",
-                                "Acquisition stopped after repeated transport errors".into(),
-                            );
+                            let e = if unsupported {
+                                e.context("acquisition stopped")
+                            } else {
+                                e.context("acquisition stopped after repeated transport errors")
+                            };
+                            h.log("error", format!("{e:#}"));
                             if forwarder.is_some() {
-                                forward_failed(
-                                    h,
-                                    &mut forwarder,
-                                    &mut auto,
-                                    &e.context(
-                                        "acquisition stopped after repeated transport errors",
-                                    ),
-                                );
+                                forward_failed(h, &mut forwarder, &mut auto, &e);
                             }
+                            acquisition_error = Some(e);
                             refresh(h, camera.as_ref());
                         }
                     }
@@ -3921,6 +4346,19 @@ fn worker(h: &WorkerHandle) {
         } else if std::mem::take(&mut reconnecting) {
             // Stopped or disconnected while the stream was being reopened.
             forget_lost(h);
+        }
+        check_retirement!(acquisition_error.as_ref());
+        if let Some(error) =
+            acquisition_error.filter(|error| !crate::transport::gige::ownership_retired(error))
+        {
+            fail_acquiring_jobs(&mut jobs, &error);
+            let wire = crate::session::protocol::wire_error(&error);
+            inspector.expire(
+                h,
+                &mut camera,
+                Some(&|| crate::session::protocol::from_wire(&wire)),
+            );
+            jobs_changed(h, camera.as_ref(), &mut jobs);
         }
     }
     // Shutting down: the shots with the saver are finished and reported,
@@ -3944,6 +4382,163 @@ fn worker(h: &WorkerHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qualified_lucid_abcy16_sidecar_names_four_unscaled_words() {
+        use crate::{frame, storage, types::LucidPixelFormat};
+
+        let directory = tempfile::tempdir().unwrap();
+        let raw: Vec<u8> = [
+            0x1234_u16, 0x8000, 0xfffe, 0x0001, 0xffff, 0, 0xabcd, 0x7f00,
+        ]
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+        let frame = Frame {
+            pixel_encoding: Some(LucidPixelFormat::Coord3dAbcy16.encoding(None)),
+            width: 2,
+            height: 1,
+            pixel_format: 0x8240_0403,
+            data: raw.clone().into(),
+            ..Default::default()
+        };
+        let path = directory.path().join("cloud.raw");
+        let encoded = frame::encode_parts(&frame, "raw", None, None).unwrap();
+        storage::save_parts(
+            &encoded.parts(),
+            &path,
+            storage::SyncMode::Off,
+            Some(0),
+            false,
+        )
+        .unwrap();
+        save_sidecar(
+            &path,
+            &frame,
+            0,
+            &Acquisition {
+                transport: Some(crate::types::Transport::GigE),
+                ..Default::default()
+            },
+            storage::SyncMode::Off,
+            Some(0),
+            ArtifactReferences {
+                chunks: None,
+                multipart: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), raw);
+        let meta: Value =
+            serde_json::from_slice(&std::fs::read(crate::naming::sidecar(&path)).unwrap()).unwrap();
+        assert_eq!(meta.get("pfnc_code"), None);
+        assert_eq!(
+            meta["pixel_encoding"],
+            json!({"namespace":"lucid","name":"Coord3D_ABCY16","code":0x8240_0403_u32})
+        );
+        assert_eq!(
+            meta["sample_layout"]["components"],
+            json!(["A", "B", "C", "Y"])
+        );
+        assert_eq!(meta["sample_layout"]["sample_type"], "uint16");
+        assert_eq!(meta["sample_layout"]["byte_order"], "little");
+        assert_eq!(meta["sample_layout"]["component_roles"]["Y"], "intensity");
+        assert_eq!(meta["row_bytes"], 16);
+        assert_eq!(meta["pixel_format"], "Coord3D_ABCY16");
+        assert_eq!(
+            frame::bit_depth_with_encoding(frame.pixel_format, frame.pixel_encoding, "raw"),
+            (16, None)
+        );
+    }
+
+    #[test]
+    fn native_coord3d_raw_sidecar_describes_exact_interleaved_words() {
+        use crate::{camera_profile::CameraKind, frame, inspect, storage, types::Transport};
+
+        let directory = tempfile::tempdir().unwrap();
+        let raw: Vec<u8> = [0x7eff_ffffu32, 0x8000_0000, 0x7fc0_2345]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let frame = Frame {
+            pixel_encoding: None,
+            width: 1,
+            height: 1,
+            pixel_format: frame::COORD3D_ABC32F,
+            data: raw.clone().into(),
+            ..Default::default()
+        };
+        for (transport, name) in [(Some(Transport::GigE), "native"), (None, "unknown")] {
+            let path = directory.path().join(format!("{name}.raw"));
+            let encoded = frame::encode_parts(&frame, "raw", None, None).unwrap();
+            storage::save_parts(
+                &encoded.parts(),
+                &path,
+                storage::SyncMode::Off,
+                Some(0),
+                false,
+            )
+            .unwrap();
+            save_sidecar(
+                &path,
+                &frame,
+                0,
+                &Acquisition {
+                    transport,
+                    ..Default::default()
+                },
+                storage::SyncMode::Off,
+                Some(0),
+                ArtifactReferences {
+                    chunks: None,
+                    multipart: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), raw);
+            let meta: Value =
+                serde_json::from_slice(&std::fs::read(crate::naming::sidecar(&path)).unwrap())
+                    .unwrap();
+            assert_eq!(meta["pfnc_code"], frame::COORD3D_ABC32F);
+            assert_eq!(meta["row_bytes"], 12);
+            assert_eq!(meta["bytes"], 12);
+            if transport.is_some() {
+                assert_eq!(
+                    meta["sample_layout"],
+                    json!({
+                        "sample_type": "float32",
+                        "organization": "interleaved",
+                        "components": ["A", "B", "C"],
+                        "byte_order": "little",
+                    })
+                );
+            } else {
+                assert!(meta.get("sample_layout").is_none());
+            }
+        }
+        let inspection = inspect::inspect(
+            &frame,
+            CameraKind::AreaScan,
+            None,
+            0,
+            inspect::PreviewFormat::Auto,
+        )
+        .unwrap();
+        assert!(inspection.image.is_none());
+        assert!(
+            inspection.measurements.exposure.is_none() && inspection.measurements.focus.is_none()
+        );
+        assert!(crate::auto::meter(&frame).is_none());
+        for format in ["png", "jpeg"] {
+            let Err(error) = frame::encode_parts(&frame, format, None, None) else {
+                panic!("coordinate words must not be encoded as {format}");
+            };
+            assert_eq!(
+                crate::types::classify(&error).kind,
+                crate::types::ErrorKind::Unsupported
+            );
+        }
+    }
 
     #[test]
     fn frame_rates_use_device_time_only_for_an_increasing_frame_pair() {
@@ -4103,6 +4698,8 @@ mod tests {
             count,
             timeout_ms: 100,
             format: format.into(),
+            part_format: None,
+            part_index: None,
             first_at_ms: crate::scheduling::now_ms() + 60_000,
             interval_ms: 1000,
             on_exists: crate::naming::OnExists::default(),
@@ -4173,6 +4770,7 @@ mod tests {
             job: None,
             lease: false,
             copy: crate::media::StreamCopy::default(),
+            timeline: None,
             warmup_ms: None,
         };
         let mut paths = Vec::new();
@@ -4208,6 +4806,7 @@ mod tests {
             job: None,
             lease: false,
             copy: crate::media::StreamCopy::default(),
+            timeline: None,
             warmup_ms: None,
         }
     }
@@ -4684,6 +5283,8 @@ mod tests {
             count,
             timeout_ms: 1000,
             format: "raw".into(),
+            part_format: None,
+            part_index: None,
             first_at_ms: 0,
             interval_ms: 0,
             on_exists,
@@ -4781,6 +5382,7 @@ mod tests {
                 job: None,
                 lease: false,
                 copy: crate::media::StreamCopy::default(),
+                timeline: None,
                 warmup_ms: None,
             })
             .unwrap_err();
@@ -4862,6 +5464,8 @@ mod tests {
                 count: 3,
                 timeout_ms: 1000,
                 format: "raw".into(),
+                part_format: None,
+                part_index: None,
                 first_at_ms: 0,
                 interval_ms: 10,
                 on_exists: crate::naming::OnExists::default(),
@@ -4941,8 +5545,11 @@ mod tests {
                 ..Default::default()
             },
             plan: crate::naming::Plan::new(&output, 2, "raw"),
+            first_arm_deadline_ns: None,
             timeout_ms: 1000,
             format: "raw".into(),
+            part_format: None,
+            part_index: None,
             sync: crate::storage::SyncMode::default(),
             manifest: None,
             source: Source::default(),
@@ -4971,17 +5578,45 @@ mod tests {
             inspect: false,
         }
     }
+    #[test]
+    fn acquisition_failure_keeps_its_reason_for_jobs_waiting_for_frames() {
+        let dir = Path::new("/tmp/capturefab-acquisition-failure");
+        let mut waiting = armed(1, dir);
+        waiting.warm = Some(Instant::now() + Duration::from_secs(1));
+        let mut saving = armed(2, dir);
+        saving.saving = saving.info.count;
+        let mut future = armed(3, dir);
+        future.info.status = CaptureStatus::Pending;
+        future.deadline = None;
+        let mut jobs = vec![waiting, saving, future];
+        let error = crate::types::Categorized::error(
+            crate::types::ErrorKind::Unsupported,
+            "multipart image payload is unsupported",
+        );
+        fail_acquiring_jobs(&mut jobs, &error);
+        assert_eq!(jobs[0].info.status, CaptureStatus::Failed);
+        assert_eq!(jobs[0].info.error_tag.as_ref().unwrap().code, "unsupported");
+        assert!(jobs[0].info.error.as_ref().unwrap().contains("multipart"));
+        assert!(jobs[0].deadline.is_none() && jobs[0].warm.is_none());
+        assert_eq!(jobs[1].info.status, CaptureStatus::Running);
+        assert_eq!(jobs[2].info.status, CaptureStatus::Pending);
+    }
     /// What the saver reports for a shot it wrote to `save.path`.
     fn written(shot: &saver::Shot, save: &saver::Save) -> saver::Written {
         let path = save.path.to_string_lossy().into_owned();
         saver::Written {
             file: saved::SavedFile {
+                received_monotonic_ns: None,
+                device_timestamp: None,
                 wall_ms: shot.wall_ms,
                 path: path.clone(),
                 bytes: 64,
                 sha256: None,
+                chunks: None,
+                multipart: None,
                 context: BTreeMap::new(),
                 item: saved::SavedItem::Capture {
+                    pixel_encoding: None,
                     frame_id: shot.frame.id,
                     device_ts_ns: shot.frame.device_ts_ns,
                     width: 8,
@@ -4994,12 +5629,14 @@ mod tests {
             shot: saver::SavedShot {
                 path,
                 frame: crate::scheduling::JobFrame {
+                    pixel_encoding: None,
                     width: 8,
                     height: 8,
                     pixel_format: crate::types::MONO8,
                 },
                 id: shot.frame.id,
                 device_ts_ns: shot.frame.device_ts_ns,
+                device_timestamp: shot.frame.device_timestamp,
                 wall_ms: shot.wall_ms,
                 settings: serde_json::Map::new(),
                 inspection: None,
@@ -5020,6 +5657,11 @@ mod tests {
     }
     fn small_frame(id: u64) -> Frame {
         Frame {
+            pixel_encoding: None,
+            device_timestamp: None,
+            received_monotonic_ns: None,
+            chunks: None,
+            multipart: None,
             id,
             width: 8,
             height: 8,
@@ -5037,7 +5679,10 @@ mod tests {
         jobs: &mut [Scheduled],
         frame: Frame,
     ) -> bool {
-        let room = saver.has_room(frame.data.len());
+        let room = saver.has_room(saver::frame_bytes(&frame, || {
+            jobs.iter()
+                .any(|job| job.info.active() && job.deadline.is_some() && job.part_format.is_some())
+        }));
         let saves = shoot(
             h,
             &mut sim_camera(),
@@ -5066,6 +5711,512 @@ mod tests {
         }
         assert_eq!(saver.held(), 0);
     }
+    #[test]
+    fn same_pfnc_jobs_share_one_retained_acquisition_and_default_failure_keeps_selected_files() {
+        use crate::transport::multipart::{GvspPartFormat, job_selection_tests};
+        for native in [false, true] {
+            let h = WorkerHandle::new();
+            let dir = tempfile::tempdir().unwrap();
+            let mut saver = saver::Saver::new(h.clone());
+            let mut jobs = [
+                armed(1, dir.path()),
+                armed(2, dir.path()),
+                armed(3, dir.path()),
+                armed(4, dir.path()),
+            ];
+            for job in &mut jobs {
+                job.info.count = 1;
+                job.min_free = Some(0);
+            }
+            jobs[1].part_format = Some(GvspPartFormat::Mono8);
+            jobs[1].part_index = Some(0);
+            jobs[2].part_format = Some(GvspPartFormat::Mono8);
+            jobs[2].part_index = Some(1);
+            jobs[3].part_format = Some(GvspPartFormat::Confidence8);
+            jobs[3].part_index = Some(5);
+            let manifest = dir.path().join("selected.jsonl");
+            jobs[2].manifest = Some(Arc::new(saved::Manifest::open(&manifest).unwrap()));
+            let frame = job_selection_tests::ambiguous(native);
+            let bytes = frame.buffer_bytes();
+            let archive = frame.multipart.as_ref().unwrap().payload.to_vec();
+            assert!(
+                saver::frame_bytes(&frame, || true)
+                    >= bytes + frame.multipart.as_ref().unwrap().buffer_bytes()
+            );
+            assert!(offer(&h, &mut saver, &mut jobs, frame));
+            drain(&h, &saver, &mut jobs);
+            assert_eq!(jobs[0].info.status, CaptureStatus::Failed);
+            assert_eq!(jobs[0].info.error_tag.as_ref().unwrap().code, "unsupported");
+            assert_eq!(jobs[0].info.files, Vec::<String>::new());
+            for (job, expected, index) in [
+                (&jobs[1], vec![10, 20], 0),
+                (&jobs[2], vec![30, 40, 50, 60], 1),
+                (&jobs[3], vec![200], 5),
+            ] {
+                assert_eq!(job.info.status, CaptureStatus::Done, "{:?}", job.info.error);
+                let path = &job.info.files[0];
+                assert_eq!(std::fs::read(path).unwrap(), expected);
+                assert_eq!(
+                    std::fs::read(format!("{path}.multipart.raw")).unwrap(),
+                    archive
+                );
+                let meta: Value = serde_json::from_slice(
+                    &std::fs::read(format!("{path}.multipart.raw.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(meta["frame_id"], 73);
+                assert_eq!(meta["device_ts_ns"], 123_456);
+                assert_eq!(meta["received_monotonic_ns"], 987_654);
+                assert_eq!(meta["wall_ms"], 77);
+                assert_eq!(meta["multipart"]["selected"], index);
+            }
+            let rows = std::fs::read_to_string(manifest).unwrap();
+            assert_eq!(rows.lines().count(), 1);
+            let row: Value = serde_json::from_str(rows.trim()).unwrap();
+            assert_eq!(row["multipart"]["selected"], 1);
+            assert_eq!(row["multipart"]["part_format"], "Mono8");
+        }
+    }
+
+    #[test]
+    fn native_multipart_measurement_only_jobs_require_explicit_selection() {
+        use crate::transport::multipart::GvspPartFormat;
+        for (format, data_type, pfnc) in [
+            (GvspPartFormat::Coord3dC16, 5, 0x0110_00b8),
+            (GvspPartFormat::Mono16, 1, 0x0110_0007),
+        ] {
+            assert_multipart_explicit_only_jobs(format, data_type, pfnc);
+        }
+    }
+
+    fn assert_multipart_explicit_only_jobs(
+        format: crate::transport::multipart::GvspPartFormat,
+        data_type: u16,
+        pfnc: u32,
+    ) {
+        use crate::transport::multipart::{GvspPartFormat, MultipartData};
+        let h = WorkerHandle::new();
+        let dir = tempfile::tempdir().unwrap();
+        let mut saver = saver::Saver::new(h.clone());
+        let mut jobs = [
+            armed(1, dir.path()),
+            armed(2, dir.path()),
+            armed(3, dir.path()),
+        ];
+        jobs[1].part_format = Some(format);
+        jobs[2].part_format = Some(GvspPartFormat::Confidence8);
+        for job in &mut jobs {
+            job.info.count = 1;
+            job.min_free = Some(0);
+        }
+        let layout = serde_json::from_value(json!({
+            "data_type_namespace":"gvsp", "selected":0, "byte_order":"big",
+            "original_filled_bytes":6, "payload_bytes":6,
+            "parts":[
+                {"index":0, "stored_offset":0, "length":4, "data_type":data_type,
+                 "format":pfnc, "width":2, "height":1, "delivered_height":1,
+                 "gvsp":{"address_offset":0, "zone_directions":0, "x_padding":0, "y_padding":0}},
+                {"index":1, "stored_offset":4, "length":2, "data_type":9,
+                 "format":0x0108_00c6, "width":2, "height":1, "delivered_height":1,
+                 "gvsp":{"address_offset":4, "zone_directions":0, "x_padding":0, "y_padding":0}},
+            ]
+        }))
+        .unwrap();
+        let payload = vec![0x12, 0x34, 0xff, 0xff, 0x80, 0xff];
+        let frame = Frame {
+            pixel_encoding: None,
+            id: 1,
+            width: 2,
+            height: 1,
+            pixel_format: pfnc,
+            data: vec![0x34, 0x12, 0xff, 0xff].into(),
+            multipart: Some(Arc::new(MultipartData {
+                layout,
+                payload: payload.clone().into(),
+            })),
+            ..Frame::default()
+        };
+        assert!(offer(&h, &mut saver, &mut jobs, frame));
+        drain(&h, &saver, &mut jobs);
+        assert_eq!(jobs[0].info.status, CaptureStatus::Failed);
+        assert!(
+            jobs[0]
+                .info
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("no ordinary intensity image")
+        );
+        let tag = jobs[0].info.error_tag.as_ref().unwrap();
+        assert_eq!(tag.code, "unsupported");
+        assert!(tag.hint.as_deref().unwrap().contains("--part-format"));
+        assert_eq!(jobs[0].info.files, Vec::<String>::new());
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("job1-")
+        }));
+        for (job, expected, index) in [
+            (&jobs[1], [0x34, 0x12, 0xff, 0xff].as_slice(), 0),
+            (&jobs[2], [0x80, 0xff].as_slice(), 1),
+        ] {
+            assert_eq!(job.info.status, CaptureStatus::Done, "{:?}", job.info.error);
+            let image = &job.info.files[0];
+            assert_eq!(std::fs::read(image).unwrap(), expected);
+            assert_eq!(
+                std::fs::read(format!("{image}.multipart.raw")).unwrap(),
+                payload
+            );
+            let companion: Value = serde_json::from_slice(
+                &std::fs::read(format!("{image}.multipart.raw.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(companion["multipart"]["selected"], index);
+            assert_eq!(companion["multipart"]["byte_order"], "big");
+        }
+    }
+
+    #[test]
+    fn native_multipart_abc32f_numbers_and_manifests_the_complete_archive() {
+        use crate::frame::COORD3D_ABC32F;
+        use crate::transport::multipart::{GvspPartFormat, MultipartData, PartTypeNamespace};
+        const MONO16: u32 = 0x0110_0007;
+        let h = WorkerHandle::new();
+        let dir = tempfile::tempdir().unwrap();
+        let mut saver = saver::Saver::new(h.clone());
+        let base = dir.path().join("cloud.raw");
+        let collision = crate::naming::multipart_payload(&base, false);
+        let output = base.to_str().unwrap();
+        assert!(
+            check_manifest(output, 1, "raw", &collision, Some(PartTypeNamespace::Gvsp)).is_err()
+        );
+        std::fs::write(&collision, b"existing archive").unwrap();
+
+        let manifest = dir.path().join("capture.jsonl");
+        let mut job = armed(1, dir.path());
+        job.plan = crate::naming::Plan::new(output, 1, "raw");
+        job.info.output = output.into();
+        job.info.count = 1;
+        job.on_exists = crate::naming::OnExists::Number;
+        job.min_free = Some(0);
+        job.manifest = Some(Arc::new(saved::Manifest::open(&manifest).unwrap()));
+        job.part_format = Some(GvspPartFormat::Coord3dAbc32f);
+        let mut jobs = [job];
+        let layout = serde_json::from_value(json!({
+            "data_type_namespace":"gvsp", "selected":0, "byte_order":"big",
+            "original_filled_bytes":14, "payload_bytes":14,
+            "parts":[
+                {"index":0, "stored_offset":0, "length":2, "data_type":1,
+                 "format":MONO16, "width":1, "height":1, "delivered_height":1,
+                 "gvsp":{"address_offset":0, "zone_directions":0, "x_padding":0, "y_padding":0}},
+                {"index":1, "stored_offset":2, "length":12, "data_type":5,
+                 "format":COORD3D_ABC32F, "width":1, "height":1, "delivered_height":1,
+                 "gvsp":{"address_offset":2, "zone_directions":0, "x_padding":0, "y_padding":0}},
+            ]
+        }))
+        .unwrap();
+        let payload = [
+            0x12, 0x34, 0x3f, 0x80, 0x00, 0x01, 0x80, 0x00, 0x00, 0x00, 0x7f, 0xc0, 0x12, 0x34,
+        ];
+        let frame = Frame {
+            pixel_encoding: None,
+            id: 53,
+            width: 1,
+            height: 1,
+            pixel_format: MONO16,
+            data: vec![0x34, 0x12].into(),
+            multipart: Some(Arc::new(MultipartData {
+                layout,
+                payload: payload.to_vec().into(),
+            })),
+            ..Frame::default()
+        };
+        assert!(offer(&h, &mut saver, &mut jobs, frame));
+        drain(&h, &saver, &mut jobs);
+        assert_eq!(
+            jobs[0].info.status,
+            CaptureStatus::Done,
+            "{:?}",
+            jobs[0].info.error
+        );
+        assert!(!base.exists());
+        assert_eq!(std::fs::read(collision).unwrap(), b"existing archive");
+        let image = Path::new(&jobs[0].info.files[0]);
+        assert_eq!(image.file_name().unwrap(), "cloud-0001.raw");
+        assert_eq!(
+            std::fs::read(image).unwrap(),
+            [
+                0x01, 0x00, 0x80, 0x3f, 0x00, 0x00, 0x00, 0x80, 0x34, 0x12, 0xc0, 0x7f
+            ]
+        );
+        let archive = crate::naming::multipart_payload(image, false);
+        assert_eq!(std::fs::read(&archive).unwrap(), payload);
+        let read_json = |path: &Path| -> Value {
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+        };
+        let sidecar = read_json(&crate::naming::sidecar(image));
+        assert_eq!(sidecar["pfnc_code"], COORD3D_ABC32F);
+        assert_eq!(
+            sidecar["sample_layout"],
+            json!({
+                "sample_type":"float32", "organization":"interleaved",
+                "components":["A", "B", "C"], "byte_order":"little",
+            })
+        );
+        let companion = read_json(&crate::naming::sidecar(&archive));
+        assert_eq!(companion["multipart"]["selected"], 1);
+        assert_eq!(companion["multipart"]["byte_order"], "big");
+        assert_eq!(companion["multipart"]["parts"][0]["format"], MONO16);
+        let manifest = read_json(&manifest);
+        assert_eq!(manifest["file"], image.to_str().unwrap());
+        assert_eq!(manifest["pixel_format"], "Coord3D_ABC32f");
+        assert_eq!(manifest["bytes"], 12);
+        assert_eq!(manifest["multipart"], sidecar["multipart"]);
+        assert!(manifest["multipart"]["sha256"].is_string());
+    }
+
+    #[test]
+    fn native_multipart_still_jobs_select_independent_maps_from_one_queued_frame() {
+        use crate::transport::multipart::{GvspPartFormat, MultipartData};
+        let h = WorkerHandle::new();
+        let dir = tempfile::tempdir().unwrap();
+        let mut saver = saver::Saver::new(h.clone());
+        let mut jobs = [
+            armed(1, dir.path()),
+            armed(2, dir.path()),
+            armed(3, dir.path()),
+        ];
+        jobs[1].part_format = Some(GvspPartFormat::Coord3dC16);
+        jobs[2].part_format = Some(GvspPartFormat::Confidence8);
+        jobs[2].info.output = dir
+            .path()
+            .join("confidence-{frame}.png")
+            .to_str()
+            .unwrap()
+            .into();
+        jobs[2].format = "png".into();
+        jobs[2].plan = crate::naming::Plan::new(&jobs[2].info.output, 2, "png");
+        for job in &mut jobs {
+            job.info.interval_ms = 0;
+            job.min_free = Some(0);
+        }
+        let layout = serde_json::from_value(json!({
+            "data_type_namespace":"gvsp", "selected":0, "byte_order":"big",
+            "original_filled_bytes":10, "payload_bytes":10,
+            "parts":[
+                {"index":0, "stored_offset":0, "length":4, "data_type":1,
+                 "format":crate::types::MONO8, "width":2, "height":2, "delivered_height":2,
+                 "gvsp":{"address_offset":0, "zone_directions":0, "x_padding":0, "y_padding":0}},
+                {"index":1, "stored_offset":4, "length":4, "data_type":5,
+                 "format":0x0110_00b8, "width":2, "height":1, "delivered_height":1,
+                 "gvsp":{"address_offset":4, "zone_directions":0, "x_padding":0, "y_padding":0}},
+                {"index":2, "stored_offset":8, "length":2, "data_type":9,
+                 "format":0x0108_00c6, "width":2, "height":1, "delivered_height":1,
+                 "gvsp":{"address_offset":8, "zone_directions":0, "x_padding":0, "y_padding":0}},
+            ]
+        }))
+        .unwrap();
+        let payload = vec![1, 2, 3, 4, 0x12, 0x34, 0xff, 0xff, 0x80, 0xff];
+        let frame = Frame {
+            pixel_encoding: None,
+            width: 2,
+            height: 2,
+            pixel_format: crate::types::MONO8,
+            data: payload[..4].to_vec().into(),
+            multipart: Some(Arc::new(MultipartData {
+                layout,
+                payload: payload.clone().into(),
+            })),
+            ..Frame::default()
+        };
+        for id in 1..=2 {
+            for job in &mut jobs {
+                job.deadline = Some(Instant::now() + Duration::from_secs(10));
+            }
+            assert!(offer(
+                &h,
+                &mut saver,
+                &mut jobs,
+                Frame {
+                    id,
+                    ..frame.clone()
+                }
+            ));
+            drain(&h, &saver, &mut jobs);
+        }
+        for (job, expected, pfnc) in [
+            (&jobs[0], [1, 2, 3, 4].as_slice(), crate::types::MONO8),
+            (&jobs[1], [0x34, 0x12, 0xff, 0xff].as_slice(), 0x0110_00b8),
+            (&jobs[2], [0x80, 0xff].as_slice(), 0x0108_00c6),
+        ] {
+            assert_eq!(job.info.captured, 2, "{:?}", job.info.error);
+            assert_eq!(job.info.frame.unwrap().pixel_format, pfnc);
+            for (index, image) in job.info.files.iter().enumerate() {
+                let bytes = std::fs::read(image).unwrap();
+                if job.format == "raw" {
+                    assert_eq!(bytes, expected);
+                    let raw: Value =
+                        serde_json::from_slice(&std::fs::read(format!("{image}.json")).unwrap())
+                            .unwrap();
+                    assert_eq!(raw["pfnc_code"], pfnc);
+                    assert_eq!(raw["frame_id"], index + 1);
+                    assert_eq!(raw["multipart"]["selected"], job.info.id - 1);
+                } else {
+                    let mut reader = png::Decoder::new(std::io::Cursor::new(bytes))
+                        .read_info()
+                        .unwrap();
+                    let mut decoded = vec![0; reader.output_buffer_size()];
+                    let info = reader.next_frame(&mut decoded).unwrap();
+                    assert_eq!(info.bit_depth, png::BitDepth::Eight);
+                    assert_eq!(info.color_type, png::ColorType::Grayscale);
+                    assert_eq!(&decoded[..info.buffer_size()], expected);
+                }
+                assert_eq!(
+                    std::fs::read(format!("{image}.multipart.raw")).unwrap(),
+                    payload
+                );
+                let companion: Value = serde_json::from_slice(
+                    &std::fs::read(format!("{image}.multipart.raw.json")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(companion["multipart"]["data_type_namespace"], "gvsp");
+                assert_eq!(companion["multipart"]["byte_order"], "big");
+                assert_eq!(companion["multipart"]["selected"], job.info.id - 1);
+            }
+        }
+    }
+
+    #[test]
+    fn still_saver_publishes_chunks_and_references_for_raw_and_encoded_images() {
+        use crate::transport::chunks::{ByteOrder, ChunkData, ImageLayout};
+        let h = WorkerHandle::new();
+        let dir = tempfile::tempdir().unwrap();
+        let mut saver = saver::Saver::new(h.clone());
+        for (id, format) in [(1, "raw"), (2, "png")] {
+            let mut frame = small_frame(id);
+            let mut payload = frame.data.to_vec();
+            payload.extend_from_slice(&[0, 0x12, 0x34, 0x56]);
+            payload.extend_from_slice(&19_u32.to_be_bytes());
+            payload.extend_from_slice(&4_u32.to_be_bytes());
+            let mut chunks = ChunkData::parse(&payload, 64, 64, ByteOrder::Big, 42).unwrap();
+            chunks.image_layout = Some(ImageLayout {
+                pixel_encoding: None,
+                offset: 0,
+                pfnc_code: Some(frame.pixel_format),
+                width: 8,
+                height: 8,
+                row_bytes: 8,
+                row_stride: 8,
+                padding_y: 0,
+                byte_order: Some(ByteOrder::Big),
+                continuous_packing: false,
+            });
+            chunks.payload = payload.clone().into();
+            frame.chunks = Some(chunks.into());
+            let output = dir.path().join(format!("frame-{id}.{format}"));
+            let mut job = armed(id, dir.path());
+            job.format = format.into();
+            job.info.output = output.to_string_lossy().into_owned();
+            job.info.count = 1;
+            job.plan = crate::naming::Plan::new(&job.info.output, 1, format);
+            job.min_free = Some(0);
+            let mut jobs = [job];
+            assert!(offer(&h, &mut saver, &mut jobs, frame));
+            drain(&h, &saver, &mut jobs);
+            assert_eq!(jobs[0].info.captured, 1, "{:?}", jobs[0].info.error);
+            let files = h.take_saved();
+            assert_eq!(files.len(), 1);
+            let file = &files[0].1;
+            let reference = file.chunks.as_ref().unwrap();
+            assert_eq!(
+                std::fs::read(reference["path"].as_str().unwrap()).unwrap(),
+                payload
+            );
+            let metadata: Value = serde_json::from_slice(
+                &std::fs::read(reference["metadata_path"].as_str().unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(metadata["chunks"]["entries"][0]["offset"], 64);
+            let image = std::fs::read(&output).unwrap();
+            if format == "raw" {
+                assert_eq!(image, vec![1; 64]);
+                let sidecar: Value = serde_json::from_slice(
+                    &std::fs::read(crate::naming::sidecar(&output)).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(&sidecar["chunks"], reference);
+            } else {
+                let mut reader = png::Decoder::new(std::io::Cursor::new(image))
+                    .read_info()
+                    .unwrap();
+                let mut pixels = vec![0; reader.output_buffer_size()];
+                let decoded = reader.next_frame(&mut pixels).unwrap();
+                assert_eq!(&pixels[..decoded.buffer_size()], &[2; 64]);
+            }
+            let manifest = file.manifest_line("sim:0", &json!({}));
+            assert_eq!(&manifest["chunks"], reference);
+        }
+        drop(saver.join());
+        h.shutdown();
+    }
+
+    #[test]
+    fn saver_bounds_short_frames_by_their_retained_backing_allocations() {
+        static FINISH: AtomicBool = AtomicBool::new(false);
+        struct Finish;
+        impl Drop for Finish {
+            fn drop(&mut self) {
+                FINISH.store(true, Ordering::Release);
+            }
+        }
+        fn slow(shot: &saver::Shot, save: &saver::Save) -> saver::Written {
+            while !FINISH.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            written(shot, save)
+        }
+        fn short_frame(id: u64) -> Frame {
+            let pool = crate::framebuf::FramePool::new(|| None);
+            let mut data = pool.take_empty(1 << 20);
+            data.extend_from_slice(&[1; 64]);
+            Frame {
+                data: data.freeze(),
+                ..small_frame(id)
+            }
+        }
+        FINISH.store(false, Ordering::Release);
+        let h = WorkerHandle::new();
+        let first = short_frame(1);
+        assert_eq!(first.data.len(), 64);
+        assert!(first.buffer_bytes() >= 1 << 20);
+        let second = short_frame(2);
+        let mut saver = saver::Saver::with(
+            h.clone(),
+            |_, shot, save| Ok(slow(shot, save)),
+            first.buffer_bytes() - 1,
+        );
+        // Release pending encoders before Saver's drop even if an assertion fails.
+        let finish = Finish;
+        let dir = temp_dir("short-frame-budget");
+        let mut jobs = [armed(1, &dir)];
+        // One frame remains allowed even when its backing exceeds the budget.
+        assert!(offer(&h, &mut saver, &mut jobs, first));
+        assert!(!saver.has_room(second.buffer_bytes()));
+        jobs[0].deadline = Some(Instant::now() + Duration::from_secs(10));
+        jobs[0].info.next_at_ms = 0;
+        assert!(!offer(&h, &mut saver, &mut jobs, second));
+        assert_eq!((jobs[0].saving, jobs[0].info.skipped), (1, 1));
+        drop(finish);
+        drain(&h, &saver, &mut jobs);
+        assert_eq!(jobs[0].info.captured, 1);
+        assert!(saver.has_room(short_frame(3).buffer_bytes()));
+        drop(saver);
+        h.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn slow_saves_hold_up_no_frames_and_a_full_queue_drops_frames() {
         // Saves finish only once the test lets them, so every frame is
@@ -5272,6 +6423,319 @@ mod tests {
         h.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
     }
+    fn ownership_failure(reason: &str) -> anyhow::Error {
+        crate::types::Categorized::new(crate::types::ErrorKind::Disconnected, reason)
+            .details(json!({"controller_ownership":"retired", "reason":reason}))
+            .into()
+    }
+
+    struct TerminalBackend {
+        simulator: crate::transport::simulator::Simulator,
+        retired: Arc<AtomicBool>,
+        dropped: Arc<AtomicBool>,
+    }
+    impl Drop for TerminalBackend {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Release);
+        }
+    }
+    impl crate::types::RegisterIo for TerminalBackend {
+        fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
+            self.simulator.read_memory(address, length)
+        }
+        fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
+            self.simulator.write_memory(address, data)
+        }
+    }
+    impl crate::types::Backend for TerminalBackend {
+        fn xml(&mut self) -> Result<String> {
+            self.simulator.xml()
+        }
+        fn start(&mut self, payload: usize) -> Result<()> {
+            self.simulator.start(payload)
+        }
+        fn next_frame(&mut self, timeout: Duration) -> Result<Frame> {
+            self.simulator.next_frame(timeout)
+        }
+        fn stop(&mut self) -> Result<()> {
+            self.simulator.stop()
+        }
+        fn terminal_error(&self) -> Option<anyhow::Error> {
+            self.retired
+                .load(Ordering::Acquire)
+                .then(|| ownership_failure("backend lease expired"))
+        }
+        fn stats(&self) -> Option<crate::types::TransportStats> {
+            Some(crate::types::TransportStats {
+                packets_received: 17,
+                ..Default::default()
+            })
+        }
+    }
+    #[test]
+    fn sticky_idle_backend_retires_waiters_but_keeps_owned_inspection() {
+        let h = WorkerHandle::idle();
+        let retired = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut camera = Some(
+            Camera::from_backend(
+                crate::transport::simulator::info(),
+                Box::new(TerminalBackend {
+                    simulator: crate::transport::simulator::Simulator::default(),
+                    retired: retired.clone(),
+                    dropped: dropped.clone(),
+                }),
+            )
+            .unwrap(),
+        );
+        camera.as_mut().unwrap().start().unwrap();
+        // A request already given its immutable frame may finish normally.
+        let dir = tempfile::tempdir().unwrap();
+        let preview = dir.path().join("owned.png");
+        let command = SessionCommand::from_json_slice(json!({"op":"frame","timeout_ms":1000,"warmup_ms":0,"fresh":0,"format":"png","preview":preview}).to_string().as_bytes()).unwrap();
+        let mut inspector = inspector::Inspector::default();
+        let mut stream = JobStream::default();
+        let mut enqueue = |inspector: &mut inspector::Inspector, camera: &mut Option<Camera>| {
+            let (tx, rx) = mpsc::channel();
+            let command = WorkerCommand::from(command.clone());
+            let request = inspector::Request::of(&command).unwrap();
+            inspector.begin(
+                &h,
+                camera,
+                &mut None,
+                Envelope {
+                    id: None,
+                    command,
+                    reply: Box::new(move |reply| {
+                        let _ = tx.send(reply);
+                    }),
+                },
+                request,
+                &mut stream,
+            );
+            rx
+        };
+        let owned = enqueue(&mut inspector, &mut camera);
+        let frame = camera
+            .as_mut()
+            .unwrap()
+            .next_frame(Duration::from_secs(1))
+            .unwrap();
+        inspector.serve(camera.as_mut().unwrap(), frame, false, &h);
+        let waiting = enqueue(&mut inspector, &mut camera);
+        assert!(inspector.has_waiting());
+        retired.store(true, Ordering::Release);
+        assert!(retirement::check(
+            &h,
+            CommandState {
+                camera: &mut camera,
+                forwarder: &mut None,
+                auto: &mut None,
+                jobs: &mut Vec::new(),
+                next_job: &mut 1,
+                scheduled_stream: &mut stream,
+            },
+            &mut inspector,
+            None
+        ));
+        assert!(camera.is_none() && dropped.load(Ordering::Acquire));
+        let error = waiting
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err();
+        assert!(crate::transport::gige::ownership_retired(&error));
+        owned.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        assert!(preview.is_file());
+        refresh(&h, None);
+        assert_eq!(h.snapshot().transport.unwrap().packets_received, 17);
+        h.shutdown();
+    }
+
+    /// Hold actual immutable frame buffers in encoders while ownership ends.
+    #[test]
+    fn retired_ownership_keeps_owned_saves_and_fails_future_frames() {
+        static GATE: (Mutex<(usize, bool)>, Condvar) = (Mutex::new((0, false)), Condvar::new());
+        fn blocked(
+            _: &WorkerHandle,
+            shot: &saver::Shot,
+            save: &saver::Save,
+        ) -> Result<saver::Written> {
+            let (state, wake) = &GATE;
+            let mut state = state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("retirement fixture gate poisoned"))?;
+            state.0 += 1;
+            wake.notify_all();
+            let (state, _) = wake
+                .wait_timeout_while(state, Duration::from_secs(10), |state| !state.1)
+                .map_err(|_| anyhow::anyhow!("retirement fixture wait poisoned"))?;
+            ensure!(state.1, "retirement fixture did not release encoder");
+            drop(state);
+            std::fs::write(&save.path, &shot.frame.data)?;
+            let archive = format!("{}.multipart.raw", save.path.display());
+            let metadata = format!("{archive}.json");
+            std::fs::write(&archive, &shot.frame.data)?;
+            std::fs::write(&metadata, b"{}")?;
+            let mut result = written(shot, save);
+            result.file.multipart = Some(Box::new(
+                json!({"path":archive,"metadata_path":metadata,"bytes":64}),
+            ));
+            Ok(result)
+        }
+        let h = WorkerHandle::idle();
+        let dir = tempfile::tempdir().unwrap();
+        let mut saver = saver::Saver::with(h.clone(), blocked, saver::QUEUE_BYTES);
+        let mut complete = armed(1, dir.path());
+        complete.info.count = 1;
+        let partial = armed(2, dir.path());
+        let mut future = armed(3, dir.path());
+        future.info.status = CaptureStatus::Pending;
+        future.info.next_at_ms = crate::scheduling::now_ms() + 60_000;
+        future.deadline = None;
+        future.warm = Some(Instant::now() + Duration::from_secs(60));
+        let mut jobs = vec![complete, partial, future];
+        assert_eq!(jobs.len(), 3);
+        let frame = small_frame(71);
+        let buffer = frame.data.clone();
+        assert!(offer(&h, &mut saver, &mut jobs, frame));
+        {
+            let (state, wake) = &GATE;
+            let (state, _) = wake
+                .wait_timeout_while(state.lock().unwrap(), Duration::from_secs(5), |state| {
+                    state.0 == 0
+                })
+                .unwrap();
+            assert!(state.0 > 0, "encoder did not take the frame");
+        }
+        assert!(buffer.is_shared());
+        assert_eq!((jobs[0].saving, jobs[1].saving), (1, 1));
+        let mut camera = Some(sim_camera());
+        let mut stream = JobStream {
+            started: true,
+            ..Default::default()
+        };
+        let mut inspector = inspector::Inspector::default();
+        let error = ownership_failure("first ownership expiry");
+        assert!(retirement::check(
+            &h,
+            CommandState {
+                camera: &mut camera,
+                forwarder: &mut None,
+                auto: &mut None,
+                jobs: &mut jobs,
+                next_job: &mut 4,
+                scheduled_stream: &mut stream,
+            },
+            &mut inspector,
+            Some(&error)
+        ));
+        assert!(camera.is_none() && !stream.started);
+        assert_eq!(jobs[0].info.status, CaptureStatus::Running);
+        for job in jobs.iter().skip(1) {
+            assert_eq!(job.info.status, CaptureStatus::Failed);
+            assert_eq!(job.info.error_tag.as_ref().unwrap().code, "disconnected");
+            assert!(
+                job.deadline.is_none()
+                    && job.warm.is_none()
+                    && job.trigger.is_none()
+                    && job.next.is_none()
+            );
+        }
+        assert!(!jobs[1].reported, "a held shot must publish before job_end");
+        let original = h.retired.lock().unwrap().clone().unwrap();
+        let later = ownership_failure("secondary cleanup error");
+        assert!(!retirement::check(
+            &h,
+            CommandState {
+                camera: &mut camera,
+                forwarder: &mut None,
+                auto: &mut None,
+                jobs: &mut jobs,
+                next_job: &mut 4,
+                scheduled_stream: &mut stream,
+            },
+            &mut inspector,
+            Some(&later)
+        ));
+        assert_eq!(h.retired.lock().unwrap().as_ref(), Some(&original));
+        assert!(
+            original["hint"]
+                .as_str()
+                .unwrap()
+                .contains("session start --name")
+        );
+        // Requests already queued on this exact worker cannot reconnect it.
+        for command in [
+            WorkerCommand::CheckConnection,
+            SessionCommand::connect("sim:0".into(), 1000).into(),
+            capture_to(
+                &dir.path().join("future.raw"),
+                1,
+                crate::naming::OnExists::Fail,
+            )
+            .into(),
+        ] {
+            let error = retirement::admission(&h, &command).unwrap();
+            assert_eq!(crate::session::protocol::wire_error(&error), original);
+        }
+        assert!(retirement::admission(&h, &SessionCommand::Disconnect.into()).is_none());
+        {
+            let (state, wake) = &GATE;
+            state.lock().unwrap().1 = true;
+            wake.notify_all();
+        }
+        drain(&h, &saver, &mut jobs);
+        sync_jobs(&h, &mut jobs);
+        assert_eq!(jobs[0].info.status, CaptureStatus::Done);
+        assert_eq!((jobs[0].info.captured, jobs[1].info.captured), (1, 1));
+        assert_eq!(jobs[1].info.status, CaptureStatus::Failed);
+        assert_eq!(
+            jobs[1].info.error.as_deref(),
+            Some("first ownership expiry")
+        );
+        // take_saved drains the whole detached outbox. Retain one immutable
+        // event snapshot for both artifact checks and publication ordering.
+        let lines = h.take_events();
+        let files = lines
+            .iter()
+            .filter_map(|line| match line {
+                Output::Saved { file, .. } => Some(file),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), 2);
+        for file in &files {
+            assert_eq!(std::fs::read(&file.path).unwrap(), [71; 64]);
+            let companion = file.multipart.as_ref().unwrap();
+            assert_eq!(
+                std::fs::read(companion["path"].as_str().unwrap()).unwrap(),
+                [71; 64]
+            );
+            assert!(Path::new(companion["metadata_path"].as_str().unwrap()).is_file());
+        }
+        let order = lines
+            .iter()
+            .filter_map(|line| match line {
+                Output::Saved { job: Some(job), .. } => Some((*job, "saved")),
+                Output::JobEnd { job, .. } => Some((*job, "end")),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for job in [1, 2] {
+            let saved = order
+                .iter()
+                .position(|entry| *entry == (job, "saved"))
+                .unwrap();
+            let ended = order
+                .iter()
+                .position(|entry| *entry == (job, "end"))
+                .unwrap();
+            assert!(saved < ended);
+        }
+        drop(saver);
+        h.shutdown();
+    }
+
     /// A simulator that counts how often its stream starts and stops.
     struct Counted {
         simulator: crate::transport::simulator::Simulator,
@@ -5361,12 +6825,14 @@ mod tests {
             Ok(saver::SavedShot {
                 path: "shot.raw".into(),
                 frame: crate::scheduling::JobFrame {
+                    pixel_encoding: None,
                     width: 8,
                     height: 8,
                     pixel_format: crate::types::MONO8,
                 },
                 id: 1,
                 device_ts_ns: None,
+                device_timestamp: None,
                 wall_ms: 0,
                 settings: serde_json::Map::new(),
                 inspection: None,
@@ -5501,12 +6967,14 @@ mod tests {
             let result = result.map(|path| saver::SavedShot {
                 path,
                 frame: crate::scheduling::JobFrame {
+                    pixel_encoding: None,
                     width: 8,
                     height: 8,
                     pixel_format: crate::types::MONO8,
                 },
                 id: 1,
                 device_ts_ns: None,
+                device_timestamp: None,
                 wall_ms: 0,
                 settings: serde_json::Map::new(),
                 inspection: None,
@@ -5663,6 +7131,7 @@ mod tests {
     fn auto(h: &WorkerHandle) -> Result<Value> {
         h.request(SessionCommand::Auto {
             continuous: false,
+            part_selection: None,
             job: None,
             max_exposure_us: None,
             region: None,
@@ -5801,6 +7270,7 @@ mod tests {
         connect(&h, "1000");
         h.request(SessionCommand::Auto {
             continuous: true,
+            part_selection: None,
             job: Some(7),
             max_exposure_us: None,
             region: None,
@@ -5901,6 +7371,11 @@ mod tests {
         assert_eq!(acquired.settings["ExposureTime"], json!(2500.0));
         assert!(acquired.settings.contains_key("Gain"));
         let frame = Frame {
+            pixel_encoding: None,
+            device_timestamp: None,
+            received_monotonic_ns: None,
+            chunks: None,
+            multipart: None,
             id: 7,
             width: 2,
             height: 1,
@@ -6376,6 +7851,7 @@ mod tests {
             &mut camera,
             SessionCommand::Auto {
                 continuous: false,
+                part_selection: None,
                 job: None,
                 max_exposure_us: None,
                 region: None,

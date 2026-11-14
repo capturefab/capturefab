@@ -9,11 +9,13 @@ mod args;
 mod auto;
 mod camera;
 mod capture;
+mod data;
 mod debug;
 mod doctor;
 mod inspect;
 mod jobs;
 pub(crate) mod login;
+mod monitor;
 mod network;
 mod onvif;
 pub(crate) mod output;
@@ -34,6 +36,11 @@ mod fuzz;
 #[cfg(test)]
 pub(crate) use output::error_code;
 
+/// Stop an owned subprocess before a second signal forces the CLI to exit.
+pub(crate) fn on_second_signal(killer: impl FnMut() + Send + 'static) {
+    signals::on_second(killer);
+}
+
 use crate::{
     ipc,
     session::{SessionCommand, SessionHandle},
@@ -45,7 +52,7 @@ use output::{Output, Report};
 use serde_json::{Value, json};
 use std::time::Duration;
 
-const OVERVIEW: &str = "Capturefab: camera capture for people and agents.
+const OVERVIEW: &str = "Capturefab: images, video and industrial data for people and agents.
 
 Usage: capturefab [--json] COMMAND [-c CAMERA] ...
 
@@ -53,6 +60,7 @@ Usage: capturefab [--json] COMMAND [-c CAMERA] ...
   capturefab info -c sim:0              what a camera is and its controls
   capturefab set -c sim:0 exposure=5ms  change settings as one atomic change
   capturefab capture -c sim:0 -o shot.png
+  capturefab data protocols --json      industrial adapters and an example config
 
 Use --json for structured results. Run `capturefab schema` for the command contract.
 More: capturefab --help, capturefab COMMAND --help";
@@ -62,8 +70,8 @@ More: capturefab --help, capturefab COMMAND --help";
     name = "capturefab",
     bin_name = "capturefab",
     version,
-    about = "Find cameras, change their settings, and save images and video.",
-    long_about = "Find cameras, change their settings, and save images and video.\n\nUse --json for structured output. Most commands print one result or error as a JSON line on stdout. Watch and shell can print multiple lines. When capture -o - writes the image to stdout, it sends JSON to stderr. Help and version flags print text.\n\nRun capturefab schema for commands and exit codes. Run capturefab schema COMMAND for options, results and errors.",
+    about = "Capture images, video and industrial time series.",
+    long_about = "Find cameras, save images and video, and record industrial signals on a shared timeline.\n\nUse --json for structured output. Most commands print one result or error as a JSON line on stdout. Watch and shell can print multiple lines. When capture -o - writes the image to stdout, it sends JSON to stderr. Help and version flags print text.\n\nRun capturefab schema for commands and exit codes. Run capturefab schema COMMAND for options, results and errors.",
     after_help = "Examples:\n  capturefab list --kind sim\n  capturefab info -c sim:0\n  capturefab set -c sim:0 exposure=5ms gain=3\n  capturefab --json get -c sim:0 ExposureTime 'TriggerMode[FrameStart]'",
     disable_help_subcommand = true
 )]
@@ -134,6 +142,12 @@ impl Global {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Record industrial signals on a shared timeline and export CSV or JSONL
+    #[command(
+        subcommand,
+        after_help = "Examples:\n  capturefab data protocols --json\n  capturefab data record --config sources.json --for 30s -o run.jsonl\n  capturefab data export run.jsonl -o run.csv"
+    )]
+    Data(data::DataCommand),
     /// List cameras: `GigE` Vision, USB3 Vision, webcams, ONVIF
     #[command(
         about = "List cameras: GigE Vision, USB3 Vision, webcams, ONVIF",
@@ -230,8 +244,8 @@ pub(crate) enum Command {
     Onvif(onvif::OnvifCommand),
     /// Check `GigE` network paths; --tune applies bandwidth sharing to cameras
     #[command(
-        about = "Check GigE network paths; --tune applies bandwidth sharing to cameras",
-        after_help = "Examples:\n  capturefab network\n  capturefab network --tune -c gige:00c0df123456 -c gige:00c0df654321"
+        about = "Check GigE paths; --tune shares bandwidth; force-ip assigns a temporary camera address",
+        after_help = "Examples:\n  capturefab network\n  capturefab network --tune -c gige:00c0df123456 -c gige:00c0df654321\n  capturefab network force-ip --mac 003053061a58 --interface 192.168.50.1 --address 192.168.50.20 --netmask 255.255.255.0 --gateway 0.0.0.0"
     )]
     Network(network::NetworkArgs),
     /// Check this computer: `FFmpeg`, folders, USB and `GigE` limits, with a fix for each warning
@@ -287,6 +301,11 @@ pub(crate) fn main() -> i32 {
         Ok(cli) => cli,
         Err(error) => return clap_failure(&error.format(&mut command), json),
     };
+    if let Some(Command::Set(args)) = cli.command.as_mut() {
+        args.camera_explicit = matches.subcommand_matches("set").is_some_and(|set| {
+            set.value_source("camera") == Some(clap::parser::ValueSource::CommandLine)
+        });
+    }
     let out = cli.global.output();
     let typed = matches.value_source("session") == Some(clap::parser::ValueSource::CommandLine);
     if let Err(error) = cli.global.settle_session(typed) {
@@ -430,6 +449,13 @@ fn missing_subcommand(mut args: impl Iterator<Item = String>) -> Option<(String,
 
 /// Run a parsed command. `None` when it printed its own output.
 pub(crate) fn run(mut cli: Cli) -> Result<Option<Report>> {
+    // Explicit network utilities are local; an ambient session is not a
+    // destination or a reason to validate an unrelated session name.
+    if cli.global.session_from_env
+        && matches!(&cli.command, Some(Command::Network(args)) if matches!(&args.action, Some(network::NetworkCommand::ForceIp(_) | network::NetworkCommand::Action(_))))
+    {
+        cli.global.session = None;
+    }
     if let Some(session) = &cli.global.session {
         ipc::validate_name(session).map_err(|error| Usage(format!("{error:#}")))?;
     }
@@ -443,8 +469,10 @@ pub(crate) fn run(mut cli: Cli) -> Result<Option<Report>> {
             Report::json(Value::Null).text(format!("{OVERVIEW}\n")),
         ));
     };
+    monitor::preflight(&command)?;
     let global = &cli.global;
     Ok(Some(match command {
+        Command::Data(command) => data::run(global, command)?,
         Command::List(args) => camera::list(global, &args)?,
         Command::Info(args) => camera::info(global, &args)?,
         Command::Features(args) => camera::features(global, args)?,
@@ -904,6 +932,9 @@ impl Client {
     }
     pub(crate) fn call(&self, command: SessionCommand) -> Result<Value> {
         command.validate()?;
+        if let Some(target) = &self.target {
+            crate::session::monitor::validate_for_selector(target, &command)?;
+        }
         match &self.host {
             JobHost::Session(session) => {
                 // Looking does not keep a session; using it does.

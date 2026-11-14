@@ -1,0 +1,197 @@
+{
+  "version": 1,
+  "basis": "Independent hand-authored Omron W342-E1-18 command/data vectors; envelope and XOR/FCS arithmetic only, authored before implementation. No physical PLC or stock implementation reference.",
+  "route": {
+    "source": [
+      0,
+      239,
+      0
+    ],
+    "target": [
+      0,
+      42,
+      0
+    ],
+    "gateway_count": 2
+  },
+  "cases": [
+    {
+      "name": "timer_flags_cross_15",
+      "signal": {
+        "name": "timer_done",
+        "area": "timer",
+        "address": 15,
+        "data_type": "bool",
+        "elements": 2
+      },
+      "sid": 1,
+      "command_hex": "010109000F000002",
+      "response_data_hex": "0001",
+      "expected": [
+        false,
+        true
+      ],
+      "udp_request_hex": "800002002A0000EF0001010109000F000002",
+      "udp_reply_hex": "C0000200EF00002A0001010100000001",
+      "tcp_request_hex": "46494E530000001A0000000200000000800002002A0000EF0001010109000F000002",
+      "tcp_reply_hex": "46494E53000000180000000200000000C0000200EF00002A0001010100000001",
+      "fa_request": "@12FA000000000010109000F00000209*\r",
+      "fa_reply": "@12FA004000000001010000000141*\r"
+    },
+    {
+      "name": "counter_flags_zero",
+      "signal": {
+        "name": "counter_done",
+        "area": "counter",
+        "address": 0,
+        "data_type": "bool",
+        "elements": 3
+      },
+      "sid": 2,
+      "command_hex": "0101098000000003",
+      "response_data_hex": "010001",
+      "expected": [
+        true,
+        false,
+        true
+      ],
+      "udp_request_hex": "800002002A0000EF00020101098000000003",
+      "udp_reply_hex": "C0000200EF00002A000201010000010001",
+      "tcp_request_hex": "46494E530000001A0000000200000000800002002A0000EF00020101098000000003",
+      "tcp_reply_hex": "46494E53000000190000000200000000C0000200EF00002A000201010000010001",
+      "fa_request": "@12FA000000001010109800000000377*\r",
+      "fa_reply": "@12FA00400000010101000001000141*\r"
+    },
+    {
+      "name": "timer_pv_last_pair",
+      "signal": {
+        "name": "timer_pv",
+        "area": "timer",
+        "address": 4094,
+        "elements": 2
+      },
+      "sid": 3,
+      "command_hex": "0101890FFE000002",
+      "response_data_hex": "1234FFFF",
+      "expected": [
+        4660,
+        65535
+      ],
+      "udp_request_hex": "800002002A0000EF00030101890FFE000002",
+      "udp_reply_hex": "C0000200EF00002A0003010100001234FFFF",
+      "tcp_request_hex": "46494E530000001A0000000200000000800002002A0000EF00030101890FFE000002",
+      "tcp_reply_hex": "46494E530000001A0000000200000000C0000200EF00002A0003010100001234FFFF",
+      "fa_request": "@12FA0000000020101890FFE00000200*\r",
+      "fa_reply": "@12FA0040000002010100001234FFFF46*\r"
+    },
+    {
+      "name": "counter_pv_last_pair",
+      "signal": {
+        "name": "counter_pv",
+        "area": "counter",
+        "address": 4094,
+        "elements": 2
+      },
+      "sid": 4,
+      "command_hex": "0101898FFE000002",
+      "response_data_hex": "00008001",
+      "expected": [
+        0,
+        32769
+      ],
+      "udp_request_hex": "800002002A0000EF00040101898FFE000002",
+      "udp_reply_hex": "C0000200EF00002A00040101000000008001",
+      "tcp_request_hex": "46494E530000001A0000000200000000800002002A0000EF00040101898FFE000002",
+      "tcp_reply_hex": "46494E530000001A0000000200000000C0000200EF00002A00040101000000008001",
+      "fa_request": "@12FA0000000030101898FFE00000209*\r",
+      "fa_reply": "@12FA004000000301010000000080014A*\r"
+    },
+    {
+      "name": "timer_flag_last",
+      "signal": {
+        "name": "last_timer",
+        "area": "timer",
+        "address": 4095,
+        "data_type": "bool"
+      },
+      "sid": 5,
+      "command_hex": "0101090FFF000001",
+      "response_data_hex": "01",
+      "expected": true,
+      "udp_request_hex": "800002002A0000EF00050101090FFF000001",
+      "udp_reply_hex": "C0000200EF00002A00050101000001",
+      "tcp_request_hex": "46494E530000001A0000000200000000800002002A0000EF00050101090FFF000001",
+      "tcp_reply_hex": "46494E53000000170000000200000000C0000200EF00002A00050101000001",
+      "fa_request": "@12FA0000000040101090FFF0000010E*\r",
+      "fa_reply": "@12FA0040000004010100000145*\r"
+    },
+    {
+      "name": "counter_pv_zero",
+      "signal": {
+        "name": "first_counter",
+        "area": "counter",
+        "address": 0
+      },
+      "sid": 6,
+      "command_hex": "0101898000000001",
+      "response_data_hex": "A1B2",
+      "expected": 41394,
+      "udp_request_hex": "800002002A0000EF00060101898000000001",
+      "udp_reply_hex": "C0000200EF00002A000601010000A1B2",
+      "tcp_request_hex": "46494E530000001A0000000200000000800002002A0000EF00060101898000000001",
+      "tcp_reply_hex": "46494E53000000180000000200000000C0000200EF00002A000601010000A1B2",
+      "fa_request": "@12FA000000005010189800000000179*\r",
+      "fa_reply": "@12FA004000000501010000A1B245*\r"
+    },
+    {
+      "name": "ordinary_bits_cross_word",
+      "signal": {
+        "name": "ordinary",
+        "area": "wr",
+        "address": 15,
+        "bit": 15,
+        "data_type": "bool",
+        "elements": 2
+      },
+      "sid": 7,
+      "command_hex": "010131000F0F0002",
+      "response_data_hex": "0100",
+      "expected": [
+        true,
+        false
+      ],
+      "udp_request_hex": "800002002A0000EF0007010131000F0F0002",
+      "udp_reply_hex": "C0000200EF00002A0007010100000100",
+      "tcp_request_hex": "46494E530000001A0000000200000000800002002A0000EF0007010131000F0F0002",
+      "tcp_reply_hex": "46494E53000000180000000200000000C0000200EF00002A0007010100000100",
+      "fa_request": "@12FA000000006010131000F0F000272*\r",
+      "fa_reply": "@12FA004000000601010000010047*\r"
+    }
+  ],
+  "limits": [
+    {
+      "name": "timer_pv_max",
+      "command_hex": "01018900000003E7",
+      "elements": 999,
+      "response_bytes": 1998
+    },
+    {
+      "name": "counter_flags_max",
+      "command_hex": "01010980000007CE",
+      "elements": 1998,
+      "response_bytes": 1998
+    },
+    {
+      "name": "fa_timer_pv_max",
+      "command_hex": "010189000000010D",
+      "elements": 269,
+      "response_bytes": 538
+    },
+    {
+      "name": "fa_counter_flags_max",
+      "command_hex": "010109800000021A",
+      "elements": 538,
+      "response_bytes": 538
+    }
+  ]
+}

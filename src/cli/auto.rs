@@ -54,6 +54,7 @@ pub(super) fn run(global: &Global, args: &AutoArgs) -> Result<Report> {
         continuous(&client)?
     } else {
         let limits = Limits {
+            part_selection: None,
             region: args.region,
             max_exposure_us: args.max_exposure.map(|max| max.as_secs_f64() * 1e6),
         };
@@ -124,6 +125,7 @@ fn adjustable(info: &Value) -> Result<()> {
 /// What settling exposure keeps to.
 #[derive(Debug, Default)]
 pub(super) struct Limits {
+    pub part_selection: Option<crate::transport::multipart::PartSelection>,
     /// Meter only this part of the frame.
     pub region: Option<[f64; 4]>,
     /// The longest exposure, in microseconds.
@@ -136,17 +138,22 @@ pub(super) struct Limits {
 /// and is left with the values it reached. A camera this started streams
 /// no longer.
 pub(super) fn settle(client: &Client, timeout: Duration, limits: &Limits) -> Result<Value> {
+    let streaming = intensity_status(client)?["streaming"] == true;
     let info = client.call(SessionCommand::Info)?;
     adjustable(&info)?;
-    let once = once_features(client, &info)?;
+    let once = if limits.part_selection.is_none() {
+        once_features(client, &info)?
+    } else {
+        Vec::new()
+    };
     if limits.region.is_none() && limits.max_exposure_us.is_none() && !once.is_empty() {
         return settle_once(client, &info, &once, timeout);
     }
-    let streaming = client.status()?["streaming"] == true;
     client.call(SessionCommand::Auto {
         continuous: false,
         region: limits.region,
         max_exposure_us: limits.max_exposure_us,
+        part_selection: limits.part_selection,
         job: None,
     })?;
     let started = !streaming && client.call(SessionCommand::Start).is_ok();
@@ -155,6 +162,9 @@ pub(super) fn settle(client: &Client, timeout: Duration, limits: &Limits) -> Res
     let watched = (|| -> Result<(Value, bool)> {
         loop {
             let auto = client.status()?["auto"].clone();
+            if let Some(error) = auto.get("error") {
+                return Err(crate::session::protocol::from_wire(error));
+            }
             if matches!(auto["state"].as_str(), Some("stable" | "limited")) {
                 return Ok((auto, true));
             }
@@ -392,6 +402,7 @@ fn off(client: &Client) -> Result<Value> {
 /// Leave auto exposure on: the camera's own continuous mode when it has
 /// one, else Capturefab's, which runs only while a session holds the camera.
 fn continuous(client: &Client) -> Result<Value> {
+    intensity_status(client)?;
     let info = client.call(SessionCommand::Info)?;
     adjustable(&info)?;
     let features = client.call(SessionCommand::FeatureList {
@@ -423,6 +434,7 @@ fn continuous(client: &Client) -> Result<Value> {
             continuous: true,
             region: None,
             max_exposure_us: None,
+            part_selection: None,
             job: None,
         })?;
         return Ok(json!({
@@ -439,6 +451,14 @@ fn continuous(client: &Client) -> Result<Value> {
         .into());
     };
     Ok(json!({"camera": info["camera"], "mode": "continuous", "by": by}))
+}
+
+fn intensity_status(client: &Client) -> Result<Value> {
+    let status = client.status()?;
+    if let Some(camera_id) = status["info"]["id"].as_str() {
+        crate::auto::require_intensity(camera_id)?;
+    }
+    Ok(status)
 }
 
 /// Result fields, for `schema`.

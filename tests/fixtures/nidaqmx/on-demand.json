@@ -1,0 +1,493 @@
+{
+  "version": 1,
+  "freeze": "Independent scratch-only pre-on-demand-native ABI/raw-value/clock oracle; no product decoder, C compiler, SDK or native execution.",
+  "profile": "fresh_owned_software_timed_ai_one_scan",
+  "scope": "Fixed ABI/raw semantics are independent of public config, private protocol and output schema. Host pacing and rejection rules are explicit Capturefab policy, not NI device guarantees.",
+  "types": {
+    "TaskHandle": "pointer-sized opaque owned handle",
+    "status": "i32",
+    "bool32": "u32",
+    "f64": "IEEE754 binary64",
+    "platform_calling_convention": "C on Linux; fixed extern system / NI __CFUNC on Windows"
+  },
+  "mandatory_common_exports": [
+    {
+      "name": "DAQmxCreateTask",
+      "returns": "i32",
+      "arguments": [
+        "const char*",
+        "TaskHandle*"
+      ]
+    },
+    {
+      "name": "DAQmxGetTaskNumChans",
+      "returns": "i32",
+      "arguments": [
+        "TaskHandle",
+        "u32*"
+      ]
+    },
+    {
+      "name": "DAQmxGetNthTaskReadChannel",
+      "returns": "i32",
+      "arguments": [
+        "TaskHandle",
+        "u32",
+        "char*",
+        "i32"
+      ]
+    },
+    {
+      "name": "DAQmxStartTask",
+      "returns": "i32",
+      "arguments": [
+        "TaskHandle"
+      ]
+    },
+    {
+      "name": "DAQmxReadAnalogF64",
+      "returns": "i32",
+      "arguments": [
+        "TaskHandle",
+        "i32",
+        "f64",
+        "u32",
+        "f64*",
+        "u32",
+        "i32*",
+        "u32*"
+      ]
+    },
+    {
+      "name": "DAQmxStopTask",
+      "returns": "i32",
+      "arguments": [
+        "TaskHandle"
+      ]
+    },
+    {
+      "name": "DAQmxClearTask",
+      "returns": "i32",
+      "arguments": [
+        "TaskHandle"
+      ]
+    },
+    {
+      "name": "DAQmxGetErrorString",
+      "returns": "i32",
+      "arguments": [
+        "i32",
+        "char*",
+        "u32"
+      ]
+    },
+    {
+      "name": "DAQmxGetExtendedErrorInfo",
+      "returns": "i32",
+      "arguments": [
+        "char*",
+        "u32"
+      ]
+    }
+  ],
+  "selected_measurement_exports": {
+    "voltage": "DAQmxCreateAIVoltageChan",
+    "thermocouple": "DAQmxCreateAIThrmcplChan",
+    "current": "DAQmxCreateAICurrentChan",
+    "optional_thermocouple_only": "DAQmxSetAITermCfg only for explicit nondefault TC terminal request",
+    "constructor_contract": "Retain immutable measurement oracles including required NULL custom-scale pointers for Volts/Amps; do not require unused constructors."
+  },
+  "forbidden_software_profile_calls": [
+    "DAQmxCfgSampClkTiming",
+    "DAQmxCfgInputBuffer",
+    "DAQmxSetReadOverWrite",
+    "DAQmxGetReadAvailSampPerChan",
+    "DAQmxGetSampClkRate",
+    "DAQmxSetSampTimingType",
+    "DAQmxGetSampTimingType"
+  ],
+  "setup_order": [
+    "Resolve nine common plus selected measurement constructor and applicable TC setter before CreateTask",
+    "CreateTask with empty name; qualify ownership only successful status and nonNULL handle",
+    "Create each requested channel once; optional TC setter immediately after its channel",
+    "GetTaskNumChans and 1-based NthTaskReadChannel bounded queries; exact normalized requested order, actual count1..64",
+    "StartTask once",
+    "Publish configured metadata without consuming pacing interval",
+    "Retain one fresh task across one-scan Reads; Finish never reads; bounded deferred diagnostics and owned Stop/Clear"
+  ],
+  "no_timing_route": {
+    "mandatory_timing_property_calls": 0,
+    "reason": "NI documents software timing without SampleClockTiming or SampleClock property selection on a fresh task. No imported task/configuration, retry or continuous fallback.",
+    "research_only": {
+      "DAQmxSetSampTimingType": {
+        "returns": "i32",
+        "arguments": [
+          "TaskHandle",
+          "i32"
+        ]
+      },
+      "on_demand_constant": 10390,
+      "sample_clock_constant": 10388,
+      "not_selected": "No getter/setter required or called; a TC01 property listing does not establish writable-value qualification."
+    }
+  },
+  "one_scan_read": {
+    "num_samps_per_channel_i32": 1,
+    "timeout": "strictly positive finite original remaining seconds computed at worker pre-FFI attempt boundary; never0 or-1",
+    "fill_mode_bool32": 1,
+    "reserved": "NULL",
+    "actual_channels": "validated actual1..64 in exact driver channel order",
+    "capacity_f64": "actual_channels, not bytes and not continuous block cap",
+    "output_initial_bits_hex": "0000000000000000 for every element",
+    "layout": "one scan, actual channel order; no availability/rate call first",
+    "completion_clock": "worker host monotonic immediately after FFI returns, before encoding or optional diagnostics"
+  },
+  "timeout_arithmetic_control": {
+    "original_deadline_ns": 2000000000,
+    "cutoff_ns": 2500000000,
+    "attempt_start_ns": 1875000000,
+    "remaining_ns": 125000000,
+    "timeout_exact_rational": "1/8",
+    "timeout_seconds": 0.125,
+    "timeout_bits_hex": "3fc0000000000000",
+    "timeout_ieee754_le_hex": "000000000000c03f",
+    "expiry_controls": [
+      {
+        "now_ns": 2000000000,
+        "sdk_call": false
+      },
+      {
+        "now_ns": 2000000001,
+        "sdk_call": false
+      }
+    ],
+    "clock_scope": "Computed from recorded worker pre-FFI timestamp. Scheduling after this timestamp may precede physical native entry; no exact C-entry remaining-time law."
+  },
+  "actual_count_cases": [
+    {
+      "status": 0,
+      "actual": 1,
+      "result": "one full scan"
+    },
+    {
+      "status": 12345,
+      "actual": 1,
+      "result": "one full scan and raw warning before deferred lookup"
+    },
+    {
+      "status": 0,
+      "actual": 0,
+      "result": "Incomplete, no sample block"
+    },
+    {
+      "status": 12345,
+      "actual": 0,
+      "result": "Incomplete, preserve raw warning, no block"
+    },
+    {
+      "status": -200284,
+      "actual": 0,
+      "result": "original native failure, no block"
+    },
+    {
+      "status": -200284,
+      "actual": 1,
+      "result": "full valid one-scan prefix plus original native failure before deferred lookup"
+    },
+    {
+      "status": 0,
+      "actual": -1,
+      "result": "invalid count, no memory inspection"
+    },
+    {
+      "status": 0,
+      "actual": 2,
+      "result": "invalid count, no memory inspection"
+    }
+  ],
+  "host_attempt_pacing": {
+    "basis": "host_software_request_spacing",
+    "interval_control_ns": 250000000,
+    "boundary": "worker HOST monotonic timestamp immediately before FFI attempt",
+    "owner": "worker monotonic next-admission frontier; parent RPC time is only a hint",
+    "next_frontier": "current admitted attempt_start + interval, checked addition",
+    "early": "healthy idle, no SDK and no frontier advance",
+    "initial_ready": "no attempt and no interval consumption; first Read may be immediately eligible",
+    "slow_read": "one eligible attempt after an overshoot; no catchup burst and no completion+interval throttle",
+    "deadline": "all waits and Read use the same original operation deadline and cutoff; no renewal",
+    "not_claimed": [
+      "exact physical SDK entry gap",
+      "hard real-time scheduling",
+      "fresh4Hz samples",
+      "ADC timing, uniqueness or simultaneous channels"
+    ],
+    "trace_control": [
+      {
+        "event": "ready",
+        "now_ns": 900000000,
+        "attempt_start_ns": null,
+        "next_not_before_ns": 0,
+        "sdk_reads": 0
+      },
+      {
+        "event": "read_admitted",
+        "now_ns": 1000000000,
+        "attempt_start_ns": 1000000000,
+        "next_not_before_ns": 1250000000,
+        "completion_ns": 1100000000,
+        "sdk_reads": 1
+      },
+      {
+        "event": "early_idle",
+        "now_ns": 1200000000,
+        "attempt_start_ns": null,
+        "next_not_before_ns": 1250000000,
+        "sdk_reads": 1
+      },
+      {
+        "event": "read_admitted_slow",
+        "now_ns": 1250000000,
+        "attempt_start_ns": 1250000000,
+        "next_not_before_ns": 1500000000,
+        "completion_ns": 1900000000,
+        "sdk_reads": 2
+      },
+      {
+        "event": "one_after_overshoot",
+        "now_ns": 1900000000,
+        "attempt_start_ns": 1900000000,
+        "next_not_before_ns": 2150000000,
+        "completion_ns": 1910000000,
+        "sdk_reads": 3
+      },
+      {
+        "event": "early_after_overshoot",
+        "now_ns": 1910000000,
+        "attempt_start_ns": null,
+        "next_not_before_ns": 2150000000,
+        "sdk_reads": 3
+      }
+    ],
+    "fixture_clock_law": "Assert ordered worker attempt/frontier transitions and causal C-entry/return brackets. Do not impose a load-sensitive exact physical C-entry interval law."
+  },
+  "patterns": [
+    {
+      "name": "positive_one",
+      "bits_hex": "3ff0000000000000",
+      "ieee754_le_hex": "000000000000f03f",
+      "classification": "normal",
+      "sign_bit": false,
+      "finite_decimal": "1"
+    },
+    {
+      "name": "negative_two_point_five",
+      "bits_hex": "c004000000000000",
+      "ieee754_le_hex": "00000000000004c0",
+      "classification": "normal",
+      "sign_bit": true,
+      "finite_decimal": "-2.5"
+    },
+    {
+      "name": "negative_zero",
+      "bits_hex": "8000000000000000",
+      "ieee754_le_hex": "0000000000000080",
+      "classification": "zero",
+      "sign_bit": true,
+      "finite_decimal": "-0"
+    },
+    {
+      "name": "positive_infinity",
+      "bits_hex": "7ff0000000000000",
+      "ieee754_le_hex": "000000000000f07f",
+      "classification": "infinity",
+      "sign_bit": false
+    },
+    {
+      "name": "negative_infinity",
+      "bits_hex": "fff0000000000000",
+      "ieee754_le_hex": "000000000000f0ff",
+      "classification": "infinity",
+      "sign_bit": true
+    },
+    {
+      "name": "quiet_nan_payload_a5",
+      "bits_hex": "7ff80000000000a5",
+      "ieee754_le_hex": "a50000000000f87f",
+      "classification": "nan",
+      "sign_bit": false
+    },
+    {
+      "name": "minimum_positive_subnormal",
+      "bits_hex": "0000000000000001",
+      "ieee754_le_hex": "0100000000000000",
+      "classification": "subnormal",
+      "sign_bit": false
+    },
+    {
+      "name": "maximum_finite",
+      "bits_hex": "7fefffffffffffff",
+      "ieee754_le_hex": "ffffffffffffef7f",
+      "classification": "normal",
+      "sign_bit": false
+    },
+    {
+      "name": "positive_zero",
+      "bits_hex": "0000000000000000",
+      "ieee754_le_hex": "0000000000000000",
+      "classification": "zero",
+      "sign_bit": false,
+      "finite_decimal": "0"
+    },
+    {
+      "name": "minimum_positive_normal",
+      "bits_hex": "0010000000000000",
+      "ieee754_le_hex": "0000000000001000",
+      "classification": "normal",
+      "sign_bit": false
+    },
+    {
+      "name": "minimum_negative_subnormal",
+      "bits_hex": "8000000000000001",
+      "ieee754_le_hex": "0100000000000080",
+      "classification": "subnormal",
+      "sign_bit": true
+    },
+    {
+      "name": "negative_quiet_nan_payload_45",
+      "bits_hex": "fff8000000000045",
+      "ieee754_le_hex": "450000000000f8ff",
+      "classification": "nan",
+      "sign_bit": true
+    }
+  ],
+  "two_channel_six_one_scan_reads": {
+    "shape": [
+      6,
+      2
+    ],
+    "layout": "scan_major_across_six_reads",
+    "all_words_le_hex": "000000000000f03f00000000000004c00000000000000080000000000000f07f000000000000f0ffa50000000000f87f0100000000000000ffffffffffffef7f000000000000000000000000000010000100000000000080450000000000f8ff"
+  },
+  "measurement_first_scan_controls": [
+    {
+      "measurement": "voltage",
+      "words_bits_hex": [
+        "3ff0000000000000",
+        "c004000000000000"
+      ],
+      "words_le_hex": "000000000000f03f00000000000004c0",
+      "finite_values": [
+        "1",
+        "-2.5"
+      ],
+      "units": "volts"
+    },
+    {
+      "measurement": "thermocouple",
+      "words_bits_hex": [
+        "4039000000000000",
+        "4039000000000000"
+      ],
+      "words_le_hex": "00000000000039400000000000003940",
+      "finite_values": [
+        "25",
+        "25"
+      ],
+      "units_control": "Identical words under requestedC/F are not locally converted."
+    },
+    {
+      "measurement": "current",
+      "words_bits_hex": [
+        "3f90000000000000",
+        "3f90000000000000"
+      ],
+      "words_le_hex": "000000000000903f000000000000903f",
+      "finite_values": [
+        "0.015625",
+        "0.015625"
+      ],
+      "units": "amps, identical under builtin/external shunt; no V/R or mA conversion"
+    }
+  ],
+  "publication_policy": {
+    "source_time": "omitted",
+    "hardware_rate_and_buffer_fields": "omitted, not null; no nominal/requested hardware rate or input buffer claim",
+    "sample_index": "returned scans in this owned epoch, not hardware conversions or loss sequence",
+    "outer_clock": "actual post-Read host completion; no interpolation or device-time claim",
+    "repeat_words": "retained without dedup, freshness or loss inference",
+    "late_completion": "at/after original deadline/cutoff is not timely admission; already admitted reply retains original completion clock even if IPC delivery is delayed",
+    "partial_error": "accepted one-scan negative prefix and original raw native code precede optional deferred diagnostics; hung Finish cannot erase prefix"
+  },
+  "immutable_prior_oracles_sha256": {
+    "abi.json": "1bbc016312c3aab6093483cfa3aeee442e6bc3aaeb74eaa8113641a090329b6b",
+    "thermocouple.json": "2a8109877c63aa7448965c0d0ac9ec060355d8dde41e98496b4ff8050ac65cb1",
+    "current.json": "14f428f82a6cf94704ac47ff2b42d18bf71553435437ae4f0345bf4260779bff",
+    "voltage-scale-null.json": "5764fe41ecab45d8b5795d15dc82f723c566d5ba0af565048224337ed321ba63"
+  },
+  "primary": [
+    {
+      "id": "software_timing_default",
+      "url": "https://docs-be.ni.com/api/bundle/ni-daqmx/page/hardwresoftwretiming.html",
+      "bytes": 5346,
+      "sha256": "0cabebbbaa95f499c51f31faf3de33dd329675fa6abd502c69990097b0859326",
+      "fact": "No SampleClockTiming call and no SampleClock property selection selects software timing; fresh task only."
+    },
+    {
+      "id": "single_sample_ai",
+      "url": "https://docs-be.ni.com/api/bundle/ni-daqmx/page/single-sample-analog-input-programming-flowch.html",
+      "bytes": 6424,
+      "sha256": "4fc966c574fab617e14bb6f75336f1e15ad7d47a5d996622f012027f5e9c491d",
+      "fact": "One value per channel; no buffering or hardware timing; explicit repeated-task Start and Stop recommended."
+    },
+    {
+      "id": "read_analog_f64",
+      "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__read__functions_1gabcf8dab848856e7c132d839b284a3e96.html",
+      "bytes": 13791,
+      "sha256": "01a269c213d2914570b8c5590b2c434a88b2962ec973c7b2283d27ac773b22a7",
+      "fact": "Fixed eight arguments; finite seconds timeout, actual returned samples, reserved NULL."
+    },
+    {
+      "id": "timing_type_research_only",
+      "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__properties__timing__sample__quantity_1ga98c78ddd7ab435a36d1d6b7cb4e22799.html",
+      "bytes": 11172,
+      "sha256": "edd9801c05eb798fe9c9c023d27967c0a987925dc6de4cca722fbd261f39da74",
+      "fact": "OnDemand10390 samples on each Read/Write; not an operation selected by this profile."
+    },
+    {
+      "id": "timing_setter_research_only",
+      "url": "https://docs-be.ni.com/api/bundle/ni-daqmx-c-api-ref/page/group__ni-daqmx__c__functions__property__manipulation__setter_1ga31fe7eadce17f99be5e5d18c7b6fb0a1.html",
+      "bytes": 6061,
+      "sha256": "1191455e19476611e1fdc309bde45c568cacfebfaaa7bef0b747bceec6806382",
+      "fact": "int32 __CFUNC DAQmxSetSampTimingType(TaskHandle,int32), not selected or called."
+    },
+    {
+      "id": "ni_constants",
+      "url": "https://raw.githubusercontent.com/ni/nidaqmx-python/1d60b6c53ef11dead0ba6aa9d6e2855351835ad7/generated/nidaqmx/constants.py",
+      "bytes": 50365,
+      "sha256": "9d15eb38ccb03769f9e5ad94289a00658ee36b6685709e4f3d49dafb25b4ae57",
+      "fact": "ON_DEMAND10390 corroboration; no per-device support claim."
+    },
+    {
+      "id": "ni_tc_example",
+      "url": "https://raw.githubusercontent.com/ni/nidaqmx-python/1d60b6c53ef11dead0ba6aa9d6e2855351835ad7/examples/analog_in/thrmcpl_sample.py",
+      "bytes": 506,
+      "sha256": "113855e3c2fe25024398e1d2c632712c86e937e7013b567fd1b96d6c79c7be24",
+      "fact": "Fresh task and TC channel then read, no timing call; not array-Read ABI or physical TC01 proof."
+    },
+    {
+      "id": "ni_voltage_example",
+      "url": "https://raw.githubusercontent.com/ni/nidaqmx-python/1d60b6c53ef11dead0ba6aa9d6e2855351835ad7/examples/analog_in/voltage_sample.py",
+      "bytes": 352,
+      "sha256": "ee5bad87f90ced3bb9c816b6851096c3fe7e5cefff4d127fef050155b7517196",
+      "fact": "Fresh task then channel/read, no timing call."
+    },
+    {
+      "id": "usb_tc01_model_spec",
+      "url": "https://download.ni.com/support/manuals/374918b.pdf",
+      "bytes": 284887,
+      "sha256": "9c47f9c58207b18a3569a6b0e272e4d7293a0aa664ad8c05fae83ccff8923d06",
+      "fact": "Printed2: one channel,250ms conversion,4S/s maximum software-timed. Model facts read by independent primary agent; no physical test."
+    }
+  ],
+  "qualification": "Synthetic fixed-ABI/raw/host-scheduling oracle only. No driver execution, device qualification, USB-TC01 OS/driver compatibility, native error-code prediction, accuracy/calibration, ADC freshness or physical timing test. TC01 model facts are not universal NI timing constraints."
+}

@@ -1,6 +1,7 @@
 [package]
 name = "capturefab"
 version = "0.6.1"
+default-run = "capturefab"
 edition = "2024"
 rust-version = "1.89"
 description = "Camera capture command-line tool for people, scripts and AI agents: GigE Vision, USB3 Vision, GenICam, webcams and streams"
@@ -10,8 +11,13 @@ keywords = ["camera", "capture", "genicam", "gige-vision", "cli"]
 categories = ["command-line-utilities"]
 
 [features]
-default = ["usb", "jpeg", "videotoolbox", "nvjpeg", "vaapi", "keychain", "shell"]
+default = ["usb", "gentl", "ni-daqmx", "jpeg", "videotoolbox", "nvjpeg", "vaapi", "keychain", "shell", "mqtt-tls"]
 usb = ["dep:nusb"]
+# Isolated consumer for explicitly configured vendor GenTL producer libraries.
+# Vendor drivers/runtimes are installed separately; no library is linked here.
+gentl = []
+# Isolated NI-DAQmx analog-input worker; installed vendor runtime is not bundled.
+ni-daqmx = []
 # libjpeg-turbo, built from source with its NEON/SSE2/AVX2 SIMD (x86 needs NASM).
 jpeg = ["dep:turbojpeg"]
 # Apple's JPEG engine through VideoToolbox, a system framework, for color
@@ -31,6 +37,8 @@ keychain = ["dep:keyring"]
 # Line editing, history and tab completion in `capturefab shell`; without it
 # the shell reads plain lines.
 shell = ["dep:rustyline"]
+# Verified MQTT TLS, including private plant CAs and client certificates.
+mqtt-tls = ["dep:rustls", "dep:webpki-roots"]
 # Count where camera frames are copied and the large allocations made, and
 # write each camera worker's and GPU JPEG helper's counts to
 # $CAPTUREFAB_COPY_REPORT (tests/copies.rs). Off in every release build.
@@ -46,7 +54,7 @@ anyhow = "1"
 clap = { version = "4.5", features = ["derive", "env"] }
 clap_complete = "4.5"
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["float_roundtrip"] }
+serde_json = { version = "1", features = ["float_roundtrip", "arbitrary_precision"] }
 roxmltree = "0.20"
 zip = { version = "2.4", default-features = false, features = ["deflate-flate2", "flate2"] }
 png = "0.17"
@@ -58,6 +66,7 @@ base64 = "0.22"
 sha1 = "0.10"
 md-5 = "0.10"
 sha2 = "0.10"
+crc32fast = "1.5"
 fs2 = "0.4"
 # Lossless storage of the bundled executable; PNG/ZIP already use this backend.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
@@ -65,6 +74,17 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 turbojpeg = { version = "1.5", optional = true, default-features = false, features = ["cmake", "require-simd"] }
 keyring = { version = "4.2", optional = true }
 zeroize = "1"
+rustls = { version = "0.23", optional = true, default-features = false, features = ["std", "ring", "tls12"] }
+webpki-roots = { version = "1", optional = true }
+opcua = { package = "async-opcua", version = "=0.19.0", features = ["client"] }
+tokio = { version = "1", features = ["rt", "net", "time", "sync", "macros"] }
+tempfile = "3"
+rsa = "0.9"
+pkcs8 = { version = "0.10", features = ["encryption", "pem"] }
+aes = "0.8"
+cbc = "0.1"
+des = "0.8"
+x509-cert = "0.2"
 rustyline = { version = "18", optional = true, default-features = false, features = ["with-file-history"] }
 
 # Inheritable pipes (a detached session's ready line, a worker's stdout
@@ -72,7 +92,7 @@ rustyline = { version = "18", optional = true, default-features = false, feature
 # a worker's private protocol handle, publishing a capture without
 # replacing a file (MoveFileExW), and the memory left (GlobalMemoryStatusEx).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Devices_Communication", "Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_LibraryLoader", "Win32_System_Performance", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 # Ctrl-C, Ctrl-Break and a closed console where there are no Unix signals,
 # which go through libc.
@@ -92,7 +112,17 @@ libc = "0.2"
 sha2 = { version = "0.10", features = ["asm"] }
 
 [dev-dependencies]
+rcgen = "0.14"
 capturefab = { path = ".", default-features = false, features = ["testing"] }
+opcua = { package = "async-opcua", version = "=0.19.0", features = ["server"] }
+
+# Controlled child for Windows helper integration tests; excluded from normal builds.
+[[bin]]
+name = "capturefab-helper-fixture"
+path = "tests/support/helper_fixture.rs"
+required-features = ["testing"]
+test = false
+bench = false
 
 [build-dependencies]
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
@@ -374,3 +404,7 @@ unnecessary_semicolon = "deny"
 [[bench]]
 name = "runtime"
 harness = false
+
+# Bound recursive built-in UA values before service dispatch; MPL source retained locally.
+[patch.crates-io]
+async-opcua-types = { path = "vendor/async-opcua-types-0.19.0" }

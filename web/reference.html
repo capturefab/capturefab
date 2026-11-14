@@ -32,15 +32,15 @@
       <nav aria-label="Main navigation"><a href="index.html">Product</a><a href="docs.html">Documentation</a><a href="downloads.html">Downloads</a><a href="downloads.html#source">Source</a></nav>
       <a class="search-trigger" href="docs.html#search" aria-label="Search documentation" aria-keyshortcuts="Control+K Meta+K"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span>Search docs</span><kbd>Ctrl K</kbd></a>
     </header>
-    <main id="main" class="docs-layout"><aside class="docs-sidebar" aria-label="Command reference navigation"><div class="sidebar-group"><p>Command reference</p><a href="#cli-basics">JSON results and errors</a><a href="#cli-global-options">Global options</a><a href="#cli-grammars">Value grammars</a><a href="#cli-cameras">Cameras and settings</a><a href="#cli-capture">Capture, record and measure</a><a href="#cli-presets">Presets</a><a href="#cli-sessions">Sessions and jobs</a><a href="#cli-network">Sign-ins and networks</a><a href="#cli-tools">Diagnostics and tools</a></div><a class="sidebar-source" href="docs.html">Back to the guides</a></aside><div class="docs-content">
-<details class="docs-mobile-nav"><summary>Browse the command reference</summary><nav aria-label="Command reference topics"><a href="#cli-basics">JSON results and errors</a><a href="#cli-global-options">Global options</a><a href="#cli-grammars">Value grammars</a><a href="#cli-cameras">Cameras and settings</a><a href="#cli-capture">Capture, record and measure</a><a href="#cli-presets">Presets</a><a href="#cli-sessions">Sessions and jobs</a><a href="#cli-network">Sign-ins and networks</a><a href="#cli-tools">Diagnostics and tools</a></nav></details>
-<header class="docs-head"><p class="eyebrow">Reference</p><h1>Commands, options and results</h1><p class="lead">Find cameras, change their settings, and save images and video. Follow a task in the <a href="docs.html">guides</a> or use the <a href="agents.md">agent instructions</a> for automation.</p></header>
+    <main id="main" class="docs-layout"><aside class="docs-sidebar" aria-label="Command reference navigation"><div class="sidebar-group"><p>Command reference</p><a href="#cli-basics">JSON results and errors</a><a href="#cli-global-options">Global options</a><a href="#cli-grammars">Value grammars</a><a href="#cli-cameras">Cameras and settings</a><a href="#cli-capture">Capture, record and measure</a><a href="#cli-data">Industrial data</a><a href="#cli-presets">Presets</a><a href="#cli-sessions">Sessions and jobs</a><a href="#cli-network">Sign-ins and networks</a><a href="#cli-tools">Diagnostics and tools</a></div><a class="sidebar-source" href="docs.html">Back to the guides</a></aside><div class="docs-content">
+<details class="docs-mobile-nav"><summary>Browse the command reference</summary><nav aria-label="Command reference topics"><a href="#cli-basics">JSON results and errors</a><a href="#cli-global-options">Global options</a><a href="#cli-grammars">Value grammars</a><a href="#cli-cameras">Cameras and settings</a><a href="#cli-capture">Capture, record and measure</a><a href="#cli-data">Industrial data</a><a href="#cli-presets">Presets</a><a href="#cli-sessions">Sessions and jobs</a><a href="#cli-network">Sign-ins and networks</a><a href="#cli-tools">Diagnostics and tools</a></nav></details>
+<header class="docs-head"><p class="eyebrow">Reference</p><h1>Commands, options and results</h1><p class="lead">Capture images, video and industrial time series. Follow a task in the <a href="docs.html">guides</a> or use the <a href="agents.md">agent instructions</a> for automation.</p></header>
 <article class="doc-section" id="cli-basics" data-doc-section data-doc-title="JSON results, exit codes and errors" data-doc-category="Command reference" data-doc-tags="json,ndjson,exit code,error code,schema,stdout,stderr,--progress"><h2>JSON results, exit codes and errors</h2><p class="doc-summary">Read JSON results and progress lines. Use exit codes to handle errors.</p>
-<p><code>--json</code> or <code>CAPTUREFAB_JSON=1</code> usually writes one result line to stdout. A failure returns <code>error</code> with <code>code</code>, <code>message</code> and optional <code>hint</code> and <code>details</code>. Use the exit code for the category and <code>error.code</code> for the specific reason.</p>
-<p><code>watch --json</code> and <code>shell --json</code> emit NDJSON. With <code>capture --json -o -</code>, image bytes go to stdout and JSON goes to stderr. <code>--progress</code> sends JSON progress to stderr. NDJSON means one JSON object per line. <code>--help</code> and <code>--version</code> print text.</p>
+<p><code>--json</code> or <code>CAPTUREFAB_JSON=1</code>: usually one stdout result; failures return <code>error.{code,message,hint?,details?}</code>. Use the exit code for the category and <code>error.code</code> for the specific reason.</p>
+<p><code>watch --json</code> and <code>shell --json</code> emit NDJSON. <code>capture --json -o -</code> writes image bytes to stdout, JSON to stderr. <code>--progress</code> emits JSON progress to stderr. NDJSON means one JSON object per line. <code>--help</code> and <code>--version</code> print text.</p>
 <p>Use <code>--progress</code> with <code>capture</code>, <code>record</code> or <code>jobs wait</code> to follow job progress. Each line has a <code>progress</code> object.</p>
-<p>Keys use <code>snake_case</code>, with units in names such as <code>exposure_us</code>. Timestamps use RFC 3339 UTC. Missing fields are omitted. A result can include up to 10 distinct warnings. Capturefab redacts credentials in camera URLs.</p>
-<p>Run <code>capturefab schema COMMAND</code> for arguments, result fields and errors. This reference uses that output and the CLI help. The contract version is <code>1</code>.</p>
+<p>Keys: <code>snake_case</code>, units as in <code>exposure_us</code>. Timestamps: RFC 3339 UTC. Missing fields are omitted. A result can include up to 10 distinct warnings. Camera URL credentials are redacted.</p>
+<p><code>capturefab schema COMMAND</code> shows arguments, results and errors. This reference uses that output and the CLI help. The contract version is <code>1</code>.</p>
 <div class="table-scroll"><table><caption>Exit codes</caption><thead><tr><th scope="col">Exit code</th><th scope="col">Category</th></tr></thead><tbody>
 <tr><td><code>0</code></td><td>ok</td></tr>
 <tr><td><code>1</code></td><td>failed</td></tr>
@@ -81,7 +81,7 @@
 <tr><td><code id="error-interrupted">interrupted</code></td><td><code>130</code></td><td>stopped by a signal; details hold partial results</td></tr>
 </tbody></table></div></article>
 <article class="doc-section" id="cli-global-options" data-doc-section data-doc-title="Global options, cameras and sessions" data-doc-category="Command reference" data-doc-tags="global options,environment,session,camera,--keep,--background"><h2>Global options, cameras and sessions</h2><p class="doc-summary">Choose a camera, control session use and see what commands can change.</p>
-<p>Put global options before or after the command.</p>
+<p>Global options work before or after the command.</p>
 <div class="table-scroll"><table><caption>Global options</caption><thead><tr><th scope="col">Option</th><th scope="col">Meaning</th><th scope="col">Environment</th></tr></thead><tbody>
 <tr><td><code>--json</code></td><td>Print JSON results and errors</td><td><code>CAPTUREFAB_JSON</code></td></tr>
 <tr><td><code>-q</code>, <code>--quiet</code></td><td>Hide status and notes. Still report errors and explicit --progress output</td><td>—</td></tr>
@@ -91,18 +91,18 @@
 <tr><td><code>-h</code>, <code>--help</code></td><td>Print help (see more with &#x27;--help&#x27;)</td><td>—</td></tr>
 <tr><td><code>-V</code>, <code>--version</code></td><td>Print version</td><td>—</td></tr>
 </tbody></table></div>
-<p>Use <code>-c CAM</code> or <code>CAPTUREFAB_CAMERA</code>. By default, use the session&#x27;s only camera or the only camera discovered. Discovery for this default excludes simulators and screens.</p>
-<p>Use <code>--session NAME</code> to choose a session. Otherwise, commands reuse a matching session. Most camera commands keep the camera open in <code>auto</code> for 60s after use. <code>--keep 0</code> can reuse a session. Use <code>--no-session</code> to bypass sessions.</p>
+<p><code>-c CAM</code> or <code>CAPTUREFAB_CAMERA</code>; else the session&#x27;s only camera, then the only discovered camera (excluding simulators/screens).</p>
+<p><code>--session NAME</code>, else matching session; warm <code>auto</code> lasts 60s. <code>--keep 0</code> reuses; <code>--no-session</code> bypasses. <code>network force-ip</code> and <code>network action</code> run locally, ignore ambient sessions, reject explicit sessions..</p>
 <p><code>--no-session</code> overrides <code>CAPTUREFAB_SESSION</code> and <code>CAPTUREFAB_KEEP</code>. It conflicts with an explicit <code>--session</code>, <code>--background</code> or positive <code>--keep</code>.</p>
-<p><code>capture</code> and <code>record</code> normally wait for the job. <code>--background</code> returns a job to follow with <code>jobs wait ID</code>.</p>
+<p><code>capture</code> and <code>record</code> wait by default. <code>--background</code> returns a job for <code>jobs wait ID</code>.</p>
 <p>Each command lists its default effect. Look for options that add a file or camera write in the argument table.</p>
 <dl><dt><code>read</code></dt><dd>Reads data. It can write a temporary preview.</dd><dt><code>file_write</code></dt><dd>Can write files or update saved data on this computer.</dd><dt><code>camera_write</code></dt><dd>Can change camera settings or jobs.</dd><dt><code>disruptive</code></dt><dd>Can hold cameras, stop streams or run camera commands.</dd></dl></article>
 <article class="doc-section" id="cli-grammars" data-doc-section data-doc-title="Selectors, names, durations and templates" data-doc-category="Command reference" data-doc-tags="selector,feature name,bank,duration,template,controls"><h2>Selectors, names, durations and templates</h2><p class="doc-summary">See what to type for camera selectors, feature names, durations and output templates.</p>
 <div class="table-scroll"><table><caption>Accepted forms</caption><thead><tr><th scope="col">Value</th><th scope="col">Form</th></tr></thead><tbody>
-<tr><td>duration</td><td>Add a unit, as in <code>250ms</code>, <code>1.5s</code> or <code>1h30m</code>. Use <code>0</code> where allowed. Some waits accept <code>none</code> for an unlimited wait</td></tr>
+<tr><td>duration</td><td>Units: <code>250ms</code>, <code>1.5s</code>, <code>1h30m</code>. Use <code>0</code> where allowed; some waits accept <code>none</code> (unlimited).</td></tr>
 <tr><td>name</td><td>Use <code>Feature</code>, <code>Feature[Selector=Value,…]</code> or <code>Feature[Value]</code> for one selector. Controls include <code>exposure</code>, <code>gain</code>, <code>fps</code>, <code>roi</code>, <code>format</code>, <code>trigger</code>, <code>auto_exposure</code> and <code>auto_wb</code></td></tr>
-<tr><td>selector</td><td>Camera ID from <code>list</code>, serial, IPv4, stream URL such as <code>rtsp://HOST/PATH</code>, <code>onvif://HOST</code>, file path, <code>sim:N[?drop=0..0.5&amp;line0=every:DUR]</code> or <code>sim:replay:PATH</code></td></tr>
-<tr><td>template</td><td>Capture names accept <code>{camera}</code>, <code>{serial}</code>, <code>{seq}</code>, <code>{seq:N}</code>, <code>{frame}</code>, <code>{time}</code>, <code>{date}</code>, <code>{datetime}</code>, <code>{tag:KEY}</code> and <code>{ext}</code></td></tr>
+<tr><td>selector</td><td>ID/serial/IPv4/URL/file; sim:N[?drop=0..0.5&amp;line0=every:DUR]; sim:replay:PATH; gige-monitor://IP?interface=IP&amp;mac=12HEX</td></tr>
+<tr><td>template</td><td>Names accept <code>{camera}</code>, <code>{serial}</code>, <code>{seq}</code>, <code>{seq:N}</code>, <code>{frame}</code>, <code>{time}</code>, <code>{date}</code>, <code>{datetime}</code>, <code>{tag:KEY}</code> and <code>{ext}</code></td></tr>
 </tbody></table></div>
 <p>In a shell, put quotes around names, selectors and templates with special characters. For example, use <code>'TriggerMode[FrameStart]'</code> or <code>'frames/{seq}.png'</code>.</p>
 <p>Use an existing folder or end the path with a separator to save numbered files. Use <code>{seq:N}</code> to pad the number to N digits, from 1 to 9. Use <code>--on-exists number</code> to add a number when a fixed capture filename already exists.</p></article>
@@ -110,7 +110,7 @@
 <h3 id="command-list"><code>capturefab list</code></h3>
 <p>List cameras: GigE Vision, USB3 Vision, webcams, ONVIF. Effect: <code>read</code>. Alias: <code>ls</code>.</p>
 <div class="table-scroll"><table><caption>capturefab list arguments</caption><thead><tr><th scope="col">Argument or option</th><th scope="col">Meaning</th><th scope="col">Details</th></tr></thead><tbody>
-<tr><td><code>--kind</code> KIND</td><td>Only these kinds (comma-separated); screen captures and sim:0 are listed only when named</td><td>one of <code>gige</code>, <code>u3v</code>, <code>webcam</code>, <code>onvif</code>, <code>screen</code>, <code>sim</code>; repeatable</td></tr>
+<tr><td><code>--kind</code> KIND</td><td>Only these kinds (comma-separated); screen captures and sim:0 are listed only when named</td><td>one of <code>gige</code>, <code>u3v</code>, <code>gentl</code>, <code>webcam</code>, <code>onvif</code>, <code>screen</code>, <code>sim</code>; repeatable</td></tr>
 <tr><td><code>--timeout</code> DUR</td><td>How long GigE and ONVIF broadcasts collect answers</td><td>default <code>1s</code></td></tr>
 </tbody></table></div>
 <div class="code-wrap"><pre><code>capturefab list
@@ -118,7 +118,7 @@ capturefab list --kind gige,u3v --timeout 3s
 capturefab list --kind sim
 capturefab --json list</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab list examples">Copy</button></div>
 <div class="table-scroll"><table><caption>capturefab list JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
-<tr><td><code>cameras</code></td><td>[{id,kind:gige|u3v|webcam|screen|onvif|stream|file|sim,vendor,model,serial,address,held_by?:{session,idle_releases_in_s?}}] — pass id to -c; held_by: a session keeps it open, the auto session for idle_releases_in_s more seconds unless used</td></tr>
+<tr><td><code>cameras</code></td><td>[{id,kind:gige|u3v|gentl|webcam|screen|onvif|stream|file|sim,vendor,model,serial,address,held_by?:{session,idle_releases_in_s?}}] — pass id to -c; held_by: a session keeps it open, the auto session for idle_releases_in_s more seconds unless used</td></tr>
 <tr><td><code>warnings</code></td><td>[string] — transports that could not be searched</td></tr>
 </tbody></table></div>
 <p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-invalid_duration"><code>invalid_duration</code></a>, <a href="#error-timeout"><code>timeout</code></a>.</p>
@@ -132,9 +132,11 @@ capturefab --json list</code></pre><button class="copy-button" type="button" ari
 capturefab --json info -c gige:00c0df123456
 capturefab info -c sim:0 --keep 5m</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab info examples">Copy</button></div>
 <div class="table-scroll"><table><caption>capturefab info JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
+<tr><td><code>acquisition_control</code></td><td>external — acquisition belongs to the controlling application</td></tr>
 <tr><td><code>address</code></td><td>string — IP address or device path</td></tr>
 <tr><td><code>bits</code></td><td>int — bits per sample</td></tr>
 <tr><td><code>camera</code></td><td>string — camera ID</td></tr>
+<tr><td><code>camera_access</code></td><td>read_only_monitor — explicit GigE monitor connection</td></tr>
 <tr><td><code>controls</code></td><td>{name:{feature,unit,min,max,value}} — canonical controls this camera has</td></tr>
 <tr><td><code>exposure_us</code></td><td>float — ExposureTime in microseconds</td></tr>
 <tr><td><code>firmware</code></td><td>string — DeviceFirmwareVersion or DeviceVersion</td></tr>
@@ -170,7 +172,7 @@ capturefab features -c sim:0 &#x27;Exposure*&#x27; --all
 capturefab features -c sim:0 --category ImageFormatControl</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab features examples">Copy</button></div>
 <div class="table-scroll"><table><caption>capturefab features JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
 <tr><td><code>camera</code></td><td>string — camera ID</td></tr>
-<tr><td><code>features</code></td><td>[{name,type:int|float|bool|enum|string|command,access:rw|ro|wo,value,unit,min,max,inc,choices,selectors,locked_by,category}] — Beginner features and common controls; every level with --all, a PATTERN or --category; locked_by when another setting locks it now</td></tr>
+<tr><td><code>features</code></td><td>[{name,type:int|float|bool|enum|string|command|register,access:rw|ro|wo,writable?:false,value,unit,min,max,inc,choices,selectors,locked_by,category}] — access is the XML declaration; writable:false disables writes in monitor mode. Beginner features and common controls; every level with --all, a PATTERN or --category; locked_by when another setting locks it now</td></tr>
 <tr><td><code>truncated</code></td><td>int — rows left out beyond the first 200; narrow with PATTERN or --category</td></tr>
 </tbody></table></div>
 <p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-feature_not_found"><code>feature_not_found</code></a>, <a href="#error-unsupported"><code>unsupported</code></a>, <a href="#error-camera_not_found"><code>camera_not_found</code></a>, <a href="#error-camera_ambiguous"><code>camera_ambiguous</code></a>, <a href="#error-camera_busy"><code>camera_busy</code></a>, <a href="#error-permission_denied"><code>permission_denied</code></a>, <a href="#error-disconnected"><code>disconnected</code></a>, <a href="#error-session_not_found"><code>session_not_found</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>, <a href="#error-timeout"><code>timeout</code></a>.</p>
@@ -197,6 +199,8 @@ capturefab get -c sim:0 -c sim:1 Width</code></pre><button class="copy-button" t
 <tr><td><code>-c</code>, <code>--camera</code> CAM</td><td>Camera ID, serial, IP address, stream URL, file path or simulator (sim:0)</td><td>env <code>CAPTUREFAB_CAMERA</code></td></tr>
 <tr><td><code>NAME=VALUE...</code></td><td>NAME=VALUE: a feature (ExposureTime=10ms), a bank (TriggerMode[FrameStart]=On) or a control (exposure=5ms, roi=0,0,640,480)</td><td>—</td></tr>
 <tr><td><code>--dry-run</code></td><td>Check every value against the camera and show the writes in order; change nothing</td><td>—</td></tr>
+<tr><td><code>--write-only</code></td><td>Assign only <code>ActionDeviceKey</code> without readback or rollback in an existing session</td><td>—</td></tr>
+<tr><td><code>--write-timeout</code> DUR</td><td>Bound the WO key operation, including ordering and worker queue waits</td><td>—</td></tr>
 <tr><td><code>--keep</code> DUR</td><td>Keep the camera open in a session after use (default 60s). Use 0 to reuse an open session or run without one</td><td>env <code>CAPTUREFAB_KEEP</code></td></tr>
 </tbody></table></div>
 <div class="code-wrap"><pre><code>capturefab set -c sim:0 exposure=5ms gain=3
@@ -206,9 +210,15 @@ capturefab set -c sim:0 roi=0,0,320,240 --dry-run</code></pre><button class="cop
 <div class="table-scroll"><table><caption>capturefab set JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
 <tr><td><code>camera</code></td><td>string — camera ID</td></tr>
 <tr><td><code>changed</code></td><td>[{name,from,to}] — every value written, in order, <code>to</code> read back (may be rounded); autos turned off to unlock a value are listed too</td></tr>
+<tr><td><code>completion</code></td><td>native_transport_ack|producer_reported — with --write-only</td></tr>
 <tr><td><code>dry_run</code></td><td>true — with --dry-run</td></tr>
+<tr><td><code>feature</code></td><td>ActionDeviceKey — with --write-only</td></tr>
 <tr><td><code>plan</code></td><td>[{name,from,to}] — with --dry-run: the writes in order, none made</td></tr>
+<tr><td><code>readback</code></td><td>unavailable_write_only — with --write-only</td></tr>
+<tr><td><code>rollback</code></td><td>not_available — with --write-only</td></tr>
+<tr><td><code>scope</code></td><td>current_control_epoch — not persisted or reapplied after reconnect — with --write-only</td></tr>
 <tr><td><code>warnings</code></td><td>[string] — with --dry-run: checks only the writes themselves can decide (a value another write of the change may unlock or bring into range)</td></tr>
+<tr><td><code>write_completed</code></td><td>true — reported completion, without readable verification — with --write-only</td></tr>
 </tbody></table></div>
 <p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-feature_not_found"><code>feature_not_found</code></a>, <a href="#error-out_of_range"><code>out_of_range</code></a>, <a href="#error-invalid_choice"><code>invalid_choice</code></a>, <a href="#error-not_writable"><code>not_writable</code></a>, <a href="#error-feature_locked"><code>feature_locked</code></a>, <a href="#error-invalid_duration"><code>invalid_duration</code></a>, <a href="#error-unsupported"><code>unsupported</code></a>, <a href="#error-camera_not_found"><code>camera_not_found</code></a>, <a href="#error-camera_ambiguous"><code>camera_ambiguous</code></a>, <a href="#error-camera_busy"><code>camera_busy</code></a>, <a href="#error-disconnected"><code>disconnected</code></a>, <a href="#error-session_not_found"><code>session_not_found</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>, <a href="#error-timeout"><code>timeout</code></a>.</p>
 <h3 id="command-exec"><code>capturefab exec</code></h3>
@@ -224,7 +234,7 @@ capturefab exec -c gige:00c0df123456 &#x27;UserSetSave[UserSet1]&#x27;</code></p
 <tr><td><code>camera</code></td><td>string — camera ID</td></tr>
 <tr><td><code>executed</code></td><td>string — the command run, with its bank</td></tr>
 </tbody></table></div>
-<p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-feature_not_found"><code>feature_not_found</code></a>, <a href="#error-not_writable"><code>not_writable</code></a>, <a href="#error-feature_locked"><code>feature_locked</code></a>, <a href="#error-camera_not_found"><code>camera_not_found</code></a>, <a href="#error-camera_ambiguous"><code>camera_ambiguous</code></a>, <a href="#error-camera_busy"><code>camera_busy</code></a>, <a href="#error-timeout"><code>timeout</code></a>.</p></article>
+<p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-unsupported"><code>unsupported</code></a>, <a href="#error-feature_not_found"><code>feature_not_found</code></a>, <a href="#error-not_writable"><code>not_writable</code></a>, <a href="#error-feature_locked"><code>feature_locked</code></a>, <a href="#error-camera_not_found"><code>camera_not_found</code></a>, <a href="#error-camera_ambiguous"><code>camera_ambiguous</code></a>, <a href="#error-camera_busy"><code>camera_busy</code></a>, <a href="#error-timeout"><code>timeout</code></a>.</p></article>
 <article class="doc-section" id="cli-capture" data-doc-section data-doc-title="Capture, record and measure" data-doc-category="Command reference" data-doc-tags="auto,capture,inspect,record,watch"><h2>Capture, record and measure</h2><p class="doc-summary">Save images and video. Measure brightness and focus or set auto exposure.</p>
 <h3 id="command-capture"><code>capturefab capture</code></h3>
 <p>Save an image, burst, time lapse or scheduled capture without overwriting files. Effect: <code>file_write</code>.</p>
@@ -237,6 +247,8 @@ capturefab exec -c gige:00c0df123456 &#x27;UserSetSave[UserSet1]&#x27;</code></p
 <tr><td><code>--at</code> TIME</td><td>Start at the next local HH:MM[:SS], or an RFC 3339 timestamp</td><td>—</td></tr>
 <tr><td><code>--in</code> DUR</td><td>Start after a delay</td><td>—</td></tr>
 <tr><td><code>-f</code>, <code>--format</code> FORMAT</td><td>Image format when -o has no extension: png (default; 16-bit for Mono10..Mono16), jpg or raw (the exact bytes, with NAME.json beside)</td><td>one of <code>png</code>, <code>jpg</code>, <code>raw</code></td></tr>
+<tr><td><code>--part-format</code> PART_FORMAT</td><td>Save a native GVSP or <code>GenTL</code> part as a local still with every component in the companion (XYZ requires RAW)</td><td>one of <code>Mono8</code>, <code>RGB8</code>, <code>YCbCr411_8</code>, <code>Coord3D_C16</code>, <code>Coord3D_C10p</code>, <code>Coord3D_C12p</code>, <code>Confidence8</code>, <code>Confidence16</code>, <code>Mono16</code>, <code>Coord3D_ABC16</code>, <code>Coord3D_ABC32f</code></td></tr>
+<tr><td><code>--part-index</code> PART_INDEX</td><td>Exact zero-based table ordinal; requires --part-format and never implies a component name</td><td>—</td></tr>
 <tr><td><code>--quality</code> 1-100</td><td>JPEG quality, 1..100 (default 90; without it, a Motion JPEG source&#x27;s own JPEG is stored as it is)</td><td>—</td></tr>
 <tr><td><code>--set</code> NAME=VALUE</td><td>Change settings first, as one atomic change (as set does); repeatable</td><td>repeatable; effect <code>camera_write</code></td></tr>
 <tr><td><code>--auto</code></td><td>Settle exposure and gain first, then hold them (as auto does)</td><td>effect <code>camera_write</code></td></tr>
@@ -244,7 +256,7 @@ capturefab exec -c gige:00c0df123456 &#x27;UserSetSave[UserSet1]&#x27;</code></p
 <tr><td><code>--tag</code> KEY=VALUE</td><td>Tag the files: {tag:KEY} in -o, and in each image&#x27;s metadata; repeatable</td><td>repeatable</td></tr>
 <tr><td><code>--timeout</code> DUR</td><td>How long to wait for each frame (default: 5s, or 3 exposures and frame periods when longer); none waits for a trigger until stopped</td><td>—</td></tr>
 <tr><td><code>--fresh</code> N</td><td>Frames to let pass after the first one exposed after the last settings change, 0..10</td><td>default <code>0</code></td></tr>
-<tr><td><code>--warmup</code> DUR</td><td>How long a camera that sets its own exposure (a webcam, or ExposureAuto=Continuous; a network stream is already running) may take to settle after it starts; 0 takes frames at once</td><td>default <code>2s</code></td></tr>
+<tr><td><code>--warmup</code> DUR</td><td>Exposure settling limit (default 2s; none for read-only monitors); 0 takes frames at once</td><td>—</td></tr>
 <tr><td><code>--on-exists</code> ON_EXISTS</td><td>When a file name without {seq} exists: fail, or number (-0001, -0002, ...)</td><td>one of <code>fail</code>, <code>number</code>; default <code>fail</code></td></tr>
 <tr><td><code>--manifest</code> FILE</td><td>Append one JSON line per saved file (path, time, size, SHA-256, settings, tags) to this file</td><td>—</td></tr>
 <tr><td><code>--sync</code> SYNC</td><td>file: each file reaches the disk before it is reported; none: skip that, for scratch captures</td><td>one of <code>file</code>, <code>none</code>; default <code>file</code></td></tr>
@@ -264,10 +276,11 @@ capturefab capture -c sim:0 -o - &gt; frame.png</code></pre><button class="copy-
 <tr><td><code>bit_depth</code></td><td>int — bits per sample in the files: 16 for PNG of Mono10..Mono16 (samples at the top bits, sBIT says how many count), every bit for raw, else 8</td></tr>
 <tr><td><code>bytes</code></td><td>int — with -o -: the image&#x27;s size</td></tr>
 <tr><td><code>camera</code></td><td>string — camera ID</td></tr>
-<tr><td><code>cameras</code></td><td>[{camera,files,count,truncated?,width,height,pixel_format,bit_depth,source_bits?,settings,time,device_ts_ns?,frames,dropped,incomplete?,resent?,duration_s?,fps?,first_id?,last_id?,gaps?,consecutive?,after_change?,warmup_ms?,settled?,bandwidth_mbps?,warnings?,inspect?,dry_run?,output?,format?,every_s?,first_at?,ends_at?,auto?}] — with -c repeated: one result per camera; in error details, a failed camera&#x27;s {camera,error,files?,truncated?,job?}</td></tr>
+<tr><td><code>cameras</code></td><td>[{camera,files,count,truncated?,multipart?,multipart_truncated?,width,height,pixel_format,pixel_encoding?,bit_depth,source_bits?,settings,time,device_ts_ns?,device_timestamp?,frames,dropped,incomplete?,resent?,duration_s?,fps?,first_id?,last_id?,gaps?,consecutive?,after_change?,warmup_ms?,settled?,bandwidth_mbps?,warnings?,inspect?,dry_run?,output?,format?,part_format?,part_index?,every_s?,first_at?,ends_at?,auto?}] — with -c repeated: one result per camera; in error details, a failed camera&#x27;s {camera,error,files?,truncated?,multipart?,multipart_truncated?,job?}</td></tr>
 <tr><td><code>consecutive</code></td><td>bool — a burst&#x27;s frames follow one another with no frame missing</td></tr>
 <tr><td><code>count</code></td><td>int — frames saved</td></tr>
-<tr><td><code>device_ts_ns</code></td><td>int — the camera&#x27;s clock when the first frame was taken (GigE, U3V, sim); never a date</td></tr>
+<tr><td><code>device_timestamp</code></td><td>{ticks,frequency_hz?} — original producer clock ticks for the first frame, with its reported frequency when known; exact unsigned integers, no inferred unit or date</td></tr>
+<tr><td><code>device_ts_ns</code></td><td>int — the camera&#x27;s clock in nanoseconds when the first frame was taken, where supplied by the transport; never a date</td></tr>
 <tr><td><code>dropped</code></td><td>int — frames lost while it ran: the encoders&#x27; queue was full, or the transport lost them</td></tr>
 <tr><td><code>dry_run</code></td><td>true — with --dry-run; nothing was captured</td></tr>
 <tr><td><code>duration_s</code></td><td>float — first to last frame, for several</td></tr>
@@ -283,12 +296,17 @@ capturefab capture -c sim:0 -o - &gt; frame.png</code></pre><button class="copy-
 <tr><td><code>height</code></td><td>int</td></tr>
 <tr><td><code>incomplete</code></td><td>int — frames that arrived incomplete, where the transport counts them</td></tr>
 <tr><td><code>inspect</code></td><td>{exposure,verdict,suggest?,focus?,preview?} — with --inspect: the last frame measured as inspect measures it</td></tr>
-<tr><td><code>job</code></td><td>{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with --background, as jobs lists it, once armed or its first frame is saved</td></tr>
-<tr><td><code>jobs</code></td><td>[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — with --background and -c repeated</td></tr>
+<tr><td><code>job</code></td><td>{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,multipart?:{image_path:{format_version,storage,path,metadata_path,bytes,sha256?,selected,count}},multipart_truncated?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with --background, as jobs lists it, once armed or its first frame is saved</td></tr>
+<tr><td><code>jobs</code></td><td>[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,multipart?:{image_path:{format_version,storage,path,metadata_path,bytes,sha256?,selected,count}},multipart_truncated?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — with --background and -c repeated</td></tr>
 <tr><td><code>last_id</code></td><td>int — a burst&#x27;s last frame&#x27;s block ID</td></tr>
+<tr><td><code>multipart</code></td><td>{image_path:{format_version,storage,path,metadata_path,bytes,sha256?,selected,count,part_format?}} — retained component archive references for local multipart or GenDC stills, bounded to the listed files and 64 KiB. Complete part metadata is in each companion JSON</td></tr>
+<tr><td><code>multipart_truncated</code></td><td>int — multipart archive references omitted from this bounded summary; each saved image still has its local archive and metadata</td></tr>
 <tr><td><code>output</code></td><td>&quot;-&quot; — with -o -: the image went to stdout</td></tr>
+<tr><td><code>part_format</code></td><td>requested exact native GVSP or GenTL part PFNC name; also present in --dry-run</td></tr>
+<tr><td><code>part_index</code></td><td>int0..31 — requested exact multipart table ordinal; requires part_format and never implies a component name</td></tr>
 <tr><td><code>passthrough</code></td><td>true — the JPEG files are the ones the source sent (an MJPEG webcam, stream or file), as they were, with the provenance comment: not decoded and encoded again</td></tr>
-<tr><td><code>pixel_format</code></td><td>string — the camera&#x27;s PFNC format</td></tr>
+<tr><td><code>pixel_encoding</code></td><td>{namespace:ids,name:Mono10g40IDS|Mono12g24IDS|BayerRG10g40IDS|BayerRG12g24IDS|BayerGR10g40IDS|BayerGR12g24IDS|BayerGB10g40IDS|BayerGB12g24IDS|BayerBG10g40IDS|BayerBG12g24IDS,code,gentl_namespace?} — explicit qualified IDS byte layout and original source code; absent for ordinary PFNC formats</td></tr>
+<tr><td><code>pixel_format</code></td><td>string — the camera&#x27;s format name</td></tr>
 <tr><td><code>resent</code></td><td>int — packets the camera sent again, where the transport counts them</td></tr>
 <tr><td><code>settings</code></td><td>{exposure_us?,auto_exposure?,gain_db?,gain?,auto_gain?,auto_wb?,fps?,trigger?,black_level?,gamma?,binning?,offset_x?,offset_y?,reverse_x?,reverse_y?} — the camera&#x27;s settings when the first frame was taken, as the camera has them; trigger: off, or its source (software, line0)</td></tr>
 <tr><td><code>settled</code></td><td>false — its exposure was still changing when --warmup ran out (with a warning)</td></tr>
@@ -314,7 +332,7 @@ capturefab capture -c sim:0 -o - &gt; frame.png</code></pre><button class="copy-
 <tr><td><code>--set</code> NAME=VALUE</td><td>Change settings first, as one atomic change (as set does); repeatable</td><td>repeatable; effect <code>camera_write</code></td></tr>
 <tr><td><code>--auto</code></td><td>Settle exposure and gain first, then hold them (as auto does)</td><td>effect <code>camera_write</code></td></tr>
 <tr><td><code>--timeout</code> DUR</td><td>How long to wait for the first frame; none waits for a trigger until stopped</td><td>default <code>10s</code></td></tr>
-<tr><td><code>--warmup</code> DUR</td><td>How long a camera that sets its own exposure (a webcam, or ExposureAuto=Continuous; a network stream is already running) may take to settle before recording; 0 records at once</td><td>default <code>2s</code></td></tr>
+<tr><td><code>--warmup</code> DUR</td><td>Exposure settling limit (default 2s; none for read-only monitors); 0 records at once</td><td>—</td></tr>
 <tr><td><code>--background</code></td><td>Leave the recording running in a session and print its job once the first frame is encoded</td><td>—</td></tr>
 <tr><td><code>--progress</code></td><td>Report progress on stderr, also without a terminal: a JSON line {progress:{job,camera,kind,state,saved,planned?,bytes?,elapsed_s,left_s?,next_s?}} as the job changes, at least each second</td><td>—</td></tr>
 <tr><td><code>--keep</code> DUR</td><td>Keep the camera open in a session after use (default 60s). Use 0 to reuse an open session or run without one</td><td>env <code>CAPTUREFAB_KEEP</code></td></tr>
@@ -336,7 +354,7 @@ capturefab record -c sim:0 -o rtsp://localhost:8554/cam --background</code></pre
 <tr><td><code>frames</code></td><td>int — frames encoded, or copied; for a stream, the camera&#x27;s frames handed to the encoder, which repeats them to keep --fps; absent when the file was cut at --max-size</td></tr>
 <tr><td><code>height</code></td><td>int</td></tr>
 <tr><td><code>incomplete</code></td><td>int — frames that arrived incomplete, where the transport counts them</td></tr>
-<tr><td><code>job</code></td><td>{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with --background: the job, as jobs lists it, once its first frame is encoded</td></tr>
+<tr><td><code>job</code></td><td>{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,multipart?:{image_path:{format_version,storage,path,metadata_path,bytes,sha256?,selected,count}},multipart_truncated?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with --background: the job, as jobs lists it, once its first frame is encoded</td></tr>
 <tr><td><code>output</code></td><td>string — the file written (template expanded), or the stream URL with credentials redacted</td></tr>
 <tr><td><code>resent</code></td><td>int — packets the camera sent again, where the transport counts them</td></tr>
 <tr><td><code>settled</code></td><td>false — its exposure was still changing when --warmup ran out (with a warning)</td></tr>
@@ -354,7 +372,7 @@ capturefab record -c sim:0 -o rtsp://localhost:8554/cam --background</code></pre
 <tr><td><code>--size</code> PX</td><td>The preview&#x27;s longest edge in pixels, 64..2048</td><td>default <code>768</code></td></tr>
 <tr><td><code>--fresh</code> N</td><td>Frames to let pass after the first one exposed after the last settings change, 0..10</td><td>default <code>0</code></td></tr>
 <tr><td><code>--timeout</code> DUR</td><td>How long to wait for the frame, up to 10m (default: 5s, or 3 exposures and frame periods when longer); none waits for a trigger until stopped</td><td>—</td></tr>
-<tr><td><code>--warmup</code> DUR</td><td>How long a camera that sets its own exposure (a webcam, or ExposureAuto=Continuous; a network stream is already running) may take to settle after it starts; 0 measures at once</td><td>default <code>2s</code></td></tr>
+<tr><td><code>--warmup</code> DUR</td><td>Exposure settling limit (default 2s; none for read-only monitors); 0 measures at once</td><td>—</td></tr>
 <tr><td><code>--set</code> NAME=VALUE</td><td>Change settings first, as one atomic change (as set does), then measure; repeatable</td><td>repeatable; effect <code>camera_write</code></td></tr>
 <tr><td><code>--for</code> DUR</td><td>Measure a frame every --every for this long (at most 50 samples), as for focusing: the series, and the sharpest frame&#x27;s measurements and preview</td><td>—</td></tr>
 <tr><td><code>--every</code> DUR</td><td>Time between samples with --for (default 200ms)</td><td>—</td></tr>
@@ -375,7 +393,7 @@ capturefab inspect -c sim:0 --show</code></pre><button class="copy-button" type=
 <tr><td><code>dropped</code></td><td>int — frames the transport lost meanwhile, where it counts them</td></tr>
 <tr><td><code>exposure</code></td><td>{mean,p1,p50,p99,clipped_low,clipped_high,clipped_low_px?,clipped_high_px?,max?} — brightness 0..1; shares and counts of pixels at black and at full scale, counted over every pixel of the region at the camera&#x27;s bit depth; max: the brightest sample as a share of full scale</td></tr>
 <tr><td><code>focus</code></td><td>{sharpness} — variance of the Laplacian over the region; compare between frames of one camera and scene (-v adds tenengrad, brenner, variance)</td></tr>
-<tr><td><code>frame</code></td><td>{width,height,pixel_format,bits?,id?,device_ts_ns?,time,age_ms} — the frame measured, taken after the command began: its block ID and the camera&#x27;s clock (ns, never a date) where the transport has them, and when it arrived</td></tr>
+<tr><td><code>frame</code></td><td>{width,height,pixel_format,pixel_encoding?:{namespace:ids,name,code,gentl_namespace?},bits?,id?,device_ts_ns?,device_timestamp?:{ticks,frequency_hz?},time,age_ms} — the frame measured, taken after the command began: its block ID, camera nanoseconds where supplied, original producer ticks with an optional reported frequency, and host arrival time; device clocks are never dates</td></tr>
 <tr><td><code>frames</code></td><td>int — frames received for this inspection, the one measured included</td></tr>
 <tr><td><code>histogram</code></td><td>[16 ints] — with -v: luminance histogram</td></tr>
 <tr><td><code>incomplete</code></td><td>int — frames that arrived incomplete meanwhile, where the transport counts them</td></tr>
@@ -442,13 +460,60 @@ capturefab auto -c sim:0 --off</code></pre><button class="copy-button" type="but
 <tr><td><code>exposure_us</code></td><td>float — the exposure held</td></tr>
 <tr><td><code>gain_db</code></td><td>float — the gain held</td></tr>
 <tr><td><code>iterations</code></td><td>int — exposure and gain changes made; by the camera, how often it was asked whether it was done</td></tr>
-<tr><td><code>job</code></td><td>{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with --continuous by capturefab: the session job it runs as, which jobs stop ends</td></tr>
+<tr><td><code>job</code></td><td>{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,multipart?:{image_path:{format_version,storage,path,metadata_path,bytes,sha256?,selected,count}},multipart_truncated?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with --continuous by capturefab: the session job it runs as, which jobs stop ends</td></tr>
 <tr><td><code>limited_by</code></td><td>exposure_max|exposure_min|gain_max|camera|timeout — what stopped it short of the target</td></tr>
 <tr><td><code>mean</code></td><td>float — mean brightness 0..1 at the end</td></tr>
 <tr><td><code>mode</code></td><td>off|continuous — with --off or --continuous</td></tr>
 <tr><td><code>settled</code></td><td>bool — brightness reached its target, or a limit; false is still exit 0</td></tr>
 </tbody></table></div>
 <p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-unsupported"><code>unsupported</code></a>, <a href="#error-interrupted"><code>interrupted</code></a>, <a href="#error-invalid_duration"><code>invalid_duration</code></a>, <a href="#error-camera_not_found"><code>camera_not_found</code></a>, <a href="#error-camera_ambiguous"><code>camera_ambiguous</code></a>, <a href="#error-camera_busy"><code>camera_busy</code></a>, <a href="#error-session_not_found"><code>session_not_found</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>, <a href="#error-timeout"><code>timeout</code></a>.</p></article>
+<article class="doc-section" id="cli-data" data-doc-section data-doc-title="Industrial data" data-doc-category="Command reference" data-doc-tags="data,data export,data protocols,data record"><h2>Industrial data</h2><p class="doc-summary">Record industrial signals on one host timeline and export CSV or JSONL.</p>
+<h3 id="command-data"><code>capturefab data</code></h3>
+<p>Record industrial signals on a shared timeline and export CSV or JSONL.</p>
+<div class="code-wrap"><pre><code>capturefab data protocols --json
+capturefab data record --config sources.json --for 30s -o run.jsonl
+capturefab data export run.jsonl -o run.csv</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab data examples">Copy</button></div>
+<h3 id="command-data-export"><code>capturefab data export</code></h3>
+<p>Export samples as CSV or JSONL. Effect: <code>file_write</code>.</p>
+<div class="table-scroll"><table><caption>capturefab data export arguments</caption><thead><tr><th scope="col">Argument or option</th><th scope="col">Meaning</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code>INPUT</code></td><td>Recording written by data record</td><td>—</td></tr>
+<tr><td><code>-o</code>, <code>--output</code> PATH</td><td>New export file; existing files are never overwritten</td><td>required</td></tr>
+<tr><td><code>--format</code> FORMAT</td><td>CSV quotes all text cells; JSONL emits one sample object per line</td><td>one of <code>csv</code>, <code>jsonl</code>; default <code>csv</code></td></tr>
+<tr><td><code>--allow-incomplete</code></td><td>Export complete rows from a failed/interrupted recording or one missing its end row</td><td>—</td></tr>
+<tr><td><code>--source</code> SOURCE</td><td>Include only this source id</td><td>—</td></tr>
+<tr><td><code>--signal</code> SIGNAL</td><td>Include only this signal name</td><td>—</td></tr>
+</tbody></table></div>
+<div class="table-scroll"><table><caption>capturefab data export JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
+<tr><td><code>bytes</code></td><td>int — export bytes</td></tr>
+<tr><td><code>complete</code></td><td>bool — source recording ended successfully</td></tr>
+<tr><td><code>format</code></td><td>csv|jsonl</td></tr>
+<tr><td><code>path</code></td><td>string — export file</td></tr>
+<tr><td><code>samples</code></td><td>int — exported samples</td></tr>
+</tbody></table></div>
+<p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-camera_not_found"><code>camera_not_found</code></a>, <a href="#error-camera_ambiguous"><code>camera_ambiguous</code></a>, <a href="#error-camera_busy"><code>camera_busy</code></a>, <a href="#error-permission_denied"><code>permission_denied</code></a>, <a href="#error-disconnected"><code>disconnected</code></a>, <a href="#error-auth_required"><code>auth_required</code></a>, <a href="#error-auth_rejected"><code>auth_rejected</code></a>, <a href="#error-session_not_found"><code>session_not_found</code></a>, <a href="#error-ffmpeg_missing"><code>ffmpeg_missing</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>, <a href="#error-timeout"><code>timeout</code></a>.</p>
+<h3 id="command-data-protocols"><code>capturefab data protocols</code></h3>
+<p>Show adapters and an example config. Effect: <code>read</code>.</p>
+<div class="table-scroll"><table><caption>capturefab data protocols JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
+<tr><td><code>example</code></td><td>{version,sources} — runnable simulator configuration</td></tr>
+<tr><td><code>protocols</code></td><td>[{protocol,implementation,requirements}] — native, native_passive or external_helper</td></tr>
+<tr><td><code>version</code></td><td>1 — configuration and recording version</td></tr>
+</tbody></table></div>
+<p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-camera_not_found"><code>camera_not_found</code></a>, <a href="#error-camera_ambiguous"><code>camera_ambiguous</code></a>, <a href="#error-camera_busy"><code>camera_busy</code></a>, <a href="#error-permission_denied"><code>permission_denied</code></a>, <a href="#error-disconnected"><code>disconnected</code></a>, <a href="#error-auth_required"><code>auth_required</code></a>, <a href="#error-auth_rejected"><code>auth_rejected</code></a>, <a href="#error-session_not_found"><code>session_not_found</code></a>, <a href="#error-ffmpeg_missing"><code>ffmpeg_missing</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>, <a href="#error-timeout"><code>timeout</code></a>.</p>
+<h3 id="command-data-record"><code>capturefab data record</code></h3>
+<p>Record signals on one host timeline. Effect: <code>disruptive</code>.</p>
+<div class="table-scroll"><table><caption>capturefab data record arguments</caption><thead><tr><th scope="col">Argument or option</th><th scope="col">Meaning</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code>--config</code> JSON</td><td>Version 1 JSON source configuration (see data protocols)</td><td>required</td></tr>
+<tr><td><code>-o</code>, <code>--output</code> PATH</td><td>New JSON Lines recording file; existing files are never overwritten</td><td>required</td></tr>
+<tr><td><code>--for</code> DUR</td><td>Recording duration, such as 30s or 1h</td><td>required</td></tr>
+</tbody></table></div>
+<div class="table-scroll"><table><caption>capturefab data record JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
+<tr><td><code>bytes</code></td><td>int — file bytes</td></tr>
+<tr><td><code>clock</code></td><td>host_monotonic_receive — comparable host timestamps, no hardware clock synchronization implied</td></tr>
+<tr><td><code>path</code></td><td>string — JSONL recording file</td></tr>
+<tr><td><code>samples</code></td><td>int — complete samples written</td></tr>
+<tr><td><code>status</code></td><td>complete; failed/interrupted work is in error.details</td></tr>
+</tbody></table></div>
+<p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-camera_not_found"><code>camera_not_found</code></a>, <a href="#error-camera_ambiguous"><code>camera_ambiguous</code></a>, <a href="#error-camera_busy"><code>camera_busy</code></a>, <a href="#error-permission_denied"><code>permission_denied</code></a>, <a href="#error-disconnected"><code>disconnected</code></a>, <a href="#error-auth_required"><code>auth_required</code></a>, <a href="#error-auth_rejected"><code>auth_rejected</code></a>, <a href="#error-session_not_found"><code>session_not_found</code></a>, <a href="#error-ffmpeg_missing"><code>ffmpeg_missing</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>, <a href="#error-timeout"><code>timeout</code></a>.</p></article>
 <article class="doc-section" id="cli-presets" data-doc-section data-doc-title="Presets" data-doc-category="Command reference" data-doc-tags="preset,preset apply,preset export,preset import,preset list,preset rm,preset save,preset show"><h2>Presets</h2><p class="doc-summary">Save a camera&#x27;s settings on this computer and restore them as one change.</p>
 <h3 id="command-preset"><code>capturefab preset</code></h3>
 <p>Saved camera settings (host-side, portable between cameras of a model).</p>
@@ -665,7 +730,7 @@ capturefab serve -c gige:00c0df123456 --live</code></pre><button class="copy-but
 capturefab jobs wait auto-1 --timeout 10m
 capturefab jobs stop all</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab jobs examples">Copy</button></div>
 <div class="table-scroll"><table><caption>capturefab jobs JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
-<tr><td><code>jobs</code></td><td>[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — every session&#x27;s, a session that ended included, as it saved them (those that had not ended as lost); finished ones for an hour after they end; with IDs, those jobs in that order; with --running, only those that have not ended</td></tr>
+<tr><td><code>jobs</code></td><td>[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,multipart?:{image_path:{format_version,storage,path,metadata_path,bytes,sha256?,selected,count}},multipart_truncated?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — every session&#x27;s, a session that ended included, as it saved them (those that had not ended as lost); finished ones for an hour after they end; with IDs, those jobs in that order; with --running, only those that have not ended</td></tr>
 </tbody></table></div>
 <p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-session_not_found"><code>session_not_found</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>, <a href="#error-timeout"><code>timeout</code></a>.</p>
 <h3 id="command-jobs-list"><code>capturefab jobs list</code></h3>
@@ -679,7 +744,7 @@ capturefab jobs list --running
 capturefab --json jobs list auto-1 auto-2
 capturefab --json jobs</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab jobs list examples">Copy</button></div>
 <div class="table-scroll"><table><caption>capturefab jobs list JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
-<tr><td><code>jobs</code></td><td>[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — every session&#x27;s, a session that ended included, as it saved them (those that had not ended as lost); finished ones for an hour after they end; with IDs, those jobs in that order; with --running, only those that have not ended</td></tr>
+<tr><td><code>jobs</code></td><td>[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,multipart?:{image_path:{format_version,storage,path,metadata_path,bytes,sha256?,selected,count}},multipart_truncated?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — every session&#x27;s, a session that ended included, as it saved them (those that had not ended as lost); finished ones for an hour after they end; with IDs, those jobs in that order; with --running, only those that have not ended</td></tr>
 </tbody></table></div>
 <p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-session_not_found"><code>session_not_found</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>, <a href="#error-timeout"><code>timeout</code></a>.</p>
 <h3 id="command-jobs-stop"><code>capturefab jobs stop</code></h3>
@@ -690,7 +755,7 @@ capturefab --json jobs</code></pre><button class="copy-button" type="button" ari
 <div class="code-wrap"><pre><code>capturefab jobs stop auto-1
 capturefab jobs stop all</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab jobs stop examples">Copy</button></div>
 <div class="table-scroll"><table><caption>capturefab jobs stop JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
-<tr><td><code>stopped</code></td><td>[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — the jobs as they are after stopping</td></tr>
+<tr><td><code>stopped</code></td><td>[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,multipart?:{image_path:{format_version,storage,path,metadata_path,bytes,sha256?,selected,count}},multipart_truncated?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — the jobs as they are after stopping</td></tr>
 </tbody></table></div>
 <p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-session_not_found"><code>session_not_found</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>, <a href="#error-timeout"><code>timeout</code></a>.</p>
 <h3 id="command-jobs-wait"><code>capturefab jobs wait</code></h3>
@@ -704,11 +769,11 @@ capturefab jobs stop all</code></pre><button class="copy-button" type="button" a
 capturefab --json jobs wait auto-1 --timeout 10m
 capturefab --json jobs wait auto-2 auto-3 auto-4</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab jobs wait examples">Copy</button></div>
 <div class="table-scroll"><table><caption>capturefab jobs wait JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
-<tr><td><code>job</code></td><td>{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with one ID: done; a failed job exits with its own error code and details.job</td></tr>
-<tr><td><code>jobs</code></td><td>[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — with several IDs, in the order given, once all have ended: all done; else the first that is not exits with its own error code, and details.jobs holds them all</td></tr>
+<tr><td><code>job</code></td><td>{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,multipart?:{image_path:{format_version,storage,path,metadata_path,bytes,sha256?,selected,count}},multipart_truncated?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with one ID: done; a failed job exits with its own error code and details.job</td></tr>
+<tr><td><code>jobs</code></td><td>[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,multipart?:{image_path:{format_version,storage,path,metadata_path,bytes,sha256?,selected,count}},multipart_truncated?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — with several IDs, in the order given, once all have ended: all done; else the first that is not exits with its own error code, and details.jobs holds them all</td></tr>
 </tbody></table></div>
 <p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-timeout"><code>timeout</code></a>, <a href="#error-interrupted"><code>interrupted</code></a>, <a href="#error-incomplete"><code>incomplete</code></a>, <a href="#error-session_not_found"><code>session_not_found</code></a>, <a href="#error-storage_full"><code>storage_full</code></a>, <a href="#error-frame_timeout"><code>frame_timeout</code></a>, <a href="#error-trigger_timeout"><code>trigger_timeout</code></a>, <a href="#error-exists"><code>exists</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>.</p></article>
-<article class="doc-section" id="cli-network" data-doc-section data-doc-title="Sign-ins and networks" data-doc-category="Command reference" data-doc-tags="login,login add,login list,login rm,network,onvif,onvif resolve"><h2>Sign-ins and networks</h2><p class="doc-summary">Save camera passwords, find ONVIF stream URLs and diagnose GigE connections.</p>
+<article class="doc-section" id="cli-network" data-doc-section data-doc-title="Sign-ins and networks" data-doc-category="Command reference" data-doc-tags="login,login add,login list,login rm,network,network action,network force-ip,onvif,onvif resolve"><h2>Sign-ins and networks</h2><p class="doc-summary">Save camera passwords, find ONVIF stream URLs and diagnose GigE connections.</p>
 <h3 id="command-login"><code>capturefab login</code></h3>
 <p>Save camera sign-ins for rtsp:// and ONVIF cameras in the OS credential store.</p>
 <div class="code-wrap"><pre><code>printf &#x27;%s\n&#x27; &quot;$PASS&quot; | capturefab login add rtsp://cam.local/stream --user admin --password-stdin
@@ -771,21 +836,90 @@ capturefab login add onvif://cam.local --user admin --password-stdin   # save it
 </tbody></table></div>
 <p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-auth_required"><code>auth_required</code></a>, <a href="#error-auth_rejected"><code>auth_rejected</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>, <a href="#error-unsupported"><code>unsupported</code></a>, <a href="#error-timeout"><code>timeout</code></a>.</p>
 <h3 id="command-network"><code>capturefab network</code></h3>
-<p>Check GigE network paths; --tune applies bandwidth sharing to cameras. Effect: <code>read</code>.</p>
+<p>Check GigE paths; --tune shares bandwidth; force-ip assigns a temporary camera address. Effect: <code>read</code>.</p>
 <div class="table-scroll"><table><caption>capturefab network arguments</caption><thead><tr><th scope="col">Argument or option</th><th scope="col">Meaning</th><th scope="col">Details</th></tr></thead><tbody>
 <tr><td><code>--tune</code></td><td>Apply bandwidth sharing (packet delay, throughput limits) to the cameras given with -c, or a session&#x27;s cameras; they keep it until power-off</td><td>effect <code>camera_write</code></td></tr>
 <tr><td><code>-c</code>, <code>--camera</code> CAM</td><td>GigE camera to tune, repeatable (with --tune; not read from CAPTUREFAB_CAMERA, so the read-only checks stay read-only)</td><td>repeatable</td></tr>
 <tr><td><code>--timeout</code> DUR</td><td>How long GigE discovery collects answers</td><td>default <code>1s</code></td></tr>
 </tbody></table></div>
 <div class="code-wrap"><pre><code>capturefab network
-capturefab network --tune -c gige:00c0df123456 -c gige:00c0df654321</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab network examples">Copy</button></div>
+capturefab network --tune -c gige:00c0df123456 -c gige:00c0df654321
+capturefab network force-ip --mac 003053061a58 --interface 192.168.50.1 --address 192.168.50.20 --netmask 255.255.255.0 --gateway 0.0.0.0</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab network examples">Copy</button></div>
 <div class="table-scroll"><table><caption>capturefab network JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
 <tr><td><code>cameras</code></td><td>[{camera:{id,kind,vendor,model,serial?,address?},active,interface?,host_address?,reachable,health:unreachable|limited|unverified|ready|unstable,summary,details,tuning?}] — GigE cameras and how each is reached; active: a session holds it; host_address: this computer&#x27;s address toward it</td></tr>
 <tr><td><code>interfaces</code></td><td>[{name,address,netmask,mtu?,speed_mbps?,kind:wired|wireless|loopback|other|unknown,up?}] — IPv4 adapters</td></tr>
 <tr><td><code>time</code></td><td>string — RFC 3339 UTC time of the scan</td></tr>
 <tr><td><code>warnings</code></td><td>[string]</td></tr>
 </tbody></table></div>
-<p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-invalid_duration"><code>invalid_duration</code></a>, <a href="#error-camera_not_found"><code>camera_not_found</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>.</p></article>
+<p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-invalid_duration"><code>invalid_duration</code></a>, <a href="#error-camera_not_found"><code>camera_not_found</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>.</p>
+<h3 id="command-network-action"><code>capturefab network action</code></h3>
+<p>Send one immediate or scheduled <code>GigE</code> Vision action. Effect: <code>disruptive</code>.</p>
+<p>Runs locally alongside already-held acquisition sessions. Explicit --session is rejected; ambient CAPTUREFAB_SESSION is ignored. Configure and arm cameras separately. Acknowledged mode requires 1..32 explicit --expect peers; sent-only rejects --expect. Optional --action-time-ticks sends an absolute device timestamp without reading or qualifying camera clocks. Zero or a target already in the past may execute immediately. One datagram is attempted, with no retry, discovery, controller acquisition or cleanup mutation. An ACK or successful send does not prove execution, frame arrival or synchronization; a post-send failure may leave a future action queued.</p>
+<div class="table-scroll"><table><caption>capturefab network action arguments</caption><thead><tr><th scope="col">Argument or option</th><th scope="col">Meaning</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code>--mode</code> MODE</td><td>Require strict replies from each expected peer, or report only the local send</td><td>one of <code>acknowledged</code>, <code>sent-only</code>; required</td></tr>
+<tr><td><code>--interface</code> IP</td><td>Current local IPv4 address selecting exactly one outgoing interface</td><td>required</td></tr>
+<tr><td><code>--device-key</code> U32</td><td>Explicit action device key, unsigned 32-bit decimal</td><td>required</td></tr>
+<tr><td><code>--group-key</code> U32</td><td>Explicit action group key, unsigned 32-bit decimal</td><td>required</td></tr>
+<tr><td><code>--group-mask</code> NONZERO</td><td>Nonzero unsigned 32-bit decimal action group mask</td><td>required</td></tr>
+<tr><td><code>--action-time-ticks</code> U64_TICKS</td><td>Optional absolute device timestamp in camera ticks; zero/past may execute immediately</td><td>—</td></tr>
+<tr><td><code>--expect</code> IP</td><td>Expected camera IPv4 address, repeatable in acknowledged mode</td><td>repeatable</td></tr>
+<tr><td><code>--timeout</code> DUR</td><td>One total operation deadline, greater than zero and at most 30s</td><td>default <code>1s</code></td></tr>
+</tbody></table></div>
+<div class="table-scroll"><table><caption>capturefab network action JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
+<tr><td><code>action</code></td><td>immediate|scheduled — explicit packet timing request</td></tr>
+<tr><td><code>action_may_have_been_issued</code></td><td>bool — conservative once send is attempted, including errors</td></tr>
+<tr><td><code>action_time_ticks?</code></td><td>u64 — requested absolute device timestamp for scheduled packets, including zero; clock and future-time validity are not verified</td></tr>
+<tr><td><code>bytes</code></td><td>int — 20 immediate or 28 scheduled on successful send</td></tr>
+<tr><td><code>duplicate_datagrams</code></td><td>int — identical admitted peer replies</td></tr>
+<tr><td><code>execution</code></td><td>not_verified</td></tr>
+<tr><td><code>expected</code></td><td>[IPv4] — explicit acknowledged peers; empty for sent-only</td></tr>
+<tr><td><code>frame_arrival</code></td><td>not_verified</td></tr>
+<tr><td><code>ignored_datagrams</code></td><td>int — unrelated or filtered traffic</td></tr>
+<tr><td><code>interface</code></td><td>{name,index,address,netmask} — selected local interface</td></tr>
+<tr><td><code>missing</code></td><td>[IPv4] — expected peers without an admitted reply</td></tr>
+<tr><td><code>mode</code></td><td>acknowledged|sent-only</td></tr>
+<tr><td><code>mutation_datagrams</code></td><td>int — exactly one on success; no retry</td></tr>
+<tr><td><code>mutation_send_attempted</code></td><td>bool</td></tr>
+<tr><td><code>outcome</code></td><td>acknowledged|sent_without_ack_confirmation — failures retain an unconfirmed partial summary in error.details.action</td></tr>
+<tr><td><code>received_datagrams</code></td><td>int — all received traffic, at most 1024</td></tr>
+<tr><td><code>request_id</code></td><td>int — nonzero GVCP request ID</td></tr>
+<tr><td><code>responses</code></td><td>[{source,status_raw,status}] — exact correlated eight-byte ACKs; full u16 status</td></tr>
+<tr><td><code>synchronization</code></td><td>not_verified</td></tr>
+<tr><td><code>verification</code></td><td>strict_action_acknowledgements|not_requested</td></tr>
+</tbody></table></div>
+<p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-usage"><code>usage</code></a>, <a href="#error-invalid_duration"><code>invalid_duration</code></a>, <a href="#error-permission_denied"><code>permission_denied</code></a>, <a href="#error-unsupported"><code>unsupported</code></a>, <a href="#error-incomplete"><code>incomplete</code></a>, <a href="#error-camera_ambiguous"><code>camera_ambiguous</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>, <a href="#error-timeout"><code>timeout</code></a>, <a href="#error-interrupted"><code>interrupted</code></a>.</p>
+<h3 id="command-network-force-ip"><code>capturefab network force-ip</code></h3>
+<p>Temporarily assign one native <code>GigE</code> camera&#x27;s IPv4 configuration, without opening it. Effect: <code>disruptive</code>.</p>
+<p>Runs locally without opening a session or camera. Explicit --session is rejected; ambient CAPTUREFAB_SESSION is ignored. The target must have no open camera object. The mandatory MAC lock is advisory: opaque GenTL aliases, other applications/runtimes and owners opened without locks are outside its coverage. One assignment datagram is sent, with no retry or rollback; power cycling restores the camera&#x27;s startup configuration.</p>
+<div class="table-scroll"><table><caption>capturefab network force-ip arguments</caption><thead><tr><th scope="col">Argument or option</th><th scope="col">Meaning</th><th scope="col">Details</th></tr></thead><tbody>
+<tr><td><code>--mac</code> MAC</td><td>Target unicast MAC, twelve hex digits or colon-separated hex pairs</td><td>required</td></tr>
+<tr><td><code>--interface</code> IP</td><td>Current local IPv4 address selecting exactly one outgoing interface</td><td>required</td></tr>
+<tr><td><code>--address</code> IP</td><td>Temporary camera IPv4 address</td><td>required</td></tr>
+<tr><td><code>--netmask</code> MASK</td><td>Temporary contiguous IPv4 subnet mask</td><td>required</td></tr>
+<tr><td><code>--gateway</code> IP</td><td>Temporary gateway; pass 0.0.0.0 for none</td><td>required</td></tr>
+<tr><td><code>--timeout</code> DUR</td><td>Total discovery, assignment and verification deadline</td><td>default <code>3s</code></td></tr>
+</tbody></table></div>
+<div class="table-scroll"><table><caption>capturefab network force-ip JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
+<tr><td><code>ack</code></td><td>received|not_observed — ACK alone does not prove assignment</td></tr>
+<tr><td><code>ack_source?</code></td><td>string — correlated ACK sender</td></tr>
+<tr><td><code>assignment_may_have_applied</code></td><td>bool — also retained in error.details.force_ip after send</td></tr>
+<tr><td><code>before</code></td><td>{configuration:{address,netmask,gateway},reply_source} — preflight discovery</td></tr>
+<tr><td><code>camera</code></td><td>string — canonical gige:MAC identity</td></tr>
+<tr><td><code>ignored_datagrams</code></td><td>int — filtered/unrelated bootstrap traffic</td></tr>
+<tr><td><code>interface</code></td><td>{name,index,address,netmask} — selected local interface</td></tr>
+<tr><td><code>limitations</code></td><td>[string] — advisory ownership and unauthenticated discovery limits</td></tr>
+<tr><td><code>mac</code></td><td>string — twelve lowercase hex digits</td></tr>
+<tr><td><code>mutation_datagrams</code></td><td>int — exactly one on success</td></tr>
+<tr><td><code>mutation_send_attempted</code></td><td>bool</td></tr>
+<tr><td><code>observed</code></td><td>{configuration:{address,netmask,gateway},reply_source} — fresh matching discovery</td></tr>
+<tr><td><code>reachability</code></td><td>not_probed — no controller acquisition</td></tr>
+<tr><td><code>received_datagrams</code></td><td>int — includes the packet that trips the 1024-packet bound</td></tr>
+<tr><td><code>requested</code></td><td>{address,netmask,gateway} — explicit temporary configuration</td></tr>
+<tr><td><code>reservation</code></td><td>{scope:advisory_selected_runtime_native_mac,no_other_open_camera_required:true}</td></tr>
+<tr><td><code>temporary</code></td><td>true</td></tr>
+<tr><td><code>verification</code></td><td>fresh_mac_and_configuration_discovery</td></tr>
+</tbody></table></div>
+<p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-usage"><code>usage</code></a>, <a href="#error-invalid_duration"><code>invalid_duration</code></a>, <a href="#error-camera_not_found"><code>camera_not_found</code></a>, <a href="#error-camera_ambiguous"><code>camera_ambiguous</code></a>, <a href="#error-camera_busy"><code>camera_busy</code></a>, <a href="#error-permission_denied"><code>permission_denied</code></a>, <a href="#error-unsupported"><code>unsupported</code></a>, <a href="#error-incomplete"><code>incomplete</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>, <a href="#error-timeout"><code>timeout</code></a>.</p></article>
 <article class="doc-section" id="cli-tools" data-doc-section data-doc-title="Diagnostics and tools" data-doc-category="Command reference" data-doc-tags="completions,debug,debug read,debug rpc,debug write,debug xml,doctor,licenses,schema,shell"><h2>Diagnostics and tools</h2><p class="doc-summary">Diagnose this computer, see the CLI contract, use the Capturefab shell or access camera registers.</p>
 <h3 id="command-doctor"><code>capturefab doctor</code></h3>
 <p>Check this computer: FFmpeg, folders, USB and GigE limits, with a fix for each warning. Effect: <code>read</code>.</p>
@@ -794,7 +928,7 @@ capturefab --json doctor</code></pre><button class="copy-button" type="button" a
 <div class="table-scroll"><table><caption>capturefab doctor JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
 <tr><td><code>arch</code></td><td>string</td></tr>
 <tr><td><code>checks</code></td><td>[{name,status:ok|warn|fail,message,fix?}] — fix is a command or step that resolves a warning</td></tr>
-<tr><td><code>features</code></td><td>{usb,jpeg,videotoolbox,nvjpeg,vaapi,keychain,shell} — what this build includes</td></tr>
+<tr><td><code>features</code></td><td>{usb,gentl,ni_daqmx,jpeg,videotoolbox,nvjpeg,vaapi,keychain,shell,mqtt_tls} — what this build includes</td></tr>
 <tr><td><code>ffmpeg</code></td><td>{source:CAPTUREFAB_FFMPEG|bundled|next_to_executable|path,path,version,bundled_error?} or {error} — FFmpeg is looked for in that order; bundled_error says why a bundled copy could not be extracted</td></tr>
 <tr><td><code>folders</code></td><td>{runtime,state,cache: {path,from,writable,fs_type,passed:[{path,from,why}],error}} — the folders in use (runtime: sessions; state: presets, sign-ins; cache: FFmpeg), path absent when there is none; which candidate each uses (from: a variable, XDG_*, login, home, run, temp, runtime) and the fallbacks passed over</td></tr>
 <tr><td><code>host</code></td><td>{cpus,threads,cpu_quota,memory:{total_bytes,available_bytes,cgroup_limit_bytes,cgroup_used_bytes,budget_bytes}} — what cgroups leave this process</td></tr>
@@ -865,14 +999,20 @@ echo &#x27;{&quot;op&quot;:&quot;status&quot;}&#x27; | capturefab --session benc
 <p>Read raw camera memory. Effect: <code>read</code>.</p>
 <div class="table-scroll"><table><caption>capturefab debug read arguments</caption><thead><tr><th scope="col">Argument or option</th><th scope="col">Meaning</th><th scope="col">Details</th></tr></thead><tbody>
 <tr><td><code>-c</code>, <code>--camera</code> CAM</td><td>Camera ID, serial, IP address, stream URL, file path or simulator (sim:0)</td><td>env <code>CAPTUREFAB_CAMERA</code></td></tr>
-<tr><td><code>ADDRESS</code></td><td>Address: decimal or 0x hexadecimal</td><td>—</td></tr>
-<tr><td><code>[LENGTH]</code></td><td>Bytes to read, 1..65536</td><td>default <code>4</code></td></tr>
+<tr><td><code>[ADDRESS]</code></td><td>Address: decimal or 0x hexadecimal</td><td>—</td></tr>
+<tr><td><code>[LENGTH]</code></td><td>Bytes to read, 1..65536 (default 4 for numeric addresses)</td><td>—</td></tr>
+<tr><td><code>--feature</code> NAME</td><td>XML-declared opaque Register, optionally at a declared selector bank</td><td>—</td></tr>
+<tr><td><code>--timeout</code> DUR</td><td>One budget for selection, metadata and byte transfer (named form only)</td><td>—</td></tr>
 </tbody></table></div>
 <div class="code-wrap"><pre><code>capturefab debug read -c sim:0 0x100 4
-capturefab --json debug read -c gige:00c0df123456 0x0938</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab debug read examples">Copy</button></div>
+capturefab --json debug read -c gige:00c0df123456 0x0938
+capturefab debug read -c CAMERA --feature &#x27;LUTValueAll[LUTSelector=LUT1]&#x27; --timeout 5s</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab debug read examples">Copy</button></div>
 <div class="table-scroll"><table><caption>capturefab debug read JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
 <tr><td><code>address</code></td><td>int</td></tr>
-<tr><td><code>hex</code></td><td>string — the bytes read</td></tr>
+<tr><td><code>bank</code></td><td>[{selector,value}] — named form only</td></tr>
+<tr><td><code>bytes</code></td><td>int — declared length, named form only</td></tr>
+<tr><td><code>feature</code></td><td>string — named form only</td></tr>
+<tr><td><code>hex</code></td><td>string — exact raw bytes</td></tr>
 </tbody></table></div>
 <p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-camera_not_found"><code>camera_not_found</code></a>, <a href="#error-camera_ambiguous"><code>camera_ambiguous</code></a>, <a href="#error-camera_busy"><code>camera_busy</code></a>, <a href="#error-permission_denied"><code>permission_denied</code></a>, <a href="#error-disconnected"><code>disconnected</code></a>, <a href="#error-auth_required"><code>auth_required</code></a>, <a href="#error-auth_rejected"><code>auth_rejected</code></a>, <a href="#error-session_not_found"><code>session_not_found</code></a>, <a href="#error-ffmpeg_missing"><code>ffmpeg_missing</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>, <a href="#error-timeout"><code>timeout</code></a>.</p>
 <h3 id="command-debug-rpc"><code>capturefab debug rpc</code></h3>
@@ -887,13 +1027,19 @@ echo &#x27;{&quot;op&quot;:&quot;status&quot;}&#x27; | capturefab --session benc
 <p>Write raw camera memory. Effect: <code>disruptive</code>.</p>
 <div class="table-scroll"><table><caption>capturefab debug write arguments</caption><thead><tr><th scope="col">Argument or option</th><th scope="col">Meaning</th><th scope="col">Details</th></tr></thead><tbody>
 <tr><td><code>-c</code>, <code>--camera</code> CAM</td><td>Camera ID, serial, IP address, stream URL, file path or simulator (sim:0)</td><td>env <code>CAPTUREFAB_CAMERA</code></td></tr>
-<tr><td><code>ADDRESS</code></td><td>Address: decimal or 0x hexadecimal</td><td>—</td></tr>
-<tr><td><code>DATA</code></td><td>Hex bytes, such as 00000001</td><td>—</td></tr>
+<tr><td><code>[ADDRESS]</code></td><td>Address: decimal or 0x hexadecimal</td><td>—</td></tr>
+<tr><td><code>[DATA]</code></td><td>Hex bytes, such as 00000001</td><td>—</td></tr>
+<tr><td><code>--feature</code> NAME</td><td>XML-declared opaque Register, optionally at a declared selector bank</td><td>—</td></tr>
+<tr><td><code>--hex</code> HEX</td><td>Exact raw bytes for the named register; no implicit commit or rollback. For large payloads, use debug rpc with JSON on stdin to avoid command-line limits</td><td>—</td></tr>
+<tr><td><code>--timeout</code> DUR</td><td>One budget for selection, metadata and byte transfer (named form only)</td><td>—</td></tr>
 </tbody></table></div>
 <div class="code-wrap"><pre><code>capturefab debug write -c sim:0 0x100 80020000
-capturefab --json debug write -c gige:00c0df123456 0x0a00 00000002</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab debug write examples">Copy</button></div>
+capturefab --json debug write -c gige:00c0df123456 0x0a00 00000002
+capturefab debug write -c CAMERA --feature FileAccessBuffer --hex 0080ff</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab debug write examples">Copy</button></div>
 <div class="table-scroll"><table><caption>capturefab debug write JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
 <tr><td><code>address</code></td><td>int</td></tr>
+<tr><td><code>bank</code></td><td>[{selector,value}] — named form only</td></tr>
+<tr><td><code>feature</code></td><td>string — named form only</td></tr>
 <tr><td><code>written</code></td><td>int — bytes</td></tr>
 </tbody></table></div>
 <p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-camera_not_found"><code>camera_not_found</code></a>, <a href="#error-camera_ambiguous"><code>camera_ambiguous</code></a>, <a href="#error-camera_busy"><code>camera_busy</code></a>, <a href="#error-permission_denied"><code>permission_denied</code></a>, <a href="#error-disconnected"><code>disconnected</code></a>, <a href="#error-auth_required"><code>auth_required</code></a>, <a href="#error-auth_rejected"><code>auth_rejected</code></a>, <a href="#error-session_not_found"><code>session_not_found</code></a>, <a href="#error-ffmpeg_missing"><code>ffmpeg_missing</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>, <a href="#error-timeout"><code>timeout</code></a>.</p>

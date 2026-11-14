@@ -174,7 +174,7 @@ pub(crate) fn tag_keys(template: &str) -> Vec<String> {
 /// such as `CON` get a `_` prefix, and the result is at most
 /// [`MAX_TAG_COMPONENT`] bytes.
 pub(crate) fn sanitize_component(value: &str) -> Result<String> {
-    let mut out: String = value
+    let out: String = value
         .trim()
         .chars()
         .map(|c| {
@@ -188,30 +188,43 @@ pub(crate) fn sanitize_component(value: &str) -> Result<String> {
             }
         })
         .collect();
-    if out.len() > MAX_TAG_COMPONENT {
-        let mut end = MAX_TAG_COMPONENT;
-        while !out.is_char_boundary(end) {
-            end -= 1;
-        }
-        out.truncate(end);
-    }
-    let out = out.trim_end_matches(['.', ' ']).trim_start();
+    let out = bounded_component(&out, MAX_TAG_COMPONENT);
     ensure!(
         !out.is_empty() && out != "." && out != "..",
         "tag value '{}' cannot be used as a file or folder name",
         value.escape_debug()
     );
-    let stem = out.split('.').next().unwrap_or("").to_ascii_uppercase();
-    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
-            && stem.len() == 4
-            && stem.as_bytes()[3].is_ascii_digit()
-            && stem.as_bytes()[3] != b'0');
-    Ok(if reserved || out.starts_with('.') {
-        format!("_{out}")
+    Ok(if reserved_component(out) || out.starts_with('.') {
+        // The safety prefix is part of the bound too. Shortening can
+        // expose another trailing dot or space, which Windows refuses.
+        format!("_{}", bounded_component(out, MAX_TAG_COMPONENT - 1))
     } else {
         out.to_owned()
     })
+}
+
+/// A component within `limit` bytes, ending at a character boundary and
+/// without leading whitespace or trailing dots and spaces.
+fn bounded_component(value: &str, limit: usize) -> &str {
+    let mut end = value.len().min(limit);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value
+        .split_at(end)
+        .0
+        .trim_end_matches(['.', ' '])
+        .trim_start()
+}
+
+/// Windows device names are reserved even when followed by an extension.
+fn reserved_component(value: &str) -> bool {
+    let stem = value.split('.').next().unwrap_or("").to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && stem.as_bytes()[3].is_ascii_digit()
+            && stem.as_bytes()[3] != b'0')
 }
 
 /// The safe path component for {tag:KEY}, or a usage error naming the key
@@ -385,13 +398,11 @@ fn safe_label(raw: &str) -> String {
         label.truncate(64);
         label.truncate(label.trim_end_matches(['-', '.']).len());
     }
-    let stem = label.split('.').next().unwrap_or("").to_ascii_uppercase();
-    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
-            && stem.len() == 4
-            && stem.as_bytes()[3].is_ascii_digit()
-            && stem.as_bytes()[3] != b'0');
-    if reserved { String::new() } else { label }
+    if reserved_component(&label) {
+        String::new()
+    } else {
+        label
+    }
 }
 
 /// {time}: the date and the time to the millisecond, so names made in the
@@ -424,6 +435,35 @@ pub(crate) fn check_free(path: &Path) -> Result<()> {
         check_one(&sidecar(path))?;
     }
     check_one(path)
+}
+
+/// A capture name also reserves its opaque chunk companion names.
+pub(crate) fn check_capture_free(path: &Path) -> Result<()> {
+    let chunks = chunk_payload(path);
+    check_one(&chunks)?;
+    check_one(&sidecar(&chunks))?;
+    check_free(path)
+}
+
+/// Reserve multipart names only for frames that actually contain components.
+pub(crate) fn check_multipart_free(path: &Path, gendc: bool) -> Result<()> {
+    let payload = multipart_payload(path, gendc);
+    check_one(&payload)?;
+    check_one(&sidecar(&payload))
+}
+
+/// The archived component ranges or the byte-exact linear `GenDC` container.
+pub(crate) fn multipart_payload(path: &Path, gendc: bool) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(if gendc { ".gendc" } else { ".multipart.raw" });
+    path.with_file_name(name)
+}
+
+/// The complete transport payload for an image that carries `GenICam` chunks.
+pub(crate) fn chunk_payload(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".chunks.raw");
+    path.with_file_name(name)
 }
 
 /// The `NAME.json` sidecar that describes the raw frame saved as `NAME`.
@@ -615,6 +655,16 @@ impl Namer {
         input: &NameInput<'_>,
         on_exists: OnExists,
     ) -> Result<PathBuf> {
+        self.candidate_inner(plan, input, on_exists, false)
+    }
+
+    fn candidate_inner(
+        &mut self,
+        plan: &Plan,
+        input: &NameInput<'_>,
+        on_exists: OnExists,
+        known_collision: bool,
+    ) -> Result<PathBuf> {
         match plan {
             Plan::Stdout => bail!("stdout output has no file name"),
             Plan::Directory { dir, ext } => self.numbered(
@@ -629,7 +679,7 @@ impl Namer {
                 SEQ_WIDTH,
                 plan,
             ),
-            Plan::File(path) => self.fixed(path.clone(), on_exists, plan),
+            Plan::File(path) => self.fixed(path.clone(), on_exists, plan, known_collision),
             Plan::Template(template) => {
                 let tokens = tokens(template)?;
                 let Some(seq) = tokens.iter().position(|t| matches!(t, Token::Seq(_))) else {
@@ -644,7 +694,7 @@ impl Namer {
                     } else {
                         on_exists
                     };
-                    return self.fixed(name.into(), on_exists, plan);
+                    return self.fixed(name.into(), on_exists, plan, known_collision);
                 };
                 let Token::Seq(width) = tokens[seq] else {
                     unreachable!("found as {{seq}}")
@@ -700,8 +750,21 @@ impl Namer {
         }
     }
 
-    fn fixed(&mut self, path: PathBuf, on_exists: OnExists, plan: &Plan) -> Result<PathBuf> {
-        match check_free(&path) {
+    fn fixed(
+        &mut self,
+        path: PathBuf,
+        on_exists: OnExists,
+        plan: &Plan,
+        known_collision: bool,
+    ) -> Result<PathBuf> {
+        let free = check_capture_free(&path).and_then(|()| {
+            if known_collision {
+                Err(OutputExists(path.clone()).into())
+            } else {
+                Ok(())
+            }
+        });
+        match free {
             Ok(()) => Ok(path),
             Err(e) if on_exists == OnExists::Number && is_exists(&e) => {
                 let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
@@ -775,7 +838,7 @@ impl Namer {
                 plan.describe()
             );
             let path = build(n);
-            match check_free(&path) {
+            match check_capture_free(&path) {
                 Ok(()) => {
                     if self.next.len() >= CACHE_KEYS && !self.next.contains_key(&key) {
                         self.next.clear();
@@ -870,7 +933,7 @@ pub(crate) fn save_named<T>(
                 path = namer
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .candidate(plan, input, on_exists)?;
+                    .candidate_inner(plan, input, on_exists, true)?;
             }
             Err(e) => return Err(e),
         }
@@ -1381,6 +1444,31 @@ mod tests {
         }
         let long = sanitize_component(&"é".repeat(100)).unwrap();
         assert!(long.len() <= MAX_TAG_COMPONENT && long.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn tag_component_bound_includes_safety_prefix() {
+        for value in [
+            format!(".{}", "a".repeat(127)),
+            format!("CON.{}", "a".repeat(124)),
+            format!(".{}", "é".repeat(100)),
+            format!("CON.{}", "é".repeat(100)),
+        ] {
+            let safe = sanitize_component(&value).unwrap();
+            assert!(safe.starts_with('_'), "{safe}");
+            assert!(safe.len() <= MAX_TAG_COMPONENT, "{safe}");
+            assert_eq!(sanitize_component(&safe).unwrap(), safe);
+        }
+        // Shortening for the prefix can expose another trailing dot or
+        // space, including after truncating at a UTF-8 boundary.
+        for tail in ['.', ' '] {
+            let value = format!(".{}{tail}x", "a".repeat(125));
+            let safe = sanitize_component(&value).unwrap();
+            assert_eq!(safe, format!("_.{}", "a".repeat(125)));
+            let value = format!(".{}{tail}é", "é".repeat(62));
+            let safe = sanitize_component(&value).unwrap();
+            assert_eq!(safe, format!("_.{}", "é".repeat(62)));
+        }
     }
 
     #[test]
